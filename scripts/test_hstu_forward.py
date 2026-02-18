@@ -9,6 +9,7 @@ import time
 from dataclasses import replace
 from pathlib import Path
 from typing import Iterable
+from tqdm import tqdm
 
 import torch
 
@@ -293,6 +294,11 @@ def main() -> None:
                 f"  first batch ready: games={batch['num_games']}, tokens={batch['total_tokens']}",
                 flush=True,
             )
+        if args.inspect_batches > 1:
+            print(
+                f"  inspected batch {batch_idx + 1}/{args.inspect_batches}",
+                flush=True,
+            )
         sampled_seq_lens.extend(int(x) for x in batch["seq_lens"].tolist())
         if (batch_idx + 1) == args.inspect_batches:
             print("Dataloader inspection complete.", flush=True)
@@ -349,7 +355,7 @@ def main() -> None:
                 out["loss"].backward()
 
         timings: list[float] = []
-        for _ in range(args.benchmark_steps):
+        for _ in tqdm(range(args.benchmark_steps), desc="Benchmarking", leave=False):
             _sync()
             start = time.perf_counter()
             model_to_run.zero_grad(set_to_none=True)

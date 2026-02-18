@@ -19,7 +19,7 @@ path = "artifacts/move_vocab_static_uci.json"
 include_unk = false
 
 [dataloader]
-max_tokens_per_batch = 16384
+max_tokens_per_batch = 24576
 num_workers = 2
 pin_memory = true
 
