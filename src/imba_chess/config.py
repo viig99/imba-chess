@@ -17,6 +17,14 @@ class DatasetConfig:
     min_avg_elo: int = 2000
     split: str = "train"
     dataset_name: str = "Lichess/standard-chess-games"
+    train_start_month: Optional[str] = None
+    train_end_month: Optional[str] = None
+    val_start_month: Optional[str] = None
+    val_end_month: Optional[str] = None
+    test_start_month: Optional[str] = None
+    test_end_month: Optional[str] = None
+    val_max_games: Optional[int] = None
+    test_max_games: Optional[int] = None
     cache_dir: Optional[str] = None
     parquet_batch_size: int = 2048
     max_seq_len: Optional[int] = None

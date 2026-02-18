@@ -111,3 +111,66 @@ def test_skips_games_with_zero_parsed_plies():
     games = list(dataset.stream_from_rows(rows))
 
     assert games == []
+
+
+def test_stream_from_rows_respects_max_games():
+    dataset = LichessDataset(min_avg_elo=2000)
+    rows = [
+        _row(Site="https://lichess.org/g1", WhiteElo="2200", BlackElo="2200"),
+        _row(Site="https://lichess.org/g2", WhiteElo="2200", BlackElo="2200"),
+    ]
+    games = list(dataset.stream_from_rows(rows, max_games=1))
+
+    assert len(games) == 1
+    assert games[0]["game_id"] == "https://lichess.org/g1"
+
+
+def test_stream_applies_val_max_games(monkeypatch):
+    rows = [
+        _row(Site="https://lichess.org/v1", WhiteElo="2200", BlackElo="2200"),
+        _row(Site="https://lichess.org/v2", WhiteElo="2200", BlackElo="2200"),
+    ]
+
+    def _fake_load_dataset(**kwargs):
+        return rows
+
+    monkeypatch.setattr("imba_chess.data.lichess_dataset.load_dataset", _fake_load_dataset)
+    dataset = LichessDataset(
+        min_avg_elo=2000,
+        split="val",
+        val_start_month="2025-08",
+        val_end_month="2025-08",
+        val_max_games=1,
+    )
+    games = list(dataset.stream())
+
+    assert len(games) == 1
+    assert games[0]["game_id"] == "https://lichess.org/v1"
+
+
+def test_temporal_mode_uses_reverse_month_order(monkeypatch):
+    captured: dict[str, object] = {}
+    rows = [_row(Site="https://lichess.org/t1", WhiteElo="2200", BlackElo="2200")]
+
+    def _fake_load_dataset(**kwargs):
+        captured.update(kwargs)
+        return rows
+
+    monkeypatch.setattr("imba_chess.data.lichess_dataset.load_dataset", _fake_load_dataset)
+    dataset = LichessDataset(
+        min_avg_elo=2000,
+        split="train",
+        train_start_month="2025-07",
+        train_end_month="2025-09",
+    )
+    games = list(dataset.stream())
+
+    assert games
+    assert captured["path"] == "parquet"
+    assert captured["split"] == "train"
+    data_files = captured["data_files"]
+    assert isinstance(data_files, dict)
+    train_files = data_files["train"]
+    assert "year=2025/month=09" in train_files[0]
+    assert "year=2025/month=08" in train_files[1]
+    assert "year=2025/month=07" in train_files[2]

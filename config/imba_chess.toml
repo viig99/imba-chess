@@ -2,6 +2,14 @@
 min_avg_elo = 2000
 split = "train"
 dataset_name = "Lichess/standard-chess-games"
+train_start_month = "2019-01"
+train_end_month = "2025-06"
+val_start_month = "2025-07"
+val_end_month = "2025-07"
+test_start_month = "2025-08"
+test_end_month = "2025-09"
+val_max_games = 100000
+test_max_games = 100000
 cache_dir = "artifacts/hf_cache"
 parquet_batch_size = 8192
 return_dataclasses = false

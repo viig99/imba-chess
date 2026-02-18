@@ -47,6 +47,14 @@ class LichessDataset:
         min_avg_elo: int = 2000,
         split: str = "train",
         dataset_name: str = "Lichess/standard-chess-games",
+        train_start_month: Optional[str] = None,
+        train_end_month: Optional[str] = None,
+        val_start_month: Optional[str] = None,
+        val_end_month: Optional[str] = None,
+        test_start_month: Optional[str] = None,
+        test_end_month: Optional[str] = None,
+        val_max_games: Optional[int] = None,
+        test_max_games: Optional[int] = None,
         cache_dir: Optional[str] = None,
         stream_columns: Optional[Sequence[str]] = None,
         parquet_batch_size: int = 2048,
@@ -57,6 +65,14 @@ class LichessDataset:
         self.min_avg_elo = min_avg_elo
         self.split = split
         self.dataset_name = dataset_name
+        self.train_start_month = train_start_month
+        self.train_end_month = train_end_month
+        self.val_start_month = val_start_month
+        self.val_end_month = val_end_month
+        self.test_start_month = test_start_month
+        self.test_end_month = test_end_month
+        self.val_max_games = val_max_games
+        self.test_max_games = test_max_games
         self.cache_dir = cache_dir
         self.stream_columns = (
             list(stream_columns) if stream_columns is not None else list(DEFAULT_STREAM_COLUMNS)
@@ -67,27 +83,22 @@ class LichessDataset:
         self.max_seq_len = max_seq_len
         self.return_dataclasses = return_dataclasses
         self.board_state_encoder = BoardStateEncoder(board_state_config)
+        self._validate_split_settings()
 
     def stream(self) -> Iterator[GameRecord | Dict[str, Any]]:
         if self.cache_dir is not None:
             Path(self.cache_dir).mkdir(parents=True, exist_ok=True)
 
-        load_kwargs: Dict[str, Any] = {
-            "split": self.split,
-            "streaming": True,
-            "cache_dir": self.cache_dir,
-            "columns": self.stream_columns,
-            "batch_size": self.parquet_batch_size,
-        }
+        load_kwargs = self._build_load_kwargs()
 
         try:
-            rows = load_dataset(self.dataset_name, **load_kwargs)
+            rows = load_dataset(**load_kwargs)
         except TypeError:
             load_kwargs.pop("columns", None)
             load_kwargs.pop("batch_size", None)
-            rows = load_dataset(self.dataset_name, **load_kwargs)
+            rows = load_dataset(**load_kwargs)
 
-        yield from self.stream_from_rows(rows)
+        yield from self.stream_from_rows(rows, max_games=self._max_games_for_split())
 
     def as_torch_iterable(
         self,
@@ -101,8 +112,12 @@ class LichessDataset:
         )
 
     def stream_from_rows(
-        self, rows: Iterable[Dict[str, Any]]
+        self,
+        rows: Iterable[Dict[str, Any]],
+        *,
+        max_games: Optional[int] = None,
     ) -> Iterator[GameRecord | Dict[str, Any]]:
+        emitted_games = 0
         for row in rows:
             if not self._is_valid_game(row):
                 continue
@@ -115,6 +130,10 @@ class LichessDataset:
                 yield game
             else:
                 yield asdict(game)
+
+            emitted_games += 1
+            if max_games is not None and emitted_games >= max_games:
+                return
 
     def _is_valid_game(self, row: Dict[str, Any]) -> bool:
         white_elo = parse_elo(row.get("WhiteElo"))
@@ -277,3 +296,93 @@ class LichessDataset:
         if result == "0-1":
             return "black", black_player, black_elo, white_player, white_elo
         return None, None, None, None, None
+
+    def _build_load_kwargs(self) -> Dict[str, Any]:
+        return {
+            "path": "parquet",
+            "data_files": {"train": self._temporal_data_files()},
+            "split": "train",
+            "streaming": True,
+            "cache_dir": self.cache_dir,
+            "columns": self.stream_columns,
+            "batch_size": self.parquet_batch_size,
+        }
+
+    def _validate_split_settings(self) -> None:
+        if self.split.lower() not in {"train", "val", "test"}:
+            raise ValueError("split must be one of {'train', 'val', 'test'}")
+        if self.val_max_games is not None and self.val_max_games < 1:
+            raise ValueError("val_max_games must be >= 1 when set")
+        if self.test_max_games is not None and self.test_max_games < 1:
+            raise ValueError("test_max_games must be >= 1 when set")
+
+    def _max_games_for_split(self) -> Optional[int]:
+        split_name = self.split.lower()
+        if split_name == "val":
+            return self.val_max_games
+        if split_name == "test":
+            return self.test_max_games
+        return None
+
+    def _month_window_for_split(self) -> tuple[str, str]:
+        split_name = self.split.lower()
+        if split_name == "train":
+            return self._require_month_window(
+                self.train_start_month, self.train_end_month, "train"
+            )
+        if split_name == "val":
+            return self._require_month_window(
+                self.val_start_month, self.val_end_month, "val"
+            )
+        if split_name == "test":
+            return self._require_month_window(
+                self.test_start_month, self.test_end_month, "test"
+            )
+        raise ValueError("split must be one of {'train', 'val', 'test'}")
+
+    @staticmethod
+    def _require_month_window(
+        start_month: Optional[str], end_month: Optional[str], split_name: str
+    ) -> tuple[str, str]:
+        if not start_month or not end_month:
+            raise ValueError(
+                f"temporal split for {split_name!r} requires start and end month"
+            )
+        return start_month, end_month
+
+    def _temporal_data_files(self) -> list[str]:
+        start_month, end_month = self._month_window_for_split()
+        start_index = self._parse_month_index(start_month)
+        end_index = self._parse_month_index(end_month)
+        self._validate_month_range(start_month, end_month)
+
+        # Newest month first so recent games appear first in the stream.
+        files: list[str] = []
+        for month_index in range(end_index, start_index - 1, -1):
+            year = month_index // 12
+            month = (month_index % 12) + 1
+            files.append(
+                f"hf://datasets/{self.dataset_name}/data/year={year:04d}/month={month:02d}/*.parquet"
+            )
+        return files
+
+    @staticmethod
+    def _parse_month_index(value: str) -> int:
+        parts = value.split("-")
+        if len(parts) != 2:
+            raise ValueError(f"Invalid month value {value!r}, expected YYYY-MM")
+        year_text, month_text = parts
+        try:
+            year = int(year_text)
+            month = int(month_text)
+        except ValueError as exc:
+            raise ValueError(f"Invalid month value {value!r}, expected YYYY-MM") from exc
+        if month < 1 or month > 12:
+            raise ValueError(f"Invalid month value {value!r}, month must be 01..12")
+        return (year * 12) + (month - 1)
+
+    def _validate_month_range(self, start_month: str, end_month: str) -> None:
+        if self._parse_month_index(start_month) > self._parse_month_index(end_month):
+            raise ValueError(
+                f"Invalid month range: start {start_month!r} is after end {end_month!r}"
+            )
