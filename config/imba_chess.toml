@@ -3,7 +3,7 @@ min_avg_elo = 2000
 split = "train"
 dataset_name = "Lichess/standard-chess-games"
 cache_dir = "artifacts/hf_cache"
-parquet_batch_size = 2048
+parquet_batch_size = 8192
 return_dataclasses = false
 max_seq_len = 512
 
