@@ -2,10 +2,10 @@ import pytest
 
 torch = pytest.importorskip("torch")
 
-from imba_chess.data.collate import collate_batch
+from imba_chess.data.collate import collate_jagged_batch
 
 
-def test_collate_batch_shapes_and_masks():
+def test_collate_jagged_batch_shapes_and_offsets():
     batch = [
         {
             "game_id": "g1",
@@ -17,9 +17,7 @@ def test_collate_batch_shapes_and_masks():
             "halfmove_bucket_id": [0, 0, 0],
             "fullmove_bucket_id": [0, 0, 1],
             "prev_move_id": [1, 1, 4],
-            "target_move_id": [0, 4, 8],
-            "attention_mask": [1, 1, 1],
-            "loss_mask": [0, 1, 1],
+            "target_move_id": [-100, 4, 8],
         },
         {
             "game_id": "g2",
@@ -31,18 +29,18 @@ def test_collate_batch_shapes_and_masks():
             "halfmove_bucket_id": [0, 0],
             "fullmove_bucket_id": [0, 0],
             "prev_move_id": [1, 1],
-            "target_move_id": [0, 3],
-            "attention_mask": [1, 1],
-            "loss_mask": [0, 1],
+            "target_move_id": [-100, 3],
         },
     ]
 
-    out = collate_batch(batch)
-
-    assert out["seq_token_id"].shape == (2, 3)
-    assert out["piece_ids"].shape == (2, 3, 64)
-    assert out["attention_mask"].tolist() == [[1, 1, 1], [1, 1, 0]]
-    assert out["loss_mask"].tolist() == [[0, 1, 1], [0, 1, 0]]
+    out = collate_jagged_batch(batch)
+    assert out["num_games"] == 2
+    assert out["total_tokens"] == 5
+    assert out["seq_lens"].tolist() == [3, 2]
+    assert out["seq_offsets"].tolist() == [0, 3, 5]
+    assert out["piece_ids"].shape == (5, 64)
+    assert out["seq_token_id"].shape == (5,)
+    assert out["target_move_id"][0].item() == -100
     assert out["game_id"] == ["g1", "g2"]
-    assert out["seq_token_id"].dtype == torch.long
+    assert out["turn_id"].dtype == torch.long
 

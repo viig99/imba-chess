@@ -24,7 +24,12 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Include <unk> only when auto-generating a missing vocab.",
     )
-    parser.add_argument("--batch-size", type=int, default=4, help="Dataloader batch size.")
+    parser.add_argument(
+        "--max-tokens-per-batch",
+        type=int,
+        default=6144,
+        help="Pack as many games as fit into this total token budget.",
+    )
     parser.add_argument("--num-batches", type=int, default=2, help="How many batches to print.")
     parser.add_argument("--num-workers", type=int, default=0, help="DataLoader workers.")
     parser.add_argument("--min-avg-elo", type=int, default=2000, help="Average Elo threshold.")
@@ -58,9 +63,8 @@ def main() -> None:
     stream_source = make_dataset(args)
     loader = build_event_dataloader(
         lichess_dataset=stream_source,
-        move_vocab_path=args.vocab_path,
-        static_vocab_include_unk=args.include_unk,
-        batch_size=args.batch_size,
+        move_vocab=move_vocab,
+        max_tokens_per_batch=args.max_tokens_per_batch,
         num_workers=args.num_workers,
     )
 

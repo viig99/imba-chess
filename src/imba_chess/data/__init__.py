@@ -1,8 +1,11 @@
 """Data utilities for imba_chess."""
 
-from .collate import collate_batch
-from .dataloader import ChessEventIterableDataset, build_event_dataloader
-from .event_builder import EventBuilder
+from .collate import collate_jagged_batch
+from .dataloader import (
+    ChessEventIterableDataset,
+    build_event_dataloader,
+)
+from .event_builder import BOS_TOKEN_ID, EVENT_TOKEN_ID, EventBuilder, TARGET_IGNORE_INDEX
 from .lichess_dataset import LichessDataset
 from .models import (
     BoardState,
@@ -19,14 +22,22 @@ from .move_vocab import (
     MoveVocabConfig,
     load_or_create_static_move_vocab,
 )
+from .packing import MaxTokensJaggedBatchDataset
 from .torch_iterable import TorchLichessIterableDataset
+from .types import EventSequence, JaggedBatch
 
 __all__ = [
     "build_event_dataloader",
     "ChessEventIterableDataset",
-    "collate_batch",
+    "MaxTokensJaggedBatchDataset",
+    "collate_jagged_batch",
     "LichessDataset",
     "EventBuilder",
+    "EVENT_TOKEN_ID",
+    "BOS_TOKEN_ID",
+    "TARGET_IGNORE_INDEX",
+    "EventSequence",
+    "JaggedBatch",
     "MoveVocab",
     "MoveVocabConfig",
     "load_or_create_static_move_vocab",

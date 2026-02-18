@@ -1,19 +1,14 @@
 from __future__ import annotations
 
-import dataclasses
 from typing import Any, Dict
 
 from .move_vocab import MoveVocab
+from .serialize import as_plain_dict
+from .types import EventSequence
 
-PAD_SEQ_TOKEN_ID = 0
-BOS_SEQ_TOKEN_ID = 1
-
-
-def _as_dict(value: Any) -> Dict[str, Any]:
-    if dataclasses.is_dataclass(value):
-        return dataclasses.asdict(value)
-    return value
-
+EVENT_TOKEN_ID = 0
+BOS_TOKEN_ID = 1
+TARGET_IGNORE_INDEX = -100
 
 class EventBuilder:
     """Build BOS+ply event sequences for next-move prediction."""
@@ -21,11 +16,11 @@ class EventBuilder:
     def __init__(self, move_vocab: MoveVocab) -> None:
         self.move_vocab = move_vocab
 
-    def build_game(self, game: Dict[str, Any]) -> Dict[str, Any]:
-        data = _as_dict(game)
-        plays = [_as_dict(play) for play in data["plays"]]
+    def build_game(self, game: Dict[str, Any]) -> EventSequence:
+        data = as_plain_dict(game)
+        plays = [as_plain_dict(play) for play in data["plays"]]
 
-        seq_token_id = [BOS_SEQ_TOKEN_ID]
+        seq_token_id = [BOS_TOKEN_ID]
         piece_ids = [[0] * 64]
         turn_id = [0]
         castle_id = [0]
@@ -33,16 +28,14 @@ class EventBuilder:
         halfmove_bucket_id = [0]
         fullmove_bucket_id = [0]
         prev_move_id = [self.move_vocab.start_id]
-        target_move_id = [self.move_vocab.pad_id]
-        attention_mask = [1]
-        loss_mask = [0]
+        target_move_id = [TARGET_IGNORE_INDEX]
 
         previous_move = self.move_vocab.start_id
         for play in plays:
-            state = _as_dict(play["state"])
+            state = as_plain_dict(play["state"])
             current_move = self.move_vocab.encode(play["move_uci"])
 
-            seq_token_id.append(PAD_SEQ_TOKEN_ID)
+            seq_token_id.append(EVENT_TOKEN_ID)
             piece_ids.append(list(state["piece_ids"]))
             turn_id.append(int(state["turn_id"]))
             castle_id.append(int(state["castle_id"]))
@@ -51,8 +44,6 @@ class EventBuilder:
             fullmove_bucket_id.append(int(state["fullmove_bucket_id"]))
             prev_move_id.append(previous_move)
             target_move_id.append(current_move)
-            attention_mask.append(1)
-            loss_mask.append(1)
 
             previous_move = current_move
 
@@ -67,7 +58,4 @@ class EventBuilder:
             "fullmove_bucket_id": fullmove_bucket_id,
             "prev_move_id": prev_move_id,
             "target_move_id": target_move_id,
-            "attention_mask": attention_mask,
-            "loss_mask": loss_mask,
         }
-

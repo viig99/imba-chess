@@ -52,13 +52,15 @@ def test_build_event_dataloader_returns_tensor_dict():
     loader = build_event_dataloader(
         lichess_dataset=dataset,
         move_vocab=vocab,
-        batch_size=2,
+        max_tokens_per_batch=1024,
         num_workers=0,
     )
 
     batch = next(iter(loader))
-    assert batch["seq_token_id"].shape == (2, 3)
-    assert batch["piece_ids"].shape == (2, 3, 64)
+    assert batch["seq_lens"].tolist() == [3, 3]
+    assert batch["seq_offsets"].tolist() == [0, 3, 6]
+    assert batch["seq_token_id"].shape == (6,)
+    assert batch["piece_ids"].shape == (6, 64)
     assert batch["target_move_id"].dtype == torch.long
     assert batch["game_id"] == ["g1", "g2"]
 
@@ -70,11 +72,33 @@ def test_build_event_dataloader_auto_creates_vocab(tmp_path):
 
     loader = build_event_dataloader(
         lichess_dataset=dataset,
-        batch_size=1,
+        max_tokens_per_batch=1024,
         num_workers=0,
         move_vocab_path=vocab_path,
     )
 
     batch = next(iter(loader))
     assert vocab_path.exists()
-    assert batch["seq_token_id"].shape == (1, 3)
+    assert batch["seq_token_id"].shape == (3,)
+
+
+def test_build_event_dataloader_packs_by_max_tokens():
+    games = [
+        _game("g1", "e2e4", "e7e5"),
+        _game("g2", "d2d4", "d7d5"),
+        _game("g3", "c2c4", "e7e6"),
+    ]
+    vocab = MoveVocab.build_from_games(games)
+    dataset = DummyLichessDataset(games)
+
+    loader = build_event_dataloader(
+        lichess_dataset=dataset,
+        move_vocab=vocab,
+        max_tokens_per_batch=6,  # each game is 3 tokens (BOS + 2 plies)
+        num_workers=0,
+    )
+
+    batches = list(loader)
+    assert len(batches) == 2
+    assert batches[0]["game_id"] == ["g1", "g2"]
+    assert batches[1]["game_id"] == ["g3"]

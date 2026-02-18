@@ -1,4 +1,4 @@
-from imba_chess.data.event_builder import BOS_SEQ_TOKEN_ID, EventBuilder
+from imba_chess.data.event_builder import BOS_TOKEN_ID, EventBuilder, TARGET_IGNORE_INDEX
 from imba_chess.data.lichess_dataset import LichessDataset
 from imba_chess.data.move_vocab import MoveVocab
 
@@ -32,9 +32,8 @@ def test_event_builder_builds_bos_plus_plies():
 
     # 4 plies + BOS
     assert len(sample["seq_token_id"]) == 5
-    assert sample["seq_token_id"][0] == BOS_SEQ_TOKEN_ID
-    assert sample["loss_mask"][0] == 0
-    assert sample["loss_mask"][1:] == [1, 1, 1, 1]
+    assert sample["seq_token_id"][0] == BOS_TOKEN_ID
+    assert sample["target_move_id"][0] == TARGET_IGNORE_INDEX
+    assert all(token_id != TARGET_IGNORE_INDEX for token_id in sample["target_move_id"][1:])
     assert sample["prev_move_id"][1] == vocab.start_id
     assert len(sample["piece_ids"][1]) == 64
-
