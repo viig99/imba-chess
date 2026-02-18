@@ -197,12 +197,22 @@ class HSTUChessModel(nn.Module):
         logits = self.prediction_head(x)
         output: dict[str, torch.Tensor] = {"logits": logits}
 
-        if return_loss and "target_move_id" in batch:
+        if return_loss:
+            if "target_move_id" not in batch:
+                raise KeyError("batch['target_move_id'] is required when return_loss=True")
             target_move_id = batch["target_move_id"].to(
                 device=logits.device, dtype=torch.long
             )
+            valid_count = int((target_move_id != self.config.ignore_index).sum().item())
+            if valid_count == 0:
+                raise ValueError(
+                    "No valid target tokens in batch (all target_move_id == ignore_index). "
+                    "Check dataset/event construction and sequence truncation settings."
+                )
             output["loss"] = F.cross_entropy(
-                logits, target_move_id, ignore_index=self.config.ignore_index
+                logits.float(),
+                target_move_id,
+                ignore_index=self.config.ignore_index,
             )
 
         return output

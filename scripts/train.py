@@ -11,7 +11,7 @@ from typing import Any
 
 import torch
 from ignite.engine import Engine, Events
-from ignite.handlers import Checkpoint, DiskSaver, global_step_from_engine
+from ignite.handlers import Checkpoint, DiskSaver, ProgressBar, global_step_from_engine
 from ignite.handlers.tensorboard_logger import TensorboardLogger
 
 from imba_chess.config import DEFAULT_CONFIG_PATH, load_repo_config
@@ -115,8 +115,13 @@ def _build_optimizer(model: torch.nn.Module, config, *, device: torch.device):
         "lr": float(config.training.max_lr),
         "weight_decay": float(config.training.weight_decay),
     }
-    if device.type == "cuda":
-        kwargs["fused"] = bool(config.training.optimizer_fused)
+    if bool(config.training.optimizer_fused):
+        if device.type != "cuda":
+            raise ValueError(
+                "training.optimizer_fused=true requires CUDA device. "
+                "Set optimizer_fused=false for CPU training."
+            )
+        kwargs["fused"] = True
     return torch.optim.AdamW(model.parameters(), **kwargs)
 
 
@@ -198,6 +203,47 @@ def _print_eval_metrics(split: str, metrics: dict[str, float]) -> None:
     print(f"  mrr: {metrics['mrr']:.6f}")
 
 
+def _validate_runtime_config(
+    *,
+    repo_config,
+    device: torch.device,
+    dtype: torch.dtype,
+) -> None:
+    if device.type == "cuda" and not torch.cuda.is_available():
+        raise RuntimeError(
+            "training.device='cuda' requested but CUDA is not available."
+        )
+    if device.type != "cuda" and dtype != torch.float32:
+        raise ValueError(
+            "Non-float32 training on CPU is unsupported in this script. "
+            "Use training.dtype='float32' or switch to CUDA."
+        )
+    if not bool(repo_config.training.deterministic_eval):
+        raise ValueError(
+            "training.deterministic_eval must be true. "
+            "Stochastic eval mode is intentionally unsupported."
+        )
+
+
+def _run_deterministic_eval(
+    *,
+    evaluator: Engine,
+    loader,
+    seed: int,
+    epoch_length: int | None,
+) -> None:
+    _set_seed(seed)
+    prev_benchmark = torch.backends.cudnn.benchmark
+    prev_deterministic = torch.backends.cudnn.deterministic
+    torch.backends.cudnn.benchmark = False
+    torch.backends.cudnn.deterministic = True
+    try:
+        evaluator.run(loader, max_epochs=1, epoch_length=epoch_length)
+    finally:
+        torch.backends.cudnn.benchmark = prev_benchmark
+        torch.backends.cudnn.deterministic = prev_deterministic
+
+
 def main() -> None:
     args = parse_args()
     repo_config = load_repo_config(args.config)
@@ -229,8 +275,10 @@ def main() -> None:
 
     device = _resolve_device(repo_config.training.device)
     dtype = _resolve_dtype(repo_config.training.dtype)
+    _validate_runtime_config(repo_config=repo_config, device=device, dtype=dtype)
     use_amp = device.type == "cuda" and dtype in (torch.float16, torch.bfloat16)
     use_scaler = device.type == "cuda" and dtype == torch.float16
+    eval_epoch_length = args.max_eval_batches
 
     move_vocab = load_or_create_static_move_vocab(
         path=repo_config.vocab.path,
@@ -293,31 +341,38 @@ def main() -> None:
         topk=(1, 3, 5, 10),
     )
 
+    fast_val_pbar = ProgressBar(persist=False, desc="val_fast")
+    fast_val_pbar.attach(
+        fast_val_evaluator,
+        output_transform=lambda out: {"games": int(out["num_games"])},
+    )
+    full_val_pbar = ProgressBar(persist=False, desc="val_full")
+    full_val_pbar.attach(
+        full_val_evaluator,
+        output_transform=lambda out: {"games": int(out["num_games"])},
+    )
+    test_pbar = ProgressBar(persist=False, desc="test")
+    test_pbar.attach(
+        test_evaluator,
+        output_transform=lambda out: {"games": int(out["num_games"])},
+    )
+
     def _run_eval_only() -> None:
-        run_kwargs: dict[str, Any] = {}
-        if args.max_eval_batches is not None:
-            run_kwargs["epoch_length"] = args.max_eval_batches
-
-        def _run_with_determinism(evaluator: Engine, loader) -> None:
-            if not bool(repo_config.training.deterministic_eval):
-                evaluator.run(loader, max_epochs=1, **run_kwargs)
-                return
-            _set_seed(int(repo_config.training.seed))
-            prev_benchmark = torch.backends.cudnn.benchmark
-            prev_deterministic = torch.backends.cudnn.deterministic
-            torch.backends.cudnn.benchmark = False
-            torch.backends.cudnn.deterministic = True
-            try:
-                evaluator.run(loader, max_epochs=1, **run_kwargs)
-            finally:
-                torch.backends.cudnn.benchmark = prev_benchmark
-                torch.backends.cudnn.deterministic = prev_deterministic
-
         if args.eval_split in {"val", "both"}:
-            _run_with_determinism(full_val_evaluator, full_val_loader)
+            _run_deterministic_eval(
+                evaluator=full_val_evaluator,
+                loader=full_val_loader,
+                seed=int(repo_config.training.seed),
+                epoch_length=eval_epoch_length,
+            )
             _print_eval_metrics("val", full_val_evaluator.state.metrics)
         if args.eval_split in {"test", "both"}:
-            _run_with_determinism(test_evaluator, test_loader)
+            _run_deterministic_eval(
+                evaluator=test_evaluator,
+                loader=test_loader,
+                seed=int(repo_config.training.seed),
+                epoch_length=eval_epoch_length,
+            )
             _print_eval_metrics("test", test_evaluator.state.metrics)
 
     if args.eval_only:
@@ -375,6 +430,15 @@ def main() -> None:
         }
 
     trainer = Engine(_train_step)
+    train_pbar = ProgressBar(persist=True, desc="train")
+    train_pbar.attach(
+        trainer,
+        output_transform=lambda out: {
+            "loss": f"{out['loss']:.4f}",
+            "lr": f"{out['lr']:.6f}",
+            "tokens": int(out["tokens"]),
+        },
+    )
     checkpoint_dir = Path(repo_config.training.checkpoint_dir)
     checkpoint_dir.mkdir(parents=True, exist_ok=True)
     checkpoint_objects: dict[str, Any] = {
@@ -444,44 +508,24 @@ def main() -> None:
 
     @trainer.on(Events.ITERATION_COMPLETED(every=repo_config.training.eval_every_steps))
     def _run_periodic_fast_val_eval(engine: Engine) -> None:
-        run_kwargs: dict[str, Any] = {}
-        if args.max_eval_batches is not None:
-            run_kwargs["epoch_length"] = args.max_eval_batches
-        if bool(repo_config.training.deterministic_eval):
-            _set_seed(int(repo_config.training.seed))
-            prev_benchmark = torch.backends.cudnn.benchmark
-            prev_deterministic = torch.backends.cudnn.deterministic
-            torch.backends.cudnn.benchmark = False
-            torch.backends.cudnn.deterministic = True
-            try:
-                fast_val_evaluator.run(fast_val_loader, max_epochs=1, **run_kwargs)
-            finally:
-                torch.backends.cudnn.benchmark = prev_benchmark
-                torch.backends.cudnn.deterministic = prev_deterministic
-        else:
-            fast_val_evaluator.run(fast_val_loader, max_epochs=1, **run_kwargs)
+        _run_deterministic_eval(
+            evaluator=fast_val_evaluator,
+            loader=fast_val_loader,
+            seed=int(repo_config.training.seed),
+            epoch_length=eval_epoch_length,
+        )
         _print_eval_metrics("val_fast", fast_val_evaluator.state.metrics)
 
     @trainer.on(
         Events.EPOCH_COMPLETED(every=int(repo_config.training.full_val_every_epochs))
     )
     def _run_periodic_full_val_eval(engine: Engine) -> None:
-        run_kwargs: dict[str, Any] = {}
-        if args.max_eval_batches is not None:
-            run_kwargs["epoch_length"] = args.max_eval_batches
-        if bool(repo_config.training.deterministic_eval):
-            _set_seed(int(repo_config.training.seed))
-            prev_benchmark = torch.backends.cudnn.benchmark
-            prev_deterministic = torch.backends.cudnn.deterministic
-            torch.backends.cudnn.benchmark = False
-            torch.backends.cudnn.deterministic = True
-            try:
-                full_val_evaluator.run(full_val_loader, max_epochs=1, **run_kwargs)
-            finally:
-                torch.backends.cudnn.benchmark = prev_benchmark
-                torch.backends.cudnn.deterministic = prev_deterministic
-        else:
-            full_val_evaluator.run(full_val_loader, max_epochs=1, **run_kwargs)
+        _run_deterministic_eval(
+            evaluator=full_val_evaluator,
+            loader=full_val_loader,
+            seed=int(repo_config.training.seed),
+            epoch_length=eval_epoch_length,
+        )
         _print_eval_metrics("val_full", full_val_evaluator.state.metrics)
 
     @trainer.on(Events.EPOCH_COMPLETED)
@@ -505,20 +549,6 @@ def main() -> None:
             max_epochs=repo_config.training.epochs,
             epoch_length=repo_config.training.steps_per_epoch,
         )
-    except Exception:
-        emergency_path = checkpoint_dir / f"emergency_iter_{trainer.state.iteration}.pt"
-        torch.save(
-            {
-                "model": model.state_dict(),
-                "optimizer": optimizer.state_dict(),
-                "scheduler": scheduler.state_dict(),
-                "trainer": trainer.state_dict(),
-                "scaler": scaler.state_dict(),
-            },
-            emergency_path,
-        )
-        print(f"Saved emergency checkpoint: {emergency_path}")
-        raise
     finally:
         tb_logger.close()
 

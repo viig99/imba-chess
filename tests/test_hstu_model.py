@@ -56,3 +56,21 @@ def test_build_hstu_chess_config_from_repo_model_section():
     assert cfg.model_dim == 256
     assert cfg.num_layers == 4
     assert cfg.dropout == 0.2
+
+
+def test_hstu_chess_model_raises_when_all_targets_ignored():
+    config = HSTUChessConfig(
+        move_vocab_size=128,
+        model_dim=64,
+        linear_hidden_dim=16,
+        attention_dim=16,
+        num_heads=2,
+        num_layers=0,
+        max_position_embeddings=32,
+    )
+    model = HSTUChessModel(config)
+    batch = _batch()
+    batch["target_move_id"] = torch.full_like(batch["target_move_id"], -100)
+
+    with pytest.raises(ValueError, match="No valid target tokens in batch"):
+        model(batch, return_loss=True)

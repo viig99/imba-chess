@@ -5,6 +5,7 @@ from typing import Any, Iterable
 import torch
 import torch.nn.functional as F
 from ignite.metrics import Metric
+from ignite.metrics.metric import reinit__is_reduced, sync_all_reduce
 
 
 def normalize_topk(topk: Iterable[int]) -> tuple[int, ...]:
@@ -52,23 +53,29 @@ class _BaseNextMoveMetric(Metric):
 class NextMoveCrossEntropy(_BaseNextMoveMetric):
     """Mean CE over non-ignore-index tokens."""
 
+    @reinit__is_reduced
     def reset(self) -> None:
         self._loss_sum = 0.0
         self._token_count = 0.0
         super().reset()
 
+    @reinit__is_reduced
     def update(self, output: Any) -> None:
         logits, targets = self._unpack_output(output)
         valid_mask = self._valid_mask(targets)
         valid_count = int(valid_mask.sum().item())
         if valid_count == 0:
-            return
+            raise ValueError(
+                "NextMoveCrossEntropy received a batch with no valid targets. "
+                "All targets are ignore_index."
+            )
         valid_logits = logits[valid_mask]
         valid_targets = targets[valid_mask]
-        loss_sum = F.cross_entropy(valid_logits, valid_targets, reduction="sum")
+        loss_sum = F.cross_entropy(valid_logits.float(), valid_targets, reduction="sum")
         self._loss_sum += float(loss_sum.item())
         self._token_count += float(valid_count)
 
+    @sync_all_reduce("_loss_sum", "_token_count")
     def compute(self) -> float:
         if self._token_count == 0.0:
             return float("nan")
@@ -84,17 +91,22 @@ class NextMoveTopKAccuracy(_BaseNextMoveMetric):
         self.k = int(k)
         super().__init__(ignore_index=ignore_index, output_transform=output_transform)
 
+    @reinit__is_reduced
     def reset(self) -> None:
         self._correct = 0.0
         self._token_count = 0.0
         super().reset()
 
+    @reinit__is_reduced
     def update(self, output: Any) -> None:
         logits, targets = self._unpack_output(output)
         valid_mask = self._valid_mask(targets)
         valid_count = int(valid_mask.sum().item())
         if valid_count == 0:
-            return
+            raise ValueError(
+                "NextMoveTopKAccuracy received a batch with no valid targets. "
+                "All targets are ignore_index."
+            )
 
         valid_logits = logits[valid_mask]
         valid_targets = targets[valid_mask]
@@ -106,6 +118,7 @@ class NextMoveTopKAccuracy(_BaseNextMoveMetric):
         self._correct += float(hits.item())
         self._token_count += float(valid_count)
 
+    @sync_all_reduce("_correct", "_token_count")
     def compute(self) -> float:
         if self._token_count == 0.0:
             return float("nan")
@@ -115,17 +128,22 @@ class NextMoveTopKAccuracy(_BaseNextMoveMetric):
 class NextMoveMRR(_BaseNextMoveMetric):
     """Mean reciprocal rank over non-ignore-index tokens."""
 
+    @reinit__is_reduced
     def reset(self) -> None:
         self._rr_sum = 0.0
         self._token_count = 0.0
         super().reset()
 
+    @reinit__is_reduced
     def update(self, output: Any) -> None:
         logits, targets = self._unpack_output(output)
         valid_mask = self._valid_mask(targets)
         valid_count = int(valid_mask.sum().item())
         if valid_count == 0:
-            return
+            raise ValueError(
+                "NextMoveMRR received a batch with no valid targets. "
+                "All targets are ignore_index."
+            )
 
         valid_logits = logits[valid_mask]
         valid_targets = targets[valid_mask]
@@ -137,6 +155,7 @@ class NextMoveMRR(_BaseNextMoveMetric):
         self._rr_sum += float((1.0 / rank).sum().item())
         self._token_count += float(valid_count)
 
+    @sync_all_reduce("_rr_sum", "_token_count")
     def compute(self) -> float:
         if self._token_count == 0.0:
             return float("nan")
@@ -146,35 +165,43 @@ class NextMoveMRR(_BaseNextMoveMetric):
 class NextMoveTokenCount(_BaseNextMoveMetric):
     """Count of valid (non-ignore-index) tokens."""
 
+    @reinit__is_reduced
     def reset(self) -> None:
         self._token_count = 0.0
         super().reset()
 
+    @reinit__is_reduced
     def update(self, output: Any) -> None:
         _, targets = self._unpack_output(output)
         self._token_count += float(self._valid_mask(targets).sum().item())
 
+    @sync_all_reduce("_token_count")
     def compute(self) -> float:
         return self._token_count
 
 
 class BatchCount(Metric):
+    @reinit__is_reduced
     def reset(self) -> None:
         self._count = 0.0
         super().reset()
 
+    @reinit__is_reduced
     def update(self, output: Any) -> None:
         self._count += 1.0
 
+    @sync_all_reduce("_count")
     def compute(self) -> float:
         return self._count
 
 
 class GameCount(Metric):
+    @reinit__is_reduced
     def reset(self) -> None:
         self._count = 0.0
         super().reset()
 
+    @reinit__is_reduced
     def update(self, output: Any) -> None:
         if not isinstance(output, dict):
             raise TypeError("Expected evaluator output to be a dict")
@@ -183,5 +210,6 @@ class GameCount(Metric):
             raise KeyError("Expected output['num_games']")
         self._count += float(num_games)
 
+    @sync_all_reduce("_count")
     def compute(self) -> float:
         return self._count

@@ -64,3 +64,20 @@ def test_next_move_metrics_with_ignore_index():
 def test_topk_metric_validates_k():
     with pytest.raises(ValueError, match="k must be >= 1"):
         NextMoveTopKAccuracy(k=0, ignore_index=-100)
+
+
+def test_metrics_raise_when_all_targets_ignored():
+    output = {
+        "logits": torch.tensor([[0.1, 0.2, 0.3]], dtype=torch.float32),
+        "targets": torch.tensor([-100], dtype=torch.long),
+        "num_games": 1.0,
+    }
+    metrics = [
+        NextMoveCrossEntropy(ignore_index=-100),
+        NextMoveTopKAccuracy(k=1, ignore_index=-100),
+        NextMoveMRR(ignore_index=-100),
+    ]
+    for metric in metrics:
+        metric.reset()
+        with pytest.raises(ValueError, match="no valid targets"):
+            metric.update(output)
