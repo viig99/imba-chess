@@ -37,7 +37,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--config", type=Path, default=DEFAULT_CONFIG_PATH)
     parser.add_argument("--inspect-batches", type=int, default=8)
     parser.add_argument("--warmup-steps", type=int, default=5)
-    parser.add_argument("--benchmark-steps", type=int, default=20)
+    parser.add_argument("--benchmark-steps", type=int, default=100)
     parser.add_argument(
         "--device",
         choices=["auto", "cpu", "cuda"],

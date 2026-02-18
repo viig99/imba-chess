@@ -19,7 +19,7 @@ path = "artifacts/move_vocab_static_uci.json"
 include_unk = false
 
 [dataloader]
-max_tokens_per_batch = 8192
+max_tokens_per_batch = 16384
 num_workers = 2
 pin_memory = true
 
@@ -28,7 +28,7 @@ model_dim = 384
 linear_hidden_dim = 48
 attention_dim = 48
 num_heads = 8
-num_layers = 6
+num_layers = 12
 dropout = 0.1
 max_position_embeddings = 512
 halfmove_vocab_size = 128
