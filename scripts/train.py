@@ -389,7 +389,7 @@ def main() -> None:
     )
     optimizer = _build_optimizer(model, repo_config, device=device)
     scheduler = _build_scheduler(optimizer, repo_config)
-    scaler = torch.cuda.amp.GradScaler(enabled=use_scaler)
+    scaler = torch.amp.GradScaler(device.type, enabled=use_scaler)
 
     def _train_step(engine: Engine, batch: dict[str, object]) -> dict[str, float]:
         model.train()
