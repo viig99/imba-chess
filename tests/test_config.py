@@ -32,10 +32,17 @@ num_layers = 8
 epochs = 5
 steps_per_epoch = 1234
 eval_every_steps = 200
+full_val_every_epochs = 1
+fast_val_max_games = 5000
 max_lr = 0.0003
-lr_start_factor = 0.2
+lr_start_factor = 0.1
 lr_end_factor = 0.5
-onecycle_pct_start = 0.3
+onecycle_warmup_fraction_first_epoch = 0.1
+seed = 123
+deterministic_eval = true
+eval_num_workers = 0
+save_last_every_steps = 300
+last_checkpoint_keep = 2
         """.strip()
         + "\n",
         encoding="utf-8",
@@ -58,10 +65,17 @@ onecycle_pct_start = 0.3
     assert config.training.epochs == 5
     assert config.training.steps_per_epoch == 1234
     assert config.training.eval_every_steps == 200
+    assert config.training.full_val_every_epochs == 1
+    assert config.training.fast_val_max_games == 5000
     assert config.training.max_lr == 0.0003
-    assert config.training.lr_start_factor == 0.2
+    assert config.training.lr_start_factor == 0.1
     assert config.training.lr_end_factor == 0.5
-    assert config.training.onecycle_pct_start == 0.3
+    assert config.training.onecycle_warmup_fraction_first_epoch == 0.1
+    assert config.training.seed == 123
+    assert config.training.deterministic_eval is True
+    assert config.training.eval_num_workers == 0
+    assert config.training.save_last_every_steps == 300
+    assert config.training.last_checkpoint_keep == 2
 
 
 def test_load_repo_config_unknown_key_raises(tmp_path):
