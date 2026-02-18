@@ -2,6 +2,7 @@ import pytest
 
 torch = pytest.importorskip("torch")
 
+from imba_chess.config import DataloaderConfig, RepoConfig, VocabConfig
 from imba_chess.data.dataloader import build_event_dataloader
 from imba_chess.data.move_vocab import MoveVocab
 
@@ -51,9 +52,8 @@ def test_build_event_dataloader_returns_tensor_dict():
 
     loader = build_event_dataloader(
         lichess_dataset=dataset,
+        config=RepoConfig(dataloader=DataloaderConfig(max_tokens_per_batch=1024)),
         move_vocab=vocab,
-        max_tokens_per_batch=1024,
-        num_workers=0,
     )
 
     batch = next(iter(loader))
@@ -72,9 +72,10 @@ def test_build_event_dataloader_auto_creates_vocab(tmp_path):
 
     loader = build_event_dataloader(
         lichess_dataset=dataset,
-        max_tokens_per_batch=1024,
-        num_workers=0,
-        move_vocab_path=vocab_path,
+        config=RepoConfig(
+            dataloader=DataloaderConfig(max_tokens_per_batch=1024),
+            vocab=VocabConfig(path=str(vocab_path)),
+        ),
     )
 
     batch = next(iter(loader))
@@ -93,9 +94,8 @@ def test_build_event_dataloader_packs_by_max_tokens():
 
     loader = build_event_dataloader(
         lichess_dataset=dataset,
+        config=RepoConfig(dataloader=DataloaderConfig(max_tokens_per_batch=6)),
         move_vocab=vocab,
-        max_tokens_per_batch=6,  # each game is 3 tokens (BOS + 2 plies)
-        num_workers=0,
     )
 
     batches = list(loader)

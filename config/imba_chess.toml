@@ -1,0 +1,23 @@
+[dataset]
+min_avg_elo = 2000
+split = "train"
+dataset_name = "Lichess/standard-chess-games"
+cache_dir = "artifacts/hf_cache"
+parquet_batch_size = 2048
+return_dataclasses = false
+
+[board_state]
+en_passant = "legal"
+halfmove_max = 100
+halfmove_bucket_size = 2
+fullmove_max = 200
+fullmove_bucket_size = 2
+
+[vocab]
+path = "artifacts/move_vocab_static_uci.json"
+include_unk = false
+
+[dataloader]
+max_tokens_per_batch = 6144
+num_workers = 0
+pin_memory = false

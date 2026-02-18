@@ -6,6 +6,7 @@ import dataclasses
 import json
 from pathlib import Path
 
+from imba_chess.config import DEFAULT_CONFIG_PATH, load_repo_config
 from imba_chess.data import LichessDataset
 
 
@@ -22,31 +23,10 @@ def parse_args() -> argparse.Namespace:
         help="Number of parsed game rows to emit.",
     )
     parser.add_argument(
-        "--min-avg-elo",
-        type=int,
-        default=2000,
-        help="Keep only games where (WhiteElo + BlackElo)/2 >= this value.",
-    )
-    parser.add_argument(
-        "--split",
-        default="train",
-        help="Hugging Face dataset split to stream from.",
-    )
-    parser.add_argument(
-        "--dataset-name",
-        default="Lichess/standard-chess-games",
-        help="Hugging Face dataset name.",
-    )
-    parser.add_argument(
-        "--cache-dir",
-        default=None,
-        help="Optional cache directory for Hugging Face metadata/temp files.",
-    )
-    parser.add_argument(
-        "--parquet-batch-size",
-        type=int,
-        default=2048,
-        help="Parquet streaming batch size (lower uses less peak memory).",
+        "--config",
+        type=Path,
+        default=DEFAULT_CONFIG_PATH,
+        help="Path to repo config TOML.",
     )
     parser.add_argument(
         "--output-jsonl",
@@ -54,23 +34,21 @@ def parse_args() -> argparse.Namespace:
         default=None,
         help="Optional output file path. If omitted, writes to stdout.",
     )
-    parser.add_argument(
-        "--return-dataclasses",
-        action="store_true",
-        help="Return dataclass objects from dataset internals (converted to JSON for output).",
-    )
     return parser.parse_args()
 
 
 def main() -> None:
     args = parse_args()
+    repo_config = load_repo_config(args.config)
+
     dataset = LichessDataset(
-        min_avg_elo=args.min_avg_elo,
-        split=args.split,
-        dataset_name=args.dataset_name,
-        cache_dir=args.cache_dir,
-        parquet_batch_size=args.parquet_batch_size,
-        return_dataclasses=args.return_dataclasses,
+        min_avg_elo=repo_config.dataset.min_avg_elo,
+        split=repo_config.dataset.split,
+        dataset_name=repo_config.dataset.dataset_name,
+        cache_dir=repo_config.dataset.cache_dir,
+        parquet_batch_size=repo_config.dataset.parquet_batch_size,
+        return_dataclasses=repo_config.dataset.return_dataclasses,
+        board_state_config=repo_config.board_state,
     )
 
     emitted = 0

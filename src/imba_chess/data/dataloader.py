@@ -1,8 +1,8 @@
 from __future__ import annotations
 
-from pathlib import Path
 from typing import Any, Iterator, Optional
 
+from ..config import RepoConfig
 from .event_builder import EventBuilder
 from .move_vocab import MoveVocab, load_or_create_static_move_vocab
 from .packing import MaxTokensJaggedBatchDataset
@@ -35,33 +35,32 @@ class ChessEventIterableDataset(IterableDataset):
 def build_event_dataloader(
     *,
     lichess_dataset: Any,
+    config: Optional[RepoConfig] = None,
     move_vocab: Optional[MoveVocab] = None,
-    move_vocab_path: str | Path = "artifacts/move_vocab_static_uci.json",
-    static_vocab_include_unk: bool = False,
-    max_tokens_per_batch: int = 6144,
-    rank: Optional[int] = None,
-    world_size: Optional[int] = None,
-    num_workers: int = 0,
-    pin_memory: bool = False,
 ) -> Any:
     if not TORCH_AVAILABLE:  # pragma: no cover
         raise ImportError("torch is required to build DataLoader")
 
+    runtime = config or RepoConfig()
+
     resolved_move_vocab = move_vocab or load_or_create_static_move_vocab(
-        path=move_vocab_path,
-        include_unk=static_vocab_include_unk,
+        path=runtime.vocab.path,
+        include_unk=runtime.vocab.include_unk,
     )
-    game_iterable_dataset = lichess_dataset.as_torch_iterable(rank=rank, world_size=world_size)
+    game_iterable_dataset = lichess_dataset.as_torch_iterable(
+        rank=runtime.dataloader.rank,
+        world_size=runtime.dataloader.world_size,
+    )
     event_builder = EventBuilder(resolved_move_vocab)
     event_dataset = ChessEventIterableDataset(game_iterable_dataset, event_builder)
     packed_dataset = MaxTokensJaggedBatchDataset(
         event_dataset=event_dataset,
-        max_tokens_per_batch=max_tokens_per_batch,
+        max_tokens_per_batch=runtime.dataloader.max_tokens_per_batch,
     )
 
     return DataLoader(
         packed_dataset,
         batch_size=None,
-        num_workers=num_workers,
-        pin_memory=pin_memory,
+        num_workers=runtime.dataloader.num_workers,
+        pin_memory=runtime.dataloader.pin_memory,
     )

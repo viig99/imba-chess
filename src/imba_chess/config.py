@@ -1,0 +1,86 @@
+from __future__ import annotations
+
+from dataclasses import dataclass, field, fields
+from pathlib import Path
+from typing import Any, Mapping, Optional, TypeVar
+
+try:
+    import tomllib
+except ModuleNotFoundError:  # pragma: no cover
+    import tomli as tomllib  # type: ignore[no-redef]
+
+DEFAULT_CONFIG_PATH = Path("config/imba_chess.toml")
+
+
+@dataclass(frozen=True)
+class DatasetConfig:
+    min_avg_elo: int = 2000
+    split: str = "train"
+    dataset_name: str = "Lichess/standard-chess-games"
+    cache_dir: Optional[str] = None
+    parquet_batch_size: int = 2048
+    return_dataclasses: bool = False
+
+
+@dataclass(frozen=True)
+class VocabConfig:
+    path: str = "artifacts/move_vocab_static_uci.json"
+    include_unk: bool = False
+
+
+@dataclass(frozen=True)
+class BoardStateConfig:
+    en_passant: str = "legal"
+    halfmove_max: int = 100
+    halfmove_bucket_size: int = 2
+    fullmove_max: int = 200
+    fullmove_bucket_size: int = 2
+
+
+@dataclass(frozen=True)
+class DataloaderConfig:
+    max_tokens_per_batch: int = 6144
+    rank: Optional[int] = None
+    world_size: Optional[int] = None
+    num_workers: int = 0
+    pin_memory: bool = False
+
+
+@dataclass(frozen=True)
+class RepoConfig:
+    dataset: DatasetConfig = field(default_factory=DatasetConfig)
+    board_state: BoardStateConfig = field(default_factory=BoardStateConfig)
+    vocab: VocabConfig = field(default_factory=VocabConfig)
+    dataloader: DataloaderConfig = field(default_factory=DataloaderConfig)
+
+
+def load_repo_config(path: str | Path | None = None) -> RepoConfig:
+    config_path = Path(path) if path is not None else DEFAULT_CONFIG_PATH
+    if not config_path.exists():
+        return RepoConfig()
+
+    with config_path.open("rb") as handle:
+        payload = tomllib.load(handle)
+
+    return RepoConfig(
+        dataset=_read_section(DatasetConfig, payload.get("dataset", {}), "dataset"),
+        board_state=_read_section(BoardStateConfig, payload.get("board_state", {}), "board_state"),
+        vocab=_read_section(VocabConfig, payload.get("vocab", {}), "vocab"),
+        dataloader=_read_section(DataloaderConfig, payload.get("dataloader", {}), "dataloader"),
+    )
+
+
+T = TypeVar("T")
+
+
+def _read_section(section_type: type[T], raw: Any, section_name: str) -> T:
+    if not isinstance(raw, Mapping):
+        raise ValueError(f"[{section_name}] must be a table")
+
+    allowed = {field.name for field in fields(section_type)}
+    unknown = sorted(set(raw.keys()) - allowed)
+    if unknown:
+        unknown_csv = ", ".join(unknown)
+        raise ValueError(f"Unknown keys in [{section_name}]: {unknown_csv}")
+
+    return section_type(**dict(raw))

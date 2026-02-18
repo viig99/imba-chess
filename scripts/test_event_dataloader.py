@@ -2,7 +2,9 @@
 from __future__ import annotations
 
 import argparse
+from pathlib import Path
 
+from imba_chess.config import DEFAULT_CONFIG_PATH, load_repo_config
 from imba_chess.data import (
     LichessDataset,
     build_event_dataloader,
@@ -15,57 +17,42 @@ def parse_args() -> argparse.Namespace:
         description="Build event dataloader and print tensor batch shapes."
     )
     parser.add_argument(
-        "--vocab-path",
-        default="artifacts/move_vocab_static_uci.json",
-        help="Path to saved static move vocab (auto-generated if missing).",
-    )
-    parser.add_argument(
-        "--include-unk",
-        action="store_true",
-        help="Include <unk> only when auto-generating a missing vocab.",
-    )
-    parser.add_argument(
-        "--max-tokens-per-batch",
-        type=int,
-        default=6144,
-        help="Pack as many games as fit into this total token budget.",
+        "--config",
+        type=Path,
+        default=DEFAULT_CONFIG_PATH,
+        help="Path to repo config TOML.",
     )
     parser.add_argument("--num-batches", type=int, default=2, help="How many batches to print.")
-    parser.add_argument("--num-workers", type=int, default=0, help="DataLoader workers.")
-    parser.add_argument("--min-avg-elo", type=int, default=2000, help="Average Elo threshold.")
-    parser.add_argument("--split", default="train", help="HF split.")
-    parser.add_argument("--dataset-name", default="Lichess/standard-chess-games", help="HF dataset name.")
-    parser.add_argument("--cache-dir", default=None, help="Optional cache dir.")
-    parser.add_argument("--parquet-batch-size", type=int, default=2048, help="Parquet streaming batch size.")
     return parser.parse_args()
 
 
-def make_dataset(args: argparse.Namespace) -> LichessDataset:
+def make_dataset(config) -> LichessDataset:
     return LichessDataset(
-        min_avg_elo=args.min_avg_elo,
-        split=args.split,
-        dataset_name=args.dataset_name,
-        cache_dir=args.cache_dir,
-        parquet_batch_size=args.parquet_batch_size,
+        min_avg_elo=config.dataset.min_avg_elo,
+        split=config.dataset.split,
+        dataset_name=config.dataset.dataset_name,
+        cache_dir=config.dataset.cache_dir,
+        parquet_batch_size=config.dataset.parquet_batch_size,
+        return_dataclasses=config.dataset.return_dataclasses,
+        board_state_config=config.board_state,
     )
 
 
 def main() -> None:
     args = parse_args()
+    config = load_repo_config(args.config)
 
     move_vocab = load_or_create_static_move_vocab(
-        path=args.vocab_path,
-        include_unk=args.include_unk,
+        path=config.vocab.path,
+        include_unk=config.vocab.include_unk,
     )
     print(f"Move vocab size: {len(move_vocab)}")
 
-    # Pass 2: stream events into torch DataLoader.
-    stream_source = make_dataset(args)
+    stream_source = make_dataset(config)
     loader = build_event_dataloader(
         lichess_dataset=stream_source,
+        config=config,
         move_vocab=move_vocab,
-        max_tokens_per_batch=args.max_tokens_per_batch,
-        num_workers=args.num_workers,
     )
 
     for batch_idx, batch in enumerate(loader):
