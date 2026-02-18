@@ -60,6 +60,8 @@ def main() -> None:
         for key, value in batch.items():
             if hasattr(value, "shape"):
                 print(f"  {key}: shape={tuple(value.shape)}, dtype={value.dtype}")
+            elif isinstance(value, (int, float, bool, str)):
+                print(f"  {key}: {type(value).__name__}={value}")
             else:
                 print(f"  {key}: {type(value).__name__}, len={len(value)}")
         if (batch_idx + 1) >= args.num_batches:

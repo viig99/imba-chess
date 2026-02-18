@@ -4,6 +4,7 @@ torch = pytest.importorskip("torch")
 
 from imba_chess.config import DataloaderConfig, RepoConfig, VocabConfig
 from imba_chess.data.dataloader import build_event_dataloader
+from imba_chess.data.event_builder import BOS_TOKEN_ID, TARGET_IGNORE_INDEX
 from imba_chess.data.move_vocab import MoveVocab
 
 
@@ -102,3 +103,28 @@ def test_build_event_dataloader_packs_by_max_tokens():
     assert len(batches) == 2
     assert batches[0]["game_id"] == ["g1", "g2"]
     assert batches[1]["game_id"] == ["g3"]
+
+
+def test_build_event_dataloader_bos_rows_match_num_games_and_targets():
+    games = [_game("g1", "e2e4", "e7e5"), _game("g2", "d2d4", "d7d5")]
+    vocab = MoveVocab.build_from_games(games)
+    dataset = DummyLichessDataset(games)
+
+    loader = build_event_dataloader(
+        lichess_dataset=dataset,
+        config=RepoConfig(dataloader=DataloaderConfig(max_tokens_per_batch=1024)),
+        move_vocab=vocab,
+    )
+
+    batch = next(iter(loader))
+    seq_token_id = batch["seq_token_id"]
+    prev_move_id = batch["prev_move_id"]
+    target_move_id = batch["target_move_id"]
+    bos_positions = torch.where(seq_token_id == BOS_TOKEN_ID)[0]
+    offset_positions = batch["seq_offsets"][:-1]
+
+    assert bos_positions.numel() == batch["num_games"]
+    assert torch.equal(bos_positions, offset_positions)
+    assert torch.all(prev_move_id[bos_positions] == vocab.start_id)
+    assert torch.all(target_move_id[bos_positions] == TARGET_IGNORE_INDEX)
+    assert torch.all(target_move_id[seq_token_id != BOS_TOKEN_ID] != TARGET_IGNORE_INDEX)
