@@ -43,3 +43,21 @@ halfmove_vocab_size = 128
 fullmove_vocab_size = 128
 ignore_index = -100
 relative_attention_bias = "position"
+
+[training]
+epochs = 20
+steps_per_epoch = 1000000
+eval_every_steps = 100000
+log_every_steps = 100
+max_lr = 1e-3
+lr_start_factor = 0.2
+lr_end_factor = 0.5
+onecycle_pct_start = 0.3
+weight_decay = 0.01
+grad_clip_norm = 1.0
+optimizer_fused = true
+compile_model = false
+device = "auto"
+dtype = "bfloat16"
+checkpoint_dir = "artifacts/checkpoints"
+checkpoint_keep = 3

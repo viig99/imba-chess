@@ -7,6 +7,7 @@ from .config import (
     DatasetConfig,
     ModelConfig,
     RepoConfig,
+    TrainingConfig,
     VocabConfig,
     load_repo_config,
 )
@@ -18,6 +19,7 @@ __all__ = [
     "ModelConfig",
     "VocabConfig",
     "DataloaderConfig",
+    "TrainingConfig",
     "RepoConfig",
     "load_repo_config",
 ]

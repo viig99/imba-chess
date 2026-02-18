@@ -27,6 +27,15 @@ max_tokens_per_batch = 4096
 
 [model]
 num_layers = 8
+
+[training]
+epochs = 5
+steps_per_epoch = 1234
+eval_every_steps = 200
+max_lr = 0.0003
+lr_start_factor = 0.2
+lr_end_factor = 0.5
+onecycle_pct_start = 0.3
         """.strip()
         + "\n",
         encoding="utf-8",
@@ -46,6 +55,13 @@ num_layers = 8
     assert config.vocab.path == "tmp_vocab.json"
     assert config.dataloader.max_tokens_per_batch == 4096
     assert config.model.num_layers == 8
+    assert config.training.epochs == 5
+    assert config.training.steps_per_epoch == 1234
+    assert config.training.eval_every_steps == 200
+    assert config.training.max_lr == 0.0003
+    assert config.training.lr_start_factor == 0.2
+    assert config.training.lr_end_factor == 0.5
+    assert config.training.onecycle_pct_start == 0.3
 
 
 def test_load_repo_config_unknown_key_raises(tmp_path):

@@ -6,6 +6,7 @@ This document defines how `imba-chess` should evaluate next-move prediction duri
 
 - Phase 1 (now): offline next-move prediction evals on held-out data.
 - Phase 2 (later): engine/self-play match evals after RL fine-tuning.
+- Runtime framework: use `pytorch-ignite` engines for eval/train/validation orchestration.
 
 ## Dataset Sources
 

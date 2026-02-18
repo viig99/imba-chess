@@ -9,6 +9,7 @@ dependencies = [
   "python-chess>=1.999",
   "tomli>=2.0.0; python_version < '3.11'",
   "torch",
+  "pytorch-ignite",
   "attn_gym",
   "tensorboard",
   "torch-optimi",

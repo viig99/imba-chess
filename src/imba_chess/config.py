@@ -71,12 +71,33 @@ class ModelConfig:
 
 
 @dataclass(frozen=True)
+class TrainingConfig:
+    epochs: int = 20
+    steps_per_epoch: int = 1_000_000
+    eval_every_steps: int = 100_000
+    log_every_steps: int = 100
+    max_lr: float = 1e-3
+    lr_start_factor: float = 0.2
+    lr_end_factor: float = 0.5
+    onecycle_pct_start: float = 0.3
+    weight_decay: float = 0.01
+    grad_clip_norm: float = 1.0
+    optimizer_fused: bool = True
+    compile_model: bool = False
+    device: str = "auto"
+    dtype: str = "bfloat16"
+    checkpoint_dir: str = "artifacts/checkpoints"
+    checkpoint_keep: int = 3
+
+
+@dataclass(frozen=True)
 class RepoConfig:
     dataset: DatasetConfig = field(default_factory=DatasetConfig)
     board_state: BoardStateConfig = field(default_factory=BoardStateConfig)
     vocab: VocabConfig = field(default_factory=VocabConfig)
     dataloader: DataloaderConfig = field(default_factory=DataloaderConfig)
     model: ModelConfig = field(default_factory=ModelConfig)
+    training: TrainingConfig = field(default_factory=TrainingConfig)
 
 
 def load_repo_config(path: str | Path | None = None) -> RepoConfig:
@@ -93,6 +114,7 @@ def load_repo_config(path: str | Path | None = None) -> RepoConfig:
         vocab=_read_section(VocabConfig, payload.get("vocab", {}), "vocab"),
         dataloader=_read_section(DataloaderConfig, payload.get("dataloader", {}), "dataloader"),
         model=_read_section(ModelConfig, payload.get("model", {}), "model"),
+        training=_read_section(TrainingConfig, payload.get("training", {}), "training"),
     )
 
 
