@@ -7,22 +7,41 @@ requires-python = ">=3.10"
 dependencies = [
   "datasets>=2.20.0",
   "python-chess>=1.999",
+  "torch",
+  "attn_gym",
+  "tensorboard",
+  "torch-optimi",
 ]
 
 [project.optional-dependencies]
-dev = [
-  "pytest>=8.0.0",
-]
+dev = ["pytest>=8.0.0"]
 
 [build-system]
 requires = ["setuptools>=68", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [tool.setuptools]
-package-dir = {"" = "src"}
+package-dir = { "" = "src" }
 
 [tool.setuptools.packages.find]
 where = ["src"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+
+[[tool.uv.index]]
+name = "pytorch-cu130"
+url = "https://download.pytorch.org/whl/cu130"
+explicit = true
+
+[[tool.uv.index]]
+name = "pytorch-cpu"
+url = "https://download.pytorch.org/whl/cpu"
+explicit = true
+
+[tool.uv.sources]
+torch = [
+  { index = "pytorch-cu130", marker = "sys_platform == 'linux'" },
+  { index = "pytorch-cpu", marker = "sys_platform == 'darwin'" },
+]
+fbgemm-gpu = { index = "pytorch-cu130", marker = "sys_platform == 'linux'" }

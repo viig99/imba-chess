@@ -18,6 +18,7 @@ from .models import (
     PlayerInfo,
 )
 from .parsing import parse_clk_seconds, parse_elo, read_pgn_from_row, to_text
+from .torch_iterable import TorchLichessIterableDataset
 
 VALID_RESULTS = {"1-0", "0-1", "1/2-1/2"}
 DEFAULT_STREAM_COLUMNS = [
@@ -83,6 +84,17 @@ class LichessDataset:
             rows = load_dataset(self.dataset_name, **load_kwargs)
 
         yield from self.stream_from_rows(rows)
+
+    def as_torch_iterable(
+        self,
+        rank: Optional[int] = None,
+        world_size: Optional[int] = None,
+    ) -> TorchLichessIterableDataset:
+        return TorchLichessIterableDataset(
+            dataset=self,
+            rank=rank,
+            world_size=world_size,
+        )
 
     def stream_from_rows(
         self, rows: Iterable[Dict[str, Any]]

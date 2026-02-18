@@ -1,5 +1,8 @@
 """Data utilities for imba_chess."""
 
+from .collate import collate_batch
+from .dataloader import ChessEventIterableDataset, build_event_dataloader
+from .event_builder import EventBuilder
 from .lichess_dataset import LichessDataset
 from .models import (
     BoardState,
@@ -10,9 +13,17 @@ from .models import (
     PlayRecord,
     PlayerInfo,
 )
+from .move_vocab import MoveVocab, MoveVocabConfig
+from .torch_iterable import TorchLichessIterableDataset
 
 __all__ = [
+    "build_event_dataloader",
+    "ChessEventIterableDataset",
+    "collate_batch",
     "LichessDataset",
+    "EventBuilder",
+    "MoveVocab",
+    "MoveVocabConfig",
     "BoardTokenConfig",
     "BoardState",
     "PlayerInfo",
@@ -20,4 +31,5 @@ __all__ = [
     "GameMetadata",
     "PlayRecord",
     "GameRecord",
+    "TorchLichessIterableDataset",
 ]
