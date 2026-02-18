@@ -33,6 +33,7 @@ def make_dataset(config) -> LichessDataset:
         dataset_name=config.dataset.dataset_name,
         cache_dir=config.dataset.cache_dir,
         parquet_batch_size=config.dataset.parquet_batch_size,
+        max_seq_len=config.dataset.max_seq_len,
         return_dataclasses=config.dataset.return_dataclasses,
         board_state_config=config.board_state,
     )

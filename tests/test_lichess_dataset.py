@@ -1,6 +1,8 @@
 import datetime as dt
 import json
 
+import pytest
+
 from imba_chess.data.lichess_dataset import LichessDataset
 from imba_chess.data.models import GameRecord
 
@@ -87,6 +89,20 @@ def test_can_return_dataclasses():
     assert games
     assert isinstance(games[0], GameRecord)
     assert games[0].plays[0].state.turn_id == 0
+
+
+def test_respects_max_seq_len_truncation():
+    dataset = LichessDataset(min_avg_elo=2000, max_seq_len=2)
+    games = list(dataset.stream_from_rows([_row()]))
+
+    assert len(games) == 1
+    assert games[0]["num_plies"] == 2
+    assert len(games[0]["plays"]) == 2
+
+
+def test_invalid_max_seq_len_raises():
+    with pytest.raises(ValueError, match="max_seq_len must be >= 1"):
+        LichessDataset(min_avg_elo=2000, max_seq_len=0)
 
 
 def test_skips_games_with_zero_parsed_plies():

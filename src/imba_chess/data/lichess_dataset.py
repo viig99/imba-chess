@@ -50,6 +50,7 @@ class LichessDataset:
         cache_dir: Optional[str] = None,
         stream_columns: Optional[Sequence[str]] = None,
         parquet_batch_size: int = 2048,
+        max_seq_len: Optional[int] = None,
         return_dataclasses: bool = False,
         board_state_config: Optional[BoardTokenConfig] = None,
     ) -> None:
@@ -61,6 +62,9 @@ class LichessDataset:
             list(stream_columns) if stream_columns is not None else list(DEFAULT_STREAM_COLUMNS)
         )
         self.parquet_batch_size = parquet_batch_size
+        if max_seq_len is not None and max_seq_len < 1:
+            raise ValueError(f"max_seq_len must be >= 1 when set, got {max_seq_len}")
+        self.max_seq_len = max_seq_len
         self.return_dataclasses = return_dataclasses
         self.board_state_encoder = BoardStateEncoder(board_state_config)
 
@@ -209,7 +213,7 @@ class LichessDataset:
         last_clock_seconds: Dict[bool, float] = {}
         play_id = 0
 
-        while node.variations:
+        while node.variations and (self.max_seq_len is None or play_id < self.max_seq_len):
             next_node = node.variations[0]
             move = next_node.move
             active_color = board.turn

@@ -19,6 +19,7 @@ class DatasetConfig:
     dataset_name: str = "Lichess/standard-chess-games"
     cache_dir: Optional[str] = None
     parquet_batch_size: int = 2048
+    max_seq_len: Optional[int] = None
     return_dataclasses: bool = False
 
 
@@ -47,11 +48,27 @@ class DataloaderConfig:
 
 
 @dataclass(frozen=True)
+class ModelConfig:
+    model_dim: int = 384
+    linear_hidden_dim: int = 128
+    attention_dim: int = 128
+    num_heads: int = 4
+    num_layers: int = 6
+    dropout: float = 0.1
+    max_position_embeddings: int = 6144
+    halfmove_vocab_size: int = 128
+    fullmove_vocab_size: int = 128
+    ignore_index: int = -100
+    relative_attention_bias: str = "position"
+
+
+@dataclass(frozen=True)
 class RepoConfig:
     dataset: DatasetConfig = field(default_factory=DatasetConfig)
     board_state: BoardStateConfig = field(default_factory=BoardStateConfig)
     vocab: VocabConfig = field(default_factory=VocabConfig)
     dataloader: DataloaderConfig = field(default_factory=DataloaderConfig)
+    model: ModelConfig = field(default_factory=ModelConfig)
 
 
 def load_repo_config(path: str | Path | None = None) -> RepoConfig:
@@ -67,6 +84,7 @@ def load_repo_config(path: str | Path | None = None) -> RepoConfig:
         board_state=_read_section(BoardStateConfig, payload.get("board_state", {}), "board_state"),
         vocab=_read_section(VocabConfig, payload.get("vocab", {}), "vocab"),
         dataloader=_read_section(DataloaderConfig, payload.get("dataloader", {}), "dataloader"),
+        model=_read_section(ModelConfig, payload.get("model", {}), "model"),
     )
 
 
