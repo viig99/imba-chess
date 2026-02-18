@@ -296,9 +296,7 @@ def main() -> None:
     base_model = HSTUChessModel(model_cfg).to(device)
     base_model.train()
     total_params = _count_params(base_model)
-    print(
-        f"Model initialized: {_format_count(total_params)} params ({total_params})"
-    )
+    print(f"Model initialized: {_format_count(total_params)} params ({total_params})")
 
     active_batch: dict[str, object] = benchmark_batch
     compile_requested = bool(args.compile)
@@ -376,7 +374,9 @@ def main() -> None:
         if compile_requested:
             if hasattr(torch, "_dynamo"):
                 torch._dynamo.reset()
-            run_model = torch.compile(base_model, dynamic=True, fullgraph=True)
+            # Keep compile enabled, but avoid strict fullgraph/dynamic settings
+            # that can force brittle Triton paths on small GPUs.
+            run_model = torch.compile(base_model, dynamic=True)
             compile_enabled = True
         else:
             run_model = base_model
@@ -392,9 +392,16 @@ def main() -> None:
                 or _is_compile_resource_failure(exc)
             ):
                 compile_error = exc
+                if _is_compile_resource_failure(exc):
+                    raise RuntimeError(
+                        "Compiled flex-attention kernel exceeds GPU resource limits. "
+                        "This is not fixed by shrinking batch tokens. "
+                        "Lower model kernel shape (e.g. attention_dim, num_heads, model_dim), "
+                        "or run with --no-compile on this GPU."
+                    ) from exc
                 if oom_shrinks >= args.oom_retries:
                     raise RuntimeError(
-                        "Compiled benchmark kept failing after shrinking batch. "
+                        "Compiled benchmark kept OOMing after shrinking batch. "
                         "Lower [dataloader].max_tokens_per_batch and/or model size."
                     ) from exc
 
@@ -414,7 +421,7 @@ def main() -> None:
                 active_batch = _trim_batch_to_games(active_batch, keep_games)
                 oom_shrinks += 1
 
-                print("\nCompile benchmark failed; retrying with smaller batch.")
+                print("\nCompile benchmark OOM; retrying with smaller batch.")
                 print(f"  error: {type(exc).__name__}: {exc}")
                 print(
                     f"  shrink: games {current_games} -> {keep_games}, "
