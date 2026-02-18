@@ -87,3 +87,11 @@ def test_can_return_dataclasses():
     assert games
     assert isinstance(games[0], GameRecord)
     assert games[0].plays[0].state.turn_id == 0
+
+
+def test_skips_games_with_zero_parsed_plies():
+    dataset = LichessDataset(min_avg_elo=2000)
+    rows = [_row(Site="https://lichess.org/bad", movetext="BAD_MOVE 1-0")]
+    games = list(dataset.stream_from_rows(rows))
+
+    assert games == []

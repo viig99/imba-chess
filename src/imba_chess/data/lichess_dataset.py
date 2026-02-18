@@ -176,6 +176,8 @@ class LichessDataset:
             white_elo=white_elo,
             black_elo=black_elo,
         )
+        if not plays:
+            return None
 
         return GameRecord(
             game_id=to_text(row.get("Site"), default=""),
