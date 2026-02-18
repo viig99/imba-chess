@@ -58,6 +58,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max-tokens-per-batch", type=int, default=None)
     parser.add_argument("--num-workers", type=int, default=None)
     parser.add_argument("--num-layers", type=int, default=None)
+    parser.add_argument(
+        "--oom-retries",
+        type=int,
+        default=6,
+        help="Number of times to shrink benchmark batch and retry on CUDA OOM.",
+    )
     return parser.parse_args()
 
 
@@ -189,6 +195,49 @@ def _get_cpu_rss_mb() -> float:
     return resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / 1024.0
 
 
+def _is_cuda_oom(exc: BaseException) -> bool:
+    text = str(exc).lower()
+    return isinstance(exc, torch.OutOfMemoryError) or "cuda out of memory" in text
+
+
+def _trim_batch_to_games(
+    batch: dict[str, object], keep_games: int
+) -> dict[str, object]:
+    if keep_games < 1:
+        raise ValueError("keep_games must be >= 1")
+
+    seq_offsets = batch["seq_offsets"]
+    if not isinstance(seq_offsets, torch.Tensor):
+        raise TypeError("Expected tensor batch['seq_offsets']")
+
+    current_games = int(batch["num_games"])
+    if keep_games >= current_games:
+        return batch
+
+    new_total_tokens = int(seq_offsets[keep_games].item())
+    trimmed: dict[str, object] = {
+        "game_id": list(batch["game_id"][:keep_games]),  # type: ignore[index]
+        "num_games": keep_games,
+        "total_tokens": new_total_tokens,
+        "seq_lens": batch["seq_lens"][:keep_games],  # type: ignore[index]
+        "seq_offsets": batch["seq_offsets"][: keep_games + 1],  # type: ignore[index]
+    }
+    flat_keys = [
+        "piece_ids",
+        "seq_token_id",
+        "turn_id",
+        "castle_id",
+        "ep_file_id",
+        "halfmove_bucket_id",
+        "fullmove_bucket_id",
+        "prev_move_id",
+        "target_move_id",
+    ]
+    for key in flat_keys:
+        trimmed[key] = batch[key][:new_total_tokens]  # type: ignore[index]
+    return trimmed
+
+
 def main() -> None:
     args = parse_args()
     repo_config = load_repo_config(args.config)
@@ -243,13 +292,7 @@ def main() -> None:
     base_model.train()
     run_model: torch.nn.Module = base_model
     compile_enabled = bool(args.compile)
-
-    seq_offsets = benchmark_batch["seq_offsets"].to(device=device, dtype=torch.long)
-    block_mask = create_batch_block_mask(
-        seq_offsets=seq_offsets,
-        total_tokens=int(benchmark_batch["total_tokens"]),
-        device=device,
-    )
+    active_batch: dict[str, object] = benchmark_batch
 
     use_amp = device.type == "cuda" and dtype in (torch.float16, torch.bfloat16)
 
@@ -264,7 +307,15 @@ def main() -> None:
 
     def _run_benchmark(
         model_to_run: torch.nn.Module,
+        batch_to_run: dict[str, object],
     ) -> tuple[list[float], float, float, float]:
+        seq_offsets = batch_to_run["seq_offsets"].to(device=device, dtype=torch.long)  # type: ignore[union-attr]
+        block_mask = create_batch_block_mask(
+            seq_offsets=seq_offsets,
+            total_tokens=int(batch_to_run["total_tokens"]),  # type: ignore[arg-type]
+            device=device,
+        )
+
         if device.type == "cuda":
             torch.cuda.reset_peak_memory_stats(device)
             mem_before = torch.cuda.memory_allocated(device)
@@ -275,7 +326,7 @@ def main() -> None:
             model_to_run.zero_grad(set_to_none=True)
             with amp_context():
                 out = model_to_run(
-                    benchmark_batch, block_mask=block_mask, return_loss=True
+                    batch_to_run, block_mask=block_mask, return_loss=True
                 )
                 out["loss"].backward()
 
@@ -286,7 +337,7 @@ def main() -> None:
             model_to_run.zero_grad(set_to_none=True)
             with amp_context():
                 out = model_to_run(
-                    benchmark_batch, block_mask=block_mask, return_loss=True
+                    batch_to_run, block_mask=block_mask, return_loss=True
                 )
                 out["loss"].backward()
             _sync()
@@ -310,41 +361,67 @@ def main() -> None:
     compile_error: Exception | None = None
     if compile_enabled:
         run_model = torch.compile(base_model, dynamic=True, fullgraph=True)
-
-    try:
-        latencies_ms, mem_before_alloc, mem_after_alloc, mem_peak_alloc = (
-            _run_benchmark(run_model)
-        )
-    except Exception as exc:
-        if compile_enabled:
-            compile_error = exc
-            print("\nCompile benchmark failed; retrying in eager mode.")
-            print(f"  error: {type(exc).__name__}: {exc}")
-            print(
-                "  hint: reduce [dataloader].max_tokens_per_batch or model attention dimensions if needed."
-            )
-            compile_enabled = False
-            run_model = base_model
-            if hasattr(torch, "_dynamo"):
-                torch._dynamo.reset()
+    oom_shrinks = 0
+    while True:
+        try:
             latencies_ms, mem_before_alloc, mem_after_alloc, mem_peak_alloc = (
-                _run_benchmark(run_model)
+                _run_benchmark(run_model, active_batch)
             )
-        else:
-            raise
+            break
+        except Exception as exc:
+            if compile_enabled:
+                compile_error = exc
+                print("\nCompile benchmark failed; retrying in eager mode.")
+                print(f"  error: {type(exc).__name__}: {exc}")
+                print(
+                    "  hint: reduce [dataloader].max_tokens_per_batch or model attention dimensions if needed."
+                )
+                compile_enabled = False
+                run_model = base_model
+                if hasattr(torch, "_dynamo"):
+                    torch._dynamo.reset()
+                if device.type == "cuda":
+                    torch.cuda.empty_cache()
+                continue
+
+            if device.type != "cuda" or not _is_cuda_oom(exc):
+                raise
+            if oom_shrinks >= args.oom_retries:
+                raise RuntimeError(
+                    "CUDA OOM persists after shrinking benchmark batch. "
+                    "Lower [dataloader].max_tokens_per_batch and/or model size."
+                ) from exc
+
+            torch.cuda.empty_cache()
+            current_games = int(active_batch["num_games"])
+            if current_games <= 1:
+                raise RuntimeError(
+                    "CUDA OOM with a single-game benchmark batch. "
+                    "Reduce dataset.max_seq_len, dataloader.max_tokens_per_batch, or model dimensions."
+                ) from exc
+
+            keep_games = max(1, int(math.floor(current_games * 0.75)))
+            if keep_games >= current_games:
+                keep_games = current_games - 1
+            active_batch = _trim_batch_to_games(active_batch, keep_games)
+            oom_shrinks += 1
+            print(
+                f"\nCUDA OOM during benchmark; retrying with fewer games: "
+                f"{current_games} -> {keep_games}, tokens={active_batch['total_tokens']}"
+            )
 
     if device.type == "cuda":
         mem_peak_reserved = torch.cuda.max_memory_reserved(device)
     else:
         mem_peak_reserved = mem_peak_alloc
 
-    batch_tokens = int(benchmark_batch["total_tokens"])
-    batch_games = int(benchmark_batch["num_games"])
+    batch_tokens = int(active_batch["total_tokens"])
+    batch_games = int(active_batch["num_games"])
     max_seq = max(sampled_seq_lens) if sampled_seq_lens else 0
     p95_seq = _percentile(sampled_seq_lens, 0.95) if sampled_seq_lens else 0
     suggested_max_seq = _round_up(max(128, max_seq), 64)
 
-    benchmark_seq_lens = [int(x) for x in benchmark_batch["seq_lens"].tolist()]
+    benchmark_seq_lens = [int(x) for x in active_batch["seq_lens"].tolist()]  # type: ignore[union-attr]
     flops = _estimate_flops(repo_config.model, benchmark_seq_lens, move_vocab_size)
     mean_ms = statistics.fmean(latencies_ms)
     p50_ms = statistics.median(latencies_ms)
@@ -361,6 +438,8 @@ def main() -> None:
     print(f"  torch.compile active: {compile_enabled}")
     if compile_error is not None:
         print("  compile fallback reason captured above.")
+    if oom_shrinks > 0:
+        print(f"  batch shrinks due to OOM: {oom_shrinks}")
     print(f"  move_vocab_size: {move_vocab_size}")
     print(f"  benchmark batch: games={batch_games}, tokens={batch_tokens}")
     print(

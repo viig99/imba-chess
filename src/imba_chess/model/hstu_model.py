@@ -12,6 +12,8 @@ from torch.nn.attention.flex_attention import BlockMask, create_block_mask
 from .hstu_attention import SequentialTransductionUnitJagged
 from .position_embedding import PositionEmbedding
 
+_compiled_create_block_mask = torch.compile(create_block_mask, dynamic=True)
+
 
 @dataclass(frozen=True)
 class HSTUChessConfig:
@@ -29,7 +31,9 @@ class HSTUChessConfig:
     relative_attention_bias: str = "position"
 
 
-def build_hstu_chess_config(model_config: Any, *, move_vocab_size: int) -> HSTUChessConfig:
+def build_hstu_chess_config(
+    model_config: Any, *, move_vocab_size: int
+) -> HSTUChessConfig:
     """Create model config from repo config model section + runtime vocab size."""
     return HSTUChessConfig(
         move_vocab_size=move_vocab_size,
@@ -58,7 +62,7 @@ def create_batch_block_mask(
 
     prefix_causal_mask = generate_prefix_lm_mask(0)
     doc_prefix_causal_mask = generate_doc_mask_mod(prefix_causal_mask, seq_offsets)
-    return create_block_mask(
+    return _compiled_create_block_mask(
         doc_prefix_causal_mask,
         B=1,
         H=None,
@@ -110,7 +114,9 @@ class HSTUChessModel(nn.Module):
         self.final_norm = nn.LayerNorm(d)
         self.prediction_head = nn.Linear(d, config.move_vocab_size, bias=False)
 
-        self.register_buffer("square_ids", torch.arange(64, dtype=torch.long), persistent=False)
+        self.register_buffer(
+            "square_ids", torch.arange(64, dtype=torch.long), persistent=False
+        )
 
     def _embed_board(self, piece_ids: torch.Tensor) -> torch.Tensor:
         # piece_ids: [S, 64]
@@ -192,7 +198,9 @@ class HSTUChessModel(nn.Module):
         output: dict[str, torch.Tensor] = {"logits": logits}
 
         if return_loss and "target_move_id" in batch:
-            target_move_id = batch["target_move_id"].to(device=logits.device, dtype=torch.long)
+            target_move_id = batch["target_move_id"].to(
+                device=logits.device, dtype=torch.long
+            )
             output["loss"] = F.cross_entropy(
                 logits, target_move_id, ignore_index=self.config.ignore_index
             )
