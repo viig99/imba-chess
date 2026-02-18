@@ -62,3 +62,19 @@ def test_build_event_dataloader_returns_tensor_dict():
     assert batch["target_move_id"].dtype == torch.long
     assert batch["game_id"] == ["g1", "g2"]
 
+
+def test_build_event_dataloader_auto_creates_vocab(tmp_path):
+    games = [_game("g1", "e2e4", "e7e5")]
+    dataset = DummyLichessDataset(games)
+    vocab_path = tmp_path / "auto_vocab.json"
+
+    loader = build_event_dataloader(
+        lichess_dataset=dataset,
+        batch_size=1,
+        num_workers=0,
+        move_vocab_path=vocab_path,
+    )
+
+    batch = next(iter(loader))
+    assert vocab_path.exists()
+    assert batch["seq_token_id"].shape == (1, 3)

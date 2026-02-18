@@ -1,6 +1,8 @@
 from pathlib import Path
 
-from imba_chess.data.move_vocab import MoveVocab
+import pytest
+
+from imba_chess.data.move_vocab import MoveVocab, load_or_create_static_move_vocab
 
 
 def test_move_vocab_build_encode_decode(tmp_path: Path):
@@ -18,3 +20,29 @@ def test_move_vocab_build_encode_decode(tmp_path: Path):
     loaded = MoveVocab.load(path)
     assert loaded.encode("e7e5") == vocab.encode("e7e5")
 
+
+def test_move_vocab_static_has_expected_size_and_promotions():
+    vocab = MoveVocab.build_static()
+
+    # 4208 static UCI tokens + pad/start specials
+    assert len(vocab) == 4210
+    assert vocab.encode("e2e4") >= 0
+    assert vocab.encode("a7a8q") >= 0
+    assert vocab.encode("h2h1n") >= 0
+
+
+def test_move_vocab_static_without_unk_raises_for_unknown():
+    vocab = MoveVocab.build_static()
+    with pytest.raises(KeyError):
+        vocab.encode("zzzz")
+
+
+def test_load_or_create_static_move_vocab_creates_and_loads(tmp_path: Path):
+    path = tmp_path / "static_vocab.json"
+    vocab = load_or_create_static_move_vocab(path=path)
+
+    assert path.exists()
+    assert len(vocab) == 4210
+
+    loaded = load_or_create_static_move_vocab(path=path)
+    assert len(loaded) == 4210

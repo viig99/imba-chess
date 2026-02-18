@@ -2,16 +2,28 @@
 from __future__ import annotations
 
 import argparse
-from itertools import islice
 
-from imba_chess.data import LichessDataset, MoveVocab, build_event_dataloader
+from imba_chess.data import (
+    LichessDataset,
+    build_event_dataloader,
+    load_or_create_static_move_vocab,
+)
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Build move vocab + event dataloader and print tensor batch shapes."
+        description="Build event dataloader and print tensor batch shapes."
     )
-    parser.add_argument("--num-games-vocab", type=int, default=128, help="Games used to build move vocab.")
+    parser.add_argument(
+        "--vocab-path",
+        default="artifacts/move_vocab_static_uci.json",
+        help="Path to saved static move vocab (auto-generated if missing).",
+    )
+    parser.add_argument(
+        "--include-unk",
+        action="store_true",
+        help="Include <unk> only when auto-generating a missing vocab.",
+    )
     parser.add_argument("--batch-size", type=int, default=4, help="Dataloader batch size.")
     parser.add_argument("--num-batches", type=int, default=2, help="How many batches to print.")
     parser.add_argument("--num-workers", type=int, default=0, help="DataLoader workers.")
@@ -36,20 +48,18 @@ def make_dataset(args: argparse.Namespace) -> LichessDataset:
 def main() -> None:
     args = parse_args()
 
-    # Pass 1: build move vocab from a bounded game sample.
-    vocab_source = make_dataset(args)
-    vocab_games = list(islice(vocab_source.stream(), args.num_games_vocab))
-    if not vocab_games:
-        raise RuntimeError("No games found to build move vocab.")
-
-    move_vocab = MoveVocab.build_from_games(vocab_games)
+    move_vocab = load_or_create_static_move_vocab(
+        path=args.vocab_path,
+        include_unk=args.include_unk,
+    )
     print(f"Move vocab size: {len(move_vocab)}")
 
     # Pass 2: stream events into torch DataLoader.
     stream_source = make_dataset(args)
     loader = build_event_dataloader(
         lichess_dataset=stream_source,
-        move_vocab=move_vocab,
+        move_vocab_path=args.vocab_path,
+        static_vocab_include_unk=args.include_unk,
         batch_size=args.batch_size,
         num_workers=args.num_workers,
     )
@@ -67,4 +77,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-

@@ -13,7 +13,12 @@ from .models import (
     PlayRecord,
     PlayerInfo,
 )
-from .move_vocab import MoveVocab, MoveVocabConfig
+from .move_vocab import (
+    DEFAULT_STATIC_MOVE_VOCAB_PATH,
+    MoveVocab,
+    MoveVocabConfig,
+    load_or_create_static_move_vocab,
+)
 from .torch_iterable import TorchLichessIterableDataset
 
 __all__ = [
@@ -24,6 +29,8 @@ __all__ = [
     "EventBuilder",
     "MoveVocab",
     "MoveVocabConfig",
+    "load_or_create_static_move_vocab",
+    "DEFAULT_STATIC_MOVE_VOCAB_PATH",
     "BoardTokenConfig",
     "BoardState",
     "PlayerInfo",

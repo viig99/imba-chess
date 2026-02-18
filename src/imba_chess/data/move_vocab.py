@@ -4,7 +4,11 @@ import json
 import dataclasses
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, Iterable, Optional
+from typing import Dict, Iterable, List, Optional
+
+import chess
+
+DEFAULT_STATIC_MOVE_VOCAB_PATH = Path("artifacts/move_vocab_static_uci.json")
 
 
 @dataclass(frozen=True)
@@ -78,6 +82,11 @@ class MoveVocab:
 
         return cls.build(iter_moves(), config=config)
 
+    @classmethod
+    def build_static(cls, config: Optional[MoveVocabConfig] = None) -> "MoveVocab":
+        cfg = config or MoveVocabConfig(include_unk=False)
+        return cls.build(all_possible_uci_moves(), config=cfg)
+
     def save(self, path: str | Path) -> None:
         output = {
             "config": {
@@ -101,3 +110,53 @@ class MoveVocab:
             include_unk=cfg_data["include_unk"],
         )
         return cls(token_to_id=payload["token_to_id"], config=config)
+
+
+def all_possible_uci_moves() -> List[str]:
+    """Deterministic superset of UCI moves: all from->to plus promotions."""
+    moves: list[str] = []
+
+    # Non-promotion moves: 64 * 63 = 4032
+    for from_square in chess.SQUARES:
+        from_name = chess.square_name(from_square)
+        for to_square in chess.SQUARES:
+            if to_square == from_square:
+                continue
+            moves.append(f"{from_name}{chess.square_name(to_square)}")
+
+    # Promotions: 44 base pawn destinations * 4 promo pieces = 176
+    promo_pieces = ("q", "r", "b", "n")
+
+    def add_promotions(from_rank: int, to_rank: int) -> None:
+        for file_idx in range(8):
+            from_square = chess.square(file_idx, from_rank)
+            from_name = chess.square_name(from_square)
+            for delta in (-1, 0, 1):
+                to_file = file_idx + delta
+                if to_file < 0 or to_file > 7:
+                    continue
+                to_square = chess.square(to_file, to_rank)
+                to_name = chess.square_name(to_square)
+                for promo in promo_pieces:
+                    moves.append(f"{from_name}{to_name}{promo}")
+
+    add_promotions(from_rank=6, to_rank=7)  # White: rank 7 -> 8
+    add_promotions(from_rank=1, to_rank=0)  # Black: rank 2 -> 1
+
+    # Keep deterministic order while deduplicating (there should be no dups).
+    return list(dict.fromkeys(moves))
+
+
+def load_or_create_static_move_vocab(
+    path: str | Path = DEFAULT_STATIC_MOVE_VOCAB_PATH,
+    *,
+    include_unk: bool = False,
+) -> MoveVocab:
+    vocab_path = Path(path)
+    if vocab_path.exists():
+        return MoveVocab.load(vocab_path)
+
+    vocab = MoveVocab.build_static(config=MoveVocabConfig(include_unk=include_unk))
+    vocab_path.parent.mkdir(parents=True, exist_ok=True)
+    vocab.save(vocab_path)
+    return vocab
