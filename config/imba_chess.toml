@@ -5,7 +5,7 @@ dataset_name = "Lichess/standard-chess-games"
 cache_dir = "artifacts/hf_cache"
 parquet_batch_size = 2048
 return_dataclasses = false
-max_seq_len = 256
+max_seq_len = 512
 
 [board_state]
 en_passant = "legal"

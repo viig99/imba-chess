@@ -24,6 +24,11 @@ from imba_chess.model import (
     create_batch_block_mask,
 )
 
+torch.set_float32_matmul_precision("high")
+torch.backends.cudnn.benchmark = True
+torch.backends.cuda.matmul.allow_bf16_reduced_precision_reduction = True
+torch.backends.cuda.enable_flash_sdp(True)
+
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
@@ -113,7 +118,9 @@ def _round_up(value: int, multiple: int) -> int:
     return ((value + multiple - 1) // multiple) * multiple
 
 
-def _estimate_flops(model_config, seq_lens: Iterable[int], move_vocab_size: int) -> dict[str, float]:
+def _estimate_flops(
+    model_config, seq_lens: Iterable[int], move_vocab_size: int
+) -> dict[str, float]:
     seq_lens = list(int(x) for x in seq_lens)
     total_tokens = float(sum(seq_lens))
     sum_tri = float(sum((l * (l + 1)) // 2 for l in seq_lens))
@@ -192,13 +199,17 @@ def main() -> None:
     model_cfg_section = repo_config.model
 
     if args.max_tokens_per_batch is not None:
-        dataloader_cfg = replace(dataloader_cfg, max_tokens_per_batch=args.max_tokens_per_batch)
+        dataloader_cfg = replace(
+            dataloader_cfg, max_tokens_per_batch=args.max_tokens_per_batch
+        )
     if args.num_workers is not None:
         dataloader_cfg = replace(dataloader_cfg, num_workers=args.num_workers)
     if args.num_layers is not None:
         model_cfg_section = replace(model_cfg_section, num_layers=args.num_layers)
 
-    repo_config = replace(repo_config, dataloader=dataloader_cfg, model=model_cfg_section)
+    repo_config = replace(
+        repo_config, dataloader=dataloader_cfg, model=model_cfg_section
+    )
 
     move_vocab = load_or_create_static_move_vocab(
         path=repo_config.vocab.path,
@@ -225,12 +236,13 @@ def main() -> None:
     if benchmark_batch is None:
         raise RuntimeError("No batch available from dataloader.")
 
-    model_cfg = build_hstu_chess_config(repo_config.model, move_vocab_size=move_vocab_size)
-    model = HSTUChessModel(model_cfg).to(device)
-    model.train()
-
-    if args.compile:
-        model = torch.compile(model)
+    model_cfg = build_hstu_chess_config(
+        repo_config.model, move_vocab_size=move_vocab_size
+    )
+    base_model = HSTUChessModel(model_cfg).to(device)
+    base_model.train()
+    run_model: torch.nn.Module = base_model
+    compile_enabled = bool(args.compile)
 
     seq_offsets = benchmark_batch["seq_offsets"].to(device=device, dtype=torch.long)
     block_mask = create_batch_block_mask(
@@ -250,37 +262,81 @@ def main() -> None:
         if device.type == "cuda":
             torch.cuda.synchronize(device)
 
+    def _run_benchmark(
+        model_to_run: torch.nn.Module,
+    ) -> tuple[list[float], float, float, float]:
+        if device.type == "cuda":
+            torch.cuda.reset_peak_memory_stats(device)
+            mem_before = torch.cuda.memory_allocated(device)
+        else:
+            mem_before = _get_cpu_rss_mb()
+
+        for _ in range(args.warmup_steps):
+            model_to_run.zero_grad(set_to_none=True)
+            with amp_context():
+                out = model_to_run(
+                    benchmark_batch, block_mask=block_mask, return_loss=True
+                )
+                out["loss"].backward()
+
+        timings: list[float] = []
+        for _ in range(args.benchmark_steps):
+            _sync()
+            start = time.perf_counter()
+            model_to_run.zero_grad(set_to_none=True)
+            with amp_context():
+                out = model_to_run(
+                    benchmark_batch, block_mask=block_mask, return_loss=True
+                )
+                out["loss"].backward()
+            _sync()
+            timings.append((time.perf_counter() - start) * 1000.0)
+
+        if device.type == "cuda":
+            mem_after = torch.cuda.memory_allocated(device)
+            mem_peak = torch.cuda.max_memory_allocated(device)
+            mem_peak_reserved = torch.cuda.max_memory_reserved(device)
+        else:
+            mem_after = _get_cpu_rss_mb()
+            mem_peak = mem_after
+            mem_peak_reserved = mem_after
+        return (
+            timings,
+            mem_before,
+            mem_after,
+            mem_peak_reserved if device.type != "cuda" else mem_peak,
+        )
+
+    compile_error: Exception | None = None
+    if compile_enabled:
+        run_model = torch.compile(base_model, dynamic=True, fullgraph=True)
+
+    try:
+        latencies_ms, mem_before_alloc, mem_after_alloc, mem_peak_alloc = (
+            _run_benchmark(run_model)
+        )
+    except Exception as exc:
+        if compile_enabled:
+            compile_error = exc
+            print("\nCompile benchmark failed; retrying in eager mode.")
+            print(f"  error: {type(exc).__name__}: {exc}")
+            print(
+                "  hint: reduce [dataloader].max_tokens_per_batch or model attention dimensions if needed."
+            )
+            compile_enabled = False
+            run_model = base_model
+            if hasattr(torch, "_dynamo"):
+                torch._dynamo.reset()
+            latencies_ms, mem_before_alloc, mem_after_alloc, mem_peak_alloc = (
+                _run_benchmark(run_model)
+            )
+        else:
+            raise
+
     if device.type == "cuda":
-        torch.cuda.reset_peak_memory_stats(device)
-        mem_before_alloc = torch.cuda.memory_allocated(device)
-    else:
-        mem_before_alloc = _get_cpu_rss_mb()
-
-    for _ in range(args.warmup_steps):
-        model.zero_grad(set_to_none=True)
-        with amp_context():
-            out = model(benchmark_batch, block_mask=block_mask, return_loss=True)
-            out["loss"].backward()
-
-    latencies_ms: list[float] = []
-    for _ in range(args.benchmark_steps):
-        _sync()
-        start = time.perf_counter()
-        model.zero_grad(set_to_none=True)
-        with amp_context():
-            out = model(benchmark_batch, block_mask=block_mask, return_loss=True)
-            out["loss"].backward()
-        _sync()
-        latencies_ms.append((time.perf_counter() - start) * 1000.0)
-
-    if device.type == "cuda":
-        mem_after_alloc = torch.cuda.memory_allocated(device)
-        mem_peak_alloc = torch.cuda.max_memory_allocated(device)
         mem_peak_reserved = torch.cuda.max_memory_reserved(device)
     else:
-        mem_after_alloc = _get_cpu_rss_mb()
-        mem_peak_alloc = mem_after_alloc
-        mem_peak_reserved = mem_after_alloc
+        mem_peak_reserved = mem_peak_alloc
 
     batch_tokens = int(benchmark_batch["total_tokens"])
     batch_games = int(benchmark_batch["num_games"])
@@ -294,21 +350,32 @@ def main() -> None:
     p50_ms = statistics.median(latencies_ms)
     p90_ms = sorted(latencies_ms)[max(0, math.ceil(0.9 * len(latencies_ms)) - 1)]
     tokens_per_s = (batch_tokens / (mean_ms / 1000.0)) if mean_ms > 0 else 0.0
-    approx_tflops = (flops["fwd_bwd_approx"] / (mean_ms / 1000.0)) / 1e12 if mean_ms > 0 else 0.0
+    approx_tflops = (
+        (flops["fwd_bwd_approx"] / (mean_ms / 1000.0)) / 1e12 if mean_ms > 0 else 0.0
+    )
 
     print("HSTU forward/backward benchmark")
     print(f"  device: {device}")
     print(f"  dtype: {dtype}")
-    print(f"  torch.compile: {args.compile}")
+    print(f"  torch.compile requested: {args.compile}")
+    print(f"  torch.compile active: {compile_enabled}")
+    if compile_error is not None:
+        print("  compile fallback reason captured above.")
     print(f"  move_vocab_size: {move_vocab_size}")
     print(f"  benchmark batch: games={batch_games}, tokens={batch_tokens}")
-    print(f"  sampled seq lens: count={len(sampled_seq_lens)}, max={max_seq}, p95={p95_seq}")
-    print(f"  model max_position_embeddings: {repo_config.model.max_position_embeddings}")
+    print(
+        f"  sampled seq lens: count={len(sampled_seq_lens)}, max={max_seq}, p95={p95_seq}"
+    )
+    print(
+        f"  model max_position_embeddings: {repo_config.model.max_position_embeddings}"
+    )
     print(f"  suggested max_position_embeddings (from sample): ~{suggested_max_seq}")
     if repo_config.model.max_position_embeddings < max_seq:
-        print("  WARNING: model max_position_embeddings is below observed max sequence length.")
+        print(
+            "  WARNING: model max_position_embeddings is below observed max sequence length."
+        )
 
-    _print_model_params(model)
+    _print_model_params(base_model)
 
     print("\nApprox FLOPs (from benchmark batch):")
     print(f"  per_hstu_layer: {_format_count(flops['per_layer'])}")
