@@ -278,14 +278,24 @@ def main() -> None:
         move_vocab=move_vocab,
     )
 
+    print(
+        f"Collecting {args.inspect_batches} dataloader batches for sequence stats...",
+        flush=True,
+    )
     iterator = iter(loader)
     benchmark_batch = None
     sampled_seq_lens: list[int] = []
-    for _ in range(args.inspect_batches):
+    for batch_idx in range(args.inspect_batches):
         batch = next(iterator)
         if benchmark_batch is None:
             benchmark_batch = batch
+            print(
+                f"  first batch ready: games={batch['num_games']}, tokens={batch['total_tokens']}",
+                flush=True,
+            )
         sampled_seq_lens.extend(int(x) for x in batch["seq_lens"].tolist())
+        if (batch_idx + 1) == args.inspect_batches:
+            print("Dataloader inspection complete.", flush=True)
 
     if benchmark_batch is None:
         raise RuntimeError("No batch available from dataloader.")
