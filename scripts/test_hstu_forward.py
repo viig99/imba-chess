@@ -59,12 +59,6 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max-tokens-per-batch", type=int, default=None)
     parser.add_argument("--num-workers", type=int, default=None)
     parser.add_argument("--num-layers", type=int, default=None)
-    parser.add_argument(
-        "--oom-retries",
-        type=int,
-        default=6,
-        help="Number of times to shrink benchmark batch and retry on CUDA OOM.",
-    )
     return parser.parse_args()
 
 
@@ -196,54 +190,6 @@ def _get_cpu_rss_mb() -> float:
     return resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / 1024.0
 
 
-def _is_cuda_oom(exc: BaseException) -> bool:
-    text = str(exc).lower()
-    return isinstance(exc, torch.OutOfMemoryError) or "cuda out of memory" in text
-
-
-def _is_compile_resource_failure(exc: BaseException) -> bool:
-    text = str(exc).lower()
-    return "no valid triton configs" in text or "out of resource" in text
-
-
-def _trim_batch_to_games(
-    batch: dict[str, object], keep_games: int
-) -> dict[str, object]:
-    if keep_games < 1:
-        raise ValueError("keep_games must be >= 1")
-
-    seq_offsets = batch["seq_offsets"]
-    if not isinstance(seq_offsets, torch.Tensor):
-        raise TypeError("Expected tensor batch['seq_offsets']")
-
-    current_games = int(batch["num_games"])
-    if keep_games >= current_games:
-        return batch
-
-    new_total_tokens = int(seq_offsets[keep_games].item())
-    trimmed: dict[str, object] = {
-        "game_id": list(batch["game_id"][:keep_games]),  # type: ignore[index]
-        "num_games": keep_games,
-        "total_tokens": new_total_tokens,
-        "seq_lens": batch["seq_lens"][:keep_games],  # type: ignore[index]
-        "seq_offsets": batch["seq_offsets"][: keep_games + 1],  # type: ignore[index]
-    }
-    flat_keys = [
-        "piece_ids",
-        "seq_token_id",
-        "turn_id",
-        "castle_id",
-        "ep_file_id",
-        "halfmove_bucket_id",
-        "fullmove_bucket_id",
-        "prev_move_id",
-        "target_move_id",
-    ]
-    for key in flat_keys:
-        trimmed[key] = batch[key][:new_total_tokens]  # type: ignore[index]
-    return trimmed
-
-
 def main() -> None:
     args = parse_args()
     repo_config = load_repo_config(args.config)
@@ -314,9 +260,15 @@ def main() -> None:
     total_params = _count_params(base_model)
     print(f"Model initialized: {_format_count(total_params)} params ({total_params})")
 
-    active_batch: dict[str, object] = benchmark_batch
     compile_requested = bool(args.compile)
-    compile_enabled = False
+    if compile_requested:
+        if hasattr(torch, "_dynamo"):
+            torch._dynamo.reset()
+        run_model: torch.nn.Module = torch.compile(base_model, dynamic=True)
+        compile_enabled = True
+    else:
+        run_model = base_model
+        compile_enabled = False
 
     use_amp = device.type == "cuda" and dtype in (torch.float16, torch.bfloat16)
 
@@ -382,107 +334,22 @@ def main() -> None:
             mem_peak_reserved if device.type != "cuda" else mem_peak,
         )
 
-    compile_error: Exception | None = None
-    oom_shrinks = 0
-    while True:
-        run_model: torch.nn.Module
-        compile_enabled = False
-        if compile_requested:
-            if hasattr(torch, "_dynamo"):
-                torch._dynamo.reset()
-            # Keep compile enabled, but avoid strict fullgraph/dynamic settings
-            # that can force brittle Triton paths on small GPUs.
-            run_model = torch.compile(base_model, dynamic=True)
-            compile_enabled = True
-        else:
-            run_model = base_model
-
-        try:
-            latencies_ms, mem_before_alloc, mem_after_alloc, mem_peak_alloc = (
-                _run_benchmark(run_model, active_batch)
-            )
-            break
-        except Exception as exc:
-            if compile_enabled and (
-                (device.type == "cuda" and _is_cuda_oom(exc))
-                or _is_compile_resource_failure(exc)
-            ):
-                compile_error = exc
-                if _is_compile_resource_failure(exc):
-                    raise RuntimeError(
-                        "Compiled flex-attention kernel exceeds GPU resource limits. "
-                        "This is not fixed by shrinking batch tokens. "
-                        "Lower model kernel shape (e.g. attention_dim, num_heads, model_dim), "
-                        "or run with --no-compile on this GPU."
-                    ) from exc
-                if oom_shrinks >= args.oom_retries:
-                    raise RuntimeError(
-                        "Compiled benchmark kept OOMing after shrinking batch. "
-                        "Lower [dataloader].max_tokens_per_batch and/or model size."
-                    ) from exc
-
-                if device.type == "cuda":
-                    torch.cuda.empty_cache()
-
-                current_games = int(active_batch["num_games"])
-                if current_games <= 1:
-                    raise RuntimeError(
-                        "Compile failed even with single-game benchmark batch. "
-                        "Reduce dataset.max_seq_len, dataloader.max_tokens_per_batch, or model dimensions."
-                    ) from exc
-
-                keep_games = max(1, int(math.floor(current_games * 0.75)))
-                if keep_games >= current_games:
-                    keep_games = current_games - 1
-                active_batch = _trim_batch_to_games(active_batch, keep_games)
-                oom_shrinks += 1
-
-                print("\nCompile benchmark OOM; retrying with smaller batch.")
-                print(f"  error: {type(exc).__name__}: {exc}")
-                print(
-                    f"  shrink: games {current_games} -> {keep_games}, "
-                    f"tokens={active_batch['total_tokens']}"
-                )
-                continue
-
-            if device.type != "cuda" or not _is_cuda_oom(exc):
-                raise
-            if oom_shrinks >= args.oom_retries:
-                raise RuntimeError(
-                    "CUDA OOM persists after shrinking benchmark batch. "
-                    "Lower [dataloader].max_tokens_per_batch and/or model size."
-                ) from exc
-
-            torch.cuda.empty_cache()
-            current_games = int(active_batch["num_games"])
-            if current_games <= 1:
-                raise RuntimeError(
-                    "CUDA OOM with a single-game benchmark batch. "
-                    "Reduce dataset.max_seq_len, dataloader.max_tokens_per_batch, or model dimensions."
-                ) from exc
-
-            keep_games = max(1, int(math.floor(current_games * 0.75)))
-            if keep_games >= current_games:
-                keep_games = current_games - 1
-            active_batch = _trim_batch_to_games(active_batch, keep_games)
-            oom_shrinks += 1
-            print(
-                f"\nCUDA OOM during benchmark; retrying with fewer games: "
-                f"{current_games} -> {keep_games}, tokens={active_batch['total_tokens']}"
-            )
+    latencies_ms, mem_before_alloc, mem_after_alloc, mem_peak_alloc = _run_benchmark(
+        run_model, benchmark_batch
+    )
 
     if device.type == "cuda":
         mem_peak_reserved = torch.cuda.max_memory_reserved(device)
     else:
         mem_peak_reserved = mem_peak_alloc
 
-    batch_tokens = int(active_batch["total_tokens"])
-    batch_games = int(active_batch["num_games"])
+    batch_tokens = int(benchmark_batch["total_tokens"])
+    batch_games = int(benchmark_batch["num_games"])
     max_seq = max(sampled_seq_lens) if sampled_seq_lens else 0
     p95_seq = _percentile(sampled_seq_lens, 0.95) if sampled_seq_lens else 0
     suggested_max_seq = _round_up(max(128, max_seq), 64)
 
-    benchmark_seq_lens = [int(x) for x in active_batch["seq_lens"].tolist()]  # type: ignore[union-attr]
+    benchmark_seq_lens = [int(x) for x in benchmark_batch["seq_lens"].tolist()]  # type: ignore[union-attr]
     flops = _estimate_flops(repo_config.model, benchmark_seq_lens, move_vocab_size)
     mean_ms = statistics.fmean(latencies_ms)
     p50_ms = statistics.median(latencies_ms)
@@ -497,10 +364,6 @@ def main() -> None:
     print(f"  dtype: {dtype}")
     print(f"  torch.compile requested: {compile_requested}")
     print(f"  torch.compile active: {compile_enabled}")
-    if compile_error is not None:
-        print("  compile retries occurred; last failure captured above.")
-    if oom_shrinks > 0:
-        print(f"  batch shrinks due to OOM: {oom_shrinks}")
     print(f"  move_vocab_size: {move_vocab_size}")
     print(f"  benchmark batch: games={batch_games}, tokens={batch_tokens}")
     print(
