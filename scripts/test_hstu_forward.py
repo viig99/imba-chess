@@ -200,6 +200,11 @@ def _is_cuda_oom(exc: BaseException) -> bool:
     return isinstance(exc, torch.OutOfMemoryError) or "cuda out of memory" in text
 
 
+def _is_compile_resource_failure(exc: BaseException) -> bool:
+    text = str(exc).lower()
+    return "no valid triton configs" in text or "out of resource" in text
+
+
 def _trim_batch_to_games(
     batch: dict[str, object], keep_games: int
 ) -> dict[str, object]:
@@ -290,9 +295,14 @@ def main() -> None:
     )
     base_model = HSTUChessModel(model_cfg).to(device)
     base_model.train()
-    run_model: torch.nn.Module = base_model
-    compile_enabled = bool(args.compile)
+    total_params = _count_params(base_model)
+    print(
+        f"Model initialized: {_format_count(total_params)} params ({total_params})"
+    )
+
     active_batch: dict[str, object] = benchmark_batch
+    compile_requested = bool(args.compile)
+    compile_enabled = False
 
     use_amp = device.type == "cuda" and dtype in (torch.float16, torch.bfloat16)
 
@@ -359,29 +369,57 @@ def main() -> None:
         )
 
     compile_error: Exception | None = None
-    if compile_enabled:
-        run_model = torch.compile(base_model, dynamic=True, fullgraph=True)
     oom_shrinks = 0
     while True:
+        run_model: torch.nn.Module
+        compile_enabled = False
+        if compile_requested:
+            if hasattr(torch, "_dynamo"):
+                torch._dynamo.reset()
+            run_model = torch.compile(base_model, dynamic=True, fullgraph=True)
+            compile_enabled = True
+        else:
+            run_model = base_model
+
         try:
             latencies_ms, mem_before_alloc, mem_after_alloc, mem_peak_alloc = (
                 _run_benchmark(run_model, active_batch)
             )
             break
         except Exception as exc:
-            if compile_enabled:
+            if compile_enabled and (
+                (device.type == "cuda" and _is_cuda_oom(exc))
+                or _is_compile_resource_failure(exc)
+            ):
                 compile_error = exc
-                print("\nCompile benchmark failed; retrying in eager mode.")
-                print(f"  error: {type(exc).__name__}: {exc}")
-                print(
-                    "  hint: reduce [dataloader].max_tokens_per_batch or model attention dimensions if needed."
-                )
-                compile_enabled = False
-                run_model = base_model
-                if hasattr(torch, "_dynamo"):
-                    torch._dynamo.reset()
+                if oom_shrinks >= args.oom_retries:
+                    raise RuntimeError(
+                        "Compiled benchmark kept failing after shrinking batch. "
+                        "Lower [dataloader].max_tokens_per_batch and/or model size."
+                    ) from exc
+
                 if device.type == "cuda":
                     torch.cuda.empty_cache()
+
+                current_games = int(active_batch["num_games"])
+                if current_games <= 1:
+                    raise RuntimeError(
+                        "Compile failed even with single-game benchmark batch. "
+                        "Reduce dataset.max_seq_len, dataloader.max_tokens_per_batch, or model dimensions."
+                    ) from exc
+
+                keep_games = max(1, int(math.floor(current_games * 0.75)))
+                if keep_games >= current_games:
+                    keep_games = current_games - 1
+                active_batch = _trim_batch_to_games(active_batch, keep_games)
+                oom_shrinks += 1
+
+                print("\nCompile benchmark failed; retrying with smaller batch.")
+                print(f"  error: {type(exc).__name__}: {exc}")
+                print(
+                    f"  shrink: games {current_games} -> {keep_games}, "
+                    f"tokens={active_batch['total_tokens']}"
+                )
                 continue
 
             if device.type != "cuda" or not _is_cuda_oom(exc):
@@ -434,10 +472,10 @@ def main() -> None:
     print("HSTU forward/backward benchmark")
     print(f"  device: {device}")
     print(f"  dtype: {dtype}")
-    print(f"  torch.compile requested: {args.compile}")
+    print(f"  torch.compile requested: {compile_requested}")
     print(f"  torch.compile active: {compile_enabled}")
     if compile_error is not None:
-        print("  compile fallback reason captured above.")
+        print("  compile retries occurred; last failure captured above.")
     if oom_shrinks > 0:
         print(f"  batch shrinks due to OOM: {oom_shrinks}")
     print(f"  move_vocab_size: {move_vocab_size}")
