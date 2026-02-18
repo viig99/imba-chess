@@ -1,5 +1,5 @@
 [dataset]
-min_avg_elo = 2000
+min_avg_elo = 2200
 split = "train"
 dataset_name = "Lichess/standard-chess-games"
 cache_dir = "artifacts/hf_cache"
@@ -19,5 +19,5 @@ include_unk = false
 
 [dataloader]
 max_tokens_per_batch = 6144
-num_workers = 0
-pin_memory = false
+num_workers = 2
+pin_memory = true
