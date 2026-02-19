@@ -1,5 +1,6 @@
 [dataset]
 min_avg_elo = 2000
+test_min_avg_elo = 2400
 split = "train"
 dataset_name = "Lichess/standard-chess-games"
 train_start_month = "2019-01"
@@ -46,7 +47,7 @@ fullmove_vocab_size = 128
 ignore_index = -100
 relative_attention_bias = "position"
 label_smoothing = 0.05
-elo_weight_min_elo = 2100
+elo_weight_min_elo = 2000
 elo_weight_max_elo = 2800
 elo_loss_weight_alpha = 1.0
 elo_loss_weight_strength = 1.0
@@ -58,6 +59,7 @@ eval_every_steps = 1000
 log_every_steps = 10
 full_val_every_epochs = 1
 fast_val_max_games = 10000
+fast_test_max_games = 10000
 max_lr = 1e-3
 lr_start_factor = 0.1
 lr_end_factor = 0.5

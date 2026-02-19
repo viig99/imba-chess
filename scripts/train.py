@@ -95,8 +95,11 @@ def _resolve_dtype(dtype_arg: str) -> torch.dtype:
 
 def _make_dataset(config, *, split: str) -> LichessDataset:
     dataset_cfg = replace(config.dataset, split=split)
+    min_avg_elo = dataset_cfg.min_avg_elo
+    if split == "test" and dataset_cfg.test_min_avg_elo is not None:
+        min_avg_elo = int(dataset_cfg.test_min_avg_elo)
     return LichessDataset(
-        min_avg_elo=dataset_cfg.min_avg_elo,
+        min_avg_elo=min_avg_elo,
         split=dataset_cfg.split,
         dataset_name=dataset_cfg.dataset_name,
         train_start_month=dataset_cfg.train_start_month,
@@ -288,6 +291,8 @@ def main() -> None:
         raise ValueError("training.full_val_every_epochs must be >= 1")
     if repo_config.training.fast_val_max_games < 1:
         raise ValueError("training.fast_val_max_games must be >= 1")
+    if repo_config.training.fast_test_max_games < 1:
+        raise ValueError("training.fast_test_max_games must be >= 1")
     if repo_config.training.last_checkpoint_keep < 1:
         raise ValueError("training.last_checkpoint_keep must be >= 1")
 
@@ -308,6 +313,10 @@ def main() -> None:
         repo_config,
         val_max_games=int(repo_config.training.fast_val_max_games),
     )
+    eval_runtime_fast_test = _make_eval_runtime_config(
+        repo_config,
+        test_max_games=int(repo_config.training.fast_test_max_games),
+    )
     eval_runtime_full_val = _make_eval_runtime_config(
         repo_config,
         val_max_games=repo_config.dataset.val_max_games,
@@ -324,6 +333,11 @@ def main() -> None:
     full_val_loader = build_event_dataloader(
         lichess_dataset=_make_dataset(eval_runtime_full_val, split="val"),
         config=eval_runtime_full_val,
+        move_vocab=move_vocab,
+    )
+    fast_test_loader = build_event_dataloader(
+        lichess_dataset=_make_dataset(eval_runtime_fast_test, split="test"),
+        config=eval_runtime_fast_test,
         move_vocab=move_vocab,
     )
     test_loader = build_event_dataloader(
@@ -353,6 +367,13 @@ def main() -> None:
         ignore_index=repo_config.model.ignore_index,
         topk=(1, 3, 5, 10),
     )
+    fast_test_evaluator = create_next_move_evaluator(
+        model=model,
+        device=device,
+        dtype=dtype,
+        ignore_index=repo_config.model.ignore_index,
+        topk=(1, 3, 5, 10),
+    )
     test_evaluator = create_next_move_evaluator(
         model=model,
         device=device,
@@ -369,6 +390,11 @@ def main() -> None:
     full_val_pbar = ProgressBar(persist=False, desc="val_full")
     full_val_pbar.attach(
         full_val_evaluator,
+        output_transform=lambda out: {"games": int(out["num_games"])},
+    )
+    fast_test_pbar = ProgressBar(persist=False, desc="test_fast")
+    fast_test_pbar.attach(
+        fast_test_evaluator,
         output_transform=lambda out: {"games": int(out["num_games"])},
     )
     test_pbar = ProgressBar(persist=False, desc="test")
@@ -527,6 +553,13 @@ def main() -> None:
         metric_names="all",
         global_step_transform=global_step_from_engine(trainer),
     )
+    tb_logger.attach_output_handler(
+        fast_test_evaluator,
+        event_name=Events.COMPLETED,
+        tag="test_fast",
+        metric_names="all",
+        global_step_transform=global_step_from_engine(trainer),
+    )
 
     best_ckpt_handler = Checkpoint(
         to_save=checkpoint_objects,
@@ -558,7 +591,7 @@ def main() -> None:
     )
 
     @trainer.on(Events.ITERATION_COMPLETED(every=repo_config.training.eval_every_steps))
-    def _run_periodic_fast_val_eval(engine: Engine) -> None:
+    def _run_periodic_fast_evals(engine: Engine) -> None:
         _run_deterministic_eval(
             evaluator=fast_val_evaluator,
             loader=fast_val_loader,
@@ -566,6 +599,13 @@ def main() -> None:
             epoch_length=eval_epoch_length,
         )
         _print_eval_metrics("val_fast", fast_val_evaluator.state.metrics)
+        _run_deterministic_eval(
+            evaluator=fast_test_evaluator,
+            loader=fast_test_loader,
+            seed=int(repo_config.training.seed),
+            epoch_length=eval_epoch_length,
+        )
+        _print_eval_metrics("test_fast", fast_test_evaluator.state.metrics)
 
     @trainer.on(
         Events.EPOCH_COMPLETED(every=int(repo_config.training.full_val_every_epochs))
@@ -607,6 +647,13 @@ def main() -> None:
             epoch_length=eval_epoch_length,
         )
         _print_eval_metrics("val_fast_resume", fast_val_evaluator.state.metrics)
+        _run_deterministic_eval(
+            evaluator=fast_test_evaluator,
+            loader=fast_test_loader,
+            seed=int(repo_config.training.seed),
+            epoch_length=eval_epoch_length,
+        )
+        _print_eval_metrics("test_fast_resume", fast_test_evaluator.state.metrics)
 
     try:
         print("Starting training with Ignite")
