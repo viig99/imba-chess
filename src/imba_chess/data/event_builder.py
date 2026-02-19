@@ -10,6 +10,7 @@ EVENT_TOKEN_ID = 0
 BOS_TOKEN_ID = 1
 TARGET_IGNORE_INDEX = -100
 
+
 class EventBuilder:
     """Build BOS+ply event sequences for next-move prediction."""
 
@@ -29,11 +30,13 @@ class EventBuilder:
         fullmove_bucket_id = [0]
         prev_move_id = [self.move_vocab.start_id]
         target_move_id = [TARGET_IGNORE_INDEX]
+        played_by_elo = [0]
 
         previous_move = self.move_vocab.start_id
         for play in plays:
             state = as_plain_dict(play["state"])
             current_move = self.move_vocab.encode(play["move_uci"])
+            current_played_by_elo = int(play.get("played_by_elo", 0))
 
             seq_token_id.append(EVENT_TOKEN_ID)
             piece_ids.append(list(state["piece_ids"]))
@@ -44,6 +47,7 @@ class EventBuilder:
             fullmove_bucket_id.append(int(state["fullmove_bucket_id"]))
             prev_move_id.append(previous_move)
             target_move_id.append(current_move)
+            played_by_elo.append(current_played_by_elo)
 
             previous_move = current_move
 
@@ -58,4 +62,5 @@ class EventBuilder:
             "fullmove_bucket_id": fullmove_bucket_id,
             "prev_move_id": prev_move_id,
             "target_move_id": target_move_id,
+            "played_by_elo": played_by_elo,
         }

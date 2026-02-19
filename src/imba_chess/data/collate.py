@@ -28,6 +28,7 @@ def collate_jagged_batch(batch: List[EventSequence]) -> JaggedBatch:
         "fullmove_bucket_id",
         "prev_move_id",
         "target_move_id",
+        "played_by_elo",
     ]
 
     flat_scalars = {key: [] for key in scalar_keys}
@@ -36,8 +37,22 @@ def collate_jagged_batch(batch: List[EventSequence]) -> JaggedBatch:
 
     for sample in batch:
         seq_len = len(sample["seq_token_id"])
+        game_id = sample.get("game_id", "<unknown>")
+        piece_ids = sample["piece_ids"]
+        if len(piece_ids) != seq_len:
+            raise ValueError(
+                f"Sample {game_id} has piece_ids length {len(piece_ids)} "
+                f"but seq_token_id length {seq_len}"
+            )
+        for key in scalar_keys:
+            values = sample[key]
+            if len(values) != seq_len:
+                raise ValueError(
+                    f"Sample {game_id} has {key} length {len(values)} "
+                    f"but seq_token_id length {seq_len}"
+                )
         seq_lens.append(seq_len)
-        flat_piece_ids.extend(sample["piece_ids"])
+        flat_piece_ids.extend(piece_ids)
         for key in scalar_keys:
             flat_scalars[key].extend(sample[key])
 

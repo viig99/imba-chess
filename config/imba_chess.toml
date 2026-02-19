@@ -45,6 +45,11 @@ halfmove_vocab_size = 128
 fullmove_vocab_size = 128
 ignore_index = -100
 relative_attention_bias = "position"
+label_smoothing = 0.05
+elo_weight_min_elo = 2100
+elo_weight_max_elo = 2800
+elo_loss_weight_alpha = 1.0
+elo_loss_weight_strength = 1.0
 
 [training]
 epochs = 100

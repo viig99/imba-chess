@@ -14,6 +14,7 @@ class EventSequence(TypedDict):
     fullmove_bucket_id: list[int]
     prev_move_id: list[int]
     target_move_id: list[int]
+    played_by_elo: list[int]
 
 
 class JaggedBatch(TypedDict):
@@ -31,4 +32,4 @@ class JaggedBatch(TypedDict):
     fullmove_bucket_id: Any
     prev_move_id: Any
     target_move_id: Any
-
+    played_by_elo: Any

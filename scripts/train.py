@@ -417,12 +417,10 @@ def main() -> None:
         should_sync_check = (
             engine.state.iteration % int(repo_config.training.log_every_steps) == 0
         )
-        if "target_move_id" not in batch:
-            raise KeyError("batch['target_move_id'] is required for training")
-        target_move_id = batch["target_move_id"]
-        if not isinstance(target_move_id, torch.Tensor):
-            raise TypeError("batch['target_move_id'] must be a torch.Tensor")
         if should_sync_check:
+            target_move_id = batch["target_move_id"]
+            if not isinstance(target_move_id, torch.Tensor):
+                raise TypeError("batch['target_move_id'] must be a torch.Tensor")
             valid_targets = target_move_id != int(repo_config.model.ignore_index)
             if not bool(valid_targets.any().item()):
                 raise ValueError(

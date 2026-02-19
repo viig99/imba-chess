@@ -73,12 +73,7 @@ class SequentialTransductionUnitJagged(torch.nn.Module):
         return score
 
     def _generate_rab_score_mod(self):
-        if self._rel_attn_bias == "position":
-            return self._position_score_mod
-        else:
-            raise ValueError(
-                f"Invalid relative attention bias module: {self._rel_attn_bias}"
-            )
+        return self._position_score_mod
 
     def forward(
         self,

@@ -70,6 +70,11 @@ class ModelConfig:
     fullmove_vocab_size: int = 128
     ignore_index: int = -100
     relative_attention_bias: str = "position"
+    label_smoothing: float = 0.0
+    elo_weight_min_elo: int = 2200
+    elo_weight_max_elo: int = 2800
+    elo_loss_weight_alpha: float = 1.0
+    elo_loss_weight_strength: float = 0.0
 
 
 @dataclass(frozen=True)

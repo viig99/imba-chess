@@ -36,4 +36,6 @@ def test_event_builder_builds_bos_plus_plies():
     assert sample["target_move_id"][0] == TARGET_IGNORE_INDEX
     assert all(token_id != TARGET_IGNORE_INDEX for token_id in sample["target_move_id"][1:])
     assert sample["prev_move_id"][1] == vocab.start_id
+    assert sample["played_by_elo"][0] == 0
+    assert len(sample["played_by_elo"]) == len(sample["seq_token_id"])
     assert len(sample["piece_ids"][1]) == 64

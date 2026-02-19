@@ -29,6 +29,11 @@ class HSTUChessConfig:
     fullmove_vocab_size: int = 128
     ignore_index: int = -100
     relative_attention_bias: str = "position"
+    label_smoothing: float = 0.0
+    elo_weight_min_elo: int = 2200
+    elo_weight_max_elo: int = 2800
+    elo_loss_weight_alpha: float = 1.0
+    elo_loss_weight_strength: float = 0.0
 
 
 def build_hstu_chess_config(
@@ -48,6 +53,11 @@ def build_hstu_chess_config(
         fullmove_vocab_size=int(model_config.fullmove_vocab_size),
         ignore_index=int(model_config.ignore_index),
         relative_attention_bias=str(model_config.relative_attention_bias),
+        label_smoothing=float(model_config.label_smoothing),
+        elo_weight_min_elo=int(model_config.elo_weight_min_elo),
+        elo_weight_max_elo=int(model_config.elo_weight_max_elo),
+        elo_loss_weight_alpha=float(model_config.elo_loss_weight_alpha),
+        elo_loss_weight_strength=float(model_config.elo_loss_weight_strength),
     )
 
 
@@ -78,6 +88,14 @@ class HSTUChessModel(nn.Module):
     def __init__(self, config: HSTUChessConfig) -> None:
         super().__init__()
         self.config = config
+        if not 0.0 <= float(config.label_smoothing) < 1.0:
+            raise ValueError("label_smoothing must be in [0.0, 1.0)")
+        if int(config.elo_weight_max_elo) <= int(config.elo_weight_min_elo):
+            raise ValueError("elo_weight_max_elo must be > elo_weight_min_elo")
+        if float(config.elo_loss_weight_alpha) <= 0.0:
+            raise ValueError("elo_loss_weight_alpha must be > 0")
+        if float(config.elo_loss_weight_strength) < 0.0:
+            raise ValueError("elo_loss_weight_strength must be >= 0")
         d = config.model_dim
 
         self.piece_embedding = nn.Embedding(13, d)
@@ -143,15 +161,11 @@ class HSTUChessModel(nn.Module):
             self.turn_embedding.num_embeddings,
         )
         castle_id = self._clamp_ids(
-            batch["castle_id"].to(
-                device=device, dtype=torch.long, non_blocking=True
-            ),
+            batch["castle_id"].to(device=device, dtype=torch.long, non_blocking=True),
             self.castle_embedding.num_embeddings,
         )
         ep_file_id = self._clamp_ids(
-            batch["ep_file_id"].to(
-                device=device, dtype=torch.long, non_blocking=True
-            ),
+            batch["ep_file_id"].to(device=device, dtype=torch.long, non_blocking=True),
             self.ep_embedding.num_embeddings,
         )
         halfmove_bucket_id = self._clamp_ids(
@@ -214,8 +228,6 @@ class HSTUChessModel(nn.Module):
         output: dict[str, torch.Tensor] = {"logits": logits}
 
         if return_loss:
-            if "target_move_id" not in batch:
-                raise KeyError("batch['target_move_id'] is required when return_loss=True")
             target_move_id = batch["target_move_id"].to(
                 device=logits.device, dtype=torch.long, non_blocking=True
             )
@@ -225,9 +237,24 @@ class HSTUChessModel(nn.Module):
                 logits.float(),
                 safe_targets,
                 reduction="none",
+                label_smoothing=self.config.label_smoothing,
             )
-            loss_sum = (per_token_loss * valid_mask.to(per_token_loss.dtype)).sum()
-            valid_count = valid_mask.sum().clamp_min(1).to(loss_sum.dtype)
-            output["loss"] = loss_sum / valid_count
+            token_weights = valid_mask.to(per_token_loss.dtype)
+            if self.config.elo_loss_weight_strength > 0.0:
+                played_by_elo = batch["played_by_elo"].to(
+                    device=logits.device, dtype=per_token_loss.dtype, non_blocking=True
+                )
+                min_elo = self.config.elo_weight_min_elo
+                max_elo = self.config.elo_weight_max_elo
+                elo_norm = ((played_by_elo - min_elo) / (max_elo - min_elo)).clamp(
+                    min=0.0, max=1.0
+                )
+                elo_curve = elo_norm.pow(self.config.elo_loss_weight_alpha)
+                elo_scale = 1.0 + self.config.elo_loss_weight_strength * elo_curve
+                token_weights = token_weights * elo_scale
+
+            loss_sum = (per_token_loss * token_weights).sum()
+            weight_sum = token_weights.sum().clamp_min(1.0)
+            output["loss"] = loss_sum / weight_sum
 
         return output
