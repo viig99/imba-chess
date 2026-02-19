@@ -53,6 +53,8 @@ class DataloaderConfig:
     world_size: Optional[int] = None
     num_workers: int = 0
     pin_memory: bool = False
+    prefetch_factor: Optional[int] = None
+    persistent_workers: bool = False
 
 
 @dataclass(frozen=True)

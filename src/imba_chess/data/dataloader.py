@@ -42,6 +42,22 @@ def build_event_dataloader(
         raise ImportError("torch is required to build DataLoader")
 
     runtime = config or RepoConfig()
+    num_workers = int(runtime.dataloader.num_workers)
+    prefetch_factor = runtime.dataloader.prefetch_factor
+    persistent_workers = bool(runtime.dataloader.persistent_workers)
+
+    if num_workers < 0:
+        raise ValueError("dataloader.num_workers must be >= 0")
+    if prefetch_factor is not None and prefetch_factor < 1:
+        raise ValueError("dataloader.prefetch_factor must be >= 1 when set")
+    if prefetch_factor is not None and num_workers == 0:
+        raise ValueError(
+            "dataloader.prefetch_factor requires dataloader.num_workers > 0"
+        )
+    if persistent_workers and num_workers == 0:
+        raise ValueError(
+            "dataloader.persistent_workers=true requires dataloader.num_workers > 0"
+        )
 
     resolved_move_vocab = move_vocab or load_or_create_static_move_vocab(
         path=runtime.vocab.path,
@@ -58,9 +74,17 @@ def build_event_dataloader(
         max_tokens_per_batch=runtime.dataloader.max_tokens_per_batch,
     )
 
+    dataloader_kwargs: dict[str, Any] = {
+        "batch_size": None,
+        "num_workers": num_workers,
+        "pin_memory": runtime.dataloader.pin_memory,
+    }
+    if num_workers > 0:
+        dataloader_kwargs["persistent_workers"] = persistent_workers
+        if prefetch_factor is not None:
+            dataloader_kwargs["prefetch_factor"] = int(prefetch_factor)
+
     return DataLoader(
         packed_dataset,
-        batch_size=None,
-        num_workers=runtime.dataloader.num_workers,
-        pin_memory=runtime.dataloader.pin_memory,
+        **dataloader_kwargs,
     )

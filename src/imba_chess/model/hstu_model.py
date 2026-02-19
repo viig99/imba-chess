@@ -129,33 +129,47 @@ class HSTUChessModel(nn.Module):
 
     def _build_content(self, batch: dict[str, Any]) -> torch.Tensor:
         device = self.piece_embedding.weight.device
-        piece_ids = batch["piece_ids"].to(device=device, dtype=torch.long)
+        piece_ids = batch["piece_ids"].to(
+            device=device, dtype=torch.long, non_blocking=True
+        )
         seq_token_id = self._clamp_ids(
-            batch["seq_token_id"].to(device=device, dtype=torch.long),
+            batch["seq_token_id"].to(
+                device=device, dtype=torch.long, non_blocking=True
+            ),
             self.seq_token_embedding.num_embeddings,
         )
         turn_id = self._clamp_ids(
-            batch["turn_id"].to(device=device, dtype=torch.long),
+            batch["turn_id"].to(device=device, dtype=torch.long, non_blocking=True),
             self.turn_embedding.num_embeddings,
         )
         castle_id = self._clamp_ids(
-            batch["castle_id"].to(device=device, dtype=torch.long),
+            batch["castle_id"].to(
+                device=device, dtype=torch.long, non_blocking=True
+            ),
             self.castle_embedding.num_embeddings,
         )
         ep_file_id = self._clamp_ids(
-            batch["ep_file_id"].to(device=device, dtype=torch.long),
+            batch["ep_file_id"].to(
+                device=device, dtype=torch.long, non_blocking=True
+            ),
             self.ep_embedding.num_embeddings,
         )
         halfmove_bucket_id = self._clamp_ids(
-            batch["halfmove_bucket_id"].to(device=device, dtype=torch.long),
+            batch["halfmove_bucket_id"].to(
+                device=device, dtype=torch.long, non_blocking=True
+            ),
             self.halfmove_embedding.num_embeddings,
         )
         fullmove_bucket_id = self._clamp_ids(
-            batch["fullmove_bucket_id"].to(device=device, dtype=torch.long),
+            batch["fullmove_bucket_id"].to(
+                device=device, dtype=torch.long, non_blocking=True
+            ),
             self.fullmove_embedding.num_embeddings,
         )
         prev_move_id = self._clamp_ids(
-            batch["prev_move_id"].to(device=device, dtype=torch.long),
+            batch["prev_move_id"].to(
+                device=device, dtype=torch.long, non_blocking=True
+            ),
             self.prev_move_embedding.num_embeddings,
         )
 
@@ -179,7 +193,9 @@ class HSTUChessModel(nn.Module):
         return_loss: bool = True,
     ) -> dict[str, torch.Tensor]:
         device = self.piece_embedding.weight.device
-        seq_offsets = batch["seq_offsets"].to(device=device, dtype=torch.long)
+        seq_offsets = batch["seq_offsets"].to(
+            device=device, dtype=torch.long, non_blocking=True
+        )
         content = self._build_content(batch)
         x = self.position_embedding(content, seq_offsets)
 
@@ -201,7 +217,7 @@ class HSTUChessModel(nn.Module):
             if "target_move_id" not in batch:
                 raise KeyError("batch['target_move_id'] is required when return_loss=True")
             target_move_id = batch["target_move_id"].to(
-                device=logits.device, dtype=torch.long
+                device=logits.device, dtype=torch.long, non_blocking=True
             )
             has_valid_target = (target_move_id != self.config.ignore_index).any()
             torch._assert(

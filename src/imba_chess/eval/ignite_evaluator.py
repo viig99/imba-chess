@@ -39,7 +39,9 @@ def create_next_move_evaluator(
 
     @torch.inference_mode()
     def _eval_step(engine: Engine, batch: dict[str, object]) -> dict[str, object]:
-        seq_offsets = batch["seq_offsets"].to(device=device, dtype=torch.long)  # type: ignore[union-attr]
+        seq_offsets = batch["seq_offsets"].to(  # type: ignore[union-attr]
+            device=device, dtype=torch.long, non_blocking=True
+        )
         block_mask = create_batch_block_mask(
             seq_offsets=seq_offsets,
             total_tokens=int(batch["total_tokens"]),  # type: ignore[arg-type]
@@ -54,7 +56,9 @@ def create_next_move_evaluator(
             output = model(batch, block_mask=block_mask, return_loss=False)
 
         logits = output["logits"].detach()
-        targets = batch["target_move_id"].to(device=logits.device, dtype=torch.long)  # type: ignore[union-attr]
+        targets = batch["target_move_id"].to(  # type: ignore[union-attr]
+            device=logits.device, dtype=torch.long, non_blocking=True
+        )
         return {
             "logits": logits,
             "targets": targets,

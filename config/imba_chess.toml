@@ -28,8 +28,10 @@ include_unk = false
 
 [dataloader]
 max_tokens_per_batch = 32768
-num_workers = 2
+num_workers = 4
 pin_memory = true
+prefetch_factor = 4
+persistent_workers = true
 
 [model]
 model_dim = 384
@@ -46,8 +48,8 @@ relative_attention_bias = "position"
 
 [training]
 epochs = 20
-steps_per_epoch = 2500
-eval_every_steps = 250
+steps_per_epoch = 10000
+eval_every_steps = 1000
 log_every_steps = 10
 full_val_every_epochs = 1
 fast_val_max_games = 5000
@@ -60,7 +62,7 @@ grad_clip_norm = 1.0
 seed = 42
 deterministic_eval = true
 eval_num_workers = 0
-save_last_every_steps = 250
+save_last_every_steps = 1000
 last_checkpoint_keep = 1
 optimizer_fused = true
 compile_model = true
