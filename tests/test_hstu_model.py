@@ -58,7 +58,7 @@ def test_build_hstu_chess_config_from_repo_model_section():
     assert cfg.dropout == 0.2
 
 
-def test_hstu_chess_model_raises_when_all_targets_ignored():
+def test_hstu_chess_model_loss_is_finite_when_all_targets_ignored():
     config = HSTUChessConfig(
         move_vocab_size=128,
         model_dim=64,
@@ -72,5 +72,6 @@ def test_hstu_chess_model_raises_when_all_targets_ignored():
     batch = _batch()
     batch["target_move_id"] = torch.full_like(batch["target_move_id"], -100)
 
-    with pytest.raises(AssertionError, match="No valid target tokens in batch"):
-        model(batch, return_loss=True)
+    out = model(batch, return_loss=True)
+    assert torch.isfinite(out["loss"])
+    assert out["loss"].item() == pytest.approx(0.0, abs=1e-8)

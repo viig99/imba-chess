@@ -219,16 +219,15 @@ class HSTUChessModel(nn.Module):
             target_move_id = batch["target_move_id"].to(
                 device=logits.device, dtype=torch.long, non_blocking=True
             )
-            has_valid_target = (target_move_id != self.config.ignore_index).any()
-            torch._assert(
-                has_valid_target,
-                "No valid target tokens in batch (all target_move_id == ignore_index). "
-                "Check dataset/event construction and sequence truncation settings.",
-            )
-            output["loss"] = F.cross_entropy(
+            valid_mask = target_move_id != self.config.ignore_index
+            safe_targets = target_move_id.masked_fill(~valid_mask, 0)
+            per_token_loss = F.cross_entropy(
                 logits.float(),
-                target_move_id,
-                ignore_index=self.config.ignore_index,
+                safe_targets,
+                reduction="none",
             )
+            loss_sum = (per_token_loss * valid_mask.to(per_token_loss.dtype)).sum()
+            valid_count = valid_mask.sum().clamp_min(1).to(loss_sum.dtype)
+            output["loss"] = loss_sum / valid_count
 
         return output

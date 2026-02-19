@@ -28,7 +28,7 @@ include_unk = false
 
 [dataloader]
 max_tokens_per_batch = 32768
-num_workers = 4
+num_workers = 2
 pin_memory = true
 prefetch_factor = 4
 persistent_workers = true

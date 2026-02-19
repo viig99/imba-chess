@@ -326,7 +326,7 @@ def main() -> None:
     )
     model: torch.nn.Module = HSTUChessModel(model_cfg).to(device)
     if repo_config.training.compile_model:
-        model = torch.compile(model, dynamic=True)
+        model = torch.compile(model, dynamic=True, fullgraph=True)
 
     fast_val_evaluator = create_next_move_evaluator(
         model=model,
@@ -403,6 +403,17 @@ def main() -> None:
     def _train_step(engine: Engine, batch: dict[str, object]) -> dict[str, float]:
         model.train()
         optimizer.zero_grad(set_to_none=True)
+        if "target_move_id" not in batch:
+            raise KeyError("batch['target_move_id'] is required for training")
+        target_move_id = batch["target_move_id"]
+        if not isinstance(target_move_id, torch.Tensor):
+            raise TypeError("batch['target_move_id'] must be a torch.Tensor")
+        valid_targets = target_move_id != int(repo_config.model.ignore_index)
+        if not bool(valid_targets.any().item()):
+            raise ValueError(
+                "No valid target tokens in training batch (all target_move_id == ignore_index). "
+                "Check dataset/event construction and max_seq_len settings."
+            )
         batch_games = int(batch["num_games"])
         prior_epoch_games = int(getattr(engine.state, "epoch_game_count", 0))
         engine.state.epoch_game_count = prior_epoch_games + batch_games
