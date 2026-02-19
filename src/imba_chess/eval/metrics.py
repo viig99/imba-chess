@@ -16,6 +16,8 @@ def normalize_topk(topk: Iterable[int]) -> tuple[int, ...]:
 
 
 class _BaseNextMoveMetric(Metric):
+    required_output_keys = ("logits", "targets")
+
     def __init__(
         self,
         *,
@@ -27,14 +29,19 @@ class _BaseNextMoveMetric(Metric):
 
     @staticmethod
     def _unpack_output(output: Any) -> tuple[torch.Tensor, torch.Tensor]:
-        if not isinstance(output, dict):
-            raise TypeError("Expected evaluator output to be a dict")
-        logits = output.get("logits", output.get("y_pred"))
-        targets = output.get("targets", output.get("y"))
-        if logits is None:
-            raise KeyError("Expected output['logits'] or output['y_pred']")
-        if targets is None:
-            raise KeyError("Expected output['targets'] or output['y']")
+        if isinstance(output, dict):
+            logits = output.get("logits", output.get("y_pred"))
+            targets = output.get("targets", output.get("y"))
+            if logits is None:
+                raise KeyError("Expected output['logits'] or output['y_pred']")
+            if targets is None:
+                raise KeyError("Expected output['targets'] or output['y']")
+        elif isinstance(output, (tuple, list)) and len(output) == 2:
+            logits, targets = output
+        else:
+            raise TypeError(
+                "Expected evaluator output to be dict or (predictions, targets) tuple"
+            )
         if not isinstance(logits, torch.Tensor):
             raise TypeError("Predictions must be a torch.Tensor")
         if not isinstance(targets, torch.Tensor):
@@ -185,6 +192,8 @@ class NextMoveTokenCount(_BaseNextMoveMetric):
 
 
 class BatchCount(Metric):
+    required_output_keys = ("num_games",)
+
     @reinit__is_reduced
     def reset(self) -> None:
         self._count = 0.0
@@ -200,6 +209,8 @@ class BatchCount(Metric):
 
 
 class GameCount(Metric):
+    required_output_keys = ("num_games",)
+
     @reinit__is_reduced
     def reset(self) -> None:
         self._count = 0.0
@@ -207,11 +218,22 @@ class GameCount(Metric):
 
     @reinit__is_reduced
     def update(self, output: Any) -> None:
-        if not isinstance(output, dict):
-            raise TypeError("Expected evaluator output to be a dict")
-        num_games = output.get("num_games")
-        if num_games is None:
-            raise KeyError("Expected output['num_games']")
+        if isinstance(output, dict):
+            num_games = output.get("num_games")
+            if num_games is None:
+                raise KeyError("Expected output['num_games']")
+        elif isinstance(output, (tuple, list)):
+            if len(output) != 1:
+                raise ValueError(
+                    "Expected single-value tuple/list for num_games metric output"
+                )
+            num_games = output[0]
+        else:
+            num_games = output
+        if isinstance(num_games, torch.Tensor):
+            if num_games.numel() != 1:
+                raise ValueError("num_games tensor must be scalar")
+            num_games = num_games.item()
         self._count += float(num_games)
 
     @sync_all_reduce("_count")
