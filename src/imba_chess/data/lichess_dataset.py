@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import asdict
 from pathlib import Path
+import random
 from typing import Any, Dict, Iterable, Iterator, Optional, Sequence
 
 import chess
@@ -60,6 +61,8 @@ class LichessDataset:
         parquet_batch_size: int = 2048,
         max_seq_len: Optional[int] = None,
         return_dataclasses: bool = False,
+        shuffle_train_month_files_on_start: bool = False,
+        train_month_shuffle_seed: Optional[int] = None,
         board_state_config: Optional[BoardTokenConfig] = None,
     ) -> None:
         self.min_avg_elo = min_avg_elo
@@ -84,6 +87,14 @@ class LichessDataset:
             raise ValueError(f"max_seq_len must be >= 1 when set, got {max_seq_len}")
         self.max_seq_len = max_seq_len
         self.return_dataclasses = return_dataclasses
+        self.shuffle_train_month_files_on_start = bool(
+            shuffle_train_month_files_on_start
+        )
+        self.train_month_shuffle_seed = (
+            int(train_month_shuffle_seed)
+            if train_month_shuffle_seed is not None
+            else random.SystemRandom().randrange(0, 2**63)
+        )
         self.board_state_encoder = BoardStateEncoder(board_state_config)
         self._validate_split_settings()
 
@@ -471,6 +482,8 @@ class LichessDataset:
             files.append(
                 f"hf://datasets/{self.dataset_name}/data/year={year:04d}/month={month:02d}/*.parquet"
             )
+        if self.split.lower() == "train" and self.shuffle_train_month_files_on_start:
+            random.Random(self.train_month_shuffle_seed).shuffle(files)
         return files
 
     @staticmethod

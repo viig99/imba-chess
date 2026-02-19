@@ -15,6 +15,9 @@ cache_dir = "artifacts/hf_cache"
 parquet_batch_size = 65536
 return_dataclasses = false
 max_seq_len = 512
+shuffle_train_month_files_on_start = true
+# Optional fixed seed for train-month shuffling; null/randomized each process start if omitted.
+# train_month_shuffle_seed = 12345
 
 [board_state]
 en_passant = "legal"

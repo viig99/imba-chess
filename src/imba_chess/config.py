@@ -30,6 +30,8 @@ class DatasetConfig:
     parquet_batch_size: int = 2048
     max_seq_len: Optional[int] = None
     return_dataclasses: bool = False
+    shuffle_train_month_files_on_start: bool = False
+    train_month_shuffle_seed: Optional[int] = None
 
 
 @dataclass(frozen=True)

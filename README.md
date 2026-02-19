@@ -145,7 +145,7 @@ uv run --python .venv/bin/python --with pytest pytest -q
 
 - Training is currently single-process in this repo flow (no end-to-end DDP launcher yet).
 - No legal-move masking in the prediction head yet (full-vocab classification).
-- Streaming order is temporal by month window (newest month first), not global random shuffle.
+- Streaming order is temporal by month window (newest month first); training can optionally shuffle month-level parquet file order on process start via `[dataset].shuffle_train_month_files_on_start`.
 
 ## References
 
