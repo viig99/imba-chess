@@ -11,7 +11,7 @@ test_end_month = "2025-09"
 val_max_games = 50000
 test_max_games = 50000
 cache_dir = "artifacts/hf_cache"
-parquet_batch_size = 8192
+parquet_batch_size = 65536
 return_dataclasses = false
 max_seq_len = 512
 
@@ -30,7 +30,7 @@ include_unk = false
 max_tokens_per_batch = 32768
 num_workers = 2
 pin_memory = true
-prefetch_factor = 4
+prefetch_factor = 2
 persistent_workers = true
 
 [model]

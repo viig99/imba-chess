@@ -89,7 +89,9 @@ def build_pgn_text(row: Dict[str, Any]) -> str:
         "Opening": row.get("Opening"),
         "Termination": row.get("Termination"),
     }
-    header_lines = [f'[{key} "{pgn_header_value(value)}"]' for key, value in headers.items()]
+    header_lines = [
+        f'[{key} "{pgn_header_value(value)}"]' for key, value in headers.items()
+    ]
     movetext = to_text(row.get("movetext"), default="")
     if not movetext.endswith(result):
         movetext = f"{movetext} {result}".strip()

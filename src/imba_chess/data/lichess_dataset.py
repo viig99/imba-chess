@@ -115,7 +115,16 @@ class LichessDataset:
             rows = load_dataset(**load_kwargs)
         prefiltered = False
         if hasattr(rows, "filter"):
-            rows = rows.filter(self._game_filter)
+            rows = rows.filter(
+                self._game_filter,
+                input_columns=[
+                    "WhiteElo",
+                    "BlackElo",
+                    "Result",
+                    "Termination",
+                    "movetext",
+                ],
+            )
             prefiltered = True
 
         yield from self.stream_from_rows(
