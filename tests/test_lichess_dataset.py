@@ -174,3 +174,30 @@ def test_temporal_mode_uses_reverse_month_order(monkeypatch):
     assert "year=2025/month=09" in train_files[0]
     assert "year=2025/month=08" in train_files[1]
     assert "year=2025/month=07" in train_files[2]
+
+
+def test_stream_shards_parquet_file_list(monkeypatch):
+    captured: dict[str, object] = {}
+    rows = [_row(Site="https://lichess.org/s1", WhiteElo="2200", BlackElo="2200")]
+
+    def _fake_load_dataset(**kwargs):
+        captured.update(kwargs)
+        return rows
+
+    monkeypatch.setattr("imba_chess.data.lichess_dataset.load_dataset", _fake_load_dataset)
+    dataset = LichessDataset(
+        min_avg_elo=2000,
+        split="train",
+        train_start_month="2025-07",
+        train_end_month="2025-10",
+    )
+    games = list(dataset.stream(shard_id=1, num_shards=2))
+
+    assert games
+    data_files = captured["data_files"]
+    assert isinstance(data_files, dict)
+    train_files = data_files["train"]
+    # global reverse-month order is [10, 09, 08, 07]; shard 1 gets [09, 07]
+    assert "year=2025/month=09" in train_files[0]
+    assert "year=2025/month=07" in train_files[1]
+    assert len(train_files) == 2

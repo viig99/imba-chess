@@ -85,11 +85,25 @@ class LichessDataset:
         self.board_state_encoder = BoardStateEncoder(board_state_config)
         self._validate_split_settings()
 
-    def stream(self) -> Iterator[GameRecord | Dict[str, Any]]:
+    def stream(
+        self,
+        *,
+        shard_id: Optional[int] = None,
+        num_shards: Optional[int] = None,
+    ) -> Iterator[GameRecord | Dict[str, Any]]:
         if self.cache_dir is not None:
             Path(self.cache_dir).mkdir(parents=True, exist_ok=True)
 
-        load_kwargs = self._build_load_kwargs()
+        data_files = self._temporal_data_files()
+        data_files = self._shard_data_files(
+            data_files=data_files,
+            shard_id=shard_id,
+            num_shards=num_shards,
+        )
+        if not data_files:
+            return
+
+        load_kwargs = self._build_load_kwargs(data_files=data_files)
 
         try:
             rows = load_dataset(**load_kwargs)
@@ -297,16 +311,33 @@ class LichessDataset:
             return "black", black_player, black_elo, white_player, white_elo
         return None, None, None, None, None
 
-    def _build_load_kwargs(self) -> Dict[str, Any]:
+    def _build_load_kwargs(self, *, data_files: list[str]) -> Dict[str, Any]:
         return {
             "path": "parquet",
-            "data_files": {"train": self._temporal_data_files()},
+            "data_files": {"train": data_files},
             "split": "train",
             "streaming": True,
             "cache_dir": self.cache_dir,
             "columns": self.stream_columns,
             "batch_size": self.parquet_batch_size,
         }
+
+    @staticmethod
+    def _shard_data_files(
+        *,
+        data_files: list[str],
+        shard_id: Optional[int],
+        num_shards: Optional[int],
+    ) -> list[str]:
+        if shard_id is None and num_shards is None:
+            return data_files
+        if shard_id is None or num_shards is None:
+            raise ValueError("shard_id and num_shards must both be set or both be None")
+        if num_shards < 1:
+            raise ValueError(f"num_shards must be >= 1, got {num_shards}")
+        if shard_id < 0 or shard_id >= num_shards:
+            raise ValueError(f"shard_id must be in [0, {num_shards}), got {shard_id}")
+        return data_files[shard_id::num_shards]
 
     def _validate_split_settings(self) -> None:
         if self.split.lower() not in {"train", "val", "test"}:

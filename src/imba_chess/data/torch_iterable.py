@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import inspect
 from typing import Any, Iterator, Optional
 
 from .sharding import iter_shard
@@ -40,6 +41,11 @@ class TorchLichessIterableDataset(IterableDataset):
 
         shard_id = (rank * num_workers) + worker_id
         num_shards = world_size * num_workers
+
+        stream_fn = getattr(self.dataset, "stream")
+        stream_signature = inspect.signature(stream_fn)
+        if "shard_id" in stream_signature.parameters and "num_shards" in stream_signature.parameters:
+            return stream_fn(shard_id=shard_id, num_shards=num_shards)
         return iter_shard(
             self.dataset.stream(), shard_id=shard_id, num_shards=num_shards
         )

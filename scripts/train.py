@@ -27,8 +27,6 @@ torch.set_float32_matmul_precision("high")
 torch.backends.cudnn.benchmark = True
 torch.backends.cuda.matmul.allow_bf16_reduced_precision_reduction = True
 torch.backends.cuda.enable_flash_sdp(True)
-torch._inductor.config.triton.cudagraph_skip_dynamic_graphs = True
-torch._inductor.config.triton.cudagraph_dynamic_shape_warn_limit = None
 
 
 def parse_args() -> argparse.Namespace:
@@ -328,9 +326,7 @@ def main() -> None:
     )
     model: torch.nn.Module = HSTUChessModel(model_cfg).to(device)
     if repo_config.training.compile_model:
-        model = torch.compile(
-            model, dynamic=True, fullgraph=True, mode="reduce-overhead"
-        )
+        model = torch.compile(model, dynamic=True, fullgraph=True)
 
     fast_val_evaluator = create_next_move_evaluator(
         model=model,
@@ -404,20 +400,24 @@ def main() -> None:
     scheduler = _build_scheduler(optimizer, repo_config)
     scaler = torch.amp.GradScaler(device.type, enabled=use_scaler)
 
-    def _train_step(engine: Engine, batch: dict[str, object]) -> dict[str, float]:
+    def _train_step(engine: Engine, batch: dict[str, object]) -> dict[str, object]:
         model.train()
         optimizer.zero_grad(set_to_none=True)
+        should_sync_check = (
+            engine.state.iteration % int(repo_config.training.log_every_steps) == 0
+        )
         if "target_move_id" not in batch:
             raise KeyError("batch['target_move_id'] is required for training")
         target_move_id = batch["target_move_id"]
         if not isinstance(target_move_id, torch.Tensor):
             raise TypeError("batch['target_move_id'] must be a torch.Tensor")
-        valid_targets = target_move_id != int(repo_config.model.ignore_index)
-        if not bool(valid_targets.any().item()):
-            raise ValueError(
-                "No valid target tokens in training batch (all target_move_id == ignore_index). "
-                "Check dataset/event construction and max_seq_len settings."
-            )
+        if should_sync_check:
+            valid_targets = target_move_id != int(repo_config.model.ignore_index)
+            if not bool(valid_targets.any().item()):
+                raise ValueError(
+                    "No valid target tokens in training batch (all target_move_id == ignore_index). "
+                    "Check dataset/event construction and max_seq_len settings."
+                )
         batch_games = int(batch["num_games"])
         prior_epoch_games = int(getattr(engine.state, "epoch_game_count", 0))
         engine.state.epoch_game_count = prior_epoch_games + batch_games
@@ -429,7 +429,7 @@ def main() -> None:
         with autocast_ctx:
             output = model(batch, return_loss=True)
             loss = output["loss"]
-        if not torch.isfinite(loss):
+        if should_sync_check and not bool(torch.isfinite(loss).item()):
             raise FloatingPointError(
                 f"Non-finite loss encountered at iteration {engine.state.iteration}"
             )
@@ -451,7 +451,7 @@ def main() -> None:
 
         scheduler.step()
         return {
-            "loss": float(loss.detach().item()),
+            "loss": loss.detach(),
             "lr": float(optimizer.param_groups[0]["lr"]),
             "tokens": float(int(batch["total_tokens"])),
             "games": float(batch_games),
@@ -466,8 +466,11 @@ def main() -> None:
     train_pbar = ProgressBar(persist=True, desc="train")
     train_pbar.attach(
         trainer,
+        event_name=Events.ITERATION_COMPLETED(
+            every=int(repo_config.training.log_every_steps)
+        ),
         output_transform=lambda out: {
-            "loss": f"{out['loss']:.4f}",
+            "loss": f"{float(out['loss'].item()):.4f}",
             "lr": f"{out['lr']:.6f}",
             "tokens": int(out["tokens"]),
             "games": int(out["games"]),
@@ -494,7 +497,12 @@ def main() -> None:
             every=repo_config.training.log_every_steps
         ),
         tag="train",
-        output_transform=lambda output: output,
+        output_transform=lambda output: {
+            "loss": float(output["loss"].item()),
+            "lr": float(output["lr"]),
+            "tokens": float(output["tokens"]),
+            "games": float(output["games"]),
+        },
     )
     tb_logger.attach_output_handler(
         fast_val_evaluator,
@@ -566,7 +574,7 @@ def main() -> None:
     def _epoch_summary(engine: Engine) -> None:
         print(
             f"epoch={engine.state.epoch} iteration={engine.state.iteration} "
-            f"loss={engine.state.output['loss']:.6f} "
+            f"loss={float(engine.state.output['loss'].item()):.6f} "
             f"lr={engine.state.output['lr']:.7f} "
             f"tokens={int(engine.state.output['tokens'])} "
             f"games_batch={int(engine.state.output['games'])} "
