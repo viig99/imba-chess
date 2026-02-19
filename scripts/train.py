@@ -394,6 +394,9 @@ def main() -> None:
     def _train_step(engine: Engine, batch: dict[str, object]) -> dict[str, float]:
         model.train()
         optimizer.zero_grad(set_to_none=True)
+        batch_games = int(batch["num_games"])
+        prior_epoch_games = int(getattr(engine.state, "epoch_game_count", 0))
+        engine.state.epoch_game_count = prior_epoch_games + batch_games
         autocast_ctx = (
             torch.autocast(device_type="cuda", dtype=dtype)
             if use_amp
@@ -427,9 +430,15 @@ def main() -> None:
             "loss": float(loss.detach().item()),
             "lr": float(optimizer.param_groups[0]["lr"]),
             "tokens": float(int(batch["total_tokens"])),
+            "games": float(batch_games),
         }
 
     trainer = Engine(_train_step)
+
+    @trainer.on(Events.EPOCH_STARTED)
+    def _reset_epoch_game_count(engine: Engine) -> None:
+        engine.state.epoch_game_count = 0
+
     train_pbar = ProgressBar(persist=True, desc="train")
     train_pbar.attach(
         trainer,
@@ -437,6 +446,7 @@ def main() -> None:
             "loss": f"{out['loss']:.4f}",
             "lr": f"{out['lr']:.6f}",
             "tokens": int(out["tokens"]),
+            "games": int(out["games"]),
         },
     )
     checkpoint_dir = Path(repo_config.training.checkpoint_dir)
@@ -534,7 +544,9 @@ def main() -> None:
             f"epoch={engine.state.epoch} iteration={engine.state.iteration} "
             f"loss={engine.state.output['loss']:.6f} "
             f"lr={engine.state.output['lr']:.7f} "
-            f"tokens={int(engine.state.output['tokens'])}"
+            f"tokens={int(engine.state.output['tokens'])} "
+            f"games_batch={int(engine.state.output['games'])} "
+            f"games_epoch={int(getattr(engine.state, 'epoch_game_count', 0))}"
         )
 
     try:
