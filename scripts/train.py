@@ -27,6 +27,8 @@ torch.set_float32_matmul_precision("high")
 torch.backends.cudnn.benchmark = True
 torch.backends.cuda.matmul.allow_bf16_reduced_precision_reduction = True
 torch.backends.cuda.enable_flash_sdp(True)
+torch._inductor.config.triton.cudagraph_skip_dynamic_graphs = True
+torch._inductor.config.triton.cudagraph_dynamic_shape_warn_limit = None
 
 
 def parse_args() -> argparse.Namespace:
