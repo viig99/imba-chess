@@ -75,7 +75,9 @@ class LichessDataset:
         self.test_max_games = test_max_games
         self.cache_dir = cache_dir
         self.stream_columns = (
-            list(stream_columns) if stream_columns is not None else list(DEFAULT_STREAM_COLUMNS)
+            list(stream_columns)
+            if stream_columns is not None
+            else list(DEFAULT_STREAM_COLUMNS)
         )
         self.parquet_batch_size = parquet_batch_size
         if max_seq_len is not None and max_seq_len < 1:
@@ -111,8 +113,20 @@ class LichessDataset:
             load_kwargs.pop("columns", None)
             load_kwargs.pop("batch_size", None)
             rows = load_dataset(**load_kwargs)
+        prefiltered = False
+        if hasattr(rows, "filter"):
+            rows = rows.filter(self._game_filter)
+            prefiltered = True
 
-        yield from self.stream_from_rows(rows, max_games=self._max_games_for_split())
+        yield from self.stream_from_rows(
+            rows,
+            max_games=self._max_games_for_split(),
+            assume_prefiltered=prefiltered,
+        )
+
+    def _game_filter(self, row: Dict[str, Any]) -> bool:
+        """Cheap row-level filter to drop invalid games before PGN parsing."""
+        return self._is_valid_game(row)
 
     def as_torch_iterable(
         self,
@@ -130,13 +144,27 @@ class LichessDataset:
         rows: Iterable[Dict[str, Any]],
         *,
         max_games: Optional[int] = None,
+        assume_prefiltered: bool = False,
     ) -> Iterator[GameRecord | Dict[str, Any]]:
         emitted_games = 0
         for row in rows:
-            if not self._is_valid_game(row):
+            white_elo = parse_elo(row.get("WhiteElo"))
+            black_elo = parse_elo(row.get("BlackElo"))
+            if white_elo is None or black_elo is None:
                 continue
 
-            game = self._parse_game_row(row)
+            if not assume_prefiltered and not self._is_valid_game(
+                row,
+                white_elo=white_elo,
+                black_elo=black_elo,
+            ):
+                continue
+
+            game = self._parse_game_row(
+                row,
+                white_elo=white_elo,
+                black_elo=black_elo,
+            )
             if game is None:
                 continue
 
@@ -149,9 +177,17 @@ class LichessDataset:
             if max_games is not None and emitted_games >= max_games:
                 return
 
-    def _is_valid_game(self, row: Dict[str, Any]) -> bool:
-        white_elo = parse_elo(row.get("WhiteElo"))
-        black_elo = parse_elo(row.get("BlackElo"))
+    def _is_valid_game(
+        self,
+        row: Dict[str, Any],
+        *,
+        white_elo: Optional[int] = None,
+        black_elo: Optional[int] = None,
+    ) -> bool:
+        if white_elo is None:
+            white_elo = parse_elo(row.get("WhiteElo"))
+        if black_elo is None:
+            black_elo = parse_elo(row.get("BlackElo"))
         if white_elo is None or black_elo is None:
             return False
 
@@ -169,9 +205,17 @@ class LichessDataset:
         movetext = to_text(row.get("movetext"), default="")
         return bool(movetext)
 
-    def _parse_game_row(self, row: Dict[str, Any]) -> Optional[GameRecord]:
-        white_elo = parse_elo(row.get("WhiteElo"))
-        black_elo = parse_elo(row.get("BlackElo"))
+    def _parse_game_row(
+        self,
+        row: Dict[str, Any],
+        *,
+        white_elo: Optional[int] = None,
+        black_elo: Optional[int] = None,
+    ) -> Optional[GameRecord]:
+        if white_elo is None:
+            white_elo = parse_elo(row.get("WhiteElo"))
+        if black_elo is None:
+            black_elo = parse_elo(row.get("BlackElo"))
         if white_elo is None or black_elo is None:
             return None
 
@@ -182,12 +226,14 @@ class LichessDataset:
         white_player = to_text(row.get("White"), default="?")
         black_player = to_text(row.get("Black"), default="?")
         result = to_text(row.get("Result"), default="")
-        winner_side, winner_player, winner_elo, loser_player, loser_elo = self._resolve_outcome(
-            result=result,
-            white_player=white_player,
-            black_player=black_player,
-            white_elo=white_elo,
-            black_elo=black_elo,
+        winner_side, winner_player, winner_elo, loser_player, loser_elo = (
+            self._resolve_outcome(
+                result=result,
+                white_player=white_player,
+                black_player=black_player,
+                white_elo=white_elo,
+                black_elo=black_elo,
+            )
         )
 
         metadata = GameMetadata(
@@ -246,14 +292,20 @@ class LichessDataset:
         last_clock_seconds: Dict[bool, float] = {}
         play_id = 0
 
-        while node.variations and (self.max_seq_len is None or play_id < self.max_seq_len):
+        while node.variations and (
+            self.max_seq_len is None or play_id < self.max_seq_len
+        ):
             next_node = node.variations[0]
             move = next_node.move
             active_color = board.turn
             active_color_text = "white" if active_color == chess.WHITE else "black"
-            active_player = white_player if active_color == chess.WHITE else black_player
+            active_player = (
+                white_player if active_color == chess.WHITE else black_player
+            )
             active_elo = white_elo if active_color == chess.WHITE else black_elo
-            opponent_player = black_player if active_color == chess.WHITE else white_player
+            opponent_player = (
+                black_player if active_color == chess.WHITE else white_player
+            )
             opponent_elo = black_elo if active_color == chess.WHITE else white_elo
 
             if winner_side is None:
@@ -304,7 +356,9 @@ class LichessDataset:
         black_player: str,
         white_elo: int,
         black_elo: int,
-    ) -> tuple[Optional[str], Optional[str], Optional[int], Optional[str], Optional[int]]:
+    ) -> tuple[
+        Optional[str], Optional[str], Optional[int], Optional[str], Optional[int]
+    ]:
         if result == "1-0":
             return "white", white_player, white_elo, black_player, black_elo
         if result == "0-1":
@@ -407,7 +461,9 @@ class LichessDataset:
             year = int(year_text)
             month = int(month_text)
         except ValueError as exc:
-            raise ValueError(f"Invalid month value {value!r}, expected YYYY-MM") from exc
+            raise ValueError(
+                f"Invalid month value {value!r}, expected YYYY-MM"
+            ) from exc
         if month < 1 or month > 12:
             raise ValueError(f"Invalid month value {value!r}, month must be 01..12")
         return (year * 12) + (month - 1)
