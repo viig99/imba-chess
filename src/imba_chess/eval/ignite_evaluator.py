@@ -60,6 +60,8 @@ def create_next_move_evaluator(
             device=logits.device, dtype=torch.long, non_blocking=True
         )
         return {
+            "y_pred": logits,
+            "y": targets,
             "logits": logits,
             "targets": targets,
             "num_games": float(int(batch["num_games"])),  # type: ignore[arg-type]

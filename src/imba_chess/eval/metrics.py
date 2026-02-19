@@ -29,12 +29,16 @@ class _BaseNextMoveMetric(Metric):
     def _unpack_output(output: Any) -> tuple[torch.Tensor, torch.Tensor]:
         if not isinstance(output, dict):
             raise TypeError("Expected evaluator output to be a dict")
-        logits = output["logits"]
-        targets = output["targets"]
+        logits = output.get("logits", output.get("y_pred"))
+        targets = output.get("targets", output.get("y"))
+        if logits is None:
+            raise KeyError("Expected output['logits'] or output['y_pred']")
+        if targets is None:
+            raise KeyError("Expected output['targets'] or output['y']")
         if not isinstance(logits, torch.Tensor):
-            raise TypeError("output['logits'] must be a torch.Tensor")
+            raise TypeError("Predictions must be a torch.Tensor")
         if not isinstance(targets, torch.Tensor):
-            raise TypeError("output['targets'] must be a torch.Tensor")
+            raise TypeError("Targets must be a torch.Tensor")
         if logits.ndim != 2:
             raise ValueError(f"logits must have shape [N, V], got {tuple(logits.shape)}")
         if targets.ndim != 1:
