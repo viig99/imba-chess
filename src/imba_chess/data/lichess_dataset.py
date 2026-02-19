@@ -113,29 +113,40 @@ class LichessDataset:
             load_kwargs.pop("columns", None)
             load_kwargs.pop("batch_size", None)
             rows = load_dataset(**load_kwargs)
-        prefiltered = False
+        elo_prefiltered = False
         if hasattr(rows, "filter"):
-            rows = rows.filter(
-                self._game_filter,
-                input_columns=[
-                    "WhiteElo",
-                    "BlackElo",
-                    "Result",
-                    "Termination",
-                    "movetext",
-                ],
-            )
-            prefiltered = True
+            try:
+                rows = rows.filter(
+                    self._game_filter_from_elo_columns,
+                    input_columns=["WhiteElo", "BlackElo"],
+                )
+            except TypeError:
+                rows = rows.filter(self._game_filter)
+            elo_prefiltered = True
 
         yield from self.stream_from_rows(
             rows,
             max_games=self._max_games_for_split(),
-            assume_prefiltered=prefiltered,
+            assume_elo_prefiltered=elo_prefiltered,
         )
 
     def _game_filter(self, row: Dict[str, Any]) -> bool:
-        """Cheap row-level filter to drop invalid games before PGN parsing."""
-        return self._is_valid_game(row)
+        """Cheap row-level filter to drop low-ELO games before PGN parsing."""
+        return self._game_filter_from_elo_columns(
+            row.get("WhiteElo"),
+            row.get("BlackElo"),
+        )
+
+    def _game_filter_from_elo_columns(
+        self,
+        white_elo_raw: Any,
+        black_elo_raw: Any,
+    ) -> bool:
+        white_elo = parse_elo(white_elo_raw)
+        black_elo = parse_elo(black_elo_raw)
+        if white_elo is None or black_elo is None:
+            return False
+        return ((white_elo + black_elo) / 2) >= self.min_avg_elo
 
     def as_torch_iterable(
         self,
@@ -153,7 +164,7 @@ class LichessDataset:
         rows: Iterable[Dict[str, Any]],
         *,
         max_games: Optional[int] = None,
-        assume_prefiltered: bool = False,
+        assume_elo_prefiltered: bool = False,
     ) -> Iterator[GameRecord | Dict[str, Any]]:
         emitted_games = 0
         for row in rows:
@@ -162,10 +173,11 @@ class LichessDataset:
             if white_elo is None or black_elo is None:
                 continue
 
-            if not assume_prefiltered and not self._is_valid_game(
+            if not self._is_valid_game(
                 row,
                 white_elo=white_elo,
                 black_elo=black_elo,
+                check_elo=not assume_elo_prefiltered,
             ):
                 continue
 
@@ -192,6 +204,7 @@ class LichessDataset:
         *,
         white_elo: Optional[int] = None,
         black_elo: Optional[int] = None,
+        check_elo: bool = True,
     ) -> bool:
         if white_elo is None:
             white_elo = parse_elo(row.get("WhiteElo"))
@@ -200,7 +213,7 @@ class LichessDataset:
         if white_elo is None or black_elo is None:
             return False
 
-        if ((white_elo + black_elo) / 2) < self.min_avg_elo:
+        if check_elo and ((white_elo + black_elo) / 2) < self.min_avg_elo:
             return False
 
         result = to_text(row.get("Result"), default="")
