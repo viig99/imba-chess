@@ -592,6 +592,24 @@ def main() -> None:
             f"games_epoch={int(getattr(engine.state, 'epoch_game_count', 0))}"
         )
 
+    if args.resume is not None:
+        current_iteration = int(getattr(trainer.state, "iteration", 0))
+        eval_every = int(repo_config.training.eval_every_steps)
+        next_eval_iteration = ((current_iteration // eval_every) + 1) * eval_every
+        print(
+            f"Resume state: epoch={int(getattr(trainer.state, 'epoch', 0))}, "
+            f"iteration={current_iteration}. "
+            f"Next periodic fast-val at iteration {next_eval_iteration}."
+        )
+        print("Running immediate fast-val after resume.")
+        _run_deterministic_eval(
+            evaluator=fast_val_evaluator,
+            loader=fast_val_loader,
+            seed=int(repo_config.training.seed),
+            epoch_length=eval_epoch_length,
+        )
+        _print_eval_metrics("val_fast_resume", fast_val_evaluator.state.metrics)
+
     try:
         print("Starting training with Ignite")
         print(
