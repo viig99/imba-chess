@@ -47,7 +47,7 @@ ignore_index = -100
 relative_attention_bias = "position"
 
 [training]
-epochs = 20
+epochs = 100
 steps_per_epoch = 10000
 eval_every_steps = 1000
 log_every_steps = 10
