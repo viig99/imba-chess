@@ -14,6 +14,11 @@ from ignite.engine import Engine, Events
 from ignite.handlers import Checkpoint, DiskSaver, ProgressBar, global_step_from_engine
 from ignite.handlers.tensorboard_logger import TensorboardLogger
 
+try:
+    from optimi import StableAdamW
+except ImportError:  # pragma: no cover
+    StableAdamW = None  # type: ignore[assignment]
+
 from imba_chess.config import DEFAULT_CONFIG_PATH, load_repo_config
 from imba_chess.data import (
     LichessDataset,
@@ -111,18 +116,23 @@ def _make_dataset(config, *, split: str) -> LichessDataset:
 
 
 def _build_optimizer(model: torch.nn.Module, config, *, device: torch.device):
+    if StableAdamW is None:
+        raise ImportError(
+            "torch-optimi is required for training. Run `uv sync` to install it."
+        )
     kwargs: dict[str, Any] = {
         "lr": float(config.training.max_lr),
         "weight_decay": float(config.training.weight_decay),
+        "triton": bool(config.training.optimizer_triton),
+        "kahan_sum": bool(config.training.optimizer_kahan_sum),
     }
-    if bool(config.training.optimizer_fused):
+    if kwargs["triton"]:
         if device.type != "cuda":
             raise ValueError(
-                "training.optimizer_fused=true requires CUDA device. "
-                "Set optimizer_fused=false for CPU training."
+                "training.optimizer_triton=true requires CUDA device. "
+                "Set optimizer_triton=false for CPU training."
             )
-        kwargs["fused"] = True
-    return torch.optim.AdamW(model.parameters(), **kwargs)
+    return StableAdamW(model.parameters(), **kwargs)
 
 
 def _build_scheduler(optimizer: torch.optim.Optimizer, config):

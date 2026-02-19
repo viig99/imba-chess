@@ -91,7 +91,8 @@ class TrainingConfig:
     eval_num_workers: int = 0
     save_last_every_steps: int = 100_000
     last_checkpoint_keep: int = 1
-    optimizer_fused: bool = True
+    optimizer_triton: bool = True
+    optimizer_kahan_sum: bool = True
     compile_model: bool = False
     device: str = "auto"
     dtype: str = "bfloat16"

@@ -16,7 +16,7 @@ Inspiration:
 - BOS + event sequence construction for next-move prediction.
 - 1D jagged token batches with max-token packing.
 - HSTU-style model for next-move prediction.
-- Ignite-based training loop (AdamW + OneCycleLR, mixed precision, periodic fast/full validation, TensorBoard logging, best/last checkpointing).
+- Ignite-based training loop (StableAdamW + OneCycleLR, mixed precision, periodic fast/full validation, TensorBoard logging, best/last checkpointing).
 
 ## Data and training flow
 
