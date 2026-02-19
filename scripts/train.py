@@ -326,7 +326,9 @@ def main() -> None:
     )
     model: torch.nn.Module = HSTUChessModel(model_cfg).to(device)
     if repo_config.training.compile_model:
-        model = torch.compile(model, dynamic=True, fullgraph=True)
+        model = torch.compile(
+            model, dynamic=True, fullgraph=True, mode="reduced-overhead"
+        )
 
     fast_val_evaluator = create_next_move_evaluator(
         model=model,
