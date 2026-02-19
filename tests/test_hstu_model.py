@@ -72,5 +72,5 @@ def test_hstu_chess_model_raises_when_all_targets_ignored():
     batch = _batch()
     batch["target_move_id"] = torch.full_like(batch["target_move_id"], -100)
 
-    with pytest.raises(ValueError, match="No valid target tokens in batch"):
+    with pytest.raises(AssertionError, match="No valid target tokens in batch"):
         model(batch, return_loss=True)
