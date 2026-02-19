@@ -163,6 +163,7 @@ def _build_scheduler(optimizer: torch.optim.Optimizer, config):
         anneal_strategy="linear",
         div_factor=1.0 / lr_start_factor,
         final_div_factor=lr_start_factor / lr_end_factor,
+        cycle_momentum=False,
         three_phase=False,
     )
 
