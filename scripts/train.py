@@ -175,10 +175,19 @@ def _make_eval_runtime_config(
         dataset_cfg = replace(dataset_cfg, val_max_games=val_max_games)
     if test_max_games is not None:
         dataset_cfg = replace(dataset_cfg, test_max_games=test_max_games)
+    eval_num_workers = int(config.training.eval_num_workers)
+    if eval_num_workers < 0:
+        raise ValueError("training.eval_num_workers must be >= 0")
     dataloader_cfg = replace(
         config.dataloader,
-        num_workers=int(config.training.eval_num_workers),
+        num_workers=eval_num_workers,
         pin_memory=False,
+        prefetch_factor=(
+            config.dataloader.prefetch_factor if eval_num_workers > 0 else None
+        ),
+        persistent_workers=(
+            config.dataloader.persistent_workers if eval_num_workers > 0 else False
+        ),
     )
     return replace(config, dataset=dataset_cfg, dataloader=dataloader_cfg)
 
