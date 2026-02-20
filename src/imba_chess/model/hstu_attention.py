@@ -106,6 +106,7 @@ class SequentialTransductionUnitJagged(torch.nn.Module):
             value=self._reshape_uvqk_for_mm(v, self._num_heads, self._linear_dim),
             block_mask=block_mask,
             score_mod=self._generate_rab_score_mod(),
+            kernel_options={"BLOCK_M": 64, "BLOCK_N": 64, "num_stages": 1},
         )  # type: ignore
 
         attn_output = self._norm_attn_output(
