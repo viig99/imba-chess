@@ -86,6 +86,7 @@ Main sections:
 - `[dataloader]` max tokens per jagged batch, workers
 - `[model]` HSTU dimensions/layers/head settings + label smoothing + Elo loss weighting
 - `[training]` optimizer/scheduler/eval cadence/checkpointing/device/precision (including fast test cadence)
+- `[eval_vs_stockfish]` defaults for engine path/limits, ladder settings, decoding policy, and debug controls
 
 ## Quickstart
 
@@ -148,6 +149,9 @@ python scripts/eval_vs_stockfish.py \
   --output-json artifacts/eval/stockfish_eval.json
 ```
 
+`scripts/eval_vs_stockfish.py` can also read defaults from `[eval_vs_stockfish]` in `config/imba_chess.toml`.
+CLI flags override TOML values when provided.
+
 Stockfish Elo-limited mode:
 
 ```bash
@@ -157,11 +161,24 @@ python scripts/eval_vs_stockfish.py \
   --stockfish-limit-strength --stockfish-elo 2400
 ```
 
+Segmented ladder eval (phase 2):
+
+```bash
+python scripts/eval_vs_stockfish.py \
+  --checkpoint artifacts/checkpoints/best_hr10_*.pt \
+  --ladder-elos 1600,1800,2000,2200,2400,2600,2800 \
+  --ladder-games-per-segment 200 \
+  --include-full-strength-segment \
+  --stockfish-time-sec 0.05 \
+  --output-json artifacts/eval/stockfish_ladder.json
+```
+
 The script reports:
 - total/completed/incomplete games
 - wins/draws/losses (+ color split)
 - average plies/full moves per game
 - score rate on completed games and on all games
+- in ladder mode: per-segment results and an aggregate summary across all segments
 
 Run tests:
 

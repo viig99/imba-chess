@@ -81,3 +81,33 @@ device = "auto"
 dtype = "bfloat16"
 checkpoint_dir = "artifacts/checkpoints"
 checkpoint_keep = 3
+
+[eval_vs_stockfish]
+games = 1000
+max_plies = 512
+seed = 42
+stockfish_path = "/usr/bin/stockfish"
+stockfish_time_sec = 0.05
+stockfish_threads = 1
+stockfish_hash_mb = 64
+stockfish_limit_strength = false
+# Optional when limit-strength mode is enabled.
+# stockfish_elo = 1600
+# Optional search limits. If omitted, only stockfish_time_sec is used.
+# stockfish_nodes = 1000
+# stockfish_depth = 10
+# Optional ladder mode.
+ladder_elos = "1320,1600,1800,2000"
+ladder_games_per_segment = 100
+# include_full_strength_segment = true
+device = "auto"
+dtype = "bfloat16"
+compile = false
+model_move_policy = "sample"
+sample_temperature = 1.2
+sample_top_k = 0
+sample_top_p = 0.6
+opening_random_plies = 2
+debug_trace_games = 3
+debug_trace_max_plies = 80
+debug_topk = 5

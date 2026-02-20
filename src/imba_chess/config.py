@@ -110,6 +110,35 @@ class TrainingConfig:
 
 
 @dataclass(frozen=True)
+class EvalVsStockfishConfig:
+    games: int = 1000
+    max_plies: int = 512
+    seed: int = 42
+    stockfish_path: str = "/usr/bin/stockfish"
+    stockfish_time_sec: Optional[float] = 0.05
+    stockfish_nodes: Optional[int] = None
+    stockfish_depth: Optional[int] = None
+    stockfish_threads: int = 1
+    stockfish_hash_mb: int = 64
+    stockfish_limit_strength: bool = False
+    stockfish_elo: Optional[int] = None
+    ladder_elos: Optional[str] = None
+    ladder_games_per_segment: Optional[int] = None
+    include_full_strength_segment: bool = True
+    device: str = "auto"
+    dtype: str = "bfloat16"
+    compile: bool = False
+    model_move_policy: str = "greedy"
+    sample_temperature: float = 1.0
+    sample_top_k: int = 0
+    sample_top_p: float = 1.0
+    opening_random_plies: int = 0
+    debug_trace_games: int = 0
+    debug_trace_max_plies: int = 80
+    debug_topk: int = 5
+
+
+@dataclass(frozen=True)
 class RepoConfig:
     dataset: DatasetConfig = field(default_factory=DatasetConfig)
     board_state: BoardStateConfig = field(default_factory=BoardStateConfig)
@@ -117,6 +146,9 @@ class RepoConfig:
     dataloader: DataloaderConfig = field(default_factory=DataloaderConfig)
     model: ModelConfig = field(default_factory=ModelConfig)
     training: TrainingConfig = field(default_factory=TrainingConfig)
+    eval_vs_stockfish: EvalVsStockfishConfig = field(
+        default_factory=EvalVsStockfishConfig
+    )
 
 
 def load_repo_config(path: str | Path | None = None) -> RepoConfig:
@@ -134,6 +166,11 @@ def load_repo_config(path: str | Path | None = None) -> RepoConfig:
         dataloader=_read_section(DataloaderConfig, payload.get("dataloader", {}), "dataloader"),
         model=_read_section(ModelConfig, payload.get("model", {}), "model"),
         training=_read_section(TrainingConfig, payload.get("training", {}), "training"),
+        eval_vs_stockfish=_read_section(
+            EvalVsStockfishConfig,
+            payload.get("eval_vs_stockfish", {}),
+            "eval_vs_stockfish",
+        ),
     )
 
 
