@@ -17,6 +17,7 @@ Inspiration:
 - 1D jagged token batches with max-token packing.
 - HSTU-style model for next-move prediction.
 - Ignite-based training loop (StableAdamW + OneCycleLR, mixed precision, periodic fast val/test + periodic full val, TensorBoard logging, best/last checkpointing).
+- Head-to-head engine evaluation script (`scripts/eval_vs_stockfish.py`) for model vs Stockfish matches.
 
 ## Data and training flow
 
@@ -134,6 +135,33 @@ Eval only:
 ```bash
 python scripts/train.py --eval-only --resume artifacts/checkpoints/best_hr10_*.pt --eval-split both
 ```
+
+Model vs Stockfish eval:
+
+```bash
+python scripts/eval_vs_stockfish.py \
+  --checkpoint artifacts/checkpoints/best_hr10_*.pt \
+  --games 1000 \
+  --stockfish-path /usr/bin/stockfish \
+  --stockfish-time-sec 0.05 \
+  --device cuda --dtype bfloat16 \
+  --output-json artifacts/eval/stockfish_eval.json
+```
+
+Stockfish Elo-limited mode:
+
+```bash
+python scripts/eval_vs_stockfish.py \
+  --checkpoint artifacts/checkpoints/best_hr10_*.pt \
+  --games 200 \
+  --stockfish-limit-strength --stockfish-elo 2400
+```
+
+The script reports:
+- total/completed/incomplete games
+- wins/draws/losses (+ color split)
+- average plies/full moves per game
+- score rate on completed games and on all games
 
 Run tests:
 
