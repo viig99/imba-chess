@@ -10,6 +10,7 @@ from pathlib import Path
 from typing import Any
 
 import torch
+from datasets.utils.logging import disable_progress_bar
 from ignite.engine import Engine, Events
 from ignite.handlers import Checkpoint, DiskSaver, ProgressBar, global_step_from_engine
 from ignite.handlers.tensorboard_logger import TensorboardLogger
@@ -271,6 +272,7 @@ def _run_deterministic_eval(
 
 def main() -> None:
     args = parse_args()
+    disable_progress_bar()
     repo_config = load_repo_config(args.config)
     if create_next_move_evaluator is None:
         raise ImportError("pytorch-ignite is not available. Run `uv sync` and retry.")

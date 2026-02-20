@@ -13,6 +13,7 @@ dependencies = [
   "attn_gym",
   "tensorboard",
   "torch-optimi",
+  "tqdm",
 ]
 
 [project.optional-dependencies]
