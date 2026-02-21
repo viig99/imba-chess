@@ -26,6 +26,7 @@ Inspiration:
 Each game becomes:
 - one BOS token
 - one token per ply (state features + previous move + target move)
+- one per-game value label `game_result_white` in `{+1, 0, -1}`
 
 ## Loss and Target Logic
 
@@ -48,6 +49,22 @@ Design rationale:
 - Label smoothing accounts for non-uniqueness of strong moves.
 - Elo weighting biases optimization toward higher-skill move decisions.
 - Weight normalization keeps gradient scale stable when weighting is enabled.
+
+### Optional value head (WDL)
+
+When `[model].enable_value_head = true`, training adds a 3-class value head:
+
+- classes are from side-to-move perspective: `loss / draw / win`
+- labels are derived from per-game `game_result_white` and per-token `turn_id`
+- value loss uses progress weighting toward later plies (`progress ^ [model].value_weight_alpha`)
+- total loss becomes:
+  - `total_loss = policy_loss + [model].value_loss_weight * value_loss`
+
+Training logs now include:
+
+- `total_loss`
+- `policy_loss`
+- `value_loss` (logged when value head is enabled)
 
 ## Evaluation Logic
 
@@ -84,7 +101,7 @@ Main sections:
 - `[board_state]` board-state encoding buckets/options
 - `[vocab]` static move vocab location
 - `[dataloader]` max tokens per jagged batch, workers
-- `[model]` HSTU dimensions/layers/head settings + label smoothing + Elo loss weighting
+- `[model]` HSTU dimensions/layers/head settings + label smoothing + Elo loss weighting + optional value head knobs
 - `[training]` optimizer/scheduler/eval cadence/checkpointing/device/precision (including fast test cadence)
 - `[eval_vs_stockfish]` defaults for engine path/limits, ladder settings, decoding policy, and debug controls
 
@@ -125,6 +142,16 @@ Start training:
 python scripts/train.py --device cuda --dtype bfloat16 --compile
 ```
 
+Enable value head training (example):
+
+```toml
+[model]
+enable_value_head = true
+value_loss_weight = 0.15
+value_weight_alpha = 1.5
+value_label_smoothing = 0.0
+```
+
 Resume training:
 
 ```bash
@@ -151,6 +178,29 @@ python scripts/eval_vs_stockfish.py \
 
 `scripts/eval_vs_stockfish.py` can also read defaults from `[eval_vs_stockfish]` in `config/imba_chess.toml`.
 CLI flags override TOML values when provided.
+
+`model_move_policy` modes:
+
+- `greedy`: pick highest-logit legal move.
+- `sample`: sample from legal moves with temperature/top-k/top-p.
+- `value_rerank`: rerank top-K policy legal moves using one-ply value lookahead.
+
+Value rerank knobs (`[eval_vs_stockfish]` or CLI):
+
+- `value_rerank_top_k` (default `8`)
+- `value_rerank_lambda` (default `0.35`)
+
+Important: `value_rerank` requires a checkpoint trained with value head and a runtime model config with `[model].enable_value_head = true`.
+
+Example:
+
+```bash
+python scripts/eval_vs_stockfish.py \
+  --checkpoint artifacts/checkpoints/last_*.pt \
+  --model-move-policy value_rerank \
+  --value-rerank-top-k 8 \
+  --value-rerank-lambda 0.35
+```
 
 Stockfish Elo-limited mode:
 
@@ -190,6 +240,7 @@ uv run --python .venv/bin/python --with pytest pytest -q
 
 - Training is currently single-process in this repo flow (no end-to-end DDP launcher yet).
 - No legal-move masking in the prediction head yet (full-vocab classification).
+- `value_rerank` is currently one-ply and unbatched across candidates (stronger but slower than plain greedy/sample).
 - Streaming order is temporal by month window (newest month first); training can optionally shuffle month-level parquet file order on process start via `[dataset].shuffle_train_month_files_on_start`.
 
 ## References

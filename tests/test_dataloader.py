@@ -19,6 +19,7 @@ class DummyLichessDataset:
 def _game(game_id: str, first_move: str, second_move: str):
     return {
         "game_id": game_id,
+        "result": "1-0",
         "plays": [
             {
                 "move_uci": first_move,
@@ -58,6 +59,7 @@ def test_build_event_dataloader_returns_tensor_dict():
     )
 
     batch = next(iter(loader))
+    assert batch["game_result_white"].tolist() == [1, 1]
     assert batch["seq_lens"].tolist() == [3, 3]
     assert batch["seq_offsets"].tolist() == [0, 3, 6]
     assert batch["seq_token_id"].shape == (6,)

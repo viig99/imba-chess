@@ -468,6 +468,11 @@ def main() -> None:
         with autocast_ctx:
             output = model(batch, return_loss=True)
             loss = output["loss"]
+            policy_loss = output.get("policy_loss", loss)
+            value_loss = output.get("value_loss")
+            has_value_loss = value_loss is not None
+            if value_loss is None:
+                value_loss = torch.zeros_like(loss)
         if should_sync_check and not bool(torch.isfinite(loss).item()):
             raise FloatingPointError(
                 f"Non-finite loss encountered at iteration {engine.state.iteration}"
@@ -491,6 +496,10 @@ def main() -> None:
         scheduler.step()
         return {
             "loss": loss.detach(),
+            "total_loss": loss.detach(),
+            "policy_loss": policy_loss.detach(),
+            "value_loss": value_loss.detach(),
+            "has_value_loss": 1.0 if has_value_loss else 0.0,
             "lr": float(optimizer.param_groups[0]["lr"]),
             "tokens": float(int(batch["total_tokens"])),
             "games": float(batch_games),
@@ -509,7 +518,13 @@ def main() -> None:
             every=int(repo_config.training.log_every_steps)
         ),
         output_transform=lambda out: {
-            "loss": f"{float(out['loss'].item()):.4f}",
+            "total": f"{float(out['total_loss'].item()):.4f}",
+            "policy": f"{float(out['policy_loss'].item()):.4f}",
+            "value": (
+                f"{float(out['value_loss'].item()):.4f}"
+                if float(out["has_value_loss"]) > 0.5
+                else "--"
+            ),
             "lr": f"{out['lr']:.6f}",
             "tokens": int(out["tokens"]),
             "games": int(out["games"]),
@@ -536,12 +551,20 @@ def main() -> None:
             every=repo_config.training.log_every_steps
         ),
         tag="train",
-        output_transform=lambda output: {
-            "loss": float(output["loss"].item()),
-            "lr": float(output["lr"]),
-            "tokens": float(output["tokens"]),
-            "games": float(output["games"]),
-        },
+        output_transform=lambda output: (
+            {
+                "total_loss": float(output["total_loss"].item()),
+                "policy_loss": float(output["policy_loss"].item()),
+                "lr": float(output["lr"]),
+                "tokens": float(output["tokens"]),
+                "games": float(output["games"]),
+            }
+            | (
+                {"value_loss": float(output["value_loss"].item())}
+                if float(output["has_value_loss"]) > 0.5
+                else {}
+            )
+        ),
     )
     tb_logger.attach_output_handler(
         fast_val_evaluator,
@@ -625,9 +648,16 @@ def main() -> None:
 
     @trainer.on(Events.EPOCH_COMPLETED)
     def _epoch_summary(engine: Engine) -> None:
+        value_loss_text = (
+            f"{float(engine.state.output['value_loss'].item()):.6f}"
+            if float(engine.state.output["has_value_loss"]) > 0.5
+            else "--"
+        )
         print(
             f"epoch={engine.state.epoch} iteration={engine.state.iteration} "
-            f"loss={float(engine.state.output['loss'].item()):.6f} "
+            f"total_loss={float(engine.state.output['total_loss'].item()):.6f} "
+            f"policy_loss={float(engine.state.output['policy_loss'].item()):.6f} "
+            f"value_loss={value_loss_text} "
             f"lr={engine.state.output['lr']:.7f} "
             f"tokens={int(engine.state.output['tokens'])} "
             f"games_batch={int(engine.state.output['games'])} "

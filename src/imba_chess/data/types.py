@@ -5,6 +5,7 @@ from typing import Any, TypedDict
 
 class EventSequence(TypedDict):
     game_id: str
+    game_result_white: int
     seq_token_id: list[int]
     piece_ids: list[list[int]]
     turn_id: list[int]
@@ -19,6 +20,7 @@ class EventSequence(TypedDict):
 
 class JaggedBatch(TypedDict):
     game_id: list[str]
+    game_result_white: Any
     num_games: int
     total_tokens: int
     seq_lens: Any

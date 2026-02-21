@@ -30,10 +30,12 @@ def collate_jagged_batch(batch: List[EventSequence]) -> JaggedBatch:
         "target_move_id",
         "played_by_elo",
     ]
+    per_game_scalar_keys = ["game_result_white"]
 
     flat_scalars = {key: [] for key in scalar_keys}
     flat_piece_ids: list[list[int]] = []
     seq_lens: list[int] = []
+    per_game_scalars = {key: [] for key in per_game_scalar_keys}
 
     for sample in batch:
         seq_len = len(sample["seq_token_id"])
@@ -55,6 +57,8 @@ def collate_jagged_batch(batch: List[EventSequence]) -> JaggedBatch:
         flat_piece_ids.extend(piece_ids)
         for key in scalar_keys:
             flat_scalars[key].extend(sample[key])
+        for key in per_game_scalar_keys:
+            per_game_scalars[key].append(sample[key])
 
     offsets = [0]
     for length in seq_lens:
@@ -71,5 +75,7 @@ def collate_jagged_batch(batch: List[EventSequence]) -> JaggedBatch:
 
     for key in scalar_keys:
         output[key] = torch.tensor(flat_scalars[key], dtype=torch.long)
+    for key in per_game_scalar_keys:
+        output[key] = torch.tensor(per_game_scalars[key], dtype=torch.long)
 
     return output

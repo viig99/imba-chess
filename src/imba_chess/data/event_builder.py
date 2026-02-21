@@ -11,6 +11,17 @@ BOS_TOKEN_ID = 1
 TARGET_IGNORE_INDEX = -100
 
 
+def _result_to_game_result_white(value: Any) -> int:
+    text = str(value).strip()
+    if text == "1-0":
+        return 1
+    if text == "0-1":
+        return -1
+    if text == "1/2-1/2":
+        return 0
+    raise ValueError(f"Unsupported game result for value target: {text!r}")
+
+
 class EventBuilder:
     """Build BOS+ply event sequences for next-move prediction."""
 
@@ -20,6 +31,9 @@ class EventBuilder:
     def build_game(self, game: Dict[str, Any]) -> EventSequence:
         data = as_plain_dict(game)
         plays = [as_plain_dict(play) for play in data["plays"]]
+        game_result_white = _result_to_game_result_white(
+            data.get("result", data.get("Result", ""))
+        )
 
         seq_token_id = [BOS_TOKEN_ID]
         piece_ids = [[0] * 64]
@@ -53,6 +67,7 @@ class EventBuilder:
 
         return {
             "game_id": data["game_id"],
+            "game_result_white": game_result_white,
             "seq_token_id": seq_token_id,
             "piece_ids": piece_ids,
             "turn_id": turn_id,

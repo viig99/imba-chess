@@ -5,7 +5,7 @@ import argparse
 import contextlib
 import json
 import random
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any
 
@@ -105,6 +105,24 @@ class _SequenceHistory:
     def record_played_move(self, move_uci: str) -> None:
         self._prev_move_id_for_next_token = int(self._move_vocab.encode(move_uci))
 
+    def clone(self) -> "_SequenceHistory":
+        clone = _SequenceHistory(
+            move_vocab=self._move_vocab,
+            board_state_encoder=self._board_state_encoder,
+        )
+        clone.seq_token_id = list(self.seq_token_id)
+        clone.piece_ids = [list(row) for row in self.piece_ids]
+        clone.turn_id = list(self.turn_id)
+        clone.castle_id = list(self.castle_id)
+        clone.ep_file_id = list(self.ep_file_id)
+        clone.halfmove_bucket_id = list(self.halfmove_bucket_id)
+        clone.fullmove_bucket_id = list(self.fullmove_bucket_id)
+        clone.prev_move_id = list(self.prev_move_id)
+        clone.target_move_id = list(self.target_move_id)
+        clone.played_by_elo = list(self.played_by_elo)
+        clone._prev_move_id_for_next_token = self._prev_move_id_for_next_token
+        return clone
+
     def _append_from_state(self, state) -> None:
         self.seq_token_id.append(EVENT_TOKEN_ID)
         self.piece_ids.append(list(state.piece_ids))
@@ -134,6 +152,7 @@ class _SequenceHistory:
         total_tokens = len(self.seq_token_id)
         return {
             "game_id": ["stockfish_eval"],
+            "game_result_white": torch.tensor([0], dtype=torch.long),
             "num_games": 1,
             "total_tokens": total_tokens,
             "seq_lens": torch.tensor([total_tokens], dtype=torch.long),
@@ -227,7 +246,7 @@ def _parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--model-move-policy",
-        choices=["greedy", "sample"],
+        choices=["greedy", "sample", "value_rerank"],
         default=None,
         help="Model move selection on legal moves.",
     )
@@ -248,6 +267,18 @@ def _parse_args() -> argparse.Namespace:
         type=float,
         default=None,
         help="Top-p nucleus truncation before sampling in (0, 1].",
+    )
+    parser.add_argument(
+        "--value-rerank-top-k",
+        type=int,
+        default=None,
+        help="Top-k policy legal moves to evaluate with value_rerank.",
+    )
+    parser.add_argument(
+        "--value-rerank-lambda",
+        type=float,
+        default=None,
+        help="Weight for value_rerank score adjustment.",
     )
     parser.add_argument(
         "--opening-random-plies",
@@ -302,13 +333,8 @@ def _load_model(
     move_vocab: MoveVocab,
     device: torch.device,
     compile_model: bool,
+    require_value_head: bool = False,
 ) -> tuple[torch.nn.Module, bool]:
-    model_cfg = build_hstu_chess_config(
-        repo_config.model,
-        move_vocab_size=len(move_vocab),
-    )
-    model: torch.nn.Module = HSTUChessModel(model_cfg).to(device)
-
     checkpoint = torch.load(checkpoint_path, map_location="cpu")
     if isinstance(checkpoint, dict) and "model" in checkpoint:
         state_dict = checkpoint["model"]
@@ -328,6 +354,27 @@ def _load_model(
         if new_key.startswith("_orig_mod."):
             new_key = new_key[len("_orig_mod.") :]
         normalized_state_dict[new_key] = value
+    checkpoint_has_value_head = any(
+        key.startswith("value_head.") for key in normalized_state_dict
+    )
+    if require_value_head and not checkpoint_has_value_head:
+        raise ValueError(
+            "model_move_policy=value_rerank requires a checkpoint with value_head "
+            "parameters, but checkpoint contains no 'value_head.*' keys."
+        )
+
+    model_cfg = build_hstu_chess_config(
+        repo_config.model,
+        move_vocab_size=len(move_vocab),
+    )
+    if bool(model_cfg.enable_value_head) != bool(checkpoint_has_value_head):
+        print(
+            "Adjusting runtime model enable_value_head to match checkpoint "
+            f"(checkpoint_has_value_head={checkpoint_has_value_head})."
+        )
+        model_cfg = replace(model_cfg, enable_value_head=checkpoint_has_value_head)
+
+    model: torch.nn.Module = HSTUChessModel(model_cfg).to(device)
     model.load_state_dict(normalized_state_dict, strict=True)
     model.eval()
     compile_enabled = False
@@ -372,20 +419,13 @@ def _parse_ladder_elos(raw: str) -> list[int]:
     return values
 
 
-def _select_model_move(
+def _forward_model(
     *,
     model: torch.nn.Module,
     batch: dict[str, Any],
-    board: chess.Board,
-    move_vocab: MoveVocab,
     device: torch.device,
     dtype: torch.dtype,
-    policy: str,
-    sample_temperature: float,
-    sample_top_k: int,
-    sample_top_p: float,
-    debug_topk: int = 0,
-) -> tuple[chess.Move, dict[str, Any]]:
+) -> dict[str, torch.Tensor]:
     seq_offsets = batch["seq_offsets"].to(
         device=device, dtype=torch.long, non_blocking=True
     )
@@ -401,9 +441,20 @@ def _select_model_move(
         else contextlib.nullcontext()
     )
     with torch.inference_mode(), autocast_ctx:
-        output = model(batch, block_mask=block_mask, return_loss=False)
+        return model(batch, block_mask=block_mask, return_loss=False)
 
-    logits = output["logits"][-1]
+
+def _value_scalar_from_logits(value_logits_last: torch.Tensor) -> float:
+    probs = torch.softmax(value_logits_last.float(), dim=-1)
+    return float((probs[2] - probs[0]).item())
+
+
+def _project_legal_logits(
+    *,
+    logits: torch.Tensor,
+    board: chess.Board,
+    move_vocab: MoveVocab,
+) -> tuple[torch.Tensor, list[chess.Move], int, int]:
     legal_moves = list(board.legal_moves)
     legal_move_ids: list[int] = []
     legal_moves_with_ids: list[chess.Move] = []
@@ -419,46 +470,222 @@ def _select_model_move(
             "No legal moves mapped to vocab ids for current board "
             f"(total legal={total_legal})."
         )
-
     legal_ids_tensor = torch.tensor(
         legal_move_ids, device=logits.device, dtype=torch.long
     )
     legal_logits = logits.index_select(0, legal_ids_tensor)
+    return legal_logits, legal_moves_with_ids, total_legal, mapped_legal
+
+
+def _select_sample_index(
+    *,
+    legal_logits: torch.Tensor,
+    mapped_legal: int,
+    sample_temperature: float,
+    sample_top_k: int,
+    sample_top_p: float,
+) -> tuple[int, torch.Tensor | None]:
+    filtered_logits = legal_logits / float(sample_temperature)
+    if sample_top_k > 0 and sample_top_k < mapped_legal:
+        topk_values, _ = torch.topk(filtered_logits, k=int(sample_top_k))
+        kth_value = topk_values[-1]
+        filtered_logits = torch.where(
+            filtered_logits >= kth_value,
+            filtered_logits,
+            torch.full_like(filtered_logits, float("-inf")),
+        )
+    if sample_top_p < 1.0:
+        sorted_logits, sorted_idx = torch.sort(filtered_logits, descending=True)
+        sorted_probs = torch.softmax(sorted_logits, dim=0)
+        cumsum_probs = torch.cumsum(sorted_probs, dim=0)
+        remove_mask = cumsum_probs > float(sample_top_p)
+        remove_mask[0] = False
+        sorted_logits = sorted_logits.masked_fill(remove_mask, float("-inf"))
+        filtered = torch.full_like(filtered_logits, float("-inf"))
+        filtered.scatter_(0, sorted_idx, sorted_logits)
+        filtered_logits = filtered
+    probs = torch.softmax(filtered_logits, dim=0)
+    if not bool(torch.isfinite(probs).all()) or float(probs.sum().item()) <= 0.0:
+        return int(torch.argmax(legal_logits).item()), None
+    return int(torch.multinomial(probs, num_samples=1).item()), probs
+
+
+def _merge_single_sequence_batches(
+    batches: list[dict[str, Any]],
+) -> dict[str, Any]:
+    if not batches:
+        raise ValueError("_merge_single_sequence_batches requires at least one batch")
+
+    seq_lens = [int(batch["total_tokens"]) for batch in batches]
+    offsets = [0]
+    for length in seq_lens:
+        offsets.append(offsets[-1] + length)
+
+    return {
+        "game_id": [batch["game_id"][0] for batch in batches],
+        "game_result_white": torch.cat(
+            [batch["game_result_white"] for batch in batches], dim=0
+        ),
+        "num_games": len(batches),
+        "total_tokens": offsets[-1],
+        "seq_lens": torch.tensor(seq_lens, dtype=torch.long),
+        "seq_offsets": torch.tensor(offsets, dtype=torch.long),
+        "piece_ids": torch.cat([batch["piece_ids"] for batch in batches], dim=0),
+        "seq_token_id": torch.cat([batch["seq_token_id"] for batch in batches], dim=0),
+        "turn_id": torch.cat([batch["turn_id"] for batch in batches], dim=0),
+        "castle_id": torch.cat([batch["castle_id"] for batch in batches], dim=0),
+        "ep_file_id": torch.cat([batch["ep_file_id"] for batch in batches], dim=0),
+        "halfmove_bucket_id": torch.cat(
+            [batch["halfmove_bucket_id"] for batch in batches], dim=0
+        ),
+        "fullmove_bucket_id": torch.cat(
+            [batch["fullmove_bucket_id"] for batch in batches], dim=0
+        ),
+        "prev_move_id": torch.cat([batch["prev_move_id"] for batch in batches], dim=0),
+        "target_move_id": torch.cat(
+            [batch["target_move_id"] for batch in batches], dim=0
+        ),
+        "played_by_elo": torch.cat([batch["played_by_elo"] for batch in batches], dim=0),
+    }
+
+
+def _select_value_rerank_index(
+    *,
+    model: torch.nn.Module,
+    history: _SequenceHistory,
+    board: chess.Board,
+    legal_logits: torch.Tensor,
+    legal_moves_with_ids: list[chess.Move],
+    device: torch.device,
+    dtype: torch.dtype,
+    value_rerank_top_k: int,
+    value_rerank_lambda: float,
+) -> tuple[int, list[dict[str, Any]]]:
+    mapped_legal = int(legal_logits.shape[0])
+    rerank_k = min(int(value_rerank_top_k), mapped_legal)
+    _, top_indices = torch.topk(legal_logits, k=rerank_k, largest=True)
+    local_indices = [int(idx.item()) for idx in top_indices]
+
+    candidate_batches: list[dict[str, Any]] = []
+    for idx in local_indices:
+        candidate_move = legal_moves_with_ids[idx]
+        next_board = board.copy(stack=False)
+        next_board.push(candidate_move)
+
+        candidate_history = history.clone()
+        candidate_history.append_observed_position(board)
+        candidate_history.record_played_move(candidate_move.uci())
+        candidate_batches.append(
+            candidate_history.build_batch_for_current_position(next_board)
+        )
+
+    merged_batch = _merge_single_sequence_batches(candidate_batches)
+    next_output = _forward_model(
+        model=model,
+        batch=merged_batch,
+        device=device,
+        dtype=dtype,
+    )
+    next_value_logits = next_output.get("value_logits")
+    if next_value_logits is None:
+        raise RuntimeError(
+            "model_move_policy=value_rerank requires value_logits in model output."
+        )
+
+    seq_offsets = merged_batch["seq_offsets"]
+    last_token_positions = seq_offsets[1:] - 1
+    next_values = next_value_logits[last_token_positions]
+
+    chosen_index = local_indices[0]
+    best_score = float("-inf")
+    rerank_rows: list[dict[str, Any]] = []
+    for row_idx, local_idx in enumerate(local_indices):
+        v_next = _value_scalar_from_logits(next_values[row_idx])
+        policy_logit = float(legal_logits[local_idx].item())
+        rerank_score = policy_logit - (float(value_rerank_lambda) * v_next)
+        rerank_rows.append(
+            {
+                "move_uci": legal_moves_with_ids[local_idx].uci(),
+                "policy_logit": policy_logit,
+                "value_next": v_next,
+                "rerank_score": rerank_score,
+            }
+        )
+        if rerank_score > best_score:
+            best_score = rerank_score
+            chosen_index = local_idx
+
+    return chosen_index, rerank_rows
+
+
+def _select_model_move(
+    *,
+    model: torch.nn.Module,
+    batch: dict[str, Any],
+    history: _SequenceHistory,
+    board: chess.Board,
+    move_vocab: MoveVocab,
+    device: torch.device,
+    dtype: torch.dtype,
+    policy: str,
+    sample_temperature: float,
+    sample_top_k: int,
+    sample_top_p: float,
+    value_rerank_top_k: int,
+    value_rerank_lambda: float,
+    debug_topk: int = 0,
+) -> tuple[chess.Move, dict[str, Any]]:
+    output = _forward_model(
+        model=model,
+        batch=batch,
+        device=device,
+        dtype=dtype,
+    )
+
+    logits = output["logits"][-1]
+    legal_logits, legal_moves_with_ids, total_legal, mapped_legal = _project_legal_logits(
+        logits=logits,
+        board=board,
+        move_vocab=move_vocab,
+    )
     probs_for_debug: torch.Tensor | None = None
+    rerank_rows: list[dict[str, Any]] = []
     if policy == "greedy":
         chosen_index = int(torch.argmax(legal_logits).item())
+    elif policy == "sample":
+        chosen_index, probs_for_debug = _select_sample_index(
+            legal_logits=legal_logits,
+            mapped_legal=mapped_legal,
+            sample_temperature=sample_temperature,
+            sample_top_k=sample_top_k,
+            sample_top_p=sample_top_p,
+        )
     else:
-        filtered_logits = legal_logits / float(sample_temperature)
-        if sample_top_k > 0 and sample_top_k < mapped_legal:
-            topk_values, _ = torch.topk(filtered_logits, k=int(sample_top_k))
-            kth_value = topk_values[-1]
-            filtered_logits = torch.where(
-                filtered_logits >= kth_value,
-                filtered_logits,
-                torch.full_like(filtered_logits, float("-inf")),
+        if output.get("value_logits") is None:
+            raise RuntimeError(
+                "model_move_policy=value_rerank requires a checkpoint with value head enabled."
             )
-        if sample_top_p < 1.0:
-            sorted_logits, sorted_idx = torch.sort(filtered_logits, descending=True)
-            sorted_probs = torch.softmax(sorted_logits, dim=0)
-            cumsum_probs = torch.cumsum(sorted_probs, dim=0)
-            remove_mask = cumsum_probs > float(sample_top_p)
-            remove_mask[0] = False
-            sorted_logits = sorted_logits.masked_fill(remove_mask, float("-inf"))
-            filtered = torch.full_like(filtered_logits, float("-inf"))
-            filtered.scatter_(0, sorted_idx, sorted_logits)
-            filtered_logits = filtered
-        probs = torch.softmax(filtered_logits, dim=0)
-        if not bool(torch.isfinite(probs).all()) or float(probs.sum().item()) <= 0.0:
-            chosen_index = int(torch.argmax(legal_logits).item())
-        else:
-            chosen_index = int(torch.multinomial(probs, num_samples=1).item())
-            probs_for_debug = probs
+        chosen_index, rerank_rows = _select_value_rerank_index(
+            model=model,
+            history=history,
+            board=board,
+            legal_logits=legal_logits,
+            legal_moves_with_ids=legal_moves_with_ids,
+            device=device,
+            dtype=dtype,
+            value_rerank_top_k=value_rerank_top_k,
+            value_rerank_lambda=value_rerank_lambda,
+        )
     debug: dict[str, Any] = {
         "total_legal_moves": total_legal,
         "mapped_legal_moves": mapped_legal,
         "coverage": (mapped_legal / total_legal) if total_legal > 0 else float("nan"),
         "policy": policy,
     }
+    if policy == "value_rerank":
+        debug["value_rerank_top_k"] = int(min(int(value_rerank_top_k), mapped_legal))
+        debug["value_rerank_lambda"] = float(value_rerank_lambda)
+        debug["value_rerank_candidates"] = rerank_rows
     if debug_topk > 0:
         k = min(int(debug_topk), mapped_legal)
         top_values, top_indices = torch.topk(legal_logits, k=k, largest=True)
@@ -543,6 +770,8 @@ def _summary_to_payload(
     sample_temperature: float,
     sample_top_k: int,
     sample_top_p: float,
+    value_rerank_top_k: int,
+    value_rerank_lambda: float,
     opening_random_plies: int,
 ) -> dict[str, Any]:
     if summary.completed_games > 0:
@@ -611,6 +840,8 @@ def _summary_to_payload(
             "sample_temperature": float(sample_temperature),
             "sample_top_k": int(sample_top_k),
             "sample_top_p": float(sample_top_p),
+            "value_rerank_top_k": int(value_rerank_top_k),
+            "value_rerank_lambda": float(value_rerank_lambda),
             "opening_random_plies": int(opening_random_plies),
         },
     }
@@ -732,6 +963,8 @@ def _run_segment(
     sample_temperature: float,
     sample_top_k: int,
     sample_top_p: float,
+    value_rerank_top_k: int,
+    value_rerank_lambda: float,
     opening_random_plies: int,
     debug_trace_games: int,
     debug_trace_max_plies: int,
@@ -774,6 +1007,7 @@ def _run_segment(
                     move, debug_info = _select_model_move(
                         model=model,
                         batch=batch,
+                        history=history,
                         board=board,
                         move_vocab=move_vocab,
                         device=device,
@@ -782,6 +1016,8 @@ def _run_segment(
                         sample_temperature=sample_temperature,
                         sample_top_k=sample_top_k,
                         sample_top_p=sample_top_p,
+                        value_rerank_top_k=value_rerank_top_k,
+                        value_rerank_lambda=value_rerank_lambda,
                         debug_topk=debug_topk,
                     )
                     summary.model_turns += 1
@@ -818,6 +1054,16 @@ def _run_segment(
                                 for entry in topk
                             )
                             tqdm.write(f"[debug][{segment_name}]   topk={topk_str}")
+                        rerank_rows = debug_info.get("value_rerank_candidates")
+                        if isinstance(rerank_rows, list) and rerank_rows:
+                            rerank_str = ", ".join(
+                                f"{entry['move_uci']}:logit={entry['policy_logit']:.3f}|"
+                                f"v_next={entry['value_next']:.3f}|score={entry['rerank_score']:.3f}"
+                                for entry in rerank_rows
+                            )
+                            tqdm.write(
+                                f"[debug][{segment_name}]   value_rerank={rerank_str}"
+                            )
                 else:
                     result = engine.play(board, engine_limit)
                     if result.move is None:
@@ -986,6 +1232,16 @@ def main() -> None:
     args.sample_top_p = float(
         eval_cfg.sample_top_p if args.sample_top_p is None else args.sample_top_p
     )
+    args.value_rerank_top_k = int(
+        eval_cfg.value_rerank_top_k
+        if args.value_rerank_top_k is None
+        else args.value_rerank_top_k
+    )
+    args.value_rerank_lambda = float(
+        eval_cfg.value_rerank_lambda
+        if args.value_rerank_lambda is None
+        else args.value_rerank_lambda
+    )
     args.opening_random_plies = int(
         eval_cfg.opening_random_plies
         if args.opening_random_plies is None
@@ -1025,8 +1281,14 @@ def main() -> None:
         raise ValueError("--sample-temperature must be > 0")
     if not (0.0 < float(args.sample_top_p) <= 1.0):
         raise ValueError("--sample-top-p must be in (0, 1]")
-    if args.model_move_policy not in {"greedy", "sample"}:
-        raise ValueError("--model-move-policy must be one of: greedy, sample")
+    if args.value_rerank_top_k < 1:
+        raise ValueError("--value-rerank-top-k must be >= 1")
+    if float(args.value_rerank_lambda) < 0.0:
+        raise ValueError("--value-rerank-lambda must be >= 0")
+    if args.model_move_policy not in {"greedy", "sample", "value_rerank"}:
+        raise ValueError(
+            "--model-move-policy must be one of: greedy, sample, value_rerank"
+        )
     if not args.stockfish_path.exists():
         raise FileNotFoundError(f"Stockfish binary not found: {args.stockfish_path}")
 
@@ -1051,6 +1313,7 @@ def main() -> None:
         move_vocab=move_vocab,
         device=device,
         compile_model=bool(args.compile),
+        require_value_head=(str(args.model_move_policy) == "value_rerank"),
     )
     engine_limit = _build_engine_limit(args)
     segment_specs = _build_segment_specs(args)
@@ -1063,6 +1326,8 @@ def main() -> None:
         "  model_policy="
         f"{args.model_move_policy}, temp={args.sample_temperature}, "
         f"top_k={args.sample_top_k}, top_p={args.sample_top_p}, "
+        f"value_rerank_top_k={args.value_rerank_top_k}, "
+        f"value_rerank_lambda={args.value_rerank_lambda}, "
         f"opening_random_plies={args.opening_random_plies}"
     )
 
@@ -1096,6 +1361,8 @@ def main() -> None:
                 sample_temperature=float(args.sample_temperature),
                 sample_top_k=int(args.sample_top_k),
                 sample_top_p=float(args.sample_top_p),
+                value_rerank_top_k=int(args.value_rerank_top_k),
+                value_rerank_lambda=float(args.value_rerank_lambda),
                 opening_random_plies=int(args.opening_random_plies),
                 debug_trace_games=max(0, int(args.debug_trace_games)),
                 debug_trace_max_plies=max(0, int(args.debug_trace_max_plies)),
@@ -1116,6 +1383,8 @@ def main() -> None:
                 sample_temperature=float(args.sample_temperature),
                 sample_top_k=int(args.sample_top_k),
                 sample_top_p=float(args.sample_top_p),
+                value_rerank_top_k=int(args.value_rerank_top_k),
+                value_rerank_lambda=float(args.value_rerank_lambda),
                 opening_random_plies=int(args.opening_random_plies),
             )
             _print_segment_summary(segment_name=spec.name, payload=segment_payload)
@@ -1157,6 +1426,8 @@ def main() -> None:
         sample_temperature=float(args.sample_temperature),
         sample_top_k=int(args.sample_top_k),
         sample_top_p=float(args.sample_top_p),
+        value_rerank_top_k=int(args.value_rerank_top_k),
+        value_rerank_lambda=float(args.value_rerank_lambda),
         opening_random_plies=int(args.opening_random_plies),
     )
     _print_segment_summary(segment_name="aggregate", payload=aggregate_payload)

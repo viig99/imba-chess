@@ -15,6 +15,7 @@ def _batch():
 
     return {
         "game_id": ["g1", "g2"],
+        "game_result_white": torch.tensor([1, -1], dtype=torch.long),
         "num_games": 2,
         "total_tokens": total_tokens,
         "seq_lens": seq_lens,
@@ -185,3 +186,101 @@ def test_elo_normalization_clamps_at_config_bounds():
         / (config.elo_weight_max_elo - config.elo_weight_min_elo)
     ).clamp(min=0.0, max=1.0)
     assert elo_norm.tolist() == pytest.approx([0.0, 0.0, 0.0, 0.5, 1.0, 1.0])
+
+
+def test_hstu_chess_model_value_head_outputs_and_combines_loss():
+    config = HSTUChessConfig(
+        move_vocab_size=128,
+        model_dim=64,
+        linear_hidden_dim=16,
+        attention_dim=16,
+        num_heads=2,
+        num_layers=0,
+        max_position_embeddings=32,
+        enable_value_head=True,
+        value_loss_weight=0.25,
+    )
+    model = HSTUChessModel(config)
+    batch = _batch()
+
+    out = model(batch, return_loss=True)
+    assert out["value_logits"].shape == (5, 3)
+    assert out["policy_loss"].ndim == 0
+    assert out["value_loss"].ndim == 0
+    expected = out["policy_loss"] + (config.value_loss_weight * out["value_loss"])
+    assert torch.allclose(out["loss"], expected, atol=1e-6, rtol=1e-6)
+
+
+def test_hstu_chess_model_value_loss_matches_manual_formula():
+    config = HSTUChessConfig(
+        move_vocab_size=128,
+        model_dim=64,
+        linear_hidden_dim=16,
+        attention_dim=16,
+        num_heads=2,
+        num_layers=0,
+        max_position_embeddings=32,
+        enable_value_head=True,
+        value_loss_weight=0.1,
+        value_weight_alpha=1.5,
+        value_label_smoothing=0.05,
+    )
+    model = HSTUChessModel(config)
+    batch = _batch()
+
+    out = model(batch, return_loss=True)
+    value_logits = out["value_logits"]
+    seq_offsets = batch["seq_offsets"].to(device=value_logits.device, dtype=torch.long)
+    counts = seq_offsets[1:] - seq_offsets[:-1]
+    token_game_id = torch.repeat_interleave(
+        torch.arange(batch["num_games"], device=value_logits.device),
+        counts,
+    )
+    game_result_white = batch["game_result_white"].to(
+        device=value_logits.device, dtype=torch.long
+    )
+    z_token = game_result_white[token_game_id]
+    turn_id = batch["turn_id"].to(device=value_logits.device, dtype=torch.long)
+    y = torch.where(turn_id == 0, z_token, -z_token)
+    value_target = (y + 1).clamp(min=0, max=2)
+
+    token_pos = torch.arange(value_logits.shape[0], device=value_logits.device) - seq_offsets[
+        token_game_id
+    ]
+    seq_len = counts[token_game_id].clamp_min(1)
+    progress = token_pos.to(torch.float32) / (seq_len.to(torch.float32) - 1.0).clamp_min(
+        1.0
+    )
+    valid_mask = (
+        batch["target_move_id"].to(device=value_logits.device, dtype=torch.long)
+        != config.ignore_index
+    )
+    value_weights = progress.pow(config.value_weight_alpha) * valid_mask.to(torch.float32)
+    per_token_loss = F.cross_entropy(
+        value_logits.float(),
+        value_target,
+        reduction="none",
+        label_smoothing=config.value_label_smoothing,
+    )
+    expected = (per_token_loss * value_weights).sum() / value_weights.sum().clamp_min(1.0)
+    assert torch.allclose(out["value_loss"], expected, atol=1e-6, rtol=1e-6)
+
+
+def test_hstu_chess_model_value_loss_is_finite_when_all_targets_ignored():
+    config = HSTUChessConfig(
+        move_vocab_size=128,
+        model_dim=64,
+        linear_hidden_dim=16,
+        attention_dim=16,
+        num_heads=2,
+        num_layers=0,
+        max_position_embeddings=32,
+        enable_value_head=True,
+    )
+    model = HSTUChessModel(config)
+    batch = _batch()
+    batch["target_move_id"] = torch.full_like(batch["target_move_id"], -100)
+
+    out = model(batch, return_loss=True)
+    assert torch.isfinite(out["value_loss"])
+    assert out["value_loss"].item() == pytest.approx(0.0, abs=1e-8)

@@ -54,6 +54,10 @@ elo_weight_min_elo = 2000
 elo_weight_max_elo = 2800
 elo_loss_weight_alpha = 1.0
 elo_loss_weight_strength = 1.0
+enable_value_head = true
+value_loss_weight = 0.15
+value_weight_alpha = 1.5
+value_label_smoothing = 0.0
 
 [training]
 epochs = 100
@@ -102,11 +106,13 @@ ladder_games_per_segment = 100
 # include_full_strength_segment = true
 device = "auto"
 dtype = "bfloat16"
-compile = false
+compile = true
 model_move_policy = "sample"
 sample_temperature = 1.2
 sample_top_k = 7
 sample_top_p = 0.6
+value_rerank_top_k = 8
+value_rerank_lambda = 0.35
 opening_random_plies = 1
 debug_trace_games = 3
 debug_trace_max_plies = 80

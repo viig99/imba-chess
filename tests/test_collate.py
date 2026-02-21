@@ -9,6 +9,7 @@ def test_collate_jagged_batch_shapes_and_offsets():
     batch = [
         {
             "game_id": "g1",
+            "game_result_white": 1,
             "seq_token_id": [1, 0, 0],
             "piece_ids": [[0] * 64, [1] * 64, [2] * 64],
             "turn_id": [0, 0, 1],
@@ -22,6 +23,7 @@ def test_collate_jagged_batch_shapes_and_offsets():
         },
         {
             "game_id": "g2",
+            "game_result_white": -1,
             "seq_token_id": [1, 0],
             "piece_ids": [[0] * 64, [3] * 64],
             "turn_id": [0, 0],
@@ -37,6 +39,7 @@ def test_collate_jagged_batch_shapes_and_offsets():
 
     out = collate_jagged_batch(batch)
     assert out["num_games"] == 2
+    assert out["game_result_white"].tolist() == [1, -1]
     assert out["total_tokens"] == 5
     assert out["seq_lens"].tolist() == [3, 2]
     assert out["seq_offsets"].tolist() == [0, 3, 5]
@@ -51,6 +54,7 @@ def test_collate_jagged_batch_raises_on_mismatched_scalar_lengths():
     batch = [
         {
             "game_id": "g_bad",
+            "game_result_white": 1,
             "seq_token_id": [1, 0, 0],
             "piece_ids": [[0] * 64, [1] * 64, [2] * 64],
             "turn_id": [0, 0, 1],

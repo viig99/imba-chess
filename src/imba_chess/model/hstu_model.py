@@ -34,6 +34,10 @@ class HSTUChessConfig:
     elo_weight_max_elo: int = 2800
     elo_loss_weight_alpha: float = 1.0
     elo_loss_weight_strength: float = 0.0
+    enable_value_head: bool = False
+    value_loss_weight: float = 0.15
+    value_weight_alpha: float = 1.5
+    value_label_smoothing: float = 0.0
 
 
 def build_hstu_chess_config(
@@ -58,6 +62,10 @@ def build_hstu_chess_config(
         elo_weight_max_elo=int(model_config.elo_weight_max_elo),
         elo_loss_weight_alpha=float(model_config.elo_loss_weight_alpha),
         elo_loss_weight_strength=float(model_config.elo_loss_weight_strength),
+        enable_value_head=bool(model_config.enable_value_head),
+        value_loss_weight=float(model_config.value_loss_weight),
+        value_weight_alpha=float(model_config.value_weight_alpha),
+        value_label_smoothing=float(model_config.value_label_smoothing),
     )
 
 
@@ -96,6 +104,12 @@ class HSTUChessModel(nn.Module):
             raise ValueError("elo_loss_weight_alpha must be > 0")
         if float(config.elo_loss_weight_strength) < 0.0:
             raise ValueError("elo_loss_weight_strength must be >= 0")
+        if float(config.value_loss_weight) < 0.0:
+            raise ValueError("value_loss_weight must be >= 0")
+        if float(config.value_weight_alpha) <= 0.0:
+            raise ValueError("value_weight_alpha must be > 0")
+        if not 0.0 <= float(config.value_label_smoothing) < 1.0:
+            raise ValueError("value_label_smoothing must be in [0.0, 1.0)")
         d = config.model_dim
 
         self.piece_embedding = nn.Embedding(13, d)
@@ -131,6 +145,7 @@ class HSTUChessModel(nn.Module):
 
         self.final_norm = nn.LayerNorm(d)
         self.prediction_head = nn.Linear(d, config.move_vocab_size, bias=False)
+        self.value_head = nn.Linear(d, 3) if config.enable_value_head else None
 
         self.register_buffer(
             "square_ids", torch.arange(64, dtype=torch.long), persistent=False
@@ -224,25 +239,34 @@ class HSTUChessModel(nn.Module):
             x = layer(x=x, block_mask=block_mask)
 
         x = self.final_norm(x)
-        logits = self.prediction_head(x)
-        output: dict[str, torch.Tensor] = {"logits": logits}
+        policy_logits = self.prediction_head(x)
+        output: dict[str, torch.Tensor] = {
+            "logits": policy_logits,
+            "policy_logits": policy_logits,
+        }
+        value_logits: torch.Tensor | None = None
+        if self.value_head is not None:
+            value_logits = self.value_head(x)
+            output["value_logits"] = value_logits
 
         if return_loss:
             target_move_id = batch["target_move_id"].to(
-                device=logits.device, dtype=torch.long, non_blocking=True
+                device=policy_logits.device, dtype=torch.long, non_blocking=True
             )
             valid_mask = target_move_id != self.config.ignore_index
             safe_targets = target_move_id.masked_fill(~valid_mask, 0)
-            per_token_loss = F.cross_entropy(
-                logits.float(),
+            per_token_policy_loss = F.cross_entropy(
+                policy_logits.float(),
                 safe_targets,
                 reduction="none",
                 label_smoothing=self.config.label_smoothing,
             )
-            token_weights = valid_mask.to(per_token_loss.dtype)
+            policy_token_weights = valid_mask.to(per_token_policy_loss.dtype)
             if self.config.elo_loss_weight_strength > 0.0:
                 played_by_elo = batch["played_by_elo"].to(
-                    device=logits.device, dtype=per_token_loss.dtype, non_blocking=True
+                    device=policy_logits.device,
+                    dtype=per_token_policy_loss.dtype,
+                    non_blocking=True,
                 )
                 min_elo = self.config.elo_weight_min_elo
                 max_elo = self.config.elo_weight_max_elo
@@ -251,10 +275,58 @@ class HSTUChessModel(nn.Module):
                 )
                 elo_curve = elo_norm.pow(self.config.elo_loss_weight_alpha)
                 elo_scale = 1.0 + self.config.elo_loss_weight_strength * elo_curve
-                token_weights = token_weights * elo_scale
+                policy_token_weights = policy_token_weights * elo_scale
 
-            loss_sum = (per_token_loss * token_weights).sum()
-            weight_sum = token_weights.sum().clamp_min(1.0)
-            output["loss"] = loss_sum / weight_sum
+            policy_loss_sum = (per_token_policy_loss * policy_token_weights).sum()
+            policy_weight_sum = policy_token_weights.sum().clamp_min(1.0)
+            policy_loss = policy_loss_sum / policy_weight_sum
+            output["policy_loss"] = policy_loss
+
+            if value_logits is not None:
+                counts = seq_offsets[1:] - seq_offsets[:-1]
+                batch_games = int(counts.numel())
+                game_result_white = batch["game_result_white"].to(
+                    device=policy_logits.device, dtype=torch.long, non_blocking=True
+                )
+                if game_result_white.ndim != 1 or int(game_result_white.shape[0]) != batch_games:
+                    raise ValueError(
+                        "game_result_white must have shape [B] where B == num_games"
+                    )
+                token_game_id = torch.repeat_interleave(
+                    torch.arange(batch_games, device=policy_logits.device),
+                    counts,
+                )
+                z_token = game_result_white.index_select(0, token_game_id)
+                turn_id = batch["turn_id"].to(
+                    device=policy_logits.device, dtype=torch.long, non_blocking=True
+                )
+                y = torch.where(turn_id == 0, z_token, -z_token)
+                value_target = (y + 1).clamp(min=0, max=2)
+
+                token_pos_in_game = torch.arange(
+                    policy_logits.shape[0], device=policy_logits.device
+                ) - seq_offsets.index_select(0, token_game_id)
+                seq_len_for_token = counts.index_select(0, token_game_id).clamp_min(1)
+                progress = token_pos_in_game.to(torch.float32) / (
+                    seq_len_for_token.to(torch.float32) - 1.0
+                ).clamp_min(1.0)
+                value_weights = progress.pow(self.config.value_weight_alpha)
+                value_weights = value_weights * valid_mask.to(value_weights.dtype)
+
+                per_token_value_loss = F.cross_entropy(
+                    value_logits.float(),
+                    value_target,
+                    reduction="none",
+                    label_smoothing=self.config.value_label_smoothing,
+                )
+                value_loss_sum = (per_token_value_loss * value_weights).sum()
+                value_weight_sum = value_weights.sum().clamp_min(1.0)
+                value_loss = value_loss_sum / value_weight_sum
+                output["value_loss"] = value_loss
+                output["loss"] = policy_loss + (
+                    self.config.value_loss_weight * value_loss
+                )
+            else:
+                output["loss"] = policy_loss
 
         return output

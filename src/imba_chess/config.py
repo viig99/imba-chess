@@ -78,6 +78,10 @@ class ModelConfig:
     elo_weight_max_elo: int = 2800
     elo_loss_weight_alpha: float = 1.0
     elo_loss_weight_strength: float = 0.0
+    enable_value_head: bool = False
+    value_loss_weight: float = 0.15
+    value_weight_alpha: float = 1.5
+    value_label_smoothing: float = 0.0
 
 
 @dataclass(frozen=True)
@@ -132,6 +136,8 @@ class EvalVsStockfishConfig:
     sample_temperature: float = 1.0
     sample_top_k: int = 0
     sample_top_p: float = 1.0
+    value_rerank_top_k: int = 8
+    value_rerank_lambda: float = 0.35
     opening_random_plies: int = 0
     debug_trace_games: int = 0
     debug_trace_max_plies: int = 80

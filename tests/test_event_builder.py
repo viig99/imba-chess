@@ -32,6 +32,7 @@ def test_event_builder_builds_bos_plus_plies():
 
     # 4 plies + BOS
     assert len(sample["seq_token_id"]) == 5
+    assert sample["game_result_white"] == 1
     assert sample["seq_token_id"][0] == BOS_TOKEN_ID
     assert sample["target_move_id"][0] == TARGET_IGNORE_INDEX
     assert all(token_id != TARGET_IGNORE_INDEX for token_id in sample["target_move_id"][1:])
