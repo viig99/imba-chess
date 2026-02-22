@@ -124,6 +124,29 @@ Preview parsed dataset samples:
 python scripts/preview_dataset.py
 ```
 
+Estimate high-Elo corpus and cache footprint:
+
+```bash
+python scripts/estimate_lichess_cache.py \
+  --all-months \
+  --min-avg-elo 2000 \
+  --sample-parquets 16 \
+  --sample-rows-per-parquet 200000 \
+  --cache-dir artifacts/hf_cache \
+  --output-json artifacts/eval/elo2000_cache_estimate.json
+```
+
+Budget planning on configured TOML time windows (`train/val/test`) with Elo + time recommendations:
+
+```bash
+python scripts/estimate_lichess_cache.py \
+  --split all \
+  --target-free-gib 40 \
+  --sample-parquets 16 \
+  --sample-rows-per-parquet 200000 \
+  --output-json artifacts/eval/budget40gib_estimate.json
+```
+
 Inspect jagged dataloader batches:
 
 ```bash
