@@ -55,8 +55,8 @@ elo_weight_max_elo = 2800
 elo_loss_weight_alpha = 1.0
 elo_loss_weight_strength = 1.0
 enable_value_head = true
-value_loss_weight = 0.35
-value_weight_alpha = 1.0
+value_loss_weight = 0.5
+value_weight_alpha = 0.9
 value_label_smoothing = 0.0
 
 [training]
