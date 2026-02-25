@@ -207,13 +207,14 @@ CLI flags override TOML values when provided.
 - `greedy`: pick highest-logit legal move.
 - `sample`: sample from legal moves with temperature/top-k/top-p.
 - `value_rerank`: rerank top-K policy legal moves using one-ply value lookahead.
+- `value_search_d2`: run policy-pruned depth-2 value search (our move, opponent best reply).
 
-Value rerank knobs (`[eval_vs_stockfish]` or CLI):
+Value-search knobs (`[eval_vs_stockfish]` or CLI):
 
 - `value_rerank_top_k` (default `8`)
 - `value_rerank_lambda` (default `0.35`)
 
-Important: `value_rerank` requires a checkpoint trained with value head and a runtime model config with `[model].enable_value_head = true`.
+Important: `value_rerank` and `value_search_d2` require a checkpoint trained with value head and a runtime model config with `[model].enable_value_head = true`.
 
 Example:
 
@@ -221,6 +222,16 @@ Example:
 python scripts/eval_vs_stockfish.py \
   --checkpoint artifacts/checkpoints/last_*.pt \
   --model-move-policy value_rerank \
+  --value-rerank-top-k 8 \
+  --value-rerank-lambda 0.35
+```
+
+Depth-2 value search example:
+
+```bash
+python scripts/eval_vs_stockfish.py \
+  --checkpoint artifacts/checkpoints/last_*.pt \
+  --model-move-policy value_search_d2 \
   --value-rerank-top-k 8 \
   --value-rerank-lambda 0.35
 ```
@@ -263,7 +274,8 @@ uv run --python .venv/bin/python --with pytest pytest -q
 
 - Training is currently single-process in this repo flow (no end-to-end DDP launcher yet).
 - No legal-move masking in the prediction head yet (full-vocab classification).
-- `value_rerank` is currently one-ply and unbatched across candidates (stronger but slower than plain greedy/sample).
+- `value_rerank` is one-ply value lookahead.
+- `value_search_d2` is depth-2 and substantially slower than greedy/sample/value_rerank.
 - Streaming order is temporal by month window (newest month first); training can optionally shuffle month-level parquet file order on process start via `[dataset].shuffle_train_month_files_on_start`.
 
 ## References

@@ -246,7 +246,7 @@ def _parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--model-move-policy",
-        choices=["greedy", "sample", "value_rerank"],
+        choices=["greedy", "sample", "value_rerank", "value_search_d2"],
         default=None,
         help="Model move selection on legal moves.",
     )
@@ -359,7 +359,7 @@ def _load_model(
     )
     if require_value_head and not checkpoint_has_value_head:
         raise ValueError(
-            "model_move_policy=value_rerank requires a checkpoint with value_head "
+            "model_move_policy in {value_rerank,value_search_d2} requires a checkpoint with value_head "
             "parameters, but checkpoint contains no 'value_head.*' keys."
         )
 
@@ -447,6 +447,21 @@ def _forward_model(
 def _value_scalar_from_logits(value_logits_last: torch.Tensor) -> float:
     probs = torch.softmax(value_logits_last.float(), dim=-1)
     return float((probs[2] - probs[0]).item())
+
+
+def _terminal_value_for_color(
+    board: chess.Board, *, color: chess.Color
+) -> float | None:
+    if not board.is_game_over(claim_draw=True):
+        return None
+    result = board.result(claim_draw=True)
+    if result == "1/2-1/2":
+        return 0.0
+    if result == "1-0":
+        return 1.0 if color == chess.WHITE else -1.0
+    if result == "0-1":
+        return 1.0 if color == chess.BLACK else -1.0
+    return 0.0
 
 
 def _project_legal_logits(
@@ -618,6 +633,197 @@ def _select_value_rerank_index(
     return chosen_index, rerank_rows
 
 
+def _select_value_search_d2_index(
+    *,
+    model: torch.nn.Module,
+    history: _SequenceHistory,
+    board: chess.Board,
+    legal_logits: torch.Tensor,
+    legal_moves_with_ids: list[chess.Move],
+    move_vocab: MoveVocab,
+    device: torch.device,
+    dtype: torch.dtype,
+    value_rerank_top_k: int,
+    value_rerank_lambda: float,
+) -> tuple[int, list[dict[str, Any]]]:
+    root_color = board.turn
+    mapped_legal = int(legal_logits.shape[0])
+    root_k = min(int(value_rerank_top_k), mapped_legal)
+    _, top_indices = torch.topk(legal_logits, k=root_k, largest=True)
+    local_indices = [int(idx.item()) for idx in top_indices]
+
+    root_candidates: list[dict[str, Any]] = []
+    board1_batches: list[dict[str, Any]] = []
+    board1_batch_to_root: list[int] = []
+    for local_idx in local_indices:
+        move = legal_moves_with_ids[local_idx]
+        board1 = board.copy(stack=False)
+        board1.push(move)
+        root_candidate: dict[str, Any] = {
+            "local_idx": local_idx,
+            "move": move,
+            "board1": board1,
+            "policy_logit": float(legal_logits[local_idx].item()),
+            "terminal_value": _terminal_value_for_color(board1, color=root_color),
+            "board1_value_opp": None,
+            "board1_logits": None,
+            "reply_candidates": [],
+        }
+        root_candidates.append(root_candidate)
+        if root_candidate["terminal_value"] is not None:
+            continue
+        candidate_history = history.clone()
+        candidate_history.append_observed_position(board)
+        candidate_history.record_played_move(move.uci())
+        root_candidate["candidate_history"] = candidate_history
+        board1_batches.append(
+            candidate_history.build_batch_for_current_position(board1)
+        )
+        board1_batch_to_root.append(len(root_candidates) - 1)
+
+    if board1_batches:
+        merged_board1_batch = _merge_single_sequence_batches(board1_batches)
+        board1_output = _forward_model(
+            model=model,
+            batch=merged_board1_batch,
+            device=device,
+            dtype=dtype,
+        )
+        board1_value_logits = board1_output.get("value_logits")
+        if board1_value_logits is None:
+            raise RuntimeError(
+                "model_move_policy=value_search_d2 requires value_logits in model output."
+            )
+        board1_offsets = merged_board1_batch["seq_offsets"]
+        board1_last_positions = board1_offsets[1:] - 1
+        board1_logits = board1_output["logits"][board1_last_positions]
+        board1_values = board1_value_logits[board1_last_positions]
+        for row_idx, root_idx in enumerate(board1_batch_to_root):
+            root_candidates[root_idx]["board1_logits"] = board1_logits[row_idx]
+            root_candidates[root_idx]["board1_value_opp"] = _value_scalar_from_logits(
+                board1_values[row_idx]
+            )
+
+    board2_batches: list[dict[str, Any]] = []
+    board2_meta: list[tuple[int, int]] = []
+    for root_idx, root_candidate in enumerate(root_candidates):
+        if root_candidate["terminal_value"] is not None:
+            continue
+        board1_logits = root_candidate.get("board1_logits")
+        board1 = root_candidate["board1"]
+        if board1_logits is None:
+            continue
+        try:
+            opp_legal_logits, opp_legal_moves, _, opp_mapped_legal = _project_legal_logits(
+                logits=board1_logits,
+                board=board1,
+                move_vocab=move_vocab,
+            )
+        except RuntimeError:
+            board1_value_opp = root_candidate.get("board1_value_opp")
+            root_candidate["worst_reply_value"] = (
+                -float(board1_value_opp) if board1_value_opp is not None else 0.0
+            )
+            continue
+
+        opp_k = min(int(value_rerank_top_k), int(opp_mapped_legal))
+        _, opp_top_indices = torch.topk(opp_legal_logits, k=opp_k, largest=True)
+        reply_rows: list[dict[str, Any]] = []
+        candidate_history = root_candidate.get("candidate_history")
+        if candidate_history is None:
+            continue
+        for opp_local_idx_tensor in opp_top_indices:
+            opp_local_idx = int(opp_local_idx_tensor.item())
+            opp_move = opp_legal_moves[opp_local_idx]
+            board2 = board1.copy(stack=False)
+            board2.push(opp_move)
+            terminal_value = _terminal_value_for_color(board2, color=root_color)
+            reply_row = {
+                "move_uci": opp_move.uci(),
+                "opp_policy_logit": float(opp_legal_logits[opp_local_idx].item()),
+                "value_after_reply": terminal_value,
+                "terminal": terminal_value is not None,
+            }
+            reply_rows.append(reply_row)
+            if terminal_value is not None:
+                continue
+            reply_history = candidate_history.clone()
+            reply_history.append_observed_position(board1)
+            reply_history.record_played_move(opp_move.uci())
+            board2_batches.append(
+                reply_history.build_batch_for_current_position(board2)
+            )
+            board2_meta.append((root_idx, len(reply_rows) - 1))
+        root_candidate["reply_candidates"] = reply_rows
+
+    if board2_batches:
+        merged_board2_batch = _merge_single_sequence_batches(board2_batches)
+        board2_output = _forward_model(
+            model=model,
+            batch=merged_board2_batch,
+            device=device,
+            dtype=dtype,
+        )
+        board2_value_logits = board2_output.get("value_logits")
+        if board2_value_logits is None:
+            raise RuntimeError(
+                "model_move_policy=value_search_d2 requires value_logits in model output."
+            )
+        board2_offsets = merged_board2_batch["seq_offsets"]
+        board2_last_positions = board2_offsets[1:] - 1
+        board2_values = board2_value_logits[board2_last_positions]
+        for row_idx, (root_idx, reply_idx) in enumerate(board2_meta):
+            root_candidates[root_idx]["reply_candidates"][reply_idx][
+                "value_after_reply"
+            ] = _value_scalar_from_logits(board2_values[row_idx])
+
+    chosen_index = local_indices[0]
+    best_score = float("-inf")
+    search_rows: list[dict[str, Any]] = []
+    for root_candidate in root_candidates:
+        if root_candidate["terminal_value"] is not None:
+            worst_reply_value = float(root_candidate["terminal_value"])
+            best_reply_uci = None
+        elif "worst_reply_value" in root_candidate:
+            worst_reply_value = float(root_candidate["worst_reply_value"])
+            best_reply_uci = None
+        else:
+            reply_rows = [
+                row
+                for row in root_candidate["reply_candidates"]
+                if row.get("value_after_reply") is not None
+            ]
+            if not reply_rows:
+                board1_value_opp = root_candidate.get("board1_value_opp")
+                worst_reply_value = (
+                    -float(board1_value_opp) if board1_value_opp is not None else 0.0
+                )
+                best_reply_uci = None
+            else:
+                best_reply = min(
+                    reply_rows, key=lambda row: float(row["value_after_reply"])
+                )
+                worst_reply_value = float(best_reply["value_after_reply"])
+                best_reply_uci = str(best_reply["move_uci"])
+
+        policy_logit = float(root_candidate["policy_logit"])
+        search_score = policy_logit + (float(value_rerank_lambda) * worst_reply_value)
+        search_rows.append(
+            {
+                "move_uci": root_candidate["move"].uci(),
+                "policy_logit": policy_logit,
+                "worst_reply_value": worst_reply_value,
+                "best_reply_uci": best_reply_uci,
+                "search_score": search_score,
+            }
+        )
+        if search_score > best_score:
+            best_score = search_score
+            chosen_index = int(root_candidate["local_idx"])
+
+    return chosen_index, search_rows
+
+
 def _select_model_move(
     *,
     model: torch.nn.Module,
@@ -650,6 +856,7 @@ def _select_model_move(
     )
     probs_for_debug: torch.Tensor | None = None
     rerank_rows: list[dict[str, Any]] = []
+    search_rows: list[dict[str, Any]] = []
     if policy == "greedy":
         chosen_index = int(torch.argmax(legal_logits).item())
     elif policy == "sample":
@@ -660,7 +867,7 @@ def _select_model_move(
             sample_top_k=sample_top_k,
             sample_top_p=sample_top_p,
         )
-    else:
+    elif policy == "value_rerank":
         if output.get("value_logits") is None:
             raise RuntimeError(
                 "model_move_policy=value_rerank requires a checkpoint with value head enabled."
@@ -676,6 +883,25 @@ def _select_model_move(
             value_rerank_top_k=value_rerank_top_k,
             value_rerank_lambda=value_rerank_lambda,
         )
+    elif policy == "value_search_d2":
+        if output.get("value_logits") is None:
+            raise RuntimeError(
+                "model_move_policy=value_search_d2 requires a checkpoint with value head enabled."
+            )
+        chosen_index, search_rows = _select_value_search_d2_index(
+            model=model,
+            history=history,
+            board=board,
+            legal_logits=legal_logits,
+            legal_moves_with_ids=legal_moves_with_ids,
+            move_vocab=move_vocab,
+            device=device,
+            dtype=dtype,
+            value_rerank_top_k=value_rerank_top_k,
+            value_rerank_lambda=value_rerank_lambda,
+        )
+    else:
+        raise ValueError(f"Unknown model move policy: {policy}")
     debug: dict[str, Any] = {
         "total_legal_moves": total_legal,
         "mapped_legal_moves": mapped_legal,
@@ -686,6 +912,10 @@ def _select_model_move(
         debug["value_rerank_top_k"] = int(min(int(value_rerank_top_k), mapped_legal))
         debug["value_rerank_lambda"] = float(value_rerank_lambda)
         debug["value_rerank_candidates"] = rerank_rows
+    if policy == "value_search_d2":
+        debug["value_rerank_top_k"] = int(min(int(value_rerank_top_k), mapped_legal))
+        debug["value_rerank_lambda"] = float(value_rerank_lambda)
+        debug["value_search_d2_candidates"] = search_rows
     if debug_topk > 0:
         k = min(int(debug_topk), mapped_legal)
         top_values, top_indices = torch.topk(legal_logits, k=k, largest=True)
@@ -1064,6 +1294,17 @@ def _run_segment(
                             tqdm.write(
                                 f"[debug][{segment_name}]   value_rerank={rerank_str}"
                             )
+                        search_rows = debug_info.get("value_search_d2_candidates")
+                        if isinstance(search_rows, list) and search_rows:
+                            search_str = ", ".join(
+                                f"{entry['move_uci']}:logit={entry['policy_logit']:.3f}|"
+                                f"worst_reply={entry['worst_reply_value']:.3f}|"
+                                f"best_reply={entry['best_reply_uci']}|score={entry['search_score']:.3f}"
+                                for entry in search_rows
+                            )
+                            tqdm.write(
+                                f"[debug][{segment_name}]   value_search_d2={search_str}"
+                            )
                 else:
                     result = engine.play(board, engine_limit)
                     if result.move is None:
@@ -1285,9 +1526,14 @@ def main() -> None:
         raise ValueError("--value-rerank-top-k must be >= 1")
     if float(args.value_rerank_lambda) < 0.0:
         raise ValueError("--value-rerank-lambda must be >= 0")
-    if args.model_move_policy not in {"greedy", "sample", "value_rerank"}:
+    if args.model_move_policy not in {
+        "greedy",
+        "sample",
+        "value_rerank",
+        "value_search_d2",
+    }:
         raise ValueError(
-            "--model-move-policy must be one of: greedy, sample, value_rerank"
+            "--model-move-policy must be one of: greedy, sample, value_rerank, value_search_d2"
         )
     if not args.stockfish_path.exists():
         raise FileNotFoundError(f"Stockfish binary not found: {args.stockfish_path}")
@@ -1313,7 +1559,9 @@ def main() -> None:
         move_vocab=move_vocab,
         device=device,
         compile_model=bool(args.compile),
-        require_value_head=(str(args.model_move_policy) == "value_rerank"),
+        require_value_head=(
+            str(args.model_move_policy) in {"value_rerank", "value_search_d2"}
+        ),
     )
     engine_limit = _build_engine_limit(args)
     segment_specs = _build_segment_specs(args)
