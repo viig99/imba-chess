@@ -209,14 +209,34 @@ CLI flags override TOML values when provided.
 - `value_rerank`: rerank top-K policy legal moves using one-ply value lookahead.
 - `value_search_d2`: run policy-pruned depth-2 value search (our move, opponent best reply).
 
-Value-search knobs (`[eval_vs_stockfish]` or CLI):
+Mode-specific knobs (`[eval_vs_stockfish]` or CLI):
 
-- `value_rerank_top_k` (default `8`)
-- `value_rerank_lambda` (default `0.35`)
+- `greedy`: no policy-specific knobs.
+- `sample`: `sample_temperature`, `sample_top_k`, `sample_top_p`.
+- `value_rerank` and `value_search_d2`: use `value_rerank_top_k` (default `8`) and `value_rerank_lambda` (default `0.35`).
 
 Important: `value_rerank` and `value_search_d2` require a checkpoint trained with value head and a runtime model config with `[model].enable_value_head = true`.
 
-Example:
+Run with `greedy` (deterministic baseline):
+
+```bash
+python scripts/eval_vs_stockfish.py \
+  --checkpoint artifacts/checkpoints/last_*.pt \
+  --model-move-policy greedy
+```
+
+Run with `sample` (stochastic decoding):
+
+```bash
+python scripts/eval_vs_stockfish.py \
+  --checkpoint artifacts/checkpoints/last_*.pt \
+  --model-move-policy sample \
+  --sample-temperature 1.2 \
+  --sample-top-k 7 \
+  --sample-top-p 0.6
+```
+
+Run with `value_rerank` (1-ply value lookahead):
 
 ```bash
 python scripts/eval_vs_stockfish.py \
@@ -226,7 +246,7 @@ python scripts/eval_vs_stockfish.py \
   --value-rerank-lambda 0.35
 ```
 
-Depth-2 value search example:
+Run with `value_search_d2` (policy-pruned depth-2 value search):
 
 ```bash
 python scripts/eval_vs_stockfish.py \
