@@ -189,7 +189,7 @@ def test_value_rerank_selects_move_using_batched_value_lookahead():
         sample_top_k=0,
         sample_top_p=1.0,
         value_rerank_top_k=2,
-        value_rerank_lambda=1.0,
+        value_rerank_lambda=0.2,
         debug_topk=0,
     )
 
@@ -279,7 +279,7 @@ def test_value_search_d2_selects_move_using_opponent_best_reply():
         sample_top_k=0,
         sample_top_p=1.0,
         value_rerank_top_k=2,
-        value_rerank_lambda=2.0,
+        value_rerank_lambda=0.2,
         debug_topk=0,
     )
 
@@ -292,6 +292,93 @@ def test_value_search_d2_selects_move_using_opponent_best_reply():
     assert float(by_move["d2d4"]["worst_reply_value"]) > float(
         by_move["e2e4"]["worst_reply_value"]
     )
+
+
+class _DummyMatePreferenceModel(torch.nn.Module):
+    """Prefers a quiet move by policy logit; only the value modes should find mate."""
+
+    def __init__(self, move_vocab: MoveVocab) -> None:
+        super().__init__()
+        self.move_vocab = move_vocab
+        self.forward_calls = 0
+
+    def forward(self, batch, *, block_mask=None, return_loss=False):  # type: ignore[no-untyped-def]
+        self.forward_calls += 1
+        total_tokens = int(batch["total_tokens"])
+        logits = torch.zeros((total_tokens, len(self.move_vocab)), dtype=torch.float32)
+        value_logits = torch.zeros((total_tokens, 3), dtype=torch.float32)
+        seq_offsets = batch["seq_offsets"]
+        for last in (seq_offsets[1:] - 1).tolist():
+            logits[last, self.move_vocab.token_to_id["a1b1"]] = 4.0
+            logits[last, self.move_vocab.token_to_id["a1a8"]] = 1.0
+        return {"logits": logits, "value_logits": value_logits}
+
+
+def _mate_in_one_setup():
+    module = _load_eval_script_module()
+    move_vocab = MoveVocab.build(
+        ["a1a8", "a1b1"],
+        config=MoveVocabConfig(include_unk=False),
+    )
+    model = _DummyMatePreferenceModel(move_vocab)
+    history = module._SequenceHistory(
+        move_vocab=move_vocab,
+        board_state_encoder=BoardStateEncoder(),
+    )
+    board = chess.Board("6k1/5ppp/8/8/8/8/8/R6K w - - 0 1")
+    batch = history.build_batch_for_current_position(board)
+    return module, move_vocab, model, history, board, batch
+
+
+def test_value_rerank_prefers_mate_in_one_over_higher_logit_move():
+    module, move_vocab, model, history, board, batch = _mate_in_one_setup()
+
+    move, _ = module._select_model_move(
+        model=model,
+        batch=batch,
+        history=history,
+        board=board,
+        move_vocab=move_vocab,
+        device=torch.device("cpu"),
+        dtype=torch.float32,
+        policy="value_rerank",
+        sample_temperature=1.0,
+        sample_top_k=0,
+        sample_top_p=1.0,
+        value_rerank_top_k=2,
+        value_rerank_lambda=0.2,
+        debug_topk=0,
+    )
+
+    assert move.uci() == "a1a8"
+    # Root eval + one batched eval for the single non-terminal candidate;
+    # the terminal (mate) board must not be sent through the value head.
+    assert model.forward_calls == 2
+
+
+def test_value_search_d2_plays_mate_in_one_immediately():
+    module, move_vocab, model, history, board, batch = _mate_in_one_setup()
+
+    move, _ = module._select_model_move(
+        model=model,
+        batch=batch,
+        history=history,
+        board=board,
+        move_vocab=move_vocab,
+        device=torch.device("cpu"),
+        dtype=torch.float32,
+        policy="value_search_d2",
+        sample_temperature=1.0,
+        sample_top_k=0,
+        sample_top_p=1.0,
+        value_rerank_top_k=2,
+        value_rerank_lambda=0.2,
+        debug_topk=0,
+    )
+
+    assert move.uci() == "a1a8"
+    # Mate short-circuits before any depth-1/depth-2 batched evals.
+    assert model.forward_calls == 1
 
 
 def test_value_search_d2_requires_value_logits():

@@ -564,6 +564,52 @@ def _merge_single_sequence_batches(
     }
 
 
+# Cap tokens per merged search forward: the eager (non-compiled) flex-attention
+# fallback materializes O(T^2) score/mask tensors, so one huge merged batch OOMs.
+_SEARCH_EVAL_MAX_TOKENS_PER_CHUNK = 4096
+
+
+def _forward_last_token_outputs(
+    *,
+    model: torch.nn.Module,
+    batches: list[dict[str, Any]],
+    device: torch.device,
+    dtype: torch.dtype,
+    policy_name: str,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Batch-evaluate single-sequence batches in token-budgeted chunks.
+
+    Returns (policy_logits, value_logits) at each sequence's last token,
+    stacked in input order.
+    """
+    policy_rows: list[torch.Tensor] = []
+    value_rows: list[torch.Tensor] = []
+    idx = 0
+    while idx < len(batches):
+        chunk = [batches[idx]]
+        chunk_tokens = int(batches[idx]["total_tokens"])
+        idx += 1
+        while (
+            idx < len(batches)
+            and chunk_tokens + int(batches[idx]["total_tokens"])
+            <= _SEARCH_EVAL_MAX_TOKENS_PER_CHUNK
+        ):
+            chunk_tokens += int(batches[idx]["total_tokens"])
+            chunk.append(batches[idx])
+            idx += 1
+        merged = _merge_single_sequence_batches(chunk)
+        output = _forward_model(model=model, batch=merged, device=device, dtype=dtype)
+        value_logits = output.get("value_logits")
+        if value_logits is None:
+            raise RuntimeError(
+                f"model_move_policy={policy_name} requires value_logits in model output."
+            )
+        last_positions = merged["seq_offsets"][1:] - 1
+        policy_rows.append(output["logits"][last_positions])
+        value_rows.append(value_logits[last_positions])
+    return torch.cat(policy_rows, dim=0), torch.cat(value_rows, dim=0)
+
+
 def _select_value_rerank_index(
     *,
     model: torch.nn.Module,
@@ -576,16 +622,34 @@ def _select_value_rerank_index(
     value_rerank_top_k: int,
     value_rerank_lambda: float,
 ) -> tuple[int, list[dict[str, Any]]]:
+    root_color = board.turn
     mapped_legal = int(legal_logits.shape[0])
     rerank_k = min(int(value_rerank_top_k), mapped_legal)
+    legal_log_probs = torch.log_softmax(legal_logits.float(), dim=0)
     _, top_indices = torch.topk(legal_logits, k=rerank_k, largest=True)
     local_indices = [int(idx.item()) for idx in top_indices]
 
+    candidates: list[dict[str, Any]] = []
     candidate_batches: list[dict[str, Any]] = []
+    batch_to_candidate: list[int] = []
     for idx in local_indices:
         candidate_move = legal_moves_with_ids[idx]
-        next_board = board.copy(stack=False)
+        # Keep the move stack so claimable draws (repetition/50-move) count as terminal.
+        next_board = board.copy()
         next_board.push(candidate_move)
+        # Terminal boards never appear as training tokens; use the exact game
+        # result instead of the value head there.
+        terminal_value = _terminal_value_for_color(next_board, color=root_color)
+        candidates.append(
+            {
+                "local_idx": idx,
+                "move": candidate_move,
+                "terminal": terminal_value is not None,
+                "value_root": terminal_value,
+            }
+        )
+        if terminal_value is not None:
+            continue
 
         candidate_history = history.clone()
         candidate_history.append_observed_position(board)
@@ -593,36 +657,37 @@ def _select_value_rerank_index(
         candidate_batches.append(
             candidate_history.build_batch_for_current_position(next_board)
         )
+        batch_to_candidate.append(len(candidates) - 1)
 
-    merged_batch = _merge_single_sequence_batches(candidate_batches)
-    next_output = _forward_model(
-        model=model,
-        batch=merged_batch,
-        device=device,
-        dtype=dtype,
-    )
-    next_value_logits = next_output.get("value_logits")
-    if next_value_logits is None:
-        raise RuntimeError(
-            "model_move_policy=value_rerank requires value_logits in model output."
+    if candidate_batches:
+        _, next_values = _forward_last_token_outputs(
+            model=model,
+            batches=candidate_batches,
+            device=device,
+            dtype=dtype,
+            policy_name="value_rerank",
         )
-
-    seq_offsets = merged_batch["seq_offsets"]
-    last_token_positions = seq_offsets[1:] - 1
-    next_values = next_value_logits[last_token_positions]
+        for row_idx, cand_idx in enumerate(batch_to_candidate):
+            # Side-to-move at next_board is the opponent; negate to root POV.
+            v_opp = _value_scalar_from_logits(next_values[row_idx])
+            candidates[cand_idx]["value_root"] = -v_opp
 
     chosen_index = local_indices[0]
     best_score = float("-inf")
     rerank_rows: list[dict[str, Any]] = []
-    for row_idx, local_idx in enumerate(local_indices):
-        v_next = _value_scalar_from_logits(next_values[row_idx])
-        policy_logit = float(legal_logits[local_idx].item())
-        rerank_score = policy_logit - (float(value_rerank_lambda) * v_next)
+    for candidate in candidates:
+        local_idx = int(candidate["local_idx"])
+        value_root = float(candidate["value_root"])
+        policy_log_prob = float(legal_log_probs[local_idx].item())
+        # Value-dominant score with a small log-prob policy prior as tiebreak.
+        rerank_score = value_root + (float(value_rerank_lambda) * policy_log_prob)
         rerank_rows.append(
             {
-                "move_uci": legal_moves_with_ids[local_idx].uci(),
-                "policy_logit": policy_logit,
-                "value_next": v_next,
+                "move_uci": candidate["move"].uci(),
+                "policy_logit": float(legal_logits[local_idx].item()),
+                "policy_log_prob": policy_log_prob,
+                "value_next": value_root,
+                "terminal": bool(candidate["terminal"]),
                 "rerank_score": rerank_score,
             }
         )
@@ -649,6 +714,7 @@ def _select_value_search_d2_index(
     root_color = board.turn
     mapped_legal = int(legal_logits.shape[0])
     root_k = min(int(value_rerank_top_k), mapped_legal)
+    legal_log_probs = torch.log_softmax(legal_logits.float(), dim=0)
     _, top_indices = torch.topk(legal_logits, k=root_k, largest=True)
     local_indices = [int(idx.item()) for idx in top_indices]
 
@@ -657,14 +723,29 @@ def _select_value_search_d2_index(
     board1_batch_to_root: list[int] = []
     for local_idx in local_indices:
         move = legal_moves_with_ids[local_idx]
-        board1 = board.copy(stack=False)
+        # Keep the move stack so claimable draws (repetition/50-move) count as terminal.
+        board1 = board.copy()
         board1.push(move)
+        terminal_value = _terminal_value_for_color(board1, color=root_color)
+        if terminal_value is not None and terminal_value >= 1.0:
+            # Immediate win (checkmate delivered): no other move can score higher.
+            return local_idx, [
+                {
+                    "move_uci": move.uci(),
+                    "policy_logit": float(legal_logits[local_idx].item()),
+                    "policy_log_prob": float(legal_log_probs[local_idx].item()),
+                    "worst_reply_value": 1.0,
+                    "best_reply_uci": None,
+                    "search_score": 1.0,
+                }
+            ]
         root_candidate: dict[str, Any] = {
             "local_idx": local_idx,
             "move": move,
             "board1": board1,
             "policy_logit": float(legal_logits[local_idx].item()),
-            "terminal_value": _terminal_value_for_color(board1, color=root_color),
+            "policy_log_prob": float(legal_log_probs[local_idx].item()),
+            "terminal_value": terminal_value,
             "board1_value_opp": None,
             "board1_logits": None,
             "reply_candidates": [],
@@ -682,22 +763,13 @@ def _select_value_search_d2_index(
         board1_batch_to_root.append(len(root_candidates) - 1)
 
     if board1_batches:
-        merged_board1_batch = _merge_single_sequence_batches(board1_batches)
-        board1_output = _forward_model(
+        board1_logits, board1_values = _forward_last_token_outputs(
             model=model,
-            batch=merged_board1_batch,
+            batches=board1_batches,
             device=device,
             dtype=dtype,
+            policy_name="value_search_d2",
         )
-        board1_value_logits = board1_output.get("value_logits")
-        if board1_value_logits is None:
-            raise RuntimeError(
-                "model_move_policy=value_search_d2 requires value_logits in model output."
-            )
-        board1_offsets = merged_board1_batch["seq_offsets"]
-        board1_last_positions = board1_offsets[1:] - 1
-        board1_logits = board1_output["logits"][board1_last_positions]
-        board1_values = board1_value_logits[board1_last_positions]
         for row_idx, root_idx in enumerate(board1_batch_to_root):
             root_candidates[root_idx]["board1_logits"] = board1_logits[row_idx]
             root_candidates[root_idx]["board1_value_opp"] = _value_scalar_from_logits(
@@ -728,14 +800,28 @@ def _select_value_search_d2_index(
 
         opp_k = min(int(value_rerank_top_k), int(opp_mapped_legal))
         _, opp_top_indices = torch.topk(opp_legal_logits, k=opp_k, largest=True)
+        opp_indices = [int(idx.item()) for idx in opp_top_indices]
+        # Always consider forcing replies (captures/checks/promotions): the
+        # tactical refutation is often a low-probability move under a
+        # human-imitation policy, so policy top-k alone misses it.
+        opp_seen = set(opp_indices)
+        for opp_idx, opp_move in enumerate(opp_legal_moves):
+            if opp_idx in opp_seen:
+                continue
+            if (
+                opp_move.promotion is not None
+                or board1.is_capture(opp_move)
+                or board1.gives_check(opp_move)
+            ):
+                opp_indices.append(opp_idx)
+                opp_seen.add(opp_idx)
         reply_rows: list[dict[str, Any]] = []
         candidate_history = root_candidate.get("candidate_history")
         if candidate_history is None:
             continue
-        for opp_local_idx_tensor in opp_top_indices:
-            opp_local_idx = int(opp_local_idx_tensor.item())
+        for opp_local_idx in opp_indices:
             opp_move = opp_legal_moves[opp_local_idx]
-            board2 = board1.copy(stack=False)
+            board2 = board1.copy()
             board2.push(opp_move)
             terminal_value = _terminal_value_for_color(board2, color=root_color)
             reply_row = {
@@ -757,21 +843,13 @@ def _select_value_search_d2_index(
         root_candidate["reply_candidates"] = reply_rows
 
     if board2_batches:
-        merged_board2_batch = _merge_single_sequence_batches(board2_batches)
-        board2_output = _forward_model(
+        _, board2_values = _forward_last_token_outputs(
             model=model,
-            batch=merged_board2_batch,
+            batches=board2_batches,
             device=device,
             dtype=dtype,
+            policy_name="value_search_d2",
         )
-        board2_value_logits = board2_output.get("value_logits")
-        if board2_value_logits is None:
-            raise RuntimeError(
-                "model_move_policy=value_search_d2 requires value_logits in model output."
-            )
-        board2_offsets = merged_board2_batch["seq_offsets"]
-        board2_last_positions = board2_offsets[1:] - 1
-        board2_values = board2_value_logits[board2_last_positions]
         for row_idx, (root_idx, reply_idx) in enumerate(board2_meta):
             root_candidates[root_idx]["reply_candidates"][reply_idx][
                 "value_after_reply"
@@ -807,11 +885,16 @@ def _select_value_search_d2_index(
                 best_reply_uci = str(best_reply["move_uci"])
 
         policy_logit = float(root_candidate["policy_logit"])
-        search_score = policy_logit + (float(value_rerank_lambda) * worst_reply_value)
+        policy_log_prob = float(root_candidate["policy_log_prob"])
+        # Value-dominant score with a small log-prob policy prior as tiebreak.
+        search_score = worst_reply_value + (
+            float(value_rerank_lambda) * policy_log_prob
+        )
         search_rows.append(
             {
                 "move_uci": root_candidate["move"].uci(),
                 "policy_logit": policy_logit,
+                "policy_log_prob": policy_log_prob,
                 "worst_reply_value": worst_reply_value,
                 "best_reply_uci": best_reply_uci,
                 "search_score": search_score,

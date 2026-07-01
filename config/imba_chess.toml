@@ -111,8 +111,9 @@ model_move_policy = "sample"
 sample_temperature = 1.0
 sample_top_k = 8
 sample_top_p = 1.0
-value_rerank_top_k = 8
-value_rerank_lambda = 0.35
+value_rerank_top_k = 16
+# Weight of the log-prob policy prior added to the value score (value-dominant scoring).
+value_rerank_lambda = 0.1
 opening_random_plies = 1
 debug_trace_games = 3
 debug_trace_max_plies = 80

@@ -213,7 +213,8 @@ Mode-specific knobs (`[eval_vs_stockfish]` or CLI):
 
 - `greedy`: no policy-specific knobs.
 - `sample`: `sample_temperature`, `sample_top_k`, `sample_top_p`.
-- `value_rerank` and `value_search_d2`: use `value_rerank_top_k` (default `8`) and `value_rerank_lambda` (default `0.35`).
+- `value_rerank` and `value_search_d2`: use `value_rerank_top_k` (default `16`) and `value_rerank_lambda` (default `0.1`).
+- Both value modes score candidates value-first: `score = value_after_best_reply + lambda * log_prob(move)`, so the value head dominates and the policy log-prob acts as a prior/tiebreak. Terminal positions (mate, stalemate, claimable draws) are scored exactly instead of via the value head, a mate-in-1 found by `value_search_d2` is played immediately, and opponent replies in `value_search_d2` always include all captures, checks, and promotions in addition to policy top-k.
 
 Important: `value_rerank` and `value_search_d2` require a checkpoint trained with value head and a runtime model config with `[model].enable_value_head = true`.
 
@@ -242,8 +243,8 @@ Run with `value_rerank` (1-ply value lookahead):
 python scripts/eval_vs_stockfish.py \
   --checkpoint artifacts/checkpoints/last_*.pt \
   --model-move-policy value_rerank \
-  --value-rerank-top-k 8 \
-  --value-rerank-lambda 0.35
+  --value-rerank-top-k 16 \
+  --value-rerank-lambda 0.1
 ```
 
 Run with `value_search_d2` (policy-pruned depth-2 value search):
@@ -252,8 +253,8 @@ Run with `value_search_d2` (policy-pruned depth-2 value search):
 python scripts/eval_vs_stockfish.py \
   --checkpoint artifacts/checkpoints/last_*.pt \
   --model-move-policy value_search_d2 \
-  --value-rerank-top-k 8 \
-  --value-rerank-lambda 0.35
+  --value-rerank-top-k 16 \
+  --value-rerank-lambda 0.1
 ```
 
 Stockfish Elo-limited mode:
