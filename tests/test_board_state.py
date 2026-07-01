@@ -65,8 +65,6 @@ def test_bucket_clamping():
 
 
 def test_invalid_en_passant_mode_raises():
-    board = chess.Board()
-    board.push_san("e4")
-    encoder = BoardStateEncoder(BoardTokenConfig(en_passant="bad"))  # type: ignore[arg-type]
+    # Mode validation now happens eagerly at construction, not on encode().
     with pytest.raises(ValueError):
-        encoder.encode(board)
+        BoardStateEncoder(BoardTokenConfig(en_passant="bad"))  # type: ignore[arg-type]

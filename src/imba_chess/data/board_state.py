@@ -4,23 +4,9 @@ import chess
 
 from .models import BoardState, BoardTokenConfig
 
-PIECE_TO_ID = {
-    "P": 1,
-    "N": 2,
-    "B": 3,
-    "R": 4,
-    "Q": 5,
-    "K": 6,
-    "p": 7,
-    "n": 8,
-    "b": 9,
-    "r": 10,
-    "q": 11,
-    "k": 12,
-}
-
 
 def _bucket(value: int, max_value: int, bucket_size: int) -> int:
+    # clamp then bucketize
     if value < 0:
         value = 0
     elif value > max_value:
@@ -29,62 +15,64 @@ def _bucket(value: int, max_value: int, bucket_size: int) -> int:
 
 
 def _castle_id(board: chess.Board) -> int:
+    # Standard chess assumption (not Chess960): castling_rights is a bitboard of rook squares.
     rights = board.castling_rights
-    mask = 0
-    if rights & chess.BB_H1:
-        mask |= 1
-    if rights & chess.BB_A1:
-        mask |= 2
-    if rights & chess.BB_H8:
-        mask |= 4
-    if rights & chess.BB_A8:
-        mask |= 8
-    return mask
-
-
-def _ep_file_id(board: chess.Board, mode: str) -> int:
-    ep_square = board.ep_square
-    if ep_square is None:
-        return 0
-
-    if mode == "legal":
-        if not board.has_legal_en_passant():
-            return 0
-    elif mode == "xfen":
-        if not board.has_pseudo_legal_en_passant():
-            return 0
-    elif mode != "fen":
-        raise ValueError(f"Unsupported en_passant mode: {mode}")
-
-    return chess.square_file(ep_square) + 1
+    return (
+        (1 if (rights & chess.BB_H1) else 0)
+        | (2 if (rights & chess.BB_A1) else 0)
+        | (4 if (rights & chess.BB_H8) else 0)
+        | (8 if (rights & chess.BB_A8) else 0)
+    )
 
 
 def _piece_ids(board: chess.Board) -> list[int]:
-    piece_ids = [0] * 64
+    # Avoid piece.symbol() + dict lookup: compute id from piece_type + color.
+    ids = [0] * 64
     for square, piece in board.piece_map().items():
-        piece_ids[square] = PIECE_TO_ID[piece.symbol()]
-    return piece_ids
+        ids[square] = piece.piece_type + (0 if piece.color == chess.WHITE else 6)
+    return ids
 
 
 class BoardStateEncoder:
     def __init__(self, config: BoardTokenConfig | None = None) -> None:
         self.config = config or BoardTokenConfig()
 
+        cfg = self.config
+        if cfg.halfmove_bucket_size <= 0:
+            raise ValueError("halfmove_bucket_size must be > 0")
+        if cfg.fullmove_bucket_size <= 0:
+            raise ValueError("fullmove_bucket_size must be > 0")
+
+        mode = cfg.en_passant
+        if mode == "fen":
+            self._ep_ok = None
+        elif mode == "legal":
+            self._ep_ok = chess.Board.has_legal_en_passant
+        elif mode == "xfen":
+            self._ep_ok = chess.Board.has_pseudo_legal_en_passant
+        else:
+            raise ValueError(f"Unsupported en_passant mode: {mode}")
+
+    def _ep_file_id(self, board: chess.Board) -> int:
+        ep_square = board.ep_square
+        if ep_square is None:
+            return 0
+        if self._ep_ok is not None and not self._ep_ok(board):
+            return 0
+        # chess.square_file(ep_square) == ep_square & 7
+        return (ep_square & 7) + 1
+
     def encode(self, board: chess.Board) -> BoardState:
+        cfg = self.config
         return BoardState(
             piece_ids=_piece_ids(board),
-            turn_id=0 if board.turn == chess.WHITE else 1,
+            turn_id=int(not board.turn),  # white(True)->0, black(False)->1
             castle_id=_castle_id(board),
-            ep_file_id=_ep_file_id(board, self.config.en_passant),
+            ep_file_id=self._ep_file_id(board),
             halfmove_bucket_id=_bucket(
-                board.halfmove_clock,
-                self.config.halfmove_max,
-                self.config.halfmove_bucket_size,
+                board.halfmove_clock, cfg.halfmove_max, cfg.halfmove_bucket_size
             ),
             fullmove_bucket_id=_bucket(
-                board.fullmove_number,
-                self.config.fullmove_max,
-                self.config.fullmove_bucket_size,
+                board.fullmove_number, cfg.fullmove_max, cfg.fullmove_bucket_size
             ),
         )
-
