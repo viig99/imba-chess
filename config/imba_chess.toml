@@ -1,6 +1,8 @@
 [dataset]
 min_avg_elo = 2000
 test_min_avg_elo = 2400
+# Drop bullet/hyperbullet: estimated duration (base + 40 * increment) must be >= 180s.
+min_time_control_sec = 180
 split = "train"
 dataset_name = "Lichess/standard-chess-games"
 train_start_month = "2021-01"

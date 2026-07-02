@@ -18,7 +18,13 @@ from .models import (
     PlayRecord,
     PlayerInfo,
 )
-from .parsing import parse_clk_seconds, parse_elo, read_pgn_from_row, to_text
+from .parsing import (
+    parse_clk_seconds,
+    parse_elo,
+    parse_time_control_seconds,
+    read_pgn_from_row,
+    to_text,
+)
 from .torch_iterable import TorchLichessIterableDataset
 
 VALID_RESULTS = {"1-0", "0-1", "1/2-1/2"}
@@ -46,6 +52,7 @@ class LichessDataset:
     def __init__(
         self,
         min_avg_elo: int = 2000,
+        min_time_control_sec: Optional[int] = None,
         split: str = "train",
         dataset_name: str = "Lichess/standard-chess-games",
         train_start_month: Optional[str] = None,
@@ -66,6 +73,9 @@ class LichessDataset:
         board_state_config: Optional[BoardTokenConfig] = None,
     ) -> None:
         self.min_avg_elo = min_avg_elo
+        self.min_time_control_sec = (
+            int(min_time_control_sec) if min_time_control_sec is not None else None
+        )
         self.split = split
         self.dataset_name = dataset_name
         self.train_start_month = train_start_month
@@ -124,40 +134,53 @@ class LichessDataset:
             load_kwargs.pop("columns", None)
             load_kwargs.pop("batch_size", None)
             rows = load_dataset(**load_kwargs)
-        elo_prefiltered = False
+        prefiltered = False
         if hasattr(rows, "filter"):
             try:
                 rows = rows.filter(
-                    self._game_filter_from_elo_columns,
-                    input_columns=["WhiteElo", "BlackElo"],
+                    self._game_filter_from_columns,
+                    input_columns=["WhiteElo", "BlackElo", "TimeControl"],
                 )
             except TypeError:
                 rows = rows.filter(self._game_filter)
-            elo_prefiltered = True
+            prefiltered = True
 
         yield from self.stream_from_rows(
             rows,
             max_games=self._max_games_for_split(),
-            assume_elo_prefiltered=elo_prefiltered,
+            assume_prefiltered=prefiltered,
         )
 
     def _game_filter(self, row: Dict[str, Any]) -> bool:
-        """Cheap row-level filter to drop low-ELO games before PGN parsing."""
-        return self._game_filter_from_elo_columns(
+        """Cheap row-level filter to drop low-ELO/fast games before PGN parsing."""
+        return self._game_filter_from_columns(
             row.get("WhiteElo"),
             row.get("BlackElo"),
+            row.get("TimeControl"),
         )
 
-    def _game_filter_from_elo_columns(
+    def _game_filter_from_columns(
         self,
         white_elo_raw: Any,
         black_elo_raw: Any,
+        time_control_raw: Any,
     ) -> bool:
         white_elo = parse_elo(white_elo_raw)
         black_elo = parse_elo(black_elo_raw)
         if white_elo is None or black_elo is None:
             return False
-        return ((white_elo + black_elo) / 2) >= self.min_avg_elo
+        if ((white_elo + black_elo) / 2) < self.min_avg_elo:
+            return False
+        return self._passes_time_control(time_control_raw)
+
+    def _passes_time_control(self, time_control_raw: Any) -> bool:
+        if self.min_time_control_sec is None:
+            return True
+        estimated_sec = parse_time_control_seconds(time_control_raw)
+        # Unknown/correspondence time controls fail a strict duration filter.
+        if estimated_sec is None:
+            return False
+        return estimated_sec >= self.min_time_control_sec
 
     def as_torch_iterable(
         self,
@@ -175,7 +198,7 @@ class LichessDataset:
         rows: Iterable[Dict[str, Any]],
         *,
         max_games: Optional[int] = None,
-        assume_elo_prefiltered: bool = False,
+        assume_prefiltered: bool = False,
     ) -> Iterator[GameRecord | Dict[str, Any]]:
         emitted_games = 0
         for row in rows:
@@ -188,7 +211,7 @@ class LichessDataset:
                 row,
                 white_elo=white_elo,
                 black_elo=black_elo,
-                check_elo=not assume_elo_prefiltered,
+                check_prefilters=not assume_prefiltered,
             ):
                 continue
 
@@ -215,7 +238,7 @@ class LichessDataset:
         *,
         white_elo: Optional[int] = None,
         black_elo: Optional[int] = None,
-        check_elo: bool = True,
+        check_prefilters: bool = True,
     ) -> bool:
         if white_elo is None:
             white_elo = parse_elo(row.get("WhiteElo"))
@@ -224,8 +247,11 @@ class LichessDataset:
         if white_elo is None or black_elo is None:
             return False
 
-        if check_elo and ((white_elo + black_elo) / 2) < self.min_avg_elo:
-            return False
+        if check_prefilters:
+            if ((white_elo + black_elo) / 2) < self.min_avg_elo:
+                return False
+            if not self._passes_time_control(row.get("TimeControl")):
+                return False
 
         result = to_text(row.get("Result"), default="")
         if result not in VALID_RESULTS:

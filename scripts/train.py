@@ -101,6 +101,7 @@ def _make_dataset(config, *, split: str) -> LichessDataset:
         min_avg_elo = int(dataset_cfg.test_min_avg_elo)
     return LichessDataset(
         min_avg_elo=min_avg_elo,
+        min_time_control_sec=dataset_cfg.min_time_control_sec,
         split=dataset_cfg.split,
         dataset_name=dataset_cfg.dataset_name,
         train_start_month=dataset_cfg.train_start_month,
