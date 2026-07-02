@@ -152,6 +152,19 @@ python scripts/eval_vs_stockfish.py \
 
 The script reports wins/draws/losses (with color split), completed/incomplete games, average game length, score rate, legal-move vocab coverage, and per-segment plus aggregate summaries in ladder mode.
 
+### Results vs Stockfish 1400 (sweep in progress)
+
+Setup: checkpoint `best_hr10_checkpoint_5` (hr@10 = 0.9208), Stockfish `UCI_Elo` 1400 at 0.05s/move, 100 games per configuration, seed 42, colors alternating. Score = (wins + 0.5 × draws) / games; ±~0.05 standard error at 100 games.
+
+| Move selection | λ | W / D / L | Score rate |
+|---|---|---|---|
+| `value_rerank`, old policy-dominant scoring (best of λ sweep) | 0.35 | 12 / 22 / 66 | 0.230 |
+| `value_search_d2`, value-dominant scoring, K=16 | 0.05 | 20 / 41 / 39 | **0.405** |
+| `value_search_d2`, value-dominant scoring, K=16 | 0.10 | *running* | — |
+| `value_search_d2`, value-dominant scoring, K=16 | 0.20 | *queued* | — |
+
+The jump from 0.23 to 0.405 (~+140 Elo vs the same opponent) is inference-only: same checkpoint, fixed search scoring (value-first with policy log-prob tiebreak), exact terminal handling, and forcing-move opponent replies. Draw share roughly doubled — the search stops losing many previously lost games; converting draws to wins is the next frontier (value head endgame quality).
+
 ## Configuration
 
 All runtime settings are in `config/imba_chess.toml`:
