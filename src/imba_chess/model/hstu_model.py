@@ -147,7 +147,17 @@ class HSTUChessModel(nn.Module):
 
         self.final_norm = nn.LayerNorm(d)
         self.prediction_head = nn.Linear(d, config.move_vocab_size, bias=False)
-        self.value_head = nn.Linear(d, 3) if config.enable_value_head else None
+        # Small private MLP: trunk features are dominated by the policy
+        # objective, so the value head needs its own capacity.
+        self.value_head = (
+            nn.Sequential(
+                nn.Linear(d, d // 2),
+                nn.SiLU(),
+                nn.Linear(d // 2, 3),
+            )
+            if config.enable_value_head
+            else None
+        )
 
         self.register_buffer(
             "square_ids", torch.arange(64, dtype=torch.long), persistent=False

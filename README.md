@@ -32,7 +32,7 @@ Each game becomes:
 
 ## Training objectives
 
-One transformer trunk, two linear heads, trained jointly:
+One transformer trunk, two heads (a linear policy head and a small MLP value head), trained jointly:
 
 ```
 total_loss = policy_loss + [model].value_loss_weight * value_loss
@@ -53,7 +53,7 @@ This is pure imitation learning: no reward signal, no self-play.
 
 ### Value head: win/draw/loss classification
 
-When `[model].enable_value_head = true`, a 3-class head is trained to predict the final result of the game from every position, from the perspective of the player about to move:
+When `[model].enable_value_head = true`, a 3-class MLP head (`Linear → SiLU → Linear`, private capacity so the policy objective doesn't crowd it out of the shared trunk) is trained to predict the final result of the game from every position, from the perspective of the player about to move:
 
 - The label for every position in a game is that game's final outcome (`game_result_white`, flipped by `turn_id`). The head therefore learns "among training games that passed through positions like this, how often did the side to move end up winning?"
 - The target itself is not discounted, but the per-token loss is weighted by game progress (`progress ^ [model].value_weight_alpha`, `progress` in `[0, 1]`): the final outcome is a noisy label for early positions and a clean one for late positions, so early positions contribute little gradient and the last positions contribute full gradient.

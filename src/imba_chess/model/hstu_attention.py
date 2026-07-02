@@ -40,9 +40,12 @@ class SequentialTransductionUnitJagged(torch.nn.Module):
         )
         torch.nn.init.xavier_uniform_(self._o.weight)
 
-        # Position bias — always present
+        # Per-head relative position bias (T5-style): heads can learn distinct
+        # distance priors (e.g. previous-move vs long-range opening context).
         self._ps_w = torch.nn.Parameter(
-            torch.empty(2 * self._max_seq_len - 1).normal_(mean=0, std=0.02),
+            torch.empty(num_heads, 2 * self._max_seq_len - 1).normal_(
+                mean=0, std=0.02
+            ),
         )
 
     def _norm_input(self, x: torch.Tensor) -> torch.Tensor:
@@ -69,7 +72,7 @@ class SequentialTransductionUnitJagged(torch.nn.Module):
         idx = torch.clamp(
             (k_idx - q_idx) + (self._max_seq_len - 1), 0, 2 * self._max_seq_len - 2
         )
-        score = score + self._ps_w[idx].to(score.dtype)
+        score = score + self._ps_w[h, idx].to(score.dtype)
         return score
 
     def _generate_rab_score_mod(self):

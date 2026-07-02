@@ -122,6 +122,33 @@ def _make_dataset(config, *, split: str) -> LichessDataset:
     )
 
 
+def _build_decay_param_groups(
+    model: torch.nn.Module, *, weight_decay: float
+) -> list[dict[str, Any]]:
+    """Decay only Linear weights; embeddings, norms, biases, and bare
+    parameters (e.g. relative-position bias tables) get no decay.
+
+    Sparsely-updated embedding rows otherwise shrink toward zero between the
+    steps that actually touch them.
+    """
+    decay_params: list[torch.nn.Parameter] = []
+    no_decay_params: list[torch.nn.Parameter] = []
+    seen: set[int] = set()
+    for module in model.modules():
+        for param_name, param in module.named_parameters(recurse=False):
+            if not param.requires_grad or id(param) in seen:
+                continue
+            seen.add(id(param))
+            if isinstance(module, torch.nn.Linear) and param_name == "weight":
+                decay_params.append(param)
+            else:
+                no_decay_params.append(param)
+    return [
+        {"params": decay_params, "weight_decay": float(weight_decay)},
+        {"params": no_decay_params, "weight_decay": 0.0},
+    ]
+
+
 def _build_optimizer(model: torch.nn.Module, config, *, device: torch.device):
     if StableAdamW is None:
         raise ImportError(
@@ -129,7 +156,6 @@ def _build_optimizer(model: torch.nn.Module, config, *, device: torch.device):
         )
     kwargs: dict[str, Any] = {
         "lr": float(config.training.max_lr),
-        "weight_decay": float(config.training.weight_decay),
         "triton": bool(config.training.optimizer_triton),
         "kahan_sum": bool(config.training.optimizer_kahan_sum),
     }
@@ -139,7 +165,10 @@ def _build_optimizer(model: torch.nn.Module, config, *, device: torch.device):
                 "training.optimizer_triton=true requires CUDA device. "
                 "Set optimizer_triton=false for CPU training."
             )
-    return StableAdamW(model.parameters(), **kwargs)
+    param_groups = _build_decay_param_groups(
+        model, weight_decay=float(config.training.weight_decay)
+    )
+    return StableAdamW(param_groups, **kwargs)
 
 
 def _build_scheduler(optimizer: torch.optim.Optimizer, config):

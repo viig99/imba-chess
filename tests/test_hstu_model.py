@@ -311,3 +311,71 @@ def test_board_embedding_distinguishes_piece_placement():
 
     assert not torch.allclose(embed(startpos), embed(same_material))
     assert not torch.allclose(embed(startpos), embed(board_missing_rook))
+
+
+def test_stu_layer_per_head_position_bias_forward_backward():
+    from imba_chess.model.hstu_attention import SequentialTransductionUnitJagged
+
+    layer = SequentialTransductionUnitJagged(
+        embedding_dim=16,
+        linear_hidden_dim=8,
+        attention_dim=8,
+        dropout_ratio=0.0,
+        num_heads=2,
+        max_seq_len=32,
+    )
+    assert layer._ps_w.shape == (2, 63)  # [num_heads, 2 * max_seq_len - 1]
+
+    x = torch.randn(5, 16)
+    out = layer(x, block_mask=None)
+    assert out.shape == (5, 16)
+    out.sum().backward()
+    assert layer._ps_w.grad is not None
+    # Each head must receive its own bias gradient.
+    assert not torch.equal(layer._ps_w.grad[0], layer._ps_w.grad[1])
+
+
+def test_optimizer_decay_groups_exclude_embeddings_norms_and_biases():
+    import importlib.util
+    import sys
+    from pathlib import Path
+
+    script_path = Path(__file__).resolve().parents[1] / "scripts" / "train.py"
+    spec = importlib.util.spec_from_file_location("train_script_for_test", script_path)
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = module
+    spec.loader.exec_module(module)
+
+    config = HSTUChessConfig(
+        move_vocab_size=64,
+        model_dim=32,
+        linear_hidden_dim=8,
+        attention_dim=8,
+        num_heads=2,
+        num_layers=2,
+        max_position_embeddings=32,
+        enable_value_head=True,
+    )
+    model = HSTUChessModel(config)
+    groups = module._build_decay_param_groups(model, weight_decay=0.01)
+    assert groups[0]["weight_decay"] == 0.01
+    assert groups[1]["weight_decay"] == 0.0
+    decay_ids = {id(p) for p in groups[0]["params"]}
+    no_decay_ids = {id(p) for p in groups[1]["params"]}
+
+    named = dict(model.named_parameters())
+    assert decay_ids.isdisjoint(no_decay_ids)
+    assert len(decay_ids) + len(no_decay_ids) == len(named)
+
+    for name, param in named.items():
+        if (
+            "embedding" in name
+            or name.endswith(".bias")
+            or "_ps_w" in name
+            or "final_norm" in name
+        ):
+            assert id(param) in no_decay_ids, f"{name} should not decay"
+
+    assert id(model.prediction_head.weight) in decay_ids
+    assert id(named["layers.0._uvqk.weight"]) in decay_ids
+    assert id(named["value_head.0.weight"]) in decay_ids
