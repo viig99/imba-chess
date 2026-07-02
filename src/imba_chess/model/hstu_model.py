@@ -112,8 +112,10 @@ class HSTUChessModel(nn.Module):
             raise ValueError("value_label_smoothing must be in [0.0, 1.0)")
         d = config.model_dim
 
-        self.piece_embedding = nn.Embedding(13, d)
-        self.square_embedding = nn.Embedding(64, d)
+        # Joint (piece, square) table: an additive piece+square scheme collapses
+        # under mean pooling to a bag of material (the square term is constant),
+        # making piece placement invisible to the model.
+        self.piece_square_embedding = nn.Embedding(13 * 64, d)
         self.seq_token_embedding = nn.Embedding(2, d)
         self.turn_embedding = nn.Embedding(2, d)
         self.castle_embedding = nn.Embedding(16, d)
@@ -152,16 +154,15 @@ class HSTUChessModel(nn.Module):
         )
 
     def _embed_board(self, piece_ids: torch.Tensor) -> torch.Tensor:
-        # piece_ids: [S, 64]
-        piece_emb = self.piece_embedding(piece_ids)
-        square_emb = self.square_embedding(self.square_ids).unsqueeze(0)
-        return (piece_emb + square_emb).mean(dim=1)
+        # piece_ids: [S, 64] -> unique id per (piece, square) pair.
+        pair_ids = piece_ids * 64 + self.square_ids
+        return self.piece_square_embedding(pair_ids).mean(dim=1)
 
     def _clamp_ids(self, ids: torch.Tensor, num_embeddings: int) -> torch.Tensor:
         return ids.clamp(min=0, max=num_embeddings - 1)
 
     def _build_content(self, batch: dict[str, Any]) -> torch.Tensor:
-        device = self.piece_embedding.weight.device
+        device = self.piece_square_embedding.weight.device
         piece_ids = batch["piece_ids"].to(
             device=device, dtype=torch.long, non_blocking=True
         )
@@ -221,7 +222,7 @@ class HSTUChessModel(nn.Module):
         block_mask: BlockMask | None = None,
         return_loss: bool = True,
     ) -> dict[str, torch.Tensor]:
-        device = self.piece_embedding.weight.device
+        device = self.piece_square_embedding.weight.device
         seq_offsets = batch["seq_offsets"].to(
             device=device, dtype=torch.long, non_blocking=True
         )

@@ -113,15 +113,26 @@ class MoveVocab:
 
 
 def all_possible_uci_moves() -> List[str]:
-    """Deterministic superset of UCI moves: all from->to plus promotions."""
+    """Deterministic superset of UCI moves: geometrically reachable from->to
+    pairs plus promotions.
+
+    Queen rays + knight jumps from each square cover every piece's movement
+    (king, pawn, castling, and en passant moves are all subsets), so no legal
+    standard-chess move is outside this set. Non-reachable pairs (e.g. a1h2)
+    can never be played and are excluded to keep the label space compact.
+    """
     moves: list[str] = []
 
-    # Non-promotion moves: 64 * 63 = 4032
+    # Non-promotion moves: queen-ray + knight targets per square = 1792.
+    board = chess.Board(None)
     for from_square in chess.SQUARES:
         from_name = chess.square_name(from_square)
-        for to_square in chess.SQUARES:
-            if to_square == from_square:
-                continue
+        targets_mask = 0
+        for piece_type in (chess.QUEEN, chess.KNIGHT):
+            board.set_piece_at(from_square, chess.Piece(piece_type, chess.WHITE))
+            targets_mask |= board.attacks_mask(from_square)
+            board.remove_piece_at(from_square)
+        for to_square in chess.SquareSet(targets_mask):
             moves.append(f"{from_name}{chess.square_name(to_square)}")
 
     # Promotions: 44 base pawn destinations * 4 promo pieces = 176

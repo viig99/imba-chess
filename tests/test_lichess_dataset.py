@@ -201,3 +201,37 @@ def test_stream_shards_parquet_file_list(monkeypatch):
     assert "year=2025/month=09" in train_files[0]
     assert "year=2025/month=07" in train_files[1]
     assert len(train_files) == 2
+
+
+def test_time_control_filter_disabled_by_default():
+    dataset = LichessDataset(min_avg_elo=2000)
+    games = list(dataset.stream_from_rows([_row(TimeControl="60+0")]))
+    assert len(games) == 1
+
+
+def test_time_control_filter_drops_fast_and_unknown_games():
+    dataset = LichessDataset(min_avg_elo=2000, min_time_control_sec=180)
+    rows = [
+        _row(Site="https://lichess.org/bullet", TimeControl="60+0"),
+        _row(Site="https://lichess.org/bullet_inc", TimeControl="120+1"),
+        _row(Site="https://lichess.org/blitz", TimeControl="180+0"),
+        _row(Site="https://lichess.org/blitz_inc", TimeControl="60+3"),
+        _row(Site="https://lichess.org/rapid", TimeControl="600+5"),
+        _row(Site="https://lichess.org/corr", TimeControl="-"),
+        _row(Site="https://lichess.org/unknown", TimeControl="?"),
+    ]
+    games = list(dataset.stream_from_rows(rows))
+    kept = {game["game_id"] for game in games}
+    assert kept == {
+        "https://lichess.org/blitz",
+        "https://lichess.org/blitz_inc",  # 60 + 40*3 = 180
+        "https://lichess.org/rapid",
+    }
+
+
+def test_time_control_column_prefilter_matches_row_filter():
+    dataset = LichessDataset(min_avg_elo=2000, min_time_control_sec=180)
+    assert dataset._game_filter_from_columns("2100", "2100", "300+0")
+    assert not dataset._game_filter_from_columns("2100", "2100", "60+0")
+    assert not dataset._game_filter_from_columns("2100", "2100", "-")
+    assert not dataset._game_filter_from_columns("1700", "1800", "300+0")

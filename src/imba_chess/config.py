@@ -16,6 +16,8 @@ DEFAULT_CONFIG_PATH = Path("config/imba_chess.toml")
 class DatasetConfig:
     min_avg_elo: int = 2000
     test_min_avg_elo: Optional[int] = None
+    # Minimum estimated game duration (base + 40 * increment seconds); None disables.
+    min_time_control_sec: Optional[int] = None
     split: str = "train"
     dataset_name: str = "Lichess/standard-chess-games"
     train_start_month: Optional[str] = None

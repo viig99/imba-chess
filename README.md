@@ -11,8 +11,10 @@ Inspiration:
 - Streaming dataset pipeline over `Lichess/standard-chess-games` (Hugging Face).
 - Temporal month-window splits for `train` / `val` / `test`.
 - Avg-Elo filtering (`(WhiteElo + BlackElo) / 2 >= min_avg_elo`) with optional stricter test filter (`test_min_avg_elo`).
+- Time-control filtering (`min_time_control_sec`, estimated duration = base + 40 × increment) to drop bullet games full of tactical mistakes.
 - PGN parsing into per-move records with board-state tokens.
-- Static UCI move vocabulary.
+- Static UCI move vocabulary: all geometrically reachable from→to pairs + promotions (1,970 tokens incl. specials) — provably covers every legal standard-chess move.
+- Placement-aware board encoding: a joint (piece, square) embedding table, mean-pooled per position (an additive piece+square scheme collapses to a bag of material under pooling).
 - BOS + event sequence construction for next-move prediction.
 - 1D jagged token batches with max-token packing.
 - HSTU-style transformer with two heads: next-move classification and win/draw/loss prediction.
@@ -216,8 +218,8 @@ uv run --python .venv/bin/python --with pytest pytest -q
 - No legal-move masking in the prediction head during training (full-vocab classification); legality is enforced at inference.
 - Lookahead is fixed at depth 2 (our move + opponent response); no deeper tree or MCTS yet.
 - Value labels are raw game outcomes, not engine evaluations (noisy for early positions).
-- No time-control filter on training data: bullet/blitz games pass the Elo filter and carry more tactical mistakes.
 - Streaming order is temporal by month window (newest first); month-level file order can be shuffled at process start via `[dataset].shuffle_train_month_files_on_start`.
+- Checkpoints trained before the placement-aware board encoding / 1,970-token vocab are incompatible with current code (check out an older commit to evaluate them).
 
 ## References
 

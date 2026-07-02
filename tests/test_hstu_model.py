@@ -284,3 +284,30 @@ def test_hstu_chess_model_value_loss_is_finite_when_all_targets_ignored():
     out = model(batch, return_loss=True)
     assert torch.isfinite(out["value_loss"])
     assert out["value_loss"].item() == pytest.approx(0.0, abs=1e-8)
+
+
+def test_board_embedding_distinguishes_piece_placement():
+    """Same material on different squares must embed differently (the old
+    additive piece+square scheme collapsed to a bag of material)."""
+    import chess
+
+    from imba_chess.data.board_state import BoardStateEncoder
+
+    config = HSTUChessConfig(move_vocab_size=32, num_layers=0, dropout=0.0)
+    model = HSTUChessModel(config)
+    encoder = BoardStateEncoder()
+
+    startpos = chess.Board()
+    same_material = chess.Board(
+        "r1bqkbnr/pp1ppppp/2n5/2p5/4P3/5N2/PPPP1PPP/RNBQKB1R w KQkq - 0 1"
+    )
+    board_missing_rook = chess.Board(
+        "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBN1 w Qkq - 0 1"
+    )
+
+    def embed(board: chess.Board) -> torch.Tensor:
+        piece_ids = torch.tensor([encoder.encode(board).piece_ids])
+        return model._embed_board(piece_ids)
+
+    assert not torch.allclose(embed(startpos), embed(same_material))
+    assert not torch.allclose(embed(startpos), embed(board_missing_rook))

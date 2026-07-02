@@ -164,8 +164,7 @@ def _estimate_flops(
 
 def _print_model_params(model: HSTUChessModel) -> None:
     rows: list[tuple[str, int]] = [
-        ("piece_embedding", _count_params(model.piece_embedding)),
-        ("square_embedding", _count_params(model.square_embedding)),
+        ("piece_square_embedding", _count_params(model.piece_square_embedding)),
         ("seq_token_embedding", _count_params(model.seq_token_embedding)),
         ("turn_embedding", _count_params(model.turn_embedding)),
         ("castle_embedding", _count_params(model.castle_embedding)),
