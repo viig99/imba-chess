@@ -152,18 +152,24 @@ python scripts/eval_vs_stockfish.py \
 
 The script reports wins/draws/losses (with color split), completed/incomplete games, average game length, score rate, legal-move vocab coverage, and per-segment plus aggregate summaries in ladder mode.
 
-### Results vs Stockfish 1400 (sweep in progress)
+### Results vs Stockfish 1400
 
 Setup: checkpoint `best_hr10_checkpoint_5` (hr@10 = 0.9208), Stockfish `UCI_Elo` 1400 at 0.05s/move, 100 games per configuration, seed 42, colors alternating. Score = (wins + 0.5 × draws) / games; ±~0.05 standard error at 100 games.
 
 | Move selection | λ | W / D / L | Score rate |
 |---|---|---|---|
-| `value_rerank`, old policy-dominant scoring (best of λ sweep) | 0.35 | 12 / 22 / 66 | 0.230 |
+| `value_search_d2`, value only (no policy prior) | 0.00 | 1 / 22 / 77 | 0.120 |
 | `value_search_d2`, value-dominant scoring, K=16 | 0.05 | 20 / 41 / 39 | **0.405** |
-| `value_search_d2`, value-dominant scoring, K=16 | 0.10 | *running* | — |
-| `value_search_d2`, value-dominant scoring, K=16 | 0.20 | *queued* | — |
+| `value_search_d2`, value-dominant scoring, K=16 | 0.10 | 27 / 26 / 47 | 0.400 |
+| `value_search_d2`, value-dominant scoring, K=16 | 0.20 | 27 / 24 / 49 | 0.390 |
+| `value_rerank`, old policy-dominant scoring (best of λ sweep) | 0.35 | 12 / 22 / 66 | 0.230 |
 
-The jump from 0.23 to 0.405 (~+140 Elo vs the same opponent) is inference-only: same checkpoint, fixed search scoring (value-first with policy log-prob tiebreak), exact terminal handling, and forcing-move opponent replies. Draw share roughly doubled — the search stops losing many previously lost games; converting draws to wins is the next frontier (value head endgame quality).
+Takeaways:
+
+- Value-dominant scoring nearly doubles the score rate over the old policy-dominant scoring (0.23 → 0.40, ~+140 Elo vs the same opponent), inference-only: same checkpoint, fixed search scoring, exact terminal handling, forcing-move opponent replies.
+- The score is flat across λ ∈ [0.05, 0.2]; larger λ trades draws for decisive games at equal expected score.
+- The λ = 0 control collapses (0.12): optimizing purely against the learned value head over-exploits its noise (Goodhart). The policy log-prob prior is a necessary regularizer that keeps candidates human-plausible, not a cosmetic tiebreak.
+- Draw share roughly doubled at λ = 0.05 vs the old scoring — the search stops losing many previously lost games; converting draws into wins (value-head endgame quality) is the next frontier.
 
 ## Configuration
 
