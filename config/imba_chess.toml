@@ -70,7 +70,9 @@ full_val_every_epochs = 1
 fast_val_max_games = 10000
 fast_test_max_games = 10000
 max_lr = 1e-3
-lr_start_factor = 0.1
+# Start at full LR: StableAdamW's update clipping + grad_clip_norm cover early
+# second-moment instability, and warmup wastes the most sample-efficient steps.
+lr_start_factor = 1.0
 lr_end_factor = 0.5
 onecycle_warmup_fraction_first_epoch = 0.1
 weight_decay = 0.01
