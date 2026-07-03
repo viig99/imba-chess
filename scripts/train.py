@@ -503,6 +503,9 @@ def main() -> None:
             has_value_loss = value_loss is not None
             if value_loss is None:
                 value_loss = torch.zeros_like(loss)
+            moves_left_loss = output.get("moves_left_loss")
+            if moves_left_loss is None:
+                moves_left_loss = torch.zeros_like(loss)
         if should_sync_check and not bool(torch.isfinite(loss).item()):
             raise FloatingPointError(
                 f"Non-finite loss encountered at iteration {engine.state.iteration}"
@@ -530,6 +533,7 @@ def main() -> None:
             "policy_loss": policy_loss.detach(),
             "value_loss": value_loss.detach(),
             "has_value_loss": 1.0 if has_value_loss else 0.0,
+            "moves_left_loss": moves_left_loss.detach(),
             "lr": float(optimizer.param_groups[0]["lr"]),
             "tokens": float(int(batch["total_tokens"])),
             "games": float(batch_games),
@@ -555,6 +559,7 @@ def main() -> None:
                 if float(out["has_value_loss"]) > 0.5
                 else "--"
             ),
+            "moves_left": f"{float(out['moves_left_loss'].item()):.4f}",
             "lr": f"{out['lr']:.6f}",
             "tokens": int(out["tokens"]),
             "games": int(out["games"]),
@@ -585,6 +590,7 @@ def main() -> None:
             {
                 "total_loss": float(output["total_loss"].item()),
                 "policy_loss": float(output["policy_loss"].item()),
+                "moves_left_loss": float(output["moves_left_loss"].item()),
                 "lr": float(output["lr"]),
                 "tokens": float(output["tokens"]),
                 "games": float(output["games"]),
@@ -688,6 +694,7 @@ def main() -> None:
             f"total_loss={float(engine.state.output['total_loss'].item()):.6f} "
             f"policy_loss={float(engine.state.output['policy_loss'].item()):.6f} "
             f"value_loss={value_loss_text} "
+            f"moves_left_loss={float(engine.state.output['moves_left_loss'].item()):.6f} "
             f"lr={engine.state.output['lr']:.7f} "
             f"tokens={int(engine.state.output['tokens'])} "
             f"games_batch={int(engine.state.output['games'])} "

@@ -38,6 +38,7 @@ class HSTUChessConfig:
     value_loss_weight: float = 0.15
     value_weight_alpha: float = 1.5
     value_label_smoothing: float = 0.0
+    moves_left_loss_weight: float = 0.05
 
 
 def build_hstu_chess_config(
@@ -66,6 +67,7 @@ def build_hstu_chess_config(
         value_loss_weight=float(model_config.value_loss_weight),
         value_weight_alpha=float(model_config.value_weight_alpha),
         value_label_smoothing=float(model_config.value_label_smoothing),
+        moves_left_loss_weight=float(model_config.moves_left_loss_weight),
     )
 
 
@@ -110,6 +112,8 @@ class HSTUChessModel(nn.Module):
             raise ValueError("value_weight_alpha must be > 0")
         if not 0.0 <= float(config.value_label_smoothing) < 1.0:
             raise ValueError("value_label_smoothing must be in [0.0, 1.0)")
+        if float(config.moves_left_loss_weight) < 0.0:
+            raise ValueError("moves_left_loss_weight must be >= 0")
         d = config.model_dim
 
         # Joint (piece, square) table: an additive piece+square scheme collapses
@@ -157,6 +161,15 @@ class HSTUChessModel(nn.Module):
             )
             if config.enable_value_head
             else None
+        )
+        # Auxiliary target: predicting log(plies remaining) forces the trunk
+        # to represent how close the game is to being decided — a feature the
+        # value head needs but the policy objective never asks for. The head's
+        # output is unused at inference.
+        self.moves_left_head = nn.Sequential(
+            nn.Linear(d, d // 2),
+            nn.SiLU(),
+            nn.Linear(d // 2, 1),
         )
 
         self.register_buffer(
@@ -293,9 +306,20 @@ class HSTUChessModel(nn.Module):
             policy_loss = policy_loss_sum / policy_weight_sum
             output["policy_loss"] = policy_loss
 
+            total_loss = policy_loss
+
+            counts = seq_offsets[1:] - seq_offsets[:-1]
+            batch_games = int(counts.numel())
+            token_game_id = torch.repeat_interleave(
+                torch.arange(batch_games, device=policy_logits.device),
+                counts,
+            )
+            token_pos_in_game = torch.arange(
+                policy_logits.shape[0], device=policy_logits.device
+            ) - seq_offsets.index_select(0, token_game_id)
+            seq_len_for_token = counts.index_select(0, token_game_id).clamp_min(1)
+
             if value_logits is not None:
-                counts = seq_offsets[1:] - seq_offsets[:-1]
-                batch_games = int(counts.numel())
                 game_result_white = batch["game_result_white"].to(
                     device=policy_logits.device, dtype=torch.long, non_blocking=True
                 )
@@ -303,10 +327,6 @@ class HSTUChessModel(nn.Module):
                     raise ValueError(
                         "game_result_white must have shape [B] where B == num_games"
                     )
-                token_game_id = torch.repeat_interleave(
-                    torch.arange(batch_games, device=policy_logits.device),
-                    counts,
-                )
                 z_token = game_result_white.index_select(0, token_game_id)
                 turn_id = batch["turn_id"].to(
                     device=policy_logits.device, dtype=torch.long, non_blocking=True
@@ -314,10 +334,6 @@ class HSTUChessModel(nn.Module):
                 y = torch.where(turn_id == 0, z_token, -z_token)
                 value_target = (y + 1).clamp(min=0, max=2)
 
-                token_pos_in_game = torch.arange(
-                    policy_logits.shape[0], device=policy_logits.device
-                ) - seq_offsets.index_select(0, token_game_id)
-                seq_len_for_token = counts.index_select(0, token_game_id).clamp_min(1)
                 progress = token_pos_in_game.to(torch.float32) / (
                     seq_len_for_token.to(torch.float32) - 1.0
                 ).clamp_min(1.0)
@@ -334,10 +350,26 @@ class HSTUChessModel(nn.Module):
                 value_weight_sum = value_weights.sum().clamp_min(1.0)
                 value_loss = value_loss_sum / value_weight_sum
                 output["value_loss"] = value_loss
-                output["loss"] = policy_loss + (
-                    self.config.value_loss_weight * value_loss
-                )
-            else:
-                output["loss"] = policy_loss
+                total_loss = total_loss + self.config.value_loss_weight * value_loss
+
+            # log1p compresses the target so errors near the end of the game
+            # (where decidedness is informative) dominate errors at move 10.
+            plies_left = (seq_len_for_token - 1 - token_pos_in_game).clamp_min(0)
+            moves_left_target = torch.log1p(plies_left.to(torch.float32))
+            moves_left_pred = self.moves_left_head(x).squeeze(-1).float()
+            output["moves_left_pred"] = moves_left_pred
+            per_token_moves_left_loss = F.huber_loss(
+                moves_left_pred, moves_left_target, reduction="none"
+            )
+            moves_left_weights = valid_mask.to(per_token_moves_left_loss.dtype)
+            moves_left_loss = (
+                per_token_moves_left_loss * moves_left_weights
+            ).sum() / moves_left_weights.sum().clamp_min(1.0)
+            output["moves_left_loss"] = moves_left_loss
+            total_loss = (
+                total_loss + self.config.moves_left_loss_weight * moves_left_loss
+            )
+
+            output["loss"] = total_loss
 
         return output

@@ -139,7 +139,7 @@ def test_hstu_chess_model_elo_weighted_loss_matches_manual_formula():
         1.0 + config.elo_loss_weight_strength * elo_curve
     )
     expected = (per_token_loss * token_weights).sum() / token_weights.sum().clamp_min(1.0)
-    assert torch.allclose(out["loss"], expected, atol=1e-6, rtol=1e-6)
+    assert torch.allclose(out["policy_loss"], expected, atol=1e-6, rtol=1e-6)
 
 
 def test_hstu_chess_model_elo_strength_zero_matches_unweighted_loss():
@@ -171,7 +171,7 @@ def test_hstu_chess_model_elo_strength_zero_matches_unweighted_loss():
     expected = (
         per_token_loss * valid_mask.to(per_token_loss.dtype)
     ).sum() / valid_mask.to(per_token_loss.dtype).sum().clamp_min(1.0)
-    assert torch.allclose(out["loss"], expected, atol=1e-6, rtol=1e-6)
+    assert torch.allclose(out["policy_loss"], expected, atol=1e-6, rtol=1e-6)
 
 
 def test_elo_normalization_clamps_at_config_bounds():
@@ -207,7 +207,11 @@ def test_hstu_chess_model_value_head_outputs_and_combines_loss():
     assert out["value_logits"].shape == (5, 3)
     assert out["policy_loss"].ndim == 0
     assert out["value_loss"].ndim == 0
-    expected = out["policy_loss"] + (config.value_loss_weight * out["value_loss"])
+    expected = (
+        out["policy_loss"]
+        + config.value_loss_weight * out["value_loss"]
+        + config.moves_left_loss_weight * out["moves_left_loss"]
+    )
     assert torch.allclose(out["loss"], expected, atol=1e-6, rtol=1e-6)
 
 
@@ -284,6 +288,59 @@ def test_hstu_chess_model_value_loss_is_finite_when_all_targets_ignored():
     out = model(batch, return_loss=True)
     assert torch.isfinite(out["value_loss"])
     assert out["value_loss"].item() == pytest.approx(0.0, abs=1e-8)
+
+
+def test_hstu_chess_model_moves_left_loss_matches_manual_formula():
+    config = HSTUChessConfig(
+        move_vocab_size=128,
+        model_dim=64,
+        linear_hidden_dim=16,
+        attention_dim=16,
+        num_heads=2,
+        num_layers=0,
+        max_position_embeddings=32,
+        moves_left_loss_weight=0.07,
+    )
+    model = HSTUChessModel(config)
+    batch = _batch()
+
+    out = model(batch, return_loss=True)
+    pred = out["moves_left_pred"]
+    assert pred.shape == (5,)
+
+    seq_offsets = batch["seq_offsets"]
+    counts = seq_offsets[1:] - seq_offsets[:-1]
+    token_game_id = torch.repeat_interleave(
+        torch.arange(batch["num_games"]), counts
+    )
+    token_pos = torch.arange(pred.shape[0]) - seq_offsets[token_game_id]
+    seq_len = counts[token_game_id].clamp_min(1)
+    plies_left = (seq_len - 1 - token_pos).clamp_min(0)
+    target = torch.log1p(plies_left.to(torch.float32))
+
+    valid_mask = (batch["target_move_id"] != config.ignore_index).to(torch.float32)
+    per_token = F.huber_loss(pred, target, reduction="none")
+    expected = (per_token * valid_mask).sum() / valid_mask.sum().clamp_min(1.0)
+    assert torch.allclose(out["moves_left_loss"], expected, atol=1e-6, rtol=1e-6)
+
+
+def test_hstu_chess_model_moves_left_head_receives_gradients():
+    config = HSTUChessConfig(
+        move_vocab_size=128,
+        model_dim=64,
+        linear_hidden_dim=16,
+        attention_dim=16,
+        num_heads=2,
+        num_layers=0,
+        max_position_embeddings=32,
+    )
+    model = HSTUChessModel(config)
+    out = model(_batch(), return_loss=True)
+    out["loss"].backward()
+
+    grads = [p.grad for p in model.moves_left_head.parameters()]
+    assert all(g is not None for g in grads)
+    assert any(g.abs().sum().item() > 0 for g in grads)
 
 
 def test_board_embedding_distinguishes_piece_placement():

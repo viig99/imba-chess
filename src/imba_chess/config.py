@@ -84,6 +84,7 @@ class ModelConfig:
     value_loss_weight: float = 0.15
     value_weight_alpha: float = 1.5
     value_label_smoothing: float = 0.0
+    moves_left_loss_weight: float = 0.05
 
 
 @dataclass(frozen=True)
