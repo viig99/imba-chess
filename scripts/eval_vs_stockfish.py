@@ -246,27 +246,9 @@ def _parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--model-move-policy",
-        choices=["greedy", "sample", "value_rerank", "value_search_d2"],
+        choices=["greedy", "value_rerank", "value_search_d2"],
         default=None,
         help="Model move selection on legal moves.",
-    )
-    parser.add_argument(
-        "--sample-temperature",
-        type=float,
-        default=None,
-        help="Softmax temperature for sampled policy.",
-    )
-    parser.add_argument(
-        "--sample-top-k",
-        type=int,
-        default=None,
-        help="Top-k truncation before sampling (0 disables).",
-    )
-    parser.add_argument(
-        "--sample-top-p",
-        type=float,
-        default=None,
-        help="Top-p nucleus truncation before sampling in (0, 1].",
     )
     parser.add_argument(
         "--value-rerank-top-k",
@@ -490,39 +472,6 @@ def _project_legal_logits(
     )
     legal_logits = logits.index_select(0, legal_ids_tensor)
     return legal_logits, legal_moves_with_ids, total_legal, mapped_legal
-
-
-def _select_sample_index(
-    *,
-    legal_logits: torch.Tensor,
-    mapped_legal: int,
-    sample_temperature: float,
-    sample_top_k: int,
-    sample_top_p: float,
-) -> tuple[int, torch.Tensor | None]:
-    filtered_logits = legal_logits / float(sample_temperature)
-    if sample_top_k > 0 and sample_top_k < mapped_legal:
-        topk_values, _ = torch.topk(filtered_logits, k=int(sample_top_k))
-        kth_value = topk_values[-1]
-        filtered_logits = torch.where(
-            filtered_logits >= kth_value,
-            filtered_logits,
-            torch.full_like(filtered_logits, float("-inf")),
-        )
-    if sample_top_p < 1.0:
-        sorted_logits, sorted_idx = torch.sort(filtered_logits, descending=True)
-        sorted_probs = torch.softmax(sorted_logits, dim=0)
-        cumsum_probs = torch.cumsum(sorted_probs, dim=0)
-        remove_mask = cumsum_probs > float(sample_top_p)
-        remove_mask[0] = False
-        sorted_logits = sorted_logits.masked_fill(remove_mask, float("-inf"))
-        filtered = torch.full_like(filtered_logits, float("-inf"))
-        filtered.scatter_(0, sorted_idx, sorted_logits)
-        filtered_logits = filtered
-    probs = torch.softmax(filtered_logits, dim=0)
-    if not bool(torch.isfinite(probs).all()) or float(probs.sum().item()) <= 0.0:
-        return int(torch.argmax(legal_logits).item()), None
-    return int(torch.multinomial(probs, num_samples=1).item()), probs
 
 
 def _merge_single_sequence_batches(
@@ -917,9 +866,6 @@ def _select_model_move(
     device: torch.device,
     dtype: torch.dtype,
     policy: str,
-    sample_temperature: float,
-    sample_top_k: int,
-    sample_top_p: float,
     value_rerank_top_k: int,
     value_rerank_lambda: float,
     debug_topk: int = 0,
@@ -937,19 +883,10 @@ def _select_model_move(
         board=board,
         move_vocab=move_vocab,
     )
-    probs_for_debug: torch.Tensor | None = None
     rerank_rows: list[dict[str, Any]] = []
     search_rows: list[dict[str, Any]] = []
     if policy == "greedy":
         chosen_index = int(torch.argmax(legal_logits).item())
-    elif policy == "sample":
-        chosen_index, probs_for_debug = _select_sample_index(
-            legal_logits=legal_logits,
-            mapped_legal=mapped_legal,
-            sample_temperature=sample_temperature,
-            sample_top_k=sample_top_k,
-            sample_top_p=sample_top_p,
-        )
     elif policy == "value_rerank":
         if output.get("value_logits") is None:
             raise RuntimeError(
@@ -1006,19 +943,9 @@ def _select_model_move(
             {
                 "move_uci": legal_moves_with_ids[int(local_idx)].uci(),
                 "logit": float(value.item()),
-                "prob": (
-                    float(probs_for_debug[int(local_idx)].item())
-                    if probs_for_debug is not None
-                    else None
-                ),
             }
             for value, local_idx in zip(top_values, top_indices)
         ]
-    debug["selected_prob"] = (
-        float(probs_for_debug[chosen_index].item())
-        if probs_for_debug is not None
-        else None
-    )
     return legal_moves_with_ids[chosen_index], debug
 
 
@@ -1080,9 +1007,6 @@ def _summary_to_payload(
     seed: int,
     max_plies: int,
     model_move_policy: str,
-    sample_temperature: float,
-    sample_top_k: int,
-    sample_top_p: float,
     value_rerank_top_k: int,
     value_rerank_lambda: float,
     opening_random_plies: int,
@@ -1150,9 +1074,6 @@ def _summary_to_payload(
             "seed": int(seed),
             "max_plies": int(max_plies),
             "model_move_policy": model_move_policy,
-            "sample_temperature": float(sample_temperature),
-            "sample_top_k": int(sample_top_k),
-            "sample_top_p": float(sample_top_p),
             "value_rerank_top_k": int(value_rerank_top_k),
             "value_rerank_lambda": float(value_rerank_lambda),
             "opening_random_plies": int(opening_random_plies),
@@ -1273,9 +1194,6 @@ def _run_segment(
     device: torch.device,
     dtype: torch.dtype,
     model_move_policy: str,
-    sample_temperature: float,
-    sample_top_k: int,
-    sample_top_p: float,
     value_rerank_top_k: int,
     value_rerank_lambda: float,
     opening_random_plies: int,
@@ -1326,9 +1244,6 @@ def _run_segment(
                         device=device,
                         dtype=dtype,
                         policy=model_move_policy,
-                        sample_temperature=sample_temperature,
-                        sample_top_k=sample_top_k,
-                        sample_top_p=sample_top_p,
                         value_rerank_top_k=value_rerank_top_k,
                         value_rerank_lambda=value_rerank_lambda,
                         debug_topk=debug_topk,
@@ -1346,24 +1261,14 @@ def _run_segment(
                     ):
                         turn = "W" if board.turn == chess.WHITE else "B"
                         coverage = float(debug_info["coverage"])
-                        selected_prob = debug_info.get("selected_prob")
-                        prob_text = (
-                            f" selected_prob={selected_prob:.4f}"
-                            if isinstance(selected_prob, float)
-                            else ""
-                        )
                         tqdm.write(
                             f"[debug][{segment_name}] game={game_idx + 1} ply={plies + 1} turn={turn} "
-                            f"coverage={coverage:.3f} selected={move.uci()}{prob_text}"
+                            f"coverage={coverage:.3f} selected={move.uci()}"
                         )
                         topk = debug_info.get("topk_legal")
                         if isinstance(topk, list) and topk:
                             topk_str = ", ".join(
-                                (
-                                    f"{entry['move_uci']}:{entry['logit']:.3f}"
-                                    if entry.get("prob") is None
-                                    else f"{entry['move_uci']}:{entry['logit']:.3f}|p={entry['prob']:.3f}"
-                                )
+                                f"{entry['move_uci']}:{entry['logit']:.3f}"
                                 for entry in topk
                             )
                             tqdm.write(f"[debug][{segment_name}]   topk={topk_str}")
@@ -1545,17 +1450,6 @@ def main() -> None:
         if args.model_move_policy is None
         else args.model_move_policy
     )
-    args.sample_temperature = float(
-        eval_cfg.sample_temperature
-        if args.sample_temperature is None
-        else args.sample_temperature
-    )
-    args.sample_top_k = int(
-        eval_cfg.sample_top_k if args.sample_top_k is None else args.sample_top_k
-    )
-    args.sample_top_p = float(
-        eval_cfg.sample_top_p if args.sample_top_p is None else args.sample_top_p
-    )
     args.value_rerank_top_k = int(
         eval_cfg.value_rerank_top_k
         if args.value_rerank_top_k is None
@@ -1599,24 +1493,17 @@ def main() -> None:
         raise ValueError("--stockfish-hash-mb must be >= 1")
     if args.opening_random_plies < 0:
         raise ValueError("--opening-random-plies must be >= 0")
-    if args.sample_top_k < 0:
-        raise ValueError("--sample-top-k must be >= 0")
-    if float(args.sample_temperature) <= 0.0:
-        raise ValueError("--sample-temperature must be > 0")
-    if not (0.0 < float(args.sample_top_p) <= 1.0):
-        raise ValueError("--sample-top-p must be in (0, 1]")
     if args.value_rerank_top_k < 1:
         raise ValueError("--value-rerank-top-k must be >= 1")
     if float(args.value_rerank_lambda) < 0.0:
         raise ValueError("--value-rerank-lambda must be >= 0")
     if args.model_move_policy not in {
         "greedy",
-        "sample",
         "value_rerank",
         "value_search_d2",
     }:
         raise ValueError(
-            "--model-move-policy must be one of: greedy, sample, value_rerank, value_search_d2"
+            "--model-move-policy must be one of: greedy, value_rerank, value_search_d2"
         )
     if not args.stockfish_path.exists():
         raise FileNotFoundError(f"Stockfish binary not found: {args.stockfish_path}")
@@ -1655,8 +1542,7 @@ def main() -> None:
     print(f"  device={device}, dtype={dtype}, compile={compile_enabled}")
     print(
         "  model_policy="
-        f"{args.model_move_policy}, temp={args.sample_temperature}, "
-        f"top_k={args.sample_top_k}, top_p={args.sample_top_p}, "
+        f"{args.model_move_policy}, "
         f"value_rerank_top_k={args.value_rerank_top_k}, "
         f"value_rerank_lambda={args.value_rerank_lambda}, "
         f"opening_random_plies={args.opening_random_plies}"
@@ -1689,9 +1575,6 @@ def main() -> None:
                 device=device,
                 dtype=dtype,
                 model_move_policy=str(args.model_move_policy),
-                sample_temperature=float(args.sample_temperature),
-                sample_top_k=int(args.sample_top_k),
-                sample_top_p=float(args.sample_top_p),
                 value_rerank_top_k=int(args.value_rerank_top_k),
                 value_rerank_lambda=float(args.value_rerank_lambda),
                 opening_random_plies=int(args.opening_random_plies),
@@ -1711,9 +1594,6 @@ def main() -> None:
                 seed=args.seed,
                 max_plies=args.max_plies,
                 model_move_policy=str(args.model_move_policy),
-                sample_temperature=float(args.sample_temperature),
-                sample_top_k=int(args.sample_top_k),
-                sample_top_p=float(args.sample_top_p),
                 value_rerank_top_k=int(args.value_rerank_top_k),
                 value_rerank_lambda=float(args.value_rerank_lambda),
                 opening_random_plies=int(args.opening_random_plies),
@@ -1754,9 +1634,6 @@ def main() -> None:
         seed=args.seed,
         max_plies=args.max_plies,
         model_move_policy=str(args.model_move_policy),
-        sample_temperature=float(args.sample_temperature),
-        sample_top_k=int(args.sample_top_k),
-        sample_top_p=float(args.sample_top_p),
         value_rerank_top_k=int(args.value_rerank_top_k),
         value_rerank_lambda=float(args.value_rerank_lambda),
         opening_random_plies=int(args.opening_random_plies),

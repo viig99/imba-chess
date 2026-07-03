@@ -136,9 +136,6 @@ class EvalVsStockfishConfig:
     dtype: str = "bfloat16"
     compile: bool = False
     model_move_policy: str = "greedy"
-    sample_temperature: float = 1.0
-    sample_top_k: int = 0
-    sample_top_p: float = 1.0
     value_rerank_top_k: int = 8
     value_rerank_lambda: float = 0.35
     opening_random_plies: int = 0

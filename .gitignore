@@ -209,3 +209,4 @@ uv.lock
 artifacts/
 logs.txt
 VALUE_SEARCH_CONVERSATION.md
+.claude/

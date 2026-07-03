@@ -80,7 +80,6 @@ Best checkpoints are selected by `hr@10` from `full_val`; last checkpoints are s
 `model_move_policy` modes:
 
 - `greedy`: play the highest-logit legal move.
-- `sample`: sample from legal moves with temperature/top-k/top-p.
 - `value_rerank`: propose top-K moves with the policy head, grade each by the value head after the move, pick the best grade.
 - `value_search_d2`: same, but each proposal is stress-tested against the opponent's best response before grading (see below).
 

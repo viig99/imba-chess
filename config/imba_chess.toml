@@ -113,9 +113,6 @@ device = "auto"
 dtype = "bfloat16"
 compile = true
 model_move_policy = "value_search_d2"
-sample_temperature = 1.0
-sample_top_k = 8
-sample_top_p = 1.0
 value_rerank_top_k = 16
 # Weight of the log-prob policy prior added to the value score (value-dominant scoring).
 # Sweep vs SF1400: flat 0.40 across 0.05-0.2; lambda=0 collapses to 0.12.
