@@ -8,7 +8,6 @@ import torch.nn as nn
 import torch.nn.functional as F
 from attn_gym.masks import generate_doc_mask_mod, generate_prefix_lm_mask
 from torch.nn.attention.flex_attention import BlockMask, create_block_mask
-from torch.utils.checkpoint import checkpoint
 
 from .hstu_attention import SequentialTransductionUnitJagged
 from .position_embedding import PositionEmbedding
@@ -118,7 +117,11 @@ class _SquareAttentionBlock(nn.Module):
         boards, squares, dim = x.shape
         qkv = self.qkv(self.attn_norm(x))
         qkv = qkv.view(boards, squares, 3, self.num_heads, dim // self.num_heads)
-        q, k, v = qkv.permute(2, 0, 3, 1, 4).unbind(0)
+        # permute+unbind leaves q/k/v as non-contiguous views sharing one
+        # buffer, which caused a stride mismatch between torch.compile's
+        # fake kernel and the real one; materializing avoids that (cheap at
+        # this size: 64 squares).
+        q, k, v = (t.contiguous() for t in qkv.permute(2, 0, 3, 1, 4).unbind(0))
         attn = F.scaled_dot_product_attention(q, k, v)
         attn = attn.transpose(1, 2).reshape(boards, squares, dim)
         x = x + self.attn_out(attn)
@@ -149,13 +152,14 @@ class BoardSquareEncoder(nn.Module):
         self.out_proj = nn.Linear(dim, out_dim)
 
     def forward(self, squares: torch.Tensor) -> torch.Tensor:
+        # Not checkpointed: under torch.compile, checkpointing a block that
+        # contains SDPA makes AOT-autograd wrap the kernel in
+        # graphsafe_run_with_rng_state (to keep RNG state consistent across
+        # the backward recompute) — that wrapped op hits a CUDA "invalid
+        # argument" during the flash-attention backward. Eager checkpointing
+        # is fine; it's specifically the compiled-recompute path that's broken.
         for block in self.blocks:
-            if self.training and torch.is_grad_enabled():
-                # Per-square activations are 64x the trunk's per-token ones;
-                # recomputing them in backward keeps peak memory in check.
-                squares = checkpoint(block, squares, use_reentrant=False)
-            else:
-                squares = block(squares)
+            squares = block(squares)
         return self.out_proj(self.final_norm(squares).mean(dim=1))
 
 
