@@ -433,6 +433,10 @@ def test_optimizer_decay_groups_exclude_embeddings_norms_and_biases():
         ):
             assert id(param) in no_decay_ids, f"{name} should not decay"
 
-    assert id(model.prediction_head.weight) in decay_ids
+    # prediction_head.weight is tied to prev_move_embedding.weight and must
+    # get embedding treatment (no decay), counted once.
+    assert model.prediction_head.weight is model.prev_move_embedding.weight
+    assert id(model.prediction_head.weight) in no_decay_ids
     assert id(named["layers.0._uvqk.weight"]) in decay_ids
     assert id(named["value_head.0.weight"]) in decay_ids
+    assert id(named["board_encoder.blocks.0.qkv.weight"]) in decay_ids

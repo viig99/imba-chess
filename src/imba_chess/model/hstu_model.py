@@ -8,6 +8,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from attn_gym.masks import generate_doc_mask_mod, generate_prefix_lm_mask
 from torch.nn.attention.flex_attention import BlockMask, create_block_mask
+from torch.utils.checkpoint import checkpoint
 
 from .hstu_attention import SequentialTransductionUnitJagged
 from .position_embedding import PositionEmbedding
@@ -92,6 +93,72 @@ def create_batch_block_mask(
     )
 
 
+# 64-dim keeps the encoder at ~2/3 of the trunk's per-token FLOPs; 128-dim
+# quadruples it and roughly triples the training step.
+_BOARD_ENCODER_DIM = 64
+_BOARD_ENCODER_HEADS = 4
+_BOARD_ENCODER_LAYERS = 2
+
+
+class _SquareAttentionBlock(nn.Module):
+    def __init__(self, *, dim: int, num_heads: int) -> None:
+        super().__init__()
+        self.num_heads = num_heads
+        self.attn_norm = nn.LayerNorm(dim)
+        self.qkv = nn.Linear(dim, 3 * dim, bias=False)
+        self.attn_out = nn.Linear(dim, dim, bias=False)
+        self.mlp_norm = nn.LayerNorm(dim)
+        self.mlp = nn.Sequential(
+            nn.Linear(dim, 2 * dim),
+            nn.SiLU(),
+            nn.Linear(2 * dim, dim),
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        boards, squares, dim = x.shape
+        qkv = self.qkv(self.attn_norm(x))
+        qkv = qkv.view(boards, squares, 3, self.num_heads, dim // self.num_heads)
+        q, k, v = qkv.permute(2, 0, 3, 1, 4).unbind(0)
+        attn = F.scaled_dot_product_attention(q, k, v)
+        attn = attn.transpose(1, 2).reshape(boards, squares, dim)
+        x = x + self.attn_out(attn)
+        return x + self.mlp(self.mlp_norm(x))
+
+
+class BoardSquareEncoder(nn.Module):
+    """Bidirectional attention over the 64 squares of each position.
+
+    Mean-pooling (piece, square) vectors is a linear aggregation: no square
+    conditions on any other before the board collapses to one vector, so
+    square interactions (attacks, pins, pawn structure) have to be recovered
+    statistically by the trunk. A couple of attention layers over the squares
+    let the board vector carry those interactions directly.
+    """
+
+    def __init__(
+        self, *, dim: int, num_heads: int, num_layers: int, out_dim: int
+    ) -> None:
+        super().__init__()
+        self.blocks = nn.ModuleList(
+            [
+                _SquareAttentionBlock(dim=dim, num_heads=num_heads)
+                for _ in range(num_layers)
+            ]
+        )
+        self.final_norm = nn.LayerNorm(dim)
+        self.out_proj = nn.Linear(dim, out_dim)
+
+    def forward(self, squares: torch.Tensor) -> torch.Tensor:
+        for block in self.blocks:
+            if self.training and torch.is_grad_enabled():
+                # Per-square activations are 64x the trunk's per-token ones;
+                # recomputing them in backward keeps peak memory in check.
+                squares = checkpoint(block, squares, use_reentrant=False)
+            else:
+                squares = block(squares)
+        return self.out_proj(self.final_norm(squares).mean(dim=1))
+
+
 class HSTUChessModel(nn.Module):
     """HSTU backbone for jagged chess event batches."""
 
@@ -119,7 +186,13 @@ class HSTUChessModel(nn.Module):
         # Joint (piece, square) table: an additive piece+square scheme collapses
         # under mean pooling to a bag of material (the square term is constant),
         # making piece placement invisible to the model.
-        self.piece_square_embedding = nn.Embedding(13 * 64, d)
+        self.piece_square_embedding = nn.Embedding(13 * 64, _BOARD_ENCODER_DIM)
+        self.board_encoder = BoardSquareEncoder(
+            dim=_BOARD_ENCODER_DIM,
+            num_heads=_BOARD_ENCODER_HEADS,
+            num_layers=_BOARD_ENCODER_LAYERS,
+            out_dim=d,
+        )
         self.seq_token_embedding = nn.Embedding(2, d)
         self.turn_embedding = nn.Embedding(2, d)
         self.castle_embedding = nn.Embedding(16, d)
@@ -151,6 +224,9 @@ class HSTUChessModel(nn.Module):
 
         self.final_norm = nn.LayerNorm(d)
         self.prediction_head = nn.Linear(d, config.move_vocab_size, bias=False)
+        # Same move vocab on the input and output side; sharing the matrix
+        # saves ~1M params and regularizes both representations.
+        self.prediction_head.weight = self.prev_move_embedding.weight
         # Small private MLP: trunk features are dominated by the policy
         # objective, so the value head needs its own capacity.
         self.value_head = (
@@ -179,7 +255,7 @@ class HSTUChessModel(nn.Module):
     def _embed_board(self, piece_ids: torch.Tensor) -> torch.Tensor:
         # piece_ids: [S, 64] -> unique id per (piece, square) pair.
         pair_ids = piece_ids * 64 + self.square_ids
-        return self.piece_square_embedding(pair_ids).mean(dim=1)
+        return self.board_encoder(self.piece_square_embedding(pair_ids))
 
     def _clamp_ids(self, ids: torch.Tensor, num_embeddings: int) -> torch.Tensor:
         return ids.clamp(min=0, max=num_embeddings - 1)

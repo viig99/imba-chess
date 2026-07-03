@@ -14,6 +14,9 @@ set -u
 
 CHECKPOINT_DIR="artifacts/checkpoints"
 RESTART_DELAY_SEC=90
+# The board encoder's checkpointed backward makes a couple of ~2 GiB requests;
+# without expandable segments they fail on fragmentation, not real exhaustion.
+export PYTORCH_ALLOC_CONF="${PYTORCH_ALLOC_CONF:-expandable_segments:True}"
 FAST_FAIL_SEC=120
 MAX_FAST_FAILS=5
 

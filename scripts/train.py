@@ -259,6 +259,35 @@ def _print_eval_metrics(split: str, metrics: dict[str, float]) -> None:
     print(f"  mrr: {metrics['mrr']:.6f}")
 
 
+def _print_model_summary(model: torch.nn.Module) -> None:
+    seen_param_ids: set[int] = set()
+    total_params = 0
+    total_bytes = 0
+    print("model summary:")
+    for name, module in model.named_children():
+        params = 0
+        param_bytes = 0
+        fresh_params = 0
+        for param in module.parameters():
+            params += param.numel()
+            param_bytes += param.numel() * param.element_size()
+            if id(param) not in seen_param_ids:
+                seen_param_ids.add(id(param))
+                fresh_params += param.numel()
+                total_params += param.numel()
+                total_bytes += param.numel() * param.element_size()
+        detail = ""
+        if isinstance(module, torch.nn.ModuleList):
+            detail = f" ({len(module)} layers)"
+        if params > 0 and fresh_params == 0:
+            detail += " (tied)"
+        print(f"  {name}{detail}: params={params:,} size={param_bytes / 2**20:.2f} MiB")
+    print(f"  total: params={total_params:,} size={total_bytes / 2**20:.2f} MiB")
+    trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    if trainable != total_params:
+        print(f"  trainable: params={trainable:,}")
+
+
 def _validate_runtime_config(
     *,
     repo_config,
@@ -384,6 +413,7 @@ def main() -> None:
         repo_config.model, move_vocab_size=len(move_vocab)
     )
     model: torch.nn.Module = HSTUChessModel(model_cfg).to(device)
+    _print_model_summary(model)
     if repo_config.training.compile_model:
         model = torch.compile(model, dynamic=True, fullgraph=True)
 
