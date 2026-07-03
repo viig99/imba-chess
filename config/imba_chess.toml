@@ -14,7 +14,7 @@ test_end_month = "2025-09"
 val_max_games = 100000
 test_max_games = 100000
 cache_dir = "artifacts/hf_cache"
-parquet_batch_size = 65536
+parquet_batch_size = 8192
 return_dataclasses = false
 max_seq_len = 512
 shuffle_train_month_files_on_start = false
@@ -33,7 +33,7 @@ path = "artifacts/move_vocab_static_uci.json"
 include_unk = false
 
 [dataloader]
-max_tokens_per_batch = 32768
+max_tokens_per_batch = 24576
 num_workers = 2
 pin_memory = true
 prefetch_factor = 2
