@@ -139,6 +139,12 @@ class EvalVsStockfishConfig:
     model_move_policy: str = "greedy"
     value_rerank_top_k: int = 8
     value_rerank_lambda: float = 0.35
+    search_budget: int = 256
+    search_top_m: int = 16
+    halving_rounds: int = 0
+    search_refutation_top_r: int = 2
+    search_expand_top: int = 3
+    search_max_depth: int = 4
     opening_random_plies: int = 0
     debug_trace_games: int = 0
     debug_trace_max_plies: int = 80

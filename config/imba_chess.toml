@@ -118,6 +118,13 @@ value_rerank_top_k = 16
 # Weight of the log-prob policy prior added to the value score (value-dominant scoring).
 # Sweep vs SF1400: flat 0.40 across 0.05-0.2; lambda=0 collapses to 0.12.
 value_rerank_lambda = 0.05
+# value_search_halving knobs (sequential halving; halving_rounds = 1 is pure beam).
+search_budget = 256
+search_top_m = 16
+halving_rounds = 0
+search_refutation_top_r = 2
+search_expand_top = 3
+search_max_depth = 4
 opening_random_plies = 1
 debug_trace_games = 3
 debug_trace_max_plies = 80

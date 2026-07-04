@@ -461,3 +461,74 @@ def test_save_traced_game_writes_pgn_and_html(tmp_path):
     assert "1. e4 e5" in pgn_text
     html_path = save_games_dir / "sf_elo_1400_game002_incomplete.html"
     assert html_path.read_text(encoding="utf-8").startswith("<!doctype html>")
+
+
+class _DummyHalvingModel(torch.nn.Module):
+    """Root policy prefers e2e4; value head says the d2d4 subtree is winning.
+
+    Value is read from the side-to-move POV, so the dummy uses the last
+    token's turn_id to keep the signal consistent at every depth.
+    """
+
+    def __init__(self, move_vocab: MoveVocab) -> None:
+        super().__init__()
+        self.move_vocab = move_vocab
+        self.forward_calls = 0
+
+    def forward(self, batch, *, block_mask=None, return_loss=False):  # type: ignore[no-untyped-def]
+        self.forward_calls += 1
+        total_tokens = int(batch["total_tokens"])
+        logits = torch.zeros((total_tokens, len(self.move_vocab)), dtype=torch.float32)
+        value_logits = torch.zeros((total_tokens, 3), dtype=torch.float32)
+        seq_offsets = batch["seq_offsets"]
+        prev_move_id = batch["prev_move_id"]
+        turn_id = batch["turn_id"]
+        d2d4_id = self.move_vocab.token_to_id["d2d4"]
+        for game_idx in range(int(batch["num_games"])):
+            start = int(seq_offsets[game_idx].item())
+            end = int(seq_offsets[game_idx + 1].item())
+            last = end - 1
+            logits[last, self.move_vocab.token_to_id["e2e4"]] = 4.0
+            logits[last, self.move_vocab.token_to_id["d2d4"]] = 3.0
+            contains_d2d4 = bool((prev_move_id[start:end] == d2d4_id).any().item())
+            good_for_white = contains_d2d4
+            stm_is_white = int(turn_id[last].item()) == 0
+            if good_for_white == stm_is_white:
+                value_logits[last] = torch.tensor([0.0, 0.0, 3.0])  # stm winning
+            else:
+                value_logits[last] = torch.tensor([3.0, 0.0, 0.0])  # stm losing
+        return {"logits": logits, "value_logits": value_logits}
+
+
+def test_value_search_halving_end_to_end_picks_value_backed_move():
+    module = _load_eval_script_module()
+    from imba_chess.eval.search import HalvingConfig
+
+    move_vocab = _mini_vocab()
+    model = _DummyHalvingModel(move_vocab)
+    history = module._SequenceHistory(
+        move_vocab=move_vocab,
+        board_state_encoder=BoardStateEncoder(),
+    )
+    board = chess.Board()
+    batch = history.build_batch_for_current_position(board)
+
+    move, debug = module._select_model_move(
+        model=model,
+        batch=batch,
+        history=history,
+        board=board,
+        move_vocab=move_vocab,
+        device=torch.device("cpu"),
+        dtype=torch.float32,
+        policy="value_search_halving",
+        value_rerank_top_k=2,
+        value_rerank_lambda=0.05,
+        debug_topk=0,
+        halving_config=HalvingConfig(budget=6, top_m=2, rounds=2, lam=0.05),
+    )
+
+    assert move.uci() == "d2d4"  # higher root logit is e2e4; value flips it
+    assert debug["policy"] == "value_search_halving"
+    rows = debug["value_search_halving_candidates"]
+    assert {row["move_uci"] for row in rows} == {"e2e4", "d2d4"}

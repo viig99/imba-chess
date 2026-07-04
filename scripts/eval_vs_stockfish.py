@@ -7,7 +7,7 @@ import json
 import random
 from dataclasses import dataclass, replace
 from pathlib import Path
-from typing import Any
+from typing import Any, Optional
 
 import chess
 import chess.engine
@@ -24,10 +24,12 @@ from imba_chess.data.event_builder import (
 from imba_chess.data.move_vocab import MoveVocab, load_or_create_static_move_vocab
 from imba_chess.eval.game_animation import render_game_html
 from imba_chess.eval.search import (
+    HalvingConfig,
     PositionEval,
     select_greedy,
     select_value_rerank,
     select_value_search_d2,
+    select_value_search_halving,
 )
 from imba_chess.model import (
     HSTUChessModel,
@@ -254,7 +256,7 @@ def _parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--model-move-policy",
-        choices=["greedy", "value_rerank", "value_search_d2"],
+        choices=["greedy", "value_rerank", "value_search_d2", "value_search_halving"],
         default=None,
         help="Model move selection on legal moves.",
     )
@@ -270,6 +272,12 @@ def _parse_args() -> argparse.Namespace:
         default=None,
         help="Weight for value_rerank score adjustment.",
     )
+    parser.add_argument("--search-budget", type=int, default=None)
+    parser.add_argument("--search-top-m", type=int, default=None)
+    parser.add_argument("--halving-rounds", type=int, default=None)
+    parser.add_argument("--search-refutation-top-r", type=int, default=None)
+    parser.add_argument("--search-expand-top", type=int, default=None)
+    parser.add_argument("--search-max-depth", type=int, default=None)
     parser.add_argument(
         "--opening-random-plies",
         type=int,
@@ -627,6 +635,7 @@ def _select_model_move(
     value_rerank_top_k: int,
     value_rerank_lambda: float,
     debug_topk: int = 0,
+    halving_config: Optional[HalvingConfig] = None,
 ) -> tuple[chess.Move, dict[str, Any]]:
     output = _forward_model(
         model=model,
@@ -651,6 +660,7 @@ def _select_model_move(
     )
     rerank_rows: list[dict[str, Any]] = []
     search_rows: list[dict[str, Any]] = []
+    halving_rows: list[dict[str, Any]] = []
     if policy == "greedy":
         chosen_index = select_greedy(legal_log_priors)
     elif policy == "value_rerank":
@@ -681,6 +691,21 @@ def _select_model_move(
             top_k=value_rerank_top_k,
             lam=value_rerank_lambda,
         )
+    elif policy == "value_search_halving":
+        if output.get("value_logits") is None:
+            raise RuntimeError(
+                "model_move_policy=value_search_halving requires a checkpoint with value head enabled."
+            )
+        if halving_config is None:
+            raise ValueError("policy=value_search_halving requires halving_config")
+        chosen_index, halving_rows = select_value_search_halving(
+            evaluator=evaluator,
+            root_handle=history,
+            board=board,
+            legal_moves=legal_moves_with_ids,
+            legal_log_priors=legal_log_priors,
+            config=halving_config,
+        )
     else:
         raise ValueError(f"Unknown model move policy: {policy}")
     debug: dict[str, Any] = {
@@ -697,6 +722,9 @@ def _select_model_move(
         debug["value_rerank_top_k"] = int(min(int(value_rerank_top_k), mapped_legal))
         debug["value_rerank_lambda"] = float(value_rerank_lambda)
         debug["value_search_d2_candidates"] = search_rows
+    if policy == "value_search_halving":
+        debug["search_budget"] = int(halving_config.budget)
+        debug["value_search_halving_candidates"] = halving_rows
     if debug_topk > 0:
         k = min(int(debug_topk), mapped_legal)
         top_values, top_indices = torch.topk(legal_logits, k=k, largest=True)
@@ -1015,6 +1043,7 @@ def _run_segment(
     debug_topk: int,
     stockfish_label: str,
     save_games_dir: Path | None,
+    halving_config: "HalvingConfig | None" = None,
 ) -> EvalSummary:
     summary = EvalSummary()
     with tqdm(
@@ -1062,6 +1091,7 @@ def _run_segment(
                         value_rerank_top_k=value_rerank_top_k,
                         value_rerank_lambda=value_rerank_lambda,
                         debug_topk=debug_topk,
+                        halving_config=halving_config,
                     )
                     summary.model_turns += 1
                     summary.legal_moves_total += int(debug_info["total_legal_moves"])
@@ -1107,6 +1137,18 @@ def _run_segment(
                             )
                             tqdm.write(
                                 f"[debug][{segment_name}]   value_search_d2={search_str}"
+                            )
+                        halving_rows = debug_info.get("value_search_halving_candidates")
+                        if isinstance(halving_rows, list) and halving_rows:
+                            halving_str = ", ".join(
+                                f"{entry['move_uci']}:evals={entry['evals_spent']}"
+                                f"|backed={entry['backed_value']}"
+                                f"|score={entry['search_score']}"
+                                f"|out_r={entry['eliminated_round']}"
+                                for entry in halving_rows
+                            )
+                            tqdm.write(
+                                f"[debug][{segment_name}]   value_search_halving={halving_str}"
                             )
                 else:
                     result = engine.play(board, engine_limit)
@@ -1286,6 +1328,30 @@ def main() -> None:
         if args.value_rerank_lambda is None
         else args.value_rerank_lambda
     )
+    args.search_budget = int(
+        eval_cfg.search_budget if args.search_budget is None else args.search_budget
+    )
+    args.search_top_m = int(
+        eval_cfg.search_top_m if args.search_top_m is None else args.search_top_m
+    )
+    args.halving_rounds = int(
+        eval_cfg.halving_rounds if args.halving_rounds is None else args.halving_rounds
+    )
+    args.search_refutation_top_r = int(
+        eval_cfg.search_refutation_top_r
+        if args.search_refutation_top_r is None
+        else args.search_refutation_top_r
+    )
+    args.search_expand_top = int(
+        eval_cfg.search_expand_top
+        if args.search_expand_top is None
+        else args.search_expand_top
+    )
+    args.search_max_depth = int(
+        eval_cfg.search_max_depth
+        if args.search_max_depth is None
+        else args.search_max_depth
+    )
     args.opening_random_plies = int(
         eval_cfg.opening_random_plies
         if args.opening_random_plies is None
@@ -1335,10 +1401,24 @@ def main() -> None:
         "greedy",
         "value_rerank",
         "value_search_d2",
+        "value_search_halving",
     }:
         raise ValueError(
-            "--model-move-policy must be one of: greedy, value_rerank, value_search_d2"
+            "--model-move-policy must be one of: greedy, value_rerank, "
+            "value_search_d2, value_search_halving"
         )
+    if args.search_budget < 1:
+        raise ValueError("--search-budget must be >= 1")
+    if args.search_top_m < 1:
+        raise ValueError("--search-top-m must be >= 1")
+    if args.halving_rounds < 0:
+        raise ValueError("--halving-rounds must be >= 0")
+    if args.search_refutation_top_r < 1:
+        raise ValueError("--search-refutation-top-r must be >= 1")
+    if args.search_expand_top < 1:
+        raise ValueError("--search-expand-top must be >= 1")
+    if args.search_max_depth < 1:
+        raise ValueError("--search-max-depth must be >= 1")
     if not args.stockfish_path.exists():
         raise FileNotFoundError(f"Stockfish binary not found: {args.stockfish_path}")
 
@@ -1364,7 +1444,8 @@ def main() -> None:
         device=device,
         compile_model=bool(args.compile),
         require_value_head=(
-            str(args.model_move_policy) in {"value_rerank", "value_search_d2"}
+            str(args.model_move_policy)
+            in {"value_rerank", "value_search_d2", "value_search_halving"}
         ),
     )
     engine_limit = _build_engine_limit(args)
@@ -1420,6 +1501,15 @@ def main() -> None:
                     elo=int(spec.elo) if spec.elo is not None else None,
                 ),
                 save_games_dir=Path(args.save_games_dir) if args.save_games else None,
+                halving_config=HalvingConfig(
+                    budget=int(args.search_budget),
+                    top_m=int(args.search_top_m),
+                    rounds=int(args.halving_rounds),
+                    refutation_top_r=int(args.search_refutation_top_r),
+                    expand_top=int(args.search_expand_top),
+                    max_depth=int(args.search_max_depth),
+                    lam=float(args.value_rerank_lambda),
+                ),
             )
             segment_payload = _summary_to_payload(
                 summary=segment_summary,

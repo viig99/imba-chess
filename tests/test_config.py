@@ -116,3 +116,13 @@ save_games_dir = "artifacts/eval/custom_games"
     assert config.eval_vs_stockfish.debug_topk == 5
     assert config.eval_vs_stockfish.save_games is False
     assert config.eval_vs_stockfish.save_games_dir == "artifacts/eval/custom_games"
+
+
+def test_eval_vs_stockfish_search_knob_defaults():
+    config = EvalVsStockfishConfig()
+    assert config.search_budget == 256
+    assert config.search_top_m == 16
+    assert config.halving_rounds == 0
+    assert config.search_refutation_top_r == 2
+    assert config.search_expand_top == 3
+    assert config.search_max_depth == 4
