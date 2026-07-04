@@ -142,6 +142,8 @@ class EvalVsStockfishConfig:
     debug_trace_games: int = 0
     debug_trace_max_plies: int = 80
     debug_topk: int = 5
+    save_games: bool = True
+    save_games_dir: str = "artifacts/eval/games"
 
 
 @dataclass(frozen=True)

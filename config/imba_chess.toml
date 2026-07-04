@@ -121,3 +121,5 @@ opening_random_plies = 1
 debug_trace_games = 3
 debug_trace_max_plies = 80
 debug_topk = 5
+save_games = true
+save_games_dir = "artifacts/eval/games"

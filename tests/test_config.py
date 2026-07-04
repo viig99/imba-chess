@@ -1,6 +1,6 @@
 import pytest
 
-from imba_chess.config import load_repo_config
+from imba_chess.config import EvalVsStockfishConfig, load_repo_config
 
 
 def test_load_repo_config_reads_sections(tmp_path):
@@ -91,3 +91,28 @@ bad_key = 1
 
     with pytest.raises(ValueError, match=r"Unknown keys in \[dataset\]"):
         load_repo_config(config_path)
+
+
+def test_eval_vs_stockfish_config_game_saving_defaults():
+    config = EvalVsStockfishConfig()
+    assert config.save_games is True
+    assert config.save_games_dir == "artifacts/eval/games"
+
+
+def test_load_repo_config_reads_eval_vs_stockfish_game_saving_fields(tmp_path):
+    config_path = tmp_path / "imba_chess.toml"
+    config_path.write_text(
+        """
+[eval_vs_stockfish]
+debug_topk = 5
+save_games = false
+save_games_dir = "artifacts/eval/custom_games"
+        """.strip()
+        + "\n",
+        encoding="utf-8",
+    )
+
+    config = load_repo_config(config_path)
+    assert config.eval_vs_stockfish.debug_topk == 5
+    assert config.eval_vs_stockfish.save_games is False
+    assert config.eval_vs_stockfish.save_games_dir == "artifacts/eval/custom_games"
