@@ -434,6 +434,11 @@ def select_value_search_halving(
     legal_log_priors: list[float],
     config: HalvingConfig,
 ) -> tuple[int, list[dict[str, Any]]]:
+    """Pick a root move by sequential halving over value-backed subtrees.
+
+    Precondition: legal_moves is non-empty (the caller projects legal moves
+    and raises before dispatch when none map to the vocab).
+    """
     root_color = board.turn
     order = _prior_order(legal_log_priors)
     picks = list(order[: min(config.top_m, len(order))])
@@ -528,7 +533,8 @@ def select_value_search_halving(
 
     for arm in arms:
         _score_arm(arm, config.lam)
-        # Preserve elimination bookkeeping; _score_arm only sets score/backed.
+        # Survivors are already scored; this pass only fills backed_value /
+        # score on eliminated arms so their debug rows are informative.
 
     best = max(survivors, key=lambda arm: arm.score)
     if best.score == float("-inf"):

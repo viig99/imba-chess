@@ -799,6 +799,7 @@ def _summary_to_payload(
     value_rerank_top_k: int,
     value_rerank_lambda: float,
     opening_random_plies: int,
+    search_knobs: dict[str, int],
 ) -> dict[str, Any]:
     if summary.completed_games > 0:
         win_rate = summary.wins / summary.completed_games
@@ -866,6 +867,7 @@ def _summary_to_payload(
             "value_rerank_top_k": int(value_rerank_top_k),
             "value_rerank_lambda": float(value_rerank_lambda),
             "opening_random_plies": int(opening_random_plies),
+            "search": search_knobs,
         },
     }
 
@@ -1526,6 +1528,14 @@ def main() -> None:
                 value_rerank_top_k=int(args.value_rerank_top_k),
                 value_rerank_lambda=float(args.value_rerank_lambda),
                 opening_random_plies=int(args.opening_random_plies),
+                search_knobs={
+                    "search_budget": int(args.search_budget),
+                    "search_top_m": int(args.search_top_m),
+                    "halving_rounds": int(args.halving_rounds),
+                    "search_refutation_top_r": int(args.search_refutation_top_r),
+                    "search_expand_top": int(args.search_expand_top),
+                    "search_max_depth": int(args.search_max_depth),
+                },
             )
             _print_segment_summary(segment_name=spec.name, payload=segment_payload)
             segment_summaries.append(segment_summary)
@@ -1566,6 +1576,14 @@ def main() -> None:
         value_rerank_top_k=int(args.value_rerank_top_k),
         value_rerank_lambda=float(args.value_rerank_lambda),
         opening_random_plies=int(args.opening_random_plies),
+        search_knobs={
+            "search_budget": int(args.search_budget),
+            "search_top_m": int(args.search_top_m),
+            "halving_rounds": int(args.halving_rounds),
+            "search_refutation_top_r": int(args.search_refutation_top_r),
+            "search_expand_top": int(args.search_expand_top),
+            "search_max_depth": int(args.search_max_depth),
+        },
     )
     _print_segment_summary(segment_name="aggregate", payload=aggregate_payload)
 
