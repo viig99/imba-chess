@@ -19,7 +19,8 @@ Inspiration:
 - 1D jagged token batches with max-token packing.
 - HSTU-style transformer with two heads: next-move classification and win/draw/loss prediction.
 - Ignite-based training loop (StableAdamW + OneCycleLR, mixed precision, periodic fast val/test + periodic full val, TensorBoard logging, best/last checkpointing).
-- Head-to-head engine evaluation (`scripts/eval_vs_stockfish.py`) with value-guided lookahead search at inference.
+- Head-to-head engine evaluation (`scripts/eval_vs_stockfish.py`) with pluggable value-guided search at inference (`src/imba_chess/eval/search.py`): depth-2 minimax and budgeted sequential-halving tree search (MCTS-lite).
+- Per-game PGN + self-contained HTML replay viewer (board animation, clickable move list) for traced eval games.
 
 ## Data and training flow
 
@@ -82,8 +83,9 @@ Best checkpoints are selected by `hr@10` from `full_val`; last checkpoints are s
 - `greedy`: play the highest-logit legal move.
 - `value_rerank`: propose top-K moves with the policy head, grade each by the value head after the move, pick the best grade.
 - `value_search_d2`: same, but each proposal is stress-tested against the opponent's best response before grading (see below).
+- `value_search_halving`: budgeted tree search — candidate moves compete for a fixed number of value-head evaluations via sequential halving, growing deeper trees under the promising moves (see below).
 
-`value_rerank` and `value_search_d2` require a checkpoint trained with the value head enabled.
+All modes except `greedy` require a checkpoint trained with the value head enabled. Search strategies live in `src/imba_chess/eval/search.py` behind a model-agnostic `PositionEvaluator` interface (unit-testable without a checkpoint); the eval script supplies the batched-inference adapter. Traced games (first `debug_trace_games` per segment) are saved as PGN plus a self-contained HTML replay viewer under `save_games_dir` for post-hoc inspection.
 
 ### How value-guided move selection works
 
@@ -117,6 +119,35 @@ Cost: 3 model calls and ~K² positions per turn instead of 1 call — roughly 30
 
 `value_rerank` is the depth-1 version of the same idea (grade positions immediately after our move, no opponent response), with the same value-dominant scoring.
 
+### How `value_search_halving` works (MCTS-lite)
+
+`value_search_d2` spends its evaluations uniformly: every candidate gets one opponent level, no more, no less — the obviously losing move gets as much attention as the two moves the decision actually hinges on. `value_search_halving` fixes the *allocation*: choosing the root move is treated as a best-arm-identification problem (which arm is best, not how good is each arm), and sequential halving — the root allocation used by Gumbel MCTS — is the canonical algorithm for that.
+
+The mechanics, per model turn:
+
+1. **Arms.** Candidates = top `search_top_m` legal moves by policy prior, plus any capture/check/promotion outside that set. A move that mates on the spot is played immediately, spending nothing.
+2. **Rounds.** A fixed budget of `search_budget` value-head evaluations is split evenly across `halving_rounds` rounds, and within a round evenly across surviving arms. After each round the worst-scoring half of the arms is eliminated; their unspent budget flows to the survivors. Obvious losers die after a handful of evaluations; the final two candidates get deep trees.
+3. **Tree growth (beam by plausibility).** Each arm owns a priority queue of unevaluated positions, ordered by the cumulative policy log-prob of the moves leading there (both sides). Its round budget is spent popping the most plausible positions, evaluating them in one batched forward per wave, and pushing their continuations: at our nodes the top `search_expand_top` moves by prior; at opponent nodes the top `search_refutation_top_r` replies **plus every forcing reply**. Forcing replies inherit their parent's queue priority rather than their own (usually tiny) prior — a refutation must compete at the plausibility of the line it refutes, or the beam prunes exactly the move that disproves the arm. Depth is capped at `search_max_depth` plies; where the tree deepens within that cap is decided entirely by the queue, so forced lines go deep while wide quiet positions stay shallow.
+4. **Scoring.** Arm score = negamax backup over the arm's realized tree (terminal positions exact, frontier leaves stand on their value-head estimate) + `value_rerank_lambda × log_prob(root move)`. **Value never chooses what to expand** — the queue is ordered by prior alone, and value enters only at backup and arm comparison. This is deliberate: ranking the beam by value estimates retains lines where the opponent cooperatively blunders (max-over-noise selection bias, the same failure the λ=0 control exposes).
+
+`halving_rounds` is the open-loop/closed-loop dial: `1` disables elimination entirely (pure prior-guided beam — all allocation decided upfront), `0` (default) auto-selects `ceil(log2(#arms))` rounds (full sequential halving — reallocation after every round). Comparing the two on the same budget attributes the gain between the deeper tree and the feedback loop.
+
+Everything is deterministic (no sampling; ties break by insertion order), the budget is a hard cap on evaluator calls, and the same terminal-exactness rules as d2 apply. See `BEAM_SEARCH_PLAN.md` for the design rationale and `docs/superpowers/specs/2026-07-04-mcts-lite-search-design.md` for the full spec.
+
+### Tuning the halving knobs
+
+| Knob | Default | What it controls | How to tune |
+|---|---|---|---|
+| `search_budget` | 256 | Total value-head evaluations per move — the strength ↔ wall-clock dial (cost is roughly linear) | The biggest lever. 256 ≈ d2's per-move cost (fair A/B). Raise to 512+ only after the algorithm has proven itself at 256; each search evaluation re-encodes the full game history, so budget is expensive late-game. |
+| `halving_rounds` | 0 (auto) | How often budget is reallocated by observed value | Keep auto. Run `--halving-rounds 1` (pure beam) once at the same budget: if beam ≈ halving, the feedback loop isn't earning its keep and prior-allocation suffices; if halving wins, more rounds concentrate budget where it matters. |
+| `search_refutation_top_r` | 2 | Opponent replies always expanded besides forcing moves | Raise to 3 if `--debug-trace-games` shows arms scored well whose refutation was never evaluated ("believed for the wrong reason"). Raising it costs queue slots everywhere, so pay for it with budget. |
+| `search_expand_top` | 3 | Our-side branching per expanded node | Lower (2) = deeper, narrower trees; higher = wider, shallower. Only worth sweeping after budget and rounds are settled. |
+| `search_max_depth` | 4 | Max plies below each candidate move | Keep it **even** — an odd horizon ends on our own move and grades unanswered threats optimistically. 6 needs a bigger budget to be meaningful. |
+| `search_top_m` | 16 | Root candidates entering the bandit | Rarely binding (forcing moves are added regardless). Raising it dilutes early-round per-arm budget; lower it only if round-1 budgets get starved. |
+| `value_rerank_lambda` | 0.05 | Policy-prior weight in the arm score | Same role and sweep as d2: flat across 0.05–0.2, collapses at 0 (Goodhart on value-head noise). Leave fixed while tuning the knobs above. |
+
+Recommended order: budget (strength/time trade) → rounds 1-vs-auto A/B (attribution) → refutation floor (only if traces demand it) → depth/branching. Change one knob per eval run — 100 games has ±0.05 standard error, so small simultaneous changes are unreadable.
+
 ### Usage
 
 Basic match (policy defaults from TOML):
@@ -140,6 +171,20 @@ python scripts/eval_vs_stockfish.py \
   --games 100
 ```
 
+Halving search (defaults from `[eval_vs_stockfish]`; shown with the beam-attribution override):
+
+```bash
+python scripts/eval_vs_stockfish.py \
+  --checkpoint artifacts/checkpoints/best_hr10_*.pt \
+  --model-move-policy value_search_halving \
+  --search-budget 256 \
+  --halving-rounds 1 \
+  --stockfish-limit-strength --stockfish-elo 1400 \
+  --games 100
+```
+
+For the standard best-checkpoint A/B there is a wrapper: `POLICIES="value_search_halving" ./eval_best_checkpoint.sh` (picks the best hr@10 checkpoint, runs 100 games vs SF1400 per policy, writes JSON + per-policy game replays, skips already-existing outputs).
+
 Ladder eval across several Stockfish levels:
 
 ```bash
@@ -153,9 +198,25 @@ python scripts/eval_vs_stockfish.py \
 
 The script reports wins/draws/losses (with color split), completed/incomplete games, average game length, score rate, legal-move vocab coverage, and per-segment plus aggregate summaries in ladder mode.
 
-### Results vs Stockfish 1400
+### Results vs Stockfish 1400 (current run, v3 pipeline)
 
-Setup: checkpoint `best_hr10_checkpoint_5` (hr@10 = 0.9208), Stockfish `UCI_Elo` 1400 at 0.05s/move, 100 games per configuration, seed 42, colors alternating. Score = (wins + 0.5 × draws) / games; ±~0.05 standard error at 100 games.
+Setup: checkpoint `best_hr10_checkpoint_6` (hr@10 = 0.9131, epoch 6 of a run still in progress), Stockfish `UCI_Elo` 1400 at 0.05s/move, 100 games per configuration, seed 42, colors alternating. Score = (wins + 0.5 × draws) / games; ±~0.05 standard error at 100 games.
+
+| Move selection | W / D / L | Score rate |
+|---|---|---|
+| `greedy` | 7 / 28 / 65 | 0.21 |
+| `value_search_d2` (K=16, λ=0.05) | 22 / 16 / 47 @ 85 games | 0.34 (final, 100 games) |
+| `value_search_halving` (N=256, defaults) | *eval in progress* | *early: 4W/0D/1L @ 5 games* |
+
+Takeaways so far:
+
+- The raw policy is markedly stronger than the previous run's (greedy 0.145 → 0.21) — attributable to the v3 changes: placement-aware board encoding, game-level shuffle buffer, corrupt-game rejection.
+- Search still multiplies the policy: d2 adds +0.13 over greedy on the same checkpoint, clearing the +0.05 gate that justified building the halving search.
+- Halving's full 100-game result, plus the `halving_rounds=1` beam attribution run and a 1600/1800/2000 ladder, will be added here as they complete. Early games look strong but 5 games carry ~±0.2 standard error — not yet evidence.
+
+### Results vs Stockfish 1400 (earlier v2 checkpoint, historical)
+
+Setup: checkpoint `best_hr10_checkpoint_5` (hr@10 = 0.9208, pre-v3 data pipeline — not directly comparable to the table above), Stockfish `UCI_Elo` 1400 at 0.05s/move, 100 games per configuration, seed 42, colors alternating.
 
 | Move selection | λ | W / D / L | Score rate |
 |---|---|---|---|
@@ -215,7 +276,7 @@ uv run --python .venv/bin/python --with pytest pytest -q
 
 - Training is single-process (no end-to-end DDP launcher yet).
 - No legal-move masking in the prediction head during training (full-vocab classification); legality is enforced at inference.
-- Lookahead is fixed at depth 2 (our move + opponent response); no deeper tree or MCTS yet.
+- Search evaluations re-encode the full game history per position (no prefix/KV caching), so per-move search cost grows with game length; caching is the planned next step if `value_search_halving` holds up.
 - Value labels are raw game outcomes, not engine evaluations (noisy for early positions).
 - Streaming order is temporal by month window (newest first); month-level file order can be shuffled at process start via `[dataset].shuffle_train_month_files_on_start`.
 - Checkpoints trained before the placement-aware board encoding / 1,970-token vocab are incompatible with current code (check out an older commit to evaluate them).
