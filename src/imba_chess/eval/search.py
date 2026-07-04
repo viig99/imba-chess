@@ -95,6 +95,75 @@ def _search_copy(board: chess.Board) -> chess.Board:
     return board.copy(stack=board.halfmove_clock)
 
 
+@dataclass
+class _RootCandidate:
+    """One top-k root move expanded one ply deep.
+
+    terminal_value is the exact game result (root POV) when the move ends the
+    game, else None; board1_eval is the value/prior evaluation of the position
+    after the move. worst_reply_value / reply_candidates are filled by
+    value_search_d2 only.
+    """
+
+    local_idx: int
+    move: chess.Move
+    board1: chess.Board
+    log_prior: float
+    terminal_value: Optional[float]
+    handle1: Any = None
+    board1_eval: Optional[PositionEval] = None
+    worst_reply_value: Optional[float] = None
+    reply_candidates: list[dict[str, Any]] = field(default_factory=list)
+
+
+def _expand_root_candidates(
+    *,
+    evaluator: PositionEvaluator,
+    root_handle: Any,
+    board: chess.Board,
+    legal_moves: list[chess.Move],
+    legal_log_priors: list[float],
+    top_k: int,
+) -> tuple[list[_RootCandidate], Optional[int]]:
+    """Build the top-k prior root candidates and batch-evaluate their boards.
+
+    Returns (candidates, mate_index). When a candidate move delivers
+    checkmate no other move can score higher: mate_index is set, no
+    evaluator call is made, and the partially built candidates list must be
+    ignored. Terminal boards never appear as training tokens, so they carry
+    the exact game result instead of going through the value head.
+    """
+    root_color = board.turn
+    candidates: list[_RootCandidate] = []
+    batch: list[tuple[Any, chess.Board]] = []
+    batch_to_candidate: list[int] = []
+    for local_idx in _prior_order(legal_log_priors)[: min(top_k, len(legal_moves))]:
+        move = legal_moves[local_idx]
+        board1 = _search_copy(board)
+        board1.push(move)
+        terminal_value = terminal_value_for_color(board1, color=root_color)
+        if terminal_value is not None and terminal_value >= 1.0:
+            return candidates, local_idx
+        candidate = _RootCandidate(
+            local_idx=local_idx,
+            move=move,
+            board1=board1,
+            log_prior=float(legal_log_priors[local_idx]),
+            terminal_value=terminal_value,
+        )
+        candidates.append(candidate)
+        if terminal_value is not None:
+            continue
+        candidate.handle1 = evaluator.extend(root_handle, board, move)
+        batch.append((candidate.handle1, board1))
+        batch_to_candidate.append(len(candidates) - 1)
+
+    if batch:
+        for cand_idx, position_eval in zip(batch_to_candidate, evaluator.evaluate(batch)):
+            candidates[cand_idx].board1_eval = position_eval
+    return candidates, None
+
+
 def select_value_rerank(
     *,
     evaluator: PositionEvaluator,
@@ -105,60 +174,50 @@ def select_value_rerank(
     top_k: int,
     lam: float,
 ) -> tuple[int, list[dict[str, Any]]]:
-    root_color = board.turn
-    local_indices = _prior_order(legal_log_priors)[: min(top_k, len(legal_moves))]
-
-    candidates: list[dict[str, Any]] = []
-    batch: list[tuple[Any, chess.Board]] = []
-    batch_to_candidate: list[int] = []
-    for idx in local_indices:
-        candidate_move = legal_moves[idx]
-        # Keep the move stack so claimable draws (repetition/50-move) count as terminal.
-        next_board = _search_copy(board)
-        next_board.push(candidate_move)
-        # Terminal boards never appear as training tokens; use the exact game
-        # result instead of the value head there.
-        terminal_value = terminal_value_for_color(next_board, color=root_color)
-        candidates.append(
+    candidates, mate_index = _expand_root_candidates(
+        evaluator=evaluator,
+        root_handle=root_handle,
+        board=board,
+        legal_moves=legal_moves,
+        legal_log_priors=legal_log_priors,
+        top_k=top_k,
+    )
+    if mate_index is not None:
+        return mate_index, [
             {
-                "local_idx": idx,
-                "move": candidate_move,
-                "terminal": terminal_value is not None,
-                "value_root": terminal_value,
+                "move_uci": legal_moves[mate_index].uci(),
+                "policy_logit": float(legal_log_priors[mate_index]),
+                "policy_log_prob": float(legal_log_priors[mate_index]),
+                "value_next": 1.0,
+                "terminal": True,
+                "rerank_score": 1.0,
             }
-        )
-        if terminal_value is not None:
-            continue
-        batch.append((evaluator.extend(root_handle, board, candidate_move), next_board))
-        batch_to_candidate.append(len(candidates) - 1)
+        ]
 
-    if batch:
-        for cand_idx, position_eval in zip(batch_to_candidate, evaluator.evaluate(batch)):
-            # Side-to-move at next_board is the opponent; negate to root POV.
-            candidates[cand_idx]["value_root"] = -position_eval.value_stm
-
-    chosen_index = local_indices[0]
+    chosen_index = candidates[0].local_idx
     best_score = float("-inf")
     rerank_rows: list[dict[str, Any]] = []
     for candidate in candidates:
-        local_idx = int(candidate["local_idx"])
-        value_root = float(candidate["value_root"])
-        log_prior = float(legal_log_priors[local_idx])
+        if candidate.terminal_value is not None:
+            value_root = float(candidate.terminal_value)
+        else:
+            # Side-to-move at board1 is the opponent; negate to root POV.
+            value_root = -float(candidate.board1_eval.value_stm)
         # Value-dominant score with a small log-prob policy prior as tiebreak.
-        rerank_score = value_root + (lam * log_prior)
+        rerank_score = value_root + (lam * candidate.log_prior)
         rerank_rows.append(
             {
-                "move_uci": candidate["move"].uci(),
-                "policy_logit": log_prior,
-                "policy_log_prob": log_prior,
+                "move_uci": candidate.move.uci(),
+                "policy_logit": candidate.log_prior,
+                "policy_log_prob": candidate.log_prior,
                 "value_next": value_root,
-                "terminal": bool(candidate["terminal"]),
+                "terminal": candidate.terminal_value is not None,
                 "rerank_score": rerank_score,
             }
         )
         if rerank_score > best_score:
             best_score = rerank_score
-            chosen_index = local_idx
+            chosen_index = candidate.local_idx
 
     return chosen_index, rerank_rows
 
@@ -174,64 +233,35 @@ def select_value_search_d2(
     lam: float,
 ) -> tuple[int, list[dict[str, Any]]]:
     root_color = board.turn
-    local_indices = _prior_order(legal_log_priors)[: min(top_k, len(legal_moves))]
-
-    root_candidates: list[dict[str, Any]] = []
-    board1_batch: list[tuple[Any, chess.Board]] = []
-    board1_batch_to_root: list[int] = []
-    for local_idx in local_indices:
-        move = legal_moves[local_idx]
-        board1 = _search_copy(board)
-        board1.push(move)
-        terminal_value = terminal_value_for_color(board1, color=root_color)
-        if terminal_value is not None and terminal_value >= 1.0:
-            # Immediate win (checkmate delivered): no other move can score higher.
-            return local_idx, [
-                {
-                    "move_uci": move.uci(),
-                    "policy_logit": float(legal_log_priors[local_idx]),
-                    "policy_log_prob": float(legal_log_priors[local_idx]),
-                    "worst_reply_value": 1.0,
-                    "best_reply_uci": None,
-                    "search_score": 1.0,
-                }
-            ]
-        root_candidate: dict[str, Any] = {
-            "local_idx": local_idx,
-            "move": move,
-            "board1": board1,
-            "log_prior": float(legal_log_priors[local_idx]),
-            "terminal_value": terminal_value,
-            "board1_eval": None,
-            "handle1": None,
-            "worst_reply_value": None,
-            "reply_candidates": [],
-        }
-        root_candidates.append(root_candidate)
-        if terminal_value is not None:
-            continue
-        handle1 = evaluator.extend(root_handle, board, move)
-        root_candidate["handle1"] = handle1
-        board1_batch.append((handle1, board1))
-        board1_batch_to_root.append(len(root_candidates) - 1)
-
-    if board1_batch:
-        for root_idx, position_eval in zip(
-            board1_batch_to_root, evaluator.evaluate(board1_batch)
-        ):
-            root_candidates[root_idx]["board1_eval"] = position_eval
+    candidates, mate_index = _expand_root_candidates(
+        evaluator=evaluator,
+        root_handle=root_handle,
+        board=board,
+        legal_moves=legal_moves,
+        legal_log_priors=legal_log_priors,
+        top_k=top_k,
+    )
+    if mate_index is not None:
+        return mate_index, [
+            {
+                "move_uci": legal_moves[mate_index].uci(),
+                "policy_logit": float(legal_log_priors[mate_index]),
+                "policy_log_prob": float(legal_log_priors[mate_index]),
+                "worst_reply_value": 1.0,
+                "best_reply_uci": None,
+                "search_score": 1.0,
+            }
+        ]
 
     board2_batch: list[tuple[Any, chess.Board]] = []
-    board2_meta: list[tuple[int, int]] = []
-    for root_idx, root_candidate in enumerate(root_candidates):
-        if root_candidate["terminal_value"] is not None:
+    board2_meta: list[tuple[_RootCandidate, int]] = []
+    for candidate in candidates:
+        if candidate.terminal_value is not None or candidate.board1_eval is None:
             continue
-        board1_eval: Optional[PositionEval] = root_candidate["board1_eval"]
-        if board1_eval is None:
-            continue
-        board1 = root_candidate["board1"]
+        board1_eval = candidate.board1_eval
+        board1 = candidate.board1
         if not board1_eval.legal_moves:
-            root_candidate["worst_reply_value"] = -float(board1_eval.value_stm)
+            candidate.worst_reply_value = -float(board1_eval.value_stm)
             continue
 
         opp_indices = _prior_order(board1_eval.legal_log_priors)[
@@ -248,13 +278,12 @@ def select_value_search_d2(
                 opp_indices.append(opp_idx)
                 opp_seen.add(opp_idx)
 
-        reply_rows: list[dict[str, Any]] = []
         for opp_local_idx in opp_indices:
             opp_move = board1_eval.legal_moves[opp_local_idx]
             board2 = _search_copy(board1)
             board2.push(opp_move)
             terminal_value = terminal_value_for_color(board2, color=root_color)
-            reply_rows.append(
+            candidate.reply_candidates.append(
                 {
                     "move_uci": opp_move.uci(),
                     "opp_policy_logit": float(
@@ -267,57 +296,56 @@ def select_value_search_d2(
             if terminal_value is not None:
                 continue
             board2_batch.append(
-                (evaluator.extend(root_candidate["handle1"], board1, opp_move), board2)
+                (evaluator.extend(candidate.handle1, board1, opp_move), board2)
             )
-            board2_meta.append((root_idx, len(reply_rows) - 1))
-        root_candidate["reply_candidates"] = reply_rows
+            board2_meta.append((candidate, len(candidate.reply_candidates) - 1))
 
     if board2_batch:
-        for (root_idx, reply_idx), position_eval in zip(
+        for (candidate, reply_idx), position_eval in zip(
             board2_meta, evaluator.evaluate(board2_batch)
         ):
             # Side-to-move at board2 is the root color again: POV matches root.
-            root_candidates[root_idx]["reply_candidates"][reply_idx][
-                "value_after_reply"
-            ] = float(position_eval.value_stm)
+            candidate.reply_candidates[reply_idx]["value_after_reply"] = float(
+                position_eval.value_stm
+            )
 
-    chosen_index = local_indices[0]
+    chosen_index = candidates[0].local_idx
     best_score = float("-inf")
     search_rows: list[dict[str, Any]] = []
-    for root_candidate in root_candidates:
-        if root_candidate["terminal_value"] is not None:
-            worst_reply_value = float(root_candidate["terminal_value"])
+    for candidate in candidates:
+        if candidate.terminal_value is not None:
+            worst_reply_value = float(candidate.terminal_value)
             best_reply_uci = None
-        elif root_candidate["worst_reply_value"] is not None:
-            worst_reply_value = float(root_candidate["worst_reply_value"])
+        elif candidate.worst_reply_value is not None:
+            worst_reply_value = float(candidate.worst_reply_value)
             best_reply_uci = None
         else:
-            reply_rows = [
+            evaluated_replies = [
                 row
-                for row in root_candidate["reply_candidates"]
+                for row in candidate.reply_candidates
                 if row.get("value_after_reply") is not None
             ]
-            if not reply_rows:
-                board1_eval = root_candidate.get("board1_eval")
+            if not evaluated_replies:
                 worst_reply_value = (
-                    -float(board1_eval.value_stm) if board1_eval is not None else 0.0
+                    -float(candidate.board1_eval.value_stm)
+                    if candidate.board1_eval is not None
+                    else 0.0
                 )
                 best_reply_uci = None
             else:
                 best_reply = min(
-                    reply_rows, key=lambda row: float(row["value_after_reply"])
+                    evaluated_replies, key=lambda row: float(row["value_after_reply"])
                 )
                 worst_reply_value = float(best_reply["value_after_reply"])
                 best_reply_uci = str(best_reply["move_uci"])
 
-        log_prior = float(root_candidate["log_prior"])
         # Value-dominant score with a small log-prob policy prior as tiebreak.
-        search_score = worst_reply_value + (lam * log_prior)
+        search_score = worst_reply_value + (lam * candidate.log_prior)
         search_rows.append(
             {
-                "move_uci": root_candidate["move"].uci(),
-                "policy_logit": log_prior,
-                "policy_log_prob": log_prior,
+                "move_uci": candidate.move.uci(),
+                "policy_logit": candidate.log_prior,
+                "policy_log_prob": candidate.log_prior,
                 "worst_reply_value": worst_reply_value,
                 "best_reply_uci": best_reply_uci,
                 "search_score": search_score,
@@ -325,7 +353,7 @@ def select_value_search_d2(
         )
         if search_score > best_score:
             best_score = search_score
-            chosen_index = int(root_candidate["local_idx"])
+            chosen_index = candidate.local_idx
 
     return chosen_index, search_rows
 

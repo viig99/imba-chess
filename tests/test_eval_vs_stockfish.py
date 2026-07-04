@@ -339,9 +339,9 @@ def test_value_rerank_prefers_mate_in_one_over_higher_logit_move():
     )
 
     assert move.uci() == "a1a8"
-    # Root eval + one batched eval for the single non-terminal candidate;
-    # the terminal (mate) board must not be sent through the value head.
-    assert model.forward_calls == 2
+    # Root eval only: finding the mate short-circuits before any candidate
+    # batch, so the value head is never consulted.
+    assert model.forward_calls == 1
 
 
 def test_value_search_d2_plays_mate_in_one_immediately():
