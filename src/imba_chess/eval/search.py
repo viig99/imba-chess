@@ -318,3 +318,235 @@ def select_value_search_d2(
             chosen_index = int(root_candidate["local_idx"])
 
     return chosen_index, search_rows
+
+
+@dataclass
+class _TreeNode:
+    board: chess.Board
+    handle: Any
+    depth: int  # plies below the arm root (arm root = 0)
+    path_log_prior: float
+    value_stm: Optional[float] = None  # set when evaluated by the value head
+    terminal_value_stm: Optional[float] = None  # exact, side-to-move POV
+    children: list["_TreeNode"] = field(default_factory=list)
+
+    @property
+    def scored(self) -> bool:
+        return self.value_stm is not None or self.terminal_value_stm is not None
+
+
+@dataclass
+class _Arm:
+    local_idx: int
+    move: chess.Move
+    root_log_prior: float
+    root_node: Optional[_TreeNode]
+    terminal_value_root: Optional[float]
+    frontier: list = field(default_factory=list)
+    evals_spent: int = 0
+    max_depth_reached: int = 0
+    eliminated_round: Optional[int] = None
+    backed_value: Optional[float] = None
+    score: float = float("-inf")
+
+
+def _backed_stm(node: _TreeNode) -> float:
+    """Negamax over the realized (partially scored) tree, side-to-move POV."""
+    if node.terminal_value_stm is not None:
+        return node.terminal_value_stm
+    child_values = [-_backed_stm(child) for child in node.children if child.scored]
+    if child_values:
+        return max(child_values)
+    assert node.value_stm is not None
+    return node.value_stm
+
+
+def _score_arm(arm: _Arm, lam: float) -> None:
+    if arm.terminal_value_root is not None:
+        backed_root = float(arm.terminal_value_root)
+    elif arm.root_node is not None and arm.root_node.scored:
+        backed_root = -_backed_stm(arm.root_node)
+    else:
+        arm.backed_value = None
+        arm.score = float("-inf")
+        return
+    arm.backed_value = backed_root
+    arm.score = backed_root + lam * arm.root_log_prior
+
+
+def _push_children(
+    arm: _Arm,
+    node: _TreeNode,
+    position_eval: PositionEval,
+    evaluator: PositionEvaluator,
+    config: HalvingConfig,
+    counter: "itertools.count",
+    root_color: chess.Color,
+) -> None:
+    if node.depth >= config.max_depth or not position_eval.legal_moves:
+        return
+    opponent_to_move = node.board.turn != root_color
+    order = _prior_order(position_eval.legal_log_priors)
+    if opponent_to_move:
+        # Refutation floor: top-r replies by prior plus ALL forcing replies.
+        picks = list(order[: config.refutation_top_r])
+        seen = set(picks)
+        for idx, move in enumerate(position_eval.legal_moves):
+            if idx not in seen and _is_forcing(node.board, move):
+                picks.append(idx)
+                seen.add(idx)
+    else:
+        picks = list(order[: config.expand_top])
+
+    for idx in picks:
+        move = position_eval.legal_moves[idx]
+        child_board = node.board.copy()
+        child_board.push(move)
+        # Forcing replies inherit the parent's priority (no decay for their
+        # own low prior): a refutation must compete at the plausibility of
+        # the line it refutes, not of the reply itself.
+        floor_pick = opponent_to_move and _is_forcing(node.board, move)
+        child_prior = node.path_log_prior + (
+            0.0 if floor_pick else position_eval.legal_log_priors[idx]
+        )
+        child = _TreeNode(
+            board=child_board,
+            handle=None,
+            depth=node.depth + 1,
+            path_log_prior=child_prior,
+        )
+        terminal_stm = terminal_value_for_color(child_board, color=child_board.turn)
+        if terminal_stm is not None:
+            child.terminal_value_stm = terminal_stm
+            node.children.append(child)
+            continue
+        child.handle = evaluator.extend(node.handle, node.board, move)
+        node.children.append(child)
+        heapq.heappush(arm.frontier, (-child.path_log_prior, next(counter), child))
+
+
+def select_value_search_halving(
+    *,
+    evaluator: PositionEvaluator,
+    root_handle: Any,
+    board: chess.Board,
+    legal_moves: list[chess.Move],
+    legal_log_priors: list[float],
+    config: HalvingConfig,
+) -> tuple[int, list[dict[str, Any]]]:
+    root_color = board.turn
+    order = _prior_order(legal_log_priors)
+    picks = list(order[: min(config.top_m, len(order))])
+    seen = set(picks)
+    for idx, move in enumerate(legal_moves):
+        if idx not in seen and _is_forcing(board, move):
+            picks.append(idx)
+            seen.add(idx)
+
+    counter = itertools.count()
+    arms: list[_Arm] = []
+    for idx in picks:
+        move = legal_moves[idx]
+        board1 = board.copy()
+        board1.push(move)
+        terminal_root = terminal_value_for_color(board1, color=root_color)
+        if terminal_root is not None and terminal_root >= 1.0:
+            # Immediate win (checkmate delivered): no other move can score higher.
+            return idx, [
+                {
+                    "move_uci": move.uci(),
+                    "policy_log_prob": float(legal_log_priors[idx]),
+                    "evals_spent": 0,
+                    "max_depth": 0,
+                    "backed_value": 1.0,
+                    "search_score": 1.0,
+                    "eliminated_round": None,
+                }
+            ]
+        arm = _Arm(
+            local_idx=idx,
+            move=move,
+            root_log_prior=float(legal_log_priors[idx]),
+            root_node=None,
+            terminal_value_root=terminal_root,
+        )
+        if terminal_root is None:
+            node = _TreeNode(
+                board=board1,
+                handle=evaluator.extend(root_handle, board, move),
+                depth=0,
+                path_log_prior=float(legal_log_priors[idx]),
+            )
+            arm.root_node = node
+            heapq.heappush(arm.frontier, (-node.path_log_prior, next(counter), node))
+        arms.append(arm)
+
+    rounds = config.rounds if config.rounds > 0 else _auto_rounds(len(arms))
+    spent = 0
+    survivors = list(arms)
+    for round_idx in range(rounds):
+        active = [arm for arm in survivors if arm.frontier]
+        if not active or spent >= config.budget:
+            break
+        per_arm = max(
+            1, (config.budget - spent) // ((rounds - round_idx) * len(active))
+        )
+        remaining = {id(arm): per_arm for arm in active}
+        # Waves: pop -> batched evaluate -> expand, until the round budget is
+        # spent or frontiers empty. One batched evaluate per wave (per level).
+        while spent < config.budget:
+            wave: list[tuple[_Arm, _TreeNode]] = []
+            for arm in active:
+                take = min(
+                    remaining[id(arm)],
+                    len(arm.frontier),
+                    config.budget - spent - len(wave),
+                )
+                for _ in range(max(0, take)):
+                    _, _, node = heapq.heappop(arm.frontier)
+                    wave.append((arm, node))
+                    remaining[id(arm)] -= 1
+            if not wave:
+                break
+            evals = evaluator.evaluate([(node.handle, node.board) for _, node in wave])
+            spent += len(wave)
+            for (arm, node), position_eval in zip(wave, evals):
+                node.value_stm = float(position_eval.value_stm)
+                arm.evals_spent += 1
+                arm.max_depth_reached = max(arm.max_depth_reached, node.depth)
+                _push_children(
+                    arm, node, position_eval, evaluator, config, counter, root_color
+                )
+        for arm in survivors:
+            _score_arm(arm, config.lam)
+        if round_idx < rounds - 1 and len(survivors) > 1:
+            survivors.sort(key=lambda arm: arm.score, reverse=True)
+            keep = math.ceil(len(survivors) / 2)
+            for arm in survivors[keep:]:
+                arm.eliminated_round = round_idx
+            survivors = survivors[:keep]
+
+    for arm in arms:
+        _score_arm(arm, config.lam)
+        # Preserve elimination bookkeeping; _score_arm only sets score/backed.
+
+    best = max(survivors, key=lambda arm: arm.score)
+    if best.score == float("-inf"):
+        # Budget starvation: fall back to the highest-prior candidate.
+        best = arms[0]
+
+    rows = [
+        {
+            "move_uci": arm.move.uci(),
+            "policy_log_prob": arm.root_log_prior,
+            "evals_spent": arm.evals_spent,
+            "max_depth": arm.max_depth_reached,
+            "backed_value": arm.backed_value
+            if arm.terminal_value_root is None
+            else float(arm.terminal_value_root),
+            "search_score": None if arm.score == float("-inf") else arm.score,
+            "eliminated_round": arm.eliminated_round,
+        }
+        for arm in arms
+    ]
+    return best.local_idx, rows
