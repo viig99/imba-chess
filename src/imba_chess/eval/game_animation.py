@@ -2,8 +2,6 @@ from __future__ import annotations
 
 import json
 from html import escape
-from pathlib import Path
-from typing import Any
 
 import chess
 import chess.pgn
@@ -66,10 +64,9 @@ let playTimer = null;
 function render() {
   boardEl.innerHTML = FRAMES[idx].svg;
   sliderEl.value = String(idx);
-  const frame = FRAMES[idx];
   plyLabelEl.textContent = idx === 0
     ? "Start position"
-    : `Ply ${idx}: ${frame.san} (${frame.side_to_move} to move)`;
+    : `Ply ${idx}: ${FRAMES[idx].san} (${idx % 2 ? "black" : "white"} to move)`;
   document.querySelectorAll(".move-cell").forEach((el) => {
     el.classList.toggle("active", Number(el.dataset.ply) === idx);
   });
@@ -114,10 +111,8 @@ sliderEl.max = String(FRAMES.length - 1);
 let moveRowHtml = "";
 for (let ply = 1; ply < FRAMES.length; ply += 2) {
   const moveNumber = Math.ceil(ply / 2);
-  const whiteFrame = FRAMES[ply];
-  const blackFrame = FRAMES[ply + 1];
-  const whiteCell = `<span class="move-cell" data-ply="${ply}">${whiteFrame.san}</span>`;
-  const blackCell = blackFrame ? `<span class="move-cell" data-ply="${ply + 1}">${blackFrame.san}</span>` : "";
+  const whiteCell = `<span class="move-cell" data-ply="${ply}">${FRAMES[ply].san}</span>`;
+  const blackCell = FRAMES[ply + 1] ? `<span class="move-cell" data-ply="${ply + 1}">${FRAMES[ply + 1].san}</span>` : "";
   moveRowHtml += `<div class="move-row"><span class="num">${moveNumber}.</span>${whiteCell}${blackCell}</div>`;
 }
 movesPanelEl.innerHTML = moveRowHtml;
@@ -131,59 +126,48 @@ render();
 </html>"""
 
 
-class GameAnimator:
-    """Renders a chess.pgn.Game as a self-contained, offline HTML replay viewer."""
+def render_game_html(game: chess.pgn.Game) -> str:
+    """Render a game as a self-contained, offline HTML replay viewer.
 
-    def render_html(self, game: chess.pgn.Game, *, metadata: dict[str, str]) -> str:
-        frames = self._build_frames(game)
-        frames_json = json.dumps(frames).replace("</", "<\\/")
-        title = escape(f"{metadata['white']} vs {metadata['black']}")
-        header_html = _render_header(metadata)
-        return (
-            _PAGE_TEMPLATE.replace("__TITLE__", title)
-            .replace("__HEADER_HTML__", header_html)
-            .replace("__FRAMES_JSON__", frames_json)
-        )
+    The page header is read from the game's White/Black/Result/Event headers.
+    """
+    frames = _build_frames(game)
+    frames_json = json.dumps(frames).replace("</", "<\\/")
+    title = escape(f"{game.headers['White']} vs {game.headers['Black']}")
+    header_html = _render_header(game, ply_count=len(frames) - 1)
+    return (
+        _PAGE_TEMPLATE.replace("__TITLE__", title)
+        .replace("__HEADER_HTML__", header_html)
+        .replace("__FRAMES_JSON__", frames_json)
+    )
 
-    def save(
-        self, path: Path, game: chess.pgn.Game, *, metadata: dict[str, str]
-    ) -> None:
-        page_html = self.render_html(game, metadata=metadata)
-        path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(page_html, encoding="utf-8")
 
-    def _build_frames(self, game: chess.pgn.Game) -> list[dict[str, Any]]:
-        board = game.board()
-        frames: list[dict[str, Any]] = [
+def _build_frames(game: chess.pgn.Game) -> list[dict[str, str | None]]:
+    board = game.board()
+    frames: list[dict[str, str | None]] = [
+        {"svg": chess.svg.board(board, size=400, coordinates=True), "san": None}
+    ]
+    for move in game.mainline_moves():
+        san = board.san(move)
+        board.push(move)
+        frames.append(
             {
-                "svg": chess.svg.board(board, size=400, coordinates=True),
-                "san": None,
-                "side_to_move": "white" if board.turn == chess.WHITE else "black",
+                "svg": chess.svg.board(board, size=400, lastmove=move, coordinates=True),
+                "san": san,
             }
-        ]
-        for move in game.mainline_moves():
-            san = board.san(move)
-            board.push(move)
-            frames.append(
-                {
-                    "svg": chess.svg.board(
-                        board, size=400, lastmove=move, coordinates=True
-                    ),
-                    "san": san,
-                    "side_to_move": "white" if board.turn == chess.WHITE else "black",
-                }
-            )
-        return frames
+        )
+    return frames
 
 
-def _render_header(metadata: dict[str, str]) -> str:
+def _render_header(game: chess.pgn.Game, *, ply_count: int) -> str:
+    headers = game.headers
     return (
         '<div class="header">'
-        f'<div class="title">{escape(metadata["white"])} vs {escape(metadata["black"])}</div>'
+        f'<div class="title">{escape(headers["White"])} vs {escape(headers["Black"])}</div>'
         '<div class="meta">'
-        f'Result: {escape(metadata["result"])} &middot; '
-        f'Segment: {escape(metadata["segment"])} &middot; '
-        f'Plies: {escape(metadata["ply_count"])}'
+        f'Result: {escape(headers["Result"])} &middot; '
+        f'Event: {escape(headers["Event"])} &middot; '
+        f"Plies: {ply_count}"
         "</div>"
         "</div>"
     )

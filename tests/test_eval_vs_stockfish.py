@@ -433,31 +433,6 @@ def test_outcome_label_covers_all_cases():
     )
 
 
-def test_build_game_pgn_sets_headers_for_model_as_black():
-    module = _load_eval_script_module()
-    board = chess.Board()
-    for move_uci in ["e2e4", "e7e5"]:
-        board.push_uci(move_uci)
-
-    game = module._build_game_pgn(
-        board=board,
-        model_color=chess.BLACK,
-        result="*",
-        segment_name="sf_elo_1400",
-        stockfish_limit_strength=True,
-        stockfish_elo=1400,
-    )
-
-    assert game.headers["White"] == "Stockfish (elo=1400)"
-    assert game.headers["Black"] == "imba-chess"
-    assert game.headers["Result"] == "*"
-    assert game.headers["ModelColor"] == "black"
-    assert game.headers["StockfishLimitStrength"] == "True"
-    assert game.headers["StockfishElo"] == "1400"
-    assert game.headers["Segment"] == "sf_elo_1400"
-    assert [move.uci() for move in game.mainline_moves()] == ["e2e4", "e7e5"]
-
-
 def test_save_traced_game_writes_pgn_and_html(tmp_path):
     module = _load_eval_script_module()
     board = chess.Board()
@@ -467,19 +442,22 @@ def test_save_traced_game_writes_pgn_and_html(tmp_path):
 
     module._save_traced_game(
         board=board,
-        model_color=chess.WHITE,
+        model_color=chess.BLACK,
         result="*",
         completed=False,
         segment_name="sf_elo_1400",
-        stockfish_limit_strength=True,
-        stockfish_elo=1400,
+        stockfish_label="Stockfish (elo=1400)",
         game_idx=1,
         save_games_dir=save_games_dir,
     )
 
-    pgn_path = save_games_dir / "sf_elo_1400_game002_incomplete.pgn"
+    pgn_text = (save_games_dir / "sf_elo_1400_game002_incomplete.pgn").read_text(
+        encoding="utf-8"
+    )
+    assert '[Event "sf_elo_1400"]' in pgn_text
+    assert '[White "Stockfish (elo=1400)"]' in pgn_text
+    assert '[Black "imba-chess"]' in pgn_text
+    assert '[Result "*"]' in pgn_text
+    assert "1. e4 e5" in pgn_text
     html_path = save_games_dir / "sf_elo_1400_game002_incomplete.html"
-    assert pgn_path.exists()
-    assert html_path.exists()
-    assert "1. e4 e5" in pgn_path.read_text(encoding="utf-8")
     assert html_path.read_text(encoding="utf-8").startswith("<!doctype html>")

@@ -22,7 +22,7 @@ from imba_chess.data.event_builder import (
     TARGET_IGNORE_INDEX,
 )
 from imba_chess.data.move_vocab import MoveVocab, load_or_create_static_move_vocab
-from imba_chess.eval.game_animation import GameAnimator
+from imba_chess.eval.game_animation import render_game_html
 from imba_chess.model import (
     HSTUChessModel,
     build_hstu_chess_config,
@@ -1147,35 +1147,6 @@ def _outcome_label(
     return "model_win" if model_won else "model_loss"
 
 
-def _build_game_pgn(
-    *,
-    board: chess.Board,
-    model_color: chess.Color,
-    result: str,
-    segment_name: str,
-    stockfish_limit_strength: bool,
-    stockfish_elo: int | None,
-) -> chess.pgn.Game:
-    game = chess.pgn.Game.from_board(board)
-    stockfish_label = _stockfish_label(
-        limit_strength=stockfish_limit_strength, elo=stockfish_elo
-    )
-    game.headers["White"] = (
-        "imba-chess" if model_color == chess.WHITE else stockfish_label
-    )
-    game.headers["Black"] = (
-        stockfish_label if model_color == chess.WHITE else "imba-chess"
-    )
-    game.headers["Result"] = result
-    game.headers["ModelColor"] = "white" if model_color == chess.WHITE else "black"
-    game.headers["StockfishLimitStrength"] = str(stockfish_limit_strength)
-    game.headers["StockfishElo"] = (
-        str(stockfish_elo) if stockfish_elo is not None else "full_strength"
-    )
-    game.headers["Segment"] = segment_name
-    return game
-
-
 def _save_traced_game(
     *,
     board: chess.Board,
@@ -1183,37 +1154,30 @@ def _save_traced_game(
     result: str,
     completed: bool,
     segment_name: str,
-    stockfish_limit_strength: bool,
-    stockfish_elo: int | None,
+    stockfish_label: str,
     game_idx: int,
     save_games_dir: Path,
 ) -> None:
     """Overwrites {segment}_game{N:03d}_{outcome}.*; if outcome changes between
     reruns (e.g. nondeterministic engine timing), the prior file is orphaned —
     use a different --save-games-dir to keep runs side by side."""
-    game = _build_game_pgn(
-        board=board,
-        model_color=model_color,
-        result=result,
-        segment_name=segment_name,
-        stockfish_limit_strength=stockfish_limit_strength,
-        stockfish_elo=stockfish_elo,
+    game = chess.pgn.Game.from_board(board)
+    game.headers["Event"] = segment_name
+    game.headers["White"] = (
+        "imba-chess" if model_color == chess.WHITE else stockfish_label
     )
+    game.headers["Black"] = (
+        stockfish_label if model_color == chess.WHITE else "imba-chess"
+    )
+    game.headers["Result"] = result
+
     outcome = _outcome_label(completed=completed, result=result, model_color=model_color)
     base_name = f"{segment_name}_game{game_idx + 1:03d}_{outcome}"
     save_games_dir.mkdir(parents=True, exist_ok=True)
-
-    pgn_path = save_games_dir / f"{base_name}.pgn"
-    pgn_path.write_text(str(game), encoding="utf-8")
-
-    metadata = {
-        "white": game.headers["White"],
-        "black": game.headers["Black"],
-        "result": result,
-        "segment": segment_name,
-        "ply_count": str(len(board.move_stack)),
-    }
-    GameAnimator().save(save_games_dir / f"{base_name}.html", game, metadata=metadata)
+    (save_games_dir / f"{base_name}.pgn").write_text(str(game), encoding="utf-8")
+    (save_games_dir / f"{base_name}.html").write_text(
+        render_game_html(game), encoding="utf-8"
+    )
 
 
 def _build_segment_options(
@@ -1302,10 +1266,8 @@ def _run_segment(
     debug_trace_games: int,
     debug_trace_max_plies: int,
     debug_topk: int,
-    stockfish_limit_strength: bool,
-    stockfish_elo: int | None,
-    save_games: bool,
-    save_games_dir: Path,
+    stockfish_label: str,
+    save_games_dir: Path | None,
 ) -> EvalSummary:
     summary = EvalSummary()
     with tqdm(
@@ -1411,15 +1373,14 @@ def _run_segment(
                 plies += 1
 
             result = board.result(claim_draw=True) if completed else "*"
-            if game_idx < debug_trace_games and save_games:
+            if save_games_dir is not None and game_idx < debug_trace_games:
                 _save_traced_game(
                     board=board,
                     model_color=model_color,
                     result=result,
                     completed=completed,
                     segment_name=segment_name,
-                    stockfish_limit_strength=stockfish_limit_strength,
-                    stockfish_elo=stockfish_elo,
+                    stockfish_label=stockfish_label,
                     game_idx=game_idx,
                     save_games_dir=save_games_dir,
                 )
@@ -1707,10 +1668,11 @@ def main() -> None:
                 debug_trace_games=max(0, int(args.debug_trace_games)),
                 debug_trace_max_plies=max(0, int(args.debug_trace_max_plies)),
                 debug_topk=max(0, int(args.debug_topk)),
-                stockfish_limit_strength=bool(spec.limit_strength),
-                stockfish_elo=(int(spec.elo) if spec.elo is not None else None),
-                save_games=bool(args.save_games),
-                save_games_dir=Path(args.save_games_dir),
+                stockfish_label=_stockfish_label(
+                    limit_strength=bool(spec.limit_strength),
+                    elo=int(spec.elo) if spec.elo is not None else None,
+                ),
+                save_games_dir=Path(args.save_games_dir) if args.save_games else None,
             )
             segment_payload = _summary_to_payload(
                 summary=segment_summary,
