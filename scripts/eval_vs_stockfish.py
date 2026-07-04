@@ -288,6 +288,18 @@ def _parse_args() -> argparse.Namespace:
         default=None,
         help="Top-k legal model moves to print in debug traces.",
     )
+    parser.add_argument(
+        "--save-games",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="Save PGN + HTML replay for each debug-traced game.",
+    )
+    parser.add_argument(
+        "--save-games-dir",
+        type=Path,
+        default=None,
+        help="Directory to write saved game PGN/HTML files into.",
+    )
     parser.add_argument("--output-json", type=Path, default=None)
     return parser.parse_args()
 
@@ -1287,6 +1299,10 @@ def _run_segment(
     debug_trace_games: int,
     debug_trace_max_plies: int,
     debug_topk: int,
+    stockfish_limit_strength: bool,
+    stockfish_elo: int | None,
+    save_games: bool,
+    save_games_dir: Path,
 ) -> EvalSummary:
     summary = EvalSummary()
     with tqdm(
@@ -1392,6 +1408,18 @@ def _run_segment(
                 plies += 1
 
             result = board.result(claim_draw=True) if completed else "*"
+            if game_idx < debug_trace_games and save_games:
+                _save_traced_game(
+                    board=board,
+                    model_color=model_color,
+                    result=result,
+                    completed=completed,
+                    segment_name=segment_name,
+                    stockfish_limit_strength=stockfish_limit_strength,
+                    stockfish_elo=stockfish_elo,
+                    game_idx=game_idx,
+                    save_games_dir=save_games_dir,
+                )
             _update_summary(
                 summary,
                 result=result,
@@ -1565,6 +1593,14 @@ def main() -> None:
     args.debug_topk = int(
         eval_cfg.debug_topk if args.debug_topk is None else args.debug_topk
     )
+    args.save_games = bool(
+        eval_cfg.save_games if args.save_games is None else args.save_games
+    )
+    args.save_games_dir = Path(
+        eval_cfg.save_games_dir
+        if args.save_games_dir is None
+        else args.save_games_dir
+    )
 
     if args.games < 1:
         raise ValueError("--games must be >= 1")
@@ -1668,6 +1704,10 @@ def main() -> None:
                 debug_trace_games=max(0, int(args.debug_trace_games)),
                 debug_trace_max_plies=max(0, int(args.debug_trace_max_plies)),
                 debug_topk=max(0, int(args.debug_topk)),
+                stockfish_limit_strength=bool(spec.limit_strength),
+                stockfish_elo=(int(spec.elo) if spec.elo is not None else None),
+                save_games=bool(args.save_games),
+                save_games_dir=Path(args.save_games_dir),
             )
             segment_payload = _summary_to_payload(
                 summary=segment_summary,
