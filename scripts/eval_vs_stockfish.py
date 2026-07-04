@@ -1188,6 +1188,9 @@ def _save_traced_game(
     game_idx: int,
     save_games_dir: Path,
 ) -> None:
+    """Overwrites {segment}_game{N:03d}_{outcome}.*; if outcome changes between
+    reruns (e.g. nondeterministic engine timing), the prior file is orphaned —
+    use a different --save-games-dir to keep runs side by side."""
     game = _build_game_pgn(
         board=board,
         model_color=model_color,

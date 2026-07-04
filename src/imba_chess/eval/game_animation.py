@@ -158,7 +158,6 @@ class GameAnimator:
             {
                 "svg": chess.svg.board(board, size=400, coordinates=True),
                 "san": None,
-                "ply": 0,
                 "side_to_move": "white" if board.turn == chess.WHITE else "black",
             }
         ]
@@ -171,7 +170,6 @@ class GameAnimator:
                         board, size=400, lastmove=move, coordinates=True
                     ),
                     "san": san,
-                    "ply": len(frames),
                     "side_to_move": "white" if board.turn == chess.WHITE else "black",
                 }
             )
