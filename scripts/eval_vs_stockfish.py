@@ -11,6 +11,7 @@ from typing import Any
 
 import chess
 import chess.engine
+import chess.pgn
 import torch
 
 from imba_chess.config import DEFAULT_CONFIG_PATH, load_repo_config
@@ -21,6 +22,7 @@ from imba_chess.data.event_builder import (
     TARGET_IGNORE_INDEX,
 )
 from imba_chess.data.move_vocab import MoveVocab, load_or_create_static_move_vocab
+from imba_chess.eval.game_animation import GameAnimator
 from imba_chess.model import (
     HSTUChessModel,
     build_hstu_chess_config,
@@ -1112,6 +1114,91 @@ def _print_segment_summary(*, segment_name: str, payload: dict[str, Any]) -> Non
     print(
         f"  as_black (W/D/L): {black['wins']}/{black['draws']}/{black['losses']}"
     )
+
+
+def _stockfish_label(*, limit_strength: bool, elo: int | None) -> str:
+    if limit_strength:
+        return f"Stockfish (elo={elo})"
+    return "Stockfish (full strength)"
+
+
+def _outcome_label(
+    *, completed: bool, result: str, model_color: chess.Color
+) -> str:
+    if not completed:
+        return "incomplete"
+    if result == "1/2-1/2":
+        return "draw"
+    model_won = (model_color == chess.WHITE and result == "1-0") or (
+        model_color == chess.BLACK and result == "0-1"
+    )
+    return "model_win" if model_won else "model_loss"
+
+
+def _build_game_pgn(
+    *,
+    board: chess.Board,
+    model_color: chess.Color,
+    result: str,
+    segment_name: str,
+    stockfish_limit_strength: bool,
+    stockfish_elo: int | None,
+) -> chess.pgn.Game:
+    game = chess.pgn.Game.from_board(board)
+    stockfish_label = _stockfish_label(
+        limit_strength=stockfish_limit_strength, elo=stockfish_elo
+    )
+    game.headers["White"] = (
+        "imba-chess" if model_color == chess.WHITE else stockfish_label
+    )
+    game.headers["Black"] = (
+        stockfish_label if model_color == chess.WHITE else "imba-chess"
+    )
+    game.headers["Result"] = result
+    game.headers["ModelColor"] = "white" if model_color == chess.WHITE else "black"
+    game.headers["StockfishLimitStrength"] = str(stockfish_limit_strength)
+    game.headers["StockfishElo"] = (
+        str(stockfish_elo) if stockfish_elo is not None else "full_strength"
+    )
+    game.headers["Segment"] = segment_name
+    return game
+
+
+def _save_traced_game(
+    *,
+    board: chess.Board,
+    model_color: chess.Color,
+    result: str,
+    completed: bool,
+    segment_name: str,
+    stockfish_limit_strength: bool,
+    stockfish_elo: int | None,
+    game_idx: int,
+    save_games_dir: Path,
+) -> None:
+    game = _build_game_pgn(
+        board=board,
+        model_color=model_color,
+        result=result,
+        segment_name=segment_name,
+        stockfish_limit_strength=stockfish_limit_strength,
+        stockfish_elo=stockfish_elo,
+    )
+    outcome = _outcome_label(completed=completed, result=result, model_color=model_color)
+    base_name = f"{segment_name}_game{game_idx + 1:03d}_{outcome}"
+    save_games_dir.mkdir(parents=True, exist_ok=True)
+
+    pgn_path = save_games_dir / f"{base_name}.pgn"
+    pgn_path.write_text(str(game), encoding="utf-8")
+
+    metadata = {
+        "white": game.headers["White"],
+        "black": game.headers["Black"],
+        "result": result,
+        "segment": segment_name,
+        "ply_count": str(len(board.move_stack)),
+    }
+    GameAnimator().save(save_games_dir / f"{base_name}.html", game, metadata=metadata)
 
 
 def _build_segment_options(
