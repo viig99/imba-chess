@@ -11,8 +11,6 @@
 # Skips a policy if its output JSON already exists (delete it to re-run).
 set -euo pipefail
 
-cd "$(dirname "${BASH_SOURCE[0]}")/.."
-
 CHECKPOINT_DIR="${CHECKPOINT_DIR:-artifacts/checkpoints}"
 OUT_DIR="${OUT_DIR:-artifacts/eval}"
 ELO="${ELO:-1400}"
@@ -45,6 +43,7 @@ for policy in ${POLICIES}; do
         --ladder-elos "${ELO}" \
         --ladder-games-per-segment "${GAMES}" \
         --no-include-full-strength-segment \
+        --save-games-dir "${OUT_DIR}/games/${tag}_sf${ELO}_${policy}" \
         --output-json "${out_json}" \
         "$@"
     echo "== ${policy} -> ${out_json} =="
