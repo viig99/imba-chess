@@ -23,6 +23,12 @@ from imba_chess.data.event_builder import (
 )
 from imba_chess.data.move_vocab import MoveVocab, load_or_create_static_move_vocab
 from imba_chess.eval.game_animation import render_game_html
+from imba_chess.eval.search import (
+    PositionEval,
+    select_greedy,
+    select_value_rerank,
+    select_value_search_d2,
+)
 from imba_chess.model import (
     HSTUChessModel,
     build_hstu_chess_config,
@@ -445,21 +451,6 @@ def _value_scalar_from_logits(value_logits_last: torch.Tensor) -> float:
     return float((probs[2] - probs[0]).item())
 
 
-def _terminal_value_for_color(
-    board: chess.Board, *, color: chess.Color
-) -> float | None:
-    if not board.is_game_over(claim_draw=True):
-        return None
-    result = board.result(claim_draw=True)
-    if result == "1/2-1/2":
-        return 0.0
-    if result == "1-0":
-        return 1.0 if color == chess.WHITE else -1.0
-    if result == "0-1":
-        return 1.0 if color == chess.BLACK else -1.0
-    return 0.0
-
-
 def _project_legal_logits(
     *,
     logits: torch.Tensor,
@@ -573,301 +564,54 @@ def _forward_last_token_outputs(
     return torch.cat(policy_rows, dim=0), torch.cat(value_rows, dim=0)
 
 
-def _select_value_rerank_index(
-    *,
-    model: torch.nn.Module,
-    history: _SequenceHistory,
-    board: chess.Board,
-    legal_logits: torch.Tensor,
-    legal_moves_with_ids: list[chess.Move],
-    device: torch.device,
-    dtype: torch.dtype,
-    value_rerank_top_k: int,
-    value_rerank_lambda: float,
-) -> tuple[int, list[dict[str, Any]]]:
-    root_color = board.turn
-    mapped_legal = int(legal_logits.shape[0])
-    rerank_k = min(int(value_rerank_top_k), mapped_legal)
-    legal_log_probs = torch.log_softmax(legal_logits.float(), dim=0)
-    _, top_indices = torch.topk(legal_logits, k=rerank_k, largest=True)
-    local_indices = [int(idx.item()) for idx in top_indices]
+class _HistoryPositionEvaluator:
+    """PositionEvaluator over _SequenceHistory handles and the chunked forward."""
 
-    candidates: list[dict[str, Any]] = []
-    candidate_batches: list[dict[str, Any]] = []
-    batch_to_candidate: list[int] = []
-    for idx in local_indices:
-        candidate_move = legal_moves_with_ids[idx]
-        # Keep the move stack so claimable draws (repetition/50-move) count as terminal.
-        next_board = board.copy()
-        next_board.push(candidate_move)
-        # Terminal boards never appear as training tokens; use the exact game
-        # result instead of the value head there.
-        terminal_value = _terminal_value_for_color(next_board, color=root_color)
-        candidates.append(
-            {
-                "local_idx": idx,
-                "move": candidate_move,
-                "terminal": terminal_value is not None,
-                "value_root": terminal_value,
-            }
+    def __init__(self, *, model, move_vocab, device, dtype, policy_name: str) -> None:
+        self._model = model
+        self._move_vocab = move_vocab
+        self._device = device
+        self._dtype = dtype
+        self._policy_name = policy_name
+
+    def extend(self, handle, board_before: chess.Board, move: chess.Move):
+        new_handle = handle.clone()
+        new_handle.append_observed_position(board_before)
+        new_handle.record_played_move(move.uci())
+        return new_handle
+
+    def evaluate(self, batch):
+        batches = [
+            handle.build_batch_for_current_position(board) for handle, board in batch
+        ]
+        policy_rows, value_rows = _forward_last_token_outputs(
+            model=self._model,
+            batches=batches,
+            device=self._device,
+            dtype=self._dtype,
+            policy_name=self._policy_name,
         )
-        if terminal_value is not None:
-            continue
-
-        candidate_history = history.clone()
-        candidate_history.append_observed_position(board)
-        candidate_history.record_played_move(candidate_move.uci())
-        candidate_batches.append(
-            candidate_history.build_batch_for_current_position(next_board)
-        )
-        batch_to_candidate.append(len(candidates) - 1)
-
-    if candidate_batches:
-        _, next_values = _forward_last_token_outputs(
-            model=model,
-            batches=candidate_batches,
-            device=device,
-            dtype=dtype,
-            policy_name="value_rerank",
-        )
-        for row_idx, cand_idx in enumerate(batch_to_candidate):
-            # Side-to-move at next_board is the opponent; negate to root POV.
-            v_opp = _value_scalar_from_logits(next_values[row_idx])
-            candidates[cand_idx]["value_root"] = -v_opp
-
-    chosen_index = local_indices[0]
-    best_score = float("-inf")
-    rerank_rows: list[dict[str, Any]] = []
-    for candidate in candidates:
-        local_idx = int(candidate["local_idx"])
-        value_root = float(candidate["value_root"])
-        policy_log_prob = float(legal_log_probs[local_idx].item())
-        # Value-dominant score with a small log-prob policy prior as tiebreak.
-        rerank_score = value_root + (float(value_rerank_lambda) * policy_log_prob)
-        rerank_rows.append(
-            {
-                "move_uci": candidate["move"].uci(),
-                "policy_logit": float(legal_logits[local_idx].item()),
-                "policy_log_prob": policy_log_prob,
-                "value_next": value_root,
-                "terminal": bool(candidate["terminal"]),
-                "rerank_score": rerank_score,
-            }
-        )
-        if rerank_score > best_score:
-            best_score = rerank_score
-            chosen_index = local_idx
-
-    return chosen_index, rerank_rows
-
-
-def _select_value_search_d2_index(
-    *,
-    model: torch.nn.Module,
-    history: _SequenceHistory,
-    board: chess.Board,
-    legal_logits: torch.Tensor,
-    legal_moves_with_ids: list[chess.Move],
-    move_vocab: MoveVocab,
-    device: torch.device,
-    dtype: torch.dtype,
-    value_rerank_top_k: int,
-    value_rerank_lambda: float,
-) -> tuple[int, list[dict[str, Any]]]:
-    root_color = board.turn
-    mapped_legal = int(legal_logits.shape[0])
-    root_k = min(int(value_rerank_top_k), mapped_legal)
-    legal_log_probs = torch.log_softmax(legal_logits.float(), dim=0)
-    _, top_indices = torch.topk(legal_logits, k=root_k, largest=True)
-    local_indices = [int(idx.item()) for idx in top_indices]
-
-    root_candidates: list[dict[str, Any]] = []
-    board1_batches: list[dict[str, Any]] = []
-    board1_batch_to_root: list[int] = []
-    for local_idx in local_indices:
-        move = legal_moves_with_ids[local_idx]
-        # Keep the move stack so claimable draws (repetition/50-move) count as terminal.
-        board1 = board.copy()
-        board1.push(move)
-        terminal_value = _terminal_value_for_color(board1, color=root_color)
-        if terminal_value is not None and terminal_value >= 1.0:
-            # Immediate win (checkmate delivered): no other move can score higher.
-            return local_idx, [
-                {
-                    "move_uci": move.uci(),
-                    "policy_logit": float(legal_logits[local_idx].item()),
-                    "policy_log_prob": float(legal_log_probs[local_idx].item()),
-                    "worst_reply_value": 1.0,
-                    "best_reply_uci": None,
-                    "search_score": 1.0,
-                }
-            ]
-        root_candidate: dict[str, Any] = {
-            "local_idx": local_idx,
-            "move": move,
-            "board1": board1,
-            "policy_logit": float(legal_logits[local_idx].item()),
-            "policy_log_prob": float(legal_log_probs[local_idx].item()),
-            "terminal_value": terminal_value,
-            "board1_value_opp": None,
-            "board1_logits": None,
-            "reply_candidates": [],
-        }
-        root_candidates.append(root_candidate)
-        if root_candidate["terminal_value"] is not None:
-            continue
-        candidate_history = history.clone()
-        candidate_history.append_observed_position(board)
-        candidate_history.record_played_move(move.uci())
-        root_candidate["candidate_history"] = candidate_history
-        board1_batches.append(
-            candidate_history.build_batch_for_current_position(board1)
-        )
-        board1_batch_to_root.append(len(root_candidates) - 1)
-
-    if board1_batches:
-        board1_logits, board1_values = _forward_last_token_outputs(
-            model=model,
-            batches=board1_batches,
-            device=device,
-            dtype=dtype,
-            policy_name="value_search_d2",
-        )
-        for row_idx, root_idx in enumerate(board1_batch_to_root):
-            root_candidates[root_idx]["board1_logits"] = board1_logits[row_idx]
-            root_candidates[root_idx]["board1_value_opp"] = _value_scalar_from_logits(
-                board1_values[row_idx]
-            )
-
-    board2_batches: list[dict[str, Any]] = []
-    board2_meta: list[tuple[int, int]] = []
-    for root_idx, root_candidate in enumerate(root_candidates):
-        if root_candidate["terminal_value"] is not None:
-            continue
-        board1_logits = root_candidate.get("board1_logits")
-        board1 = root_candidate["board1"]
-        if board1_logits is None:
-            continue
-        try:
-            opp_legal_logits, opp_legal_moves, _, opp_mapped_legal = _project_legal_logits(
-                logits=board1_logits,
-                board=board1,
-                move_vocab=move_vocab,
-            )
-        except RuntimeError:
-            board1_value_opp = root_candidate.get("board1_value_opp")
-            root_candidate["worst_reply_value"] = (
-                -float(board1_value_opp) if board1_value_opp is not None else 0.0
-            )
-            continue
-
-        opp_k = min(int(value_rerank_top_k), int(opp_mapped_legal))
-        _, opp_top_indices = torch.topk(opp_legal_logits, k=opp_k, largest=True)
-        opp_indices = [int(idx.item()) for idx in opp_top_indices]
-        # Always consider forcing replies (captures/checks/promotions): the
-        # tactical refutation is often a low-probability move under a
-        # human-imitation policy, so policy top-k alone misses it.
-        opp_seen = set(opp_indices)
-        for opp_idx, opp_move in enumerate(opp_legal_moves):
-            if opp_idx in opp_seen:
-                continue
-            if (
-                opp_move.promotion is not None
-                or board1.is_capture(opp_move)
-                or board1.gives_check(opp_move)
-            ):
-                opp_indices.append(opp_idx)
-                opp_seen.add(opp_idx)
-        reply_rows: list[dict[str, Any]] = []
-        candidate_history = root_candidate.get("candidate_history")
-        if candidate_history is None:
-            continue
-        for opp_local_idx in opp_indices:
-            opp_move = opp_legal_moves[opp_local_idx]
-            board2 = board1.copy()
-            board2.push(opp_move)
-            terminal_value = _terminal_value_for_color(board2, color=root_color)
-            reply_row = {
-                "move_uci": opp_move.uci(),
-                "opp_policy_logit": float(opp_legal_logits[opp_local_idx].item()),
-                "value_after_reply": terminal_value,
-                "terminal": terminal_value is not None,
-            }
-            reply_rows.append(reply_row)
-            if terminal_value is not None:
-                continue
-            reply_history = candidate_history.clone()
-            reply_history.append_observed_position(board1)
-            reply_history.record_played_move(opp_move.uci())
-            board2_batches.append(
-                reply_history.build_batch_for_current_position(board2)
-            )
-            board2_meta.append((root_idx, len(reply_rows) - 1))
-        root_candidate["reply_candidates"] = reply_rows
-
-    if board2_batches:
-        _, board2_values = _forward_last_token_outputs(
-            model=model,
-            batches=board2_batches,
-            device=device,
-            dtype=dtype,
-            policy_name="value_search_d2",
-        )
-        for row_idx, (root_idx, reply_idx) in enumerate(board2_meta):
-            root_candidates[root_idx]["reply_candidates"][reply_idx][
-                "value_after_reply"
-            ] = _value_scalar_from_logits(board2_values[row_idx])
-
-    chosen_index = local_indices[0]
-    best_score = float("-inf")
-    search_rows: list[dict[str, Any]] = []
-    for root_candidate in root_candidates:
-        if root_candidate["terminal_value"] is not None:
-            worst_reply_value = float(root_candidate["terminal_value"])
-            best_reply_uci = None
-        elif "worst_reply_value" in root_candidate:
-            worst_reply_value = float(root_candidate["worst_reply_value"])
-            best_reply_uci = None
-        else:
-            reply_rows = [
-                row
-                for row in root_candidate["reply_candidates"]
-                if row.get("value_after_reply") is not None
-            ]
-            if not reply_rows:
-                board1_value_opp = root_candidate.get("board1_value_opp")
-                worst_reply_value = (
-                    -float(board1_value_opp) if board1_value_opp is not None else 0.0
+        results = []
+        for row_idx, (_, board) in enumerate(batch):
+            value_stm = _value_scalar_from_logits(value_rows[row_idx])
+            try:
+                legal_logits, legal_moves, _, _ = _project_legal_logits(
+                    logits=policy_rows[row_idx],
+                    board=board,
+                    move_vocab=self._move_vocab,
                 )
-                best_reply_uci = None
-            else:
-                best_reply = min(
-                    reply_rows, key=lambda row: float(row["value_after_reply"])
+                log_priors = torch.log_softmax(legal_logits.float(), dim=0).tolist()
+            except RuntimeError:
+                # No legal move maps to the vocab: value-only leaf.
+                legal_moves, log_priors = [], []
+            results.append(
+                PositionEval(
+                    value_stm=value_stm,
+                    legal_moves=legal_moves,
+                    legal_log_priors=log_priors,
                 )
-                worst_reply_value = float(best_reply["value_after_reply"])
-                best_reply_uci = str(best_reply["move_uci"])
-
-        policy_logit = float(root_candidate["policy_logit"])
-        policy_log_prob = float(root_candidate["policy_log_prob"])
-        # Value-dominant score with a small log-prob policy prior as tiebreak.
-        search_score = worst_reply_value + (
-            float(value_rerank_lambda) * policy_log_prob
-        )
-        search_rows.append(
-            {
-                "move_uci": root_candidate["move"].uci(),
-                "policy_logit": policy_logit,
-                "policy_log_prob": policy_log_prob,
-                "worst_reply_value": worst_reply_value,
-                "best_reply_uci": best_reply_uci,
-                "search_score": search_score,
-            }
-        )
-        if search_score > best_score:
-            best_score = search_score
-            chosen_index = int(root_candidate["local_idx"])
-
-    return chosen_index, search_rows
+            )
+        return results
 
 
 def _select_model_move(
@@ -897,42 +641,45 @@ def _select_model_move(
         board=board,
         move_vocab=move_vocab,
     )
+    legal_log_priors = torch.log_softmax(legal_logits.float(), dim=0).tolist()
+    evaluator = _HistoryPositionEvaluator(
+        model=model,
+        move_vocab=move_vocab,
+        device=device,
+        dtype=dtype,
+        policy_name=policy,
+    )
     rerank_rows: list[dict[str, Any]] = []
     search_rows: list[dict[str, Any]] = []
     if policy == "greedy":
-        chosen_index = int(torch.argmax(legal_logits).item())
+        chosen_index = select_greedy(legal_log_priors)
     elif policy == "value_rerank":
         if output.get("value_logits") is None:
             raise RuntimeError(
                 "model_move_policy=value_rerank requires a checkpoint with value head enabled."
             )
-        chosen_index, rerank_rows = _select_value_rerank_index(
-            model=model,
-            history=history,
+        chosen_index, rerank_rows = select_value_rerank(
+            evaluator=evaluator,
+            root_handle=history,
             board=board,
-            legal_logits=legal_logits,
-            legal_moves_with_ids=legal_moves_with_ids,
-            device=device,
-            dtype=dtype,
-            value_rerank_top_k=value_rerank_top_k,
-            value_rerank_lambda=value_rerank_lambda,
+            legal_moves=legal_moves_with_ids,
+            legal_log_priors=legal_log_priors,
+            top_k=value_rerank_top_k,
+            lam=value_rerank_lambda,
         )
     elif policy == "value_search_d2":
         if output.get("value_logits") is None:
             raise RuntimeError(
                 "model_move_policy=value_search_d2 requires a checkpoint with value head enabled."
             )
-        chosen_index, search_rows = _select_value_search_d2_index(
-            model=model,
-            history=history,
+        chosen_index, search_rows = select_value_search_d2(
+            evaluator=evaluator,
+            root_handle=history,
             board=board,
-            legal_logits=legal_logits,
-            legal_moves_with_ids=legal_moves_with_ids,
-            move_vocab=move_vocab,
-            device=device,
-            dtype=dtype,
-            value_rerank_top_k=value_rerank_top_k,
-            value_rerank_lambda=value_rerank_lambda,
+            legal_moves=legal_moves_with_ids,
+            legal_log_priors=legal_log_priors,
+            top_k=value_rerank_top_k,
+            lam=value_rerank_lambda,
         )
     else:
         raise ValueError(f"Unknown model move policy: {policy}")
