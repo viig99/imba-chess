@@ -31,9 +31,10 @@ class DatasetConfig:
     cache_dir: Optional[str] = None
     parquet_batch_size: int = 2048
     max_seq_len: Optional[int] = None
-    return_dataclasses: bool = False
     shuffle_train_month_files_on_start: bool = False
     train_month_shuffle_seed: Optional[int] = None
+    # Game-level shuffle buffer for the train stream; 0 disables.
+    train_shuffle_buffer_size: int = 0
 
 
 @dataclass(frozen=True)

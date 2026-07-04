@@ -6,7 +6,6 @@ from pathlib import Path
 from typing import Dict, Iterable, List, Optional
 
 import chess
-from .serialize import as_plain_dict
 
 DEFAULT_STATIC_MOVE_VOCAB_PATH = Path("artifacts/move_vocab_static_uci.json")
 
@@ -74,11 +73,8 @@ class MoveVocab:
     ) -> "MoveVocab":
         def iter_moves() -> Iterable[str]:
             for game in games:
-                game_obj = as_plain_dict(game)
-                plays = game_obj["plays"]
-                for play in plays:
-                    play_obj = as_plain_dict(play)
-                    yield play_obj["move_uci"]
+                for play in game["plays"]:
+                    yield play["move_uci"]
 
         return cls.build(iter_moves(), config=config)
 

@@ -115,9 +115,9 @@ def _make_dataset(config, *, split: str) -> LichessDataset:
         cache_dir=dataset_cfg.cache_dir,
         parquet_batch_size=dataset_cfg.parquet_batch_size,
         max_seq_len=dataset_cfg.max_seq_len,
-        return_dataclasses=dataset_cfg.return_dataclasses,
         shuffle_train_month_files_on_start=dataset_cfg.shuffle_train_month_files_on_start,
         train_month_shuffle_seed=dataset_cfg.train_month_shuffle_seed,
+        train_shuffle_buffer_size=dataset_cfg.train_shuffle_buffer_size,
         board_state_config=config.board_state,
     )
 

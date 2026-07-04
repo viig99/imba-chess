@@ -7,15 +7,7 @@ from .dataloader import (
 )
 from .event_builder import BOS_TOKEN_ID, EVENT_TOKEN_ID, EventBuilder, TARGET_IGNORE_INDEX
 from .lichess_dataset import LichessDataset
-from .models import (
-    BoardState,
-    BoardTokenConfig,
-    GameMetadata,
-    GamePlayers,
-    GameRecord,
-    PlayRecord,
-    PlayerInfo,
-)
+from .models import BoardState, BoardTokenConfig
 from .move_vocab import (
     DEFAULT_STATIC_MOVE_VOCAB_PATH,
     MoveVocab,
@@ -44,10 +36,5 @@ __all__ = [
     "DEFAULT_STATIC_MOVE_VOCAB_PATH",
     "BoardTokenConfig",
     "BoardState",
-    "PlayerInfo",
-    "GamePlayers",
-    "GameMetadata",
-    "PlayRecord",
-    "GameRecord",
     "TorchLichessIterableDataset",
 ]

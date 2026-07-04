@@ -3,7 +3,6 @@ from __future__ import annotations
 from typing import Any, Dict
 
 from .move_vocab import MoveVocab
-from .serialize import as_plain_dict
 from .types import EventSequence
 
 EVENT_TOKEN_ID = 0
@@ -29,11 +28,7 @@ class EventBuilder:
         self.move_vocab = move_vocab
 
     def build_game(self, game: Dict[str, Any]) -> EventSequence:
-        data = as_plain_dict(game)
-        plays = [as_plain_dict(play) for play in data["plays"]]
-        game_result_white = _result_to_game_result_white(
-            data.get("result", data.get("Result", ""))
-        )
+        game_result_white = _result_to_game_result_white(game["result"])
 
         seq_token_id = [BOS_TOKEN_ID]
         piece_ids = [[0] * 64]
@@ -47,8 +42,8 @@ class EventBuilder:
         played_by_elo = [0]
 
         previous_move = self.move_vocab.start_id
-        for play in plays:
-            state = as_plain_dict(play["state"])
+        for play in game["plays"]:
+            state = play["state"]
             current_move = self.move_vocab.encode(play["move_uci"])
             current_played_by_elo = int(play.get("played_by_elo", 0))
 
@@ -66,7 +61,7 @@ class EventBuilder:
             previous_move = current_move
 
         return {
-            "game_id": data["game_id"],
+            "game_id": game["game_id"],
             "game_result_white": game_result_white,
             "seq_token_id": seq_token_id,
             "piece_ids": piece_ids,

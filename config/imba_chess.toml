@@ -15,9 +15,10 @@ val_max_games = 100000
 test_max_games = 100000
 cache_dir = "artifacts/hf_cache"
 parquet_batch_size = 8192
-return_dataclasses = false
 max_seq_len = 512
-shuffle_train_month_files_on_start = false
+shuffle_train_month_files_on_start = true
+# Game-level shuffle buffer per dataloader worker (rows held in memory); 0 disables.
+train_shuffle_buffer_size = 10000
 # Optional fixed seed for train-month shuffling; null/randomized each process start if omitted.
 # train_month_shuffle_seed = 12345
 

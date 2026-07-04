@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import asdict
+import io
 from pathlib import Path
 import random
 from typing import Any, Dict, Iterable, Iterator, Optional, Sequence
@@ -10,44 +10,28 @@ import chess.pgn
 from datasets import load_dataset
 
 from .board_state import BoardStateEncoder
-from .models import (
-    BoardTokenConfig,
-    GameMetadata,
-    GamePlayers,
-    GameRecord,
-    PlayRecord,
-    PlayerInfo,
-)
-from .parsing import (
-    parse_clk_seconds,
-    parse_elo,
-    parse_time_control_seconds,
-    read_pgn_from_row,
-    to_text,
-)
+from .models import BoardTokenConfig
+from .parsing import parse_elo, parse_time_control_seconds, to_text
 from .torch_iterable import TorchLichessIterableDataset
 
 VALID_RESULTS = {"1-0", "0-1", "1/2-1/2"}
 DEFAULT_STREAM_COLUMNS = [
-    "Event",
     "Site",
-    "UTCDate",
-    "UTCTime",
-    "White",
-    "Black",
     "Result",
     "WhiteElo",
     "BlackElo",
-    "ECO",
-    "Opening",
-    "Termination",
     "TimeControl",
+    "Termination",
     "movetext",
 ]
 
 
 class LichessDataset:
-    """Streaming Lichess parser with average-Elo filtering."""
+    """Streaming Lichess parser with average-Elo filtering.
+
+    Yields lean plain-dict game records for training:
+    {game_id, result, white_elo, black_elo, plays: [{move_uci, state, played_by_elo}]}
+    """
 
     def __init__(
         self,
@@ -67,9 +51,9 @@ class LichessDataset:
         stream_columns: Optional[Sequence[str]] = None,
         parquet_batch_size: int = 2048,
         max_seq_len: Optional[int] = None,
-        return_dataclasses: bool = False,
         shuffle_train_month_files_on_start: bool = False,
         train_month_shuffle_seed: Optional[int] = None,
+        train_shuffle_buffer_size: int = 0,
         board_state_config: Optional[BoardTokenConfig] = None,
     ) -> None:
         self.min_avg_elo = min_avg_elo
@@ -96,15 +80,19 @@ class LichessDataset:
         if max_seq_len is not None and max_seq_len < 1:
             raise ValueError(f"max_seq_len must be >= 1 when set, got {max_seq_len}")
         self.max_seq_len = max_seq_len
-        self.return_dataclasses = return_dataclasses
         self.shuffle_train_month_files_on_start = bool(
             shuffle_train_month_files_on_start
         )
+        # Fixed at construction (pre-fork) so all dataloader workers shuffle
+        # identically, keeping their strided file shards disjoint.
         self.train_month_shuffle_seed = (
             int(train_month_shuffle_seed)
             if train_month_shuffle_seed is not None
             else random.SystemRandom().randrange(0, 2**63)
         )
+        if train_shuffle_buffer_size < 0:
+            raise ValueError("train_shuffle_buffer_size must be >= 0")
+        self.train_shuffle_buffer_size = int(train_shuffle_buffer_size)
         self.board_state_encoder = BoardStateEncoder(board_state_config)
         self._validate_split_settings()
 
@@ -113,7 +101,7 @@ class LichessDataset:
         *,
         shard_id: Optional[int] = None,
         num_shards: Optional[int] = None,
-    ) -> Iterator[GameRecord | Dict[str, Any]]:
+    ) -> Iterator[Dict[str, Any]]:
         if self.cache_dir is not None:
             Path(self.cache_dir).mkdir(parents=True, exist_ok=True)
 
@@ -144,6 +132,15 @@ class LichessDataset:
             except TypeError:
                 rows = rows.filter(self._game_filter)
             prefiltered = True
+        if (
+            self.split.lower() == "train"
+            and self.train_shuffle_buffer_size > 0
+            and hasattr(rows, "shuffle")
+        ):
+            rows = rows.shuffle(
+                seed=self.train_month_shuffle_seed,
+                buffer_size=self.train_shuffle_buffer_size,
+            )
 
         yield from self.stream_from_rows(
             rows,
@@ -199,230 +196,95 @@ class LichessDataset:
         *,
         max_games: Optional[int] = None,
         assume_prefiltered: bool = False,
-    ) -> Iterator[GameRecord | Dict[str, Any]]:
+    ) -> Iterator[Dict[str, Any]]:
         emitted_games = 0
         for row in rows:
             white_elo = parse_elo(row.get("WhiteElo"))
             black_elo = parse_elo(row.get("BlackElo"))
             if white_elo is None or black_elo is None:
                 continue
+            if not assume_prefiltered:
+                if ((white_elo + black_elo) / 2) < self.min_avg_elo:
+                    continue
+                if not self._passes_time_control(row.get("TimeControl")):
+                    continue
 
-            if not self._is_valid_game(
-                row,
-                white_elo=white_elo,
-                black_elo=black_elo,
-                check_prefilters=not assume_prefiltered,
-            ):
+            result = to_text(row.get("Result"), default="")
+            if result not in VALID_RESULTS:
+                continue
+            termination = to_text(row.get("Termination"), default="").lower()
+            if "abandon" in termination or "abort" in termination:
                 continue
 
             game = self._parse_game_row(
-                row,
-                white_elo=white_elo,
-                black_elo=black_elo,
+                row, result=result, white_elo=white_elo, black_elo=black_elo
             )
             if game is None:
                 continue
 
-            if self.return_dataclasses:
-                yield game
-            else:
-                yield asdict(game)
-
+            yield game
             emitted_games += 1
             if max_games is not None and emitted_games >= max_games:
                 return
-
-    def _is_valid_game(
-        self,
-        row: Dict[str, Any],
-        *,
-        white_elo: Optional[int] = None,
-        black_elo: Optional[int] = None,
-        check_prefilters: bool = True,
-    ) -> bool:
-        if white_elo is None:
-            white_elo = parse_elo(row.get("WhiteElo"))
-        if black_elo is None:
-            black_elo = parse_elo(row.get("BlackElo"))
-        if white_elo is None or black_elo is None:
-            return False
-
-        if check_prefilters:
-            if ((white_elo + black_elo) / 2) < self.min_avg_elo:
-                return False
-            if not self._passes_time_control(row.get("TimeControl")):
-                return False
-
-        result = to_text(row.get("Result"), default="")
-        if result not in VALID_RESULTS:
-            return False
-
-        termination = to_text(row.get("Termination"), default="").lower()
-        if "abandon" in termination or "abort" in termination:
-            return False
-
-        movetext = to_text(row.get("movetext"), default="")
-        return bool(movetext)
 
     def _parse_game_row(
         self,
         row: Dict[str, Any],
         *,
-        white_elo: Optional[int] = None,
-        black_elo: Optional[int] = None,
-    ) -> Optional[GameRecord]:
-        if white_elo is None:
-            white_elo = parse_elo(row.get("WhiteElo"))
-        if black_elo is None:
-            black_elo = parse_elo(row.get("BlackElo"))
-        if white_elo is None or black_elo is None:
+        result: str,
+        white_elo: int,
+        black_elo: int,
+    ) -> Optional[Dict[str, Any]]:
+        movetext = to_text(row.get("movetext"), default="")
+        game = chess.pgn.read_game(io.StringIO(movetext))
+        # game.errors means the movetext broke mid-parse (illegal/corrupt move);
+        # the truncated prefix would carry a result label it never reached.
+        if game is None or game.errors:
             return None
 
-        game = read_pgn_from_row(row)
-        if game is None:
-            return None
-
-        white_player = to_text(row.get("White"), default="?")
-        black_player = to_text(row.get("Black"), default="?")
-        result = to_text(row.get("Result"), default="")
-        winner_side, winner_player, winner_elo, loser_player, loser_elo = (
-            self._resolve_outcome(
-                result=result,
-                white_player=white_player,
-                black_player=black_player,
-                white_elo=white_elo,
-                black_elo=black_elo,
-            )
-        )
-
-        metadata = GameMetadata(
-            event=to_text(row.get("Event"), default="?"),
-            termination=to_text(row.get("Termination"), default="?"),
-            eco=to_text(row.get("ECO"), default="?"),
-            opening=to_text(row.get("Opening"), default="?"),
-            time_control=to_text(row.get("TimeControl"), default="?"),
-            utc_date=to_text(row.get("UTCDate"), default="?"),
-            utc_time=to_text(row.get("UTCTime"), default="?"),
-        )
-
-        players = GamePlayers(
-            white=PlayerInfo(name=white_player, elo=white_elo),
-            black=PlayerInfo(name=black_player, elo=black_elo),
-        )
-
-        plays = self._extract_plays(
-            game=game,
-            winner_side=winner_side,
-            white_player=white_player,
-            black_player=black_player,
-            white_elo=white_elo,
-            black_elo=black_elo,
-        )
+        plays = self._extract_plays(game, white_elo=white_elo, black_elo=black_elo)
         if not plays:
             return None
 
-        return GameRecord(
-            game_id=to_text(row.get("Site"), default=""),
-            result=result,
-            winner_side=winner_side,
-            winner_player=winner_player,
-            winner_elo=winner_elo,
-            loser_player=loser_player,
-            loser_elo=loser_elo,
-            average_elo=(white_elo + black_elo) / 2,
-            num_plies=len(plays),
-            players=players,
-            metadata=metadata,
-            plays=plays,
-        )
+        return {
+            "game_id": to_text(row.get("Site"), default=""),
+            "result": result,
+            "white_elo": white_elo,
+            "black_elo": black_elo,
+            "plays": plays,
+        }
 
     def _extract_plays(
         self,
         game: chess.pgn.Game,
-        winner_side: Optional[str],
-        white_player: str,
-        black_player: str,
+        *,
         white_elo: int,
         black_elo: int,
-    ) -> list[PlayRecord]:
-        plays: list[PlayRecord] = []
+    ) -> list[dict[str, Any]]:
+        plays: list[dict[str, Any]] = []
         board = game.board()
         node = game
-        last_clock_seconds: Dict[bool, float] = {}
-        play_id = 0
 
         while node.variations and (
-            self.max_seq_len is None or play_id < self.max_seq_len
+            self.max_seq_len is None or len(plays) < self.max_seq_len
         ):
-            next_node = node.variations[0]
-            move = next_node.move
-            active_color = board.turn
-            active_color_text = "white" if active_color == chess.WHITE else "black"
-            active_player = (
-                white_player if active_color == chess.WHITE else black_player
-            )
-            active_elo = white_elo if active_color == chess.WHITE else black_elo
-            opponent_player = (
-                black_player if active_color == chess.WHITE else white_player
-            )
-            opponent_elo = black_elo if active_color == chess.WHITE else white_elo
-
-            if winner_side is None:
-                outcome_for_player = "draw"
-            elif winner_side == active_color_text:
-                outcome_for_player = "win"
-            else:
-                outcome_for_player = "loss"
-
-            remaining = parse_clk_seconds(next_node.comment)
-            time_taken = None
-            if remaining is not None and active_color in last_clock_seconds:
-                previous = last_clock_seconds[active_color]
-                if previous >= remaining:
-                    time_taken = previous - remaining
-            if remaining is not None:
-                last_clock_seconds[active_color] = remaining
-
+            node = node.variations[0]
+            move = node.move
             state = self.board_state_encoder.encode(board)
-            san = board.san(move)
-            board.push(move)
-            play_id += 1
-
             plays.append(
-                PlayRecord(
-                    play_id=play_id,
-                    move_uci=move.uci(),
-                    move_san=san,
-                    state=state,
-                    time_remaining_seconds=remaining,
-                    time_taken_seconds=time_taken,
-                    played_by_color=active_color_text,
-                    played_by=active_player,
-                    played_by_elo=active_elo,
-                    opponent_player=opponent_player,
-                    opponent_elo=opponent_elo,
-                    outcome_for_player=outcome_for_player,
-                )
+                {
+                    "move_uci": move.uci(),
+                    # vars() is a shallow, zero-copy view of the frozen
+                    # BoardState; consumers must not mutate it.
+                    "state": vars(state),
+                    "played_by_elo": (
+                        white_elo if board.turn == chess.WHITE else black_elo
+                    ),
+                }
             )
-            node = next_node
+            board.push(move)
 
         return plays
-
-    @staticmethod
-    def _resolve_outcome(
-        result: str,
-        white_player: str,
-        black_player: str,
-        white_elo: int,
-        black_elo: int,
-    ) -> tuple[
-        Optional[str], Optional[str], Optional[int], Optional[str], Optional[int]
-    ]:
-        if result == "1-0":
-            return "white", white_player, white_elo, black_player, black_elo
-        if result == "0-1":
-            return "black", black_player, black_elo, white_player, white_elo
-        return None, None, None, None, None
 
     def _build_load_kwargs(self, *, data_files: list[str]) -> Dict[str, Any]:
         return {
@@ -501,6 +363,8 @@ class LichessDataset:
         self._validate_month_range(start_month, end_month)
 
         # Newest month first so recent games appear first in the stream.
+        # NOTE: workers shard over these month-level globs, so num_workers
+        # beyond the number of months in the window get empty shards.
         files: list[str] = []
         for month_index in range(end_index, start_index - 1, -1):
             year = month_index // 12

@@ -4,7 +4,6 @@ import json
 import pytest
 
 from imba_chess.data.lichess_dataset import LichessDataset
-from imba_chess.data.models import GameRecord
 
 
 def _row(**overrides):
@@ -42,28 +41,30 @@ def test_elo_filter_uses_average_threshold():
     assert games[0]["game_id"] != "https://lichess.org/low"
 
 
-def test_move_and_clock_parsing():
+def test_move_parsing_yields_lean_records():
     dataset = LichessDataset(min_avg_elo=2000)
     games = list(dataset.stream_from_rows([_row()]))
     assert len(games) == 1
 
     game = games[0]
+    assert game["game_id"] == "https://lichess.org/example"
+    assert game["result"] == "1-0"
+    assert game["white_elo"] == 2100
+    assert game["black_elo"] == 1900
+
     plays = game["plays"]
-    assert game["num_plies"] == 4
-    assert plays[0]["play_id"] == 1
-    assert plays[0]["move_uci"] == "e2e4"
+    assert len(plays) == 4
+    assert [play["move_uci"] for play in plays] == ["e2e4", "e7e5", "g1f3", "b8c6"]
+    # played_by_elo alternates white/black
+    assert [play["played_by_elo"] for play in plays] == [2100, 1900, 2100, 1900]
     assert len(plays[0]["state"]["piece_ids"]) == 64
     assert plays[0]["state"]["turn_id"] == 0
+    assert plays[1]["state"]["turn_id"] == 1
     assert plays[0]["state"]["castle_id"] == 15
     assert plays[0]["state"]["ep_file_id"] == 0
-    assert plays[0]["outcome_for_player"] == "win"
-    assert plays[1]["outcome_for_player"] == "loss"
-    assert plays[2]["time_taken_seconds"] == 10.0
-    assert game["winner_player"] == "Alice"
-    assert game["loser_player"] == "Bob"
 
 
-def test_typed_date_time_values_are_supported_and_json_serializable():
+def test_output_is_json_serializable_with_typed_row_values():
     dataset = LichessDataset(min_avg_elo=2000)
     games = list(
         dataset.stream_from_rows(
@@ -77,18 +78,17 @@ def test_typed_date_time_values_are_supported_and_json_serializable():
     )
 
     assert games
-    assert games[0]["metadata"]["utc_date"] == "2026-01-01"
-    assert games[0]["metadata"]["utc_time"] == "12:00:00"
     json.dumps(games[0])
 
 
-def test_can_return_dataclasses():
-    dataset = LichessDataset(min_avg_elo=2000, return_dataclasses=True)
-    games = list(dataset.stream_from_rows([_row(WhiteElo="2200", BlackElo="2200")]))
+def test_rejects_games_with_corrupt_movetext():
+    dataset = LichessDataset(min_avg_elo=2000)
+    # Qxe5 is illegal on move 2; the parser truncates there. The truncated
+    # prefix must be rejected, not emitted with the full-game result label.
+    rows = [_row(movetext="1. e4 e5 2. Qxe5 Nf6 1-0")]
+    games = list(dataset.stream_from_rows(rows))
 
-    assert games
-    assert isinstance(games[0], GameRecord)
-    assert games[0].plays[0].state.turn_id == 0
+    assert games == []
 
 
 def test_respects_max_seq_len_truncation():
@@ -96,7 +96,6 @@ def test_respects_max_seq_len_truncation():
     games = list(dataset.stream_from_rows([_row()]))
 
     assert len(games) == 1
-    assert games[0]["num_plies"] == 2
     assert len(games[0]["plays"]) == 2
 
 
@@ -146,6 +145,61 @@ def test_stream_applies_val_max_games(monkeypatch):
 
     assert len(games) == 1
     assert games[0]["game_id"] == "https://lichess.org/v1"
+
+
+class _FakeStream:
+    """Minimal stand-in for a HF streaming dataset with filter/shuffle."""
+
+    def __init__(self, rows):
+        self.rows = rows
+        self.shuffle_calls: list[dict] = []
+
+    def filter(self, fn, input_columns=None):
+        return self
+
+    def shuffle(self, *, seed, buffer_size):
+        self.shuffle_calls.append({"seed": seed, "buffer_size": buffer_size})
+        return self
+
+    def __iter__(self):
+        return iter(self.rows)
+
+
+def test_stream_shuffles_train_split_with_buffer(monkeypatch):
+    fake = _FakeStream([_row(WhiteElo="2200", BlackElo="2200")])
+    monkeypatch.setattr(
+        "imba_chess.data.lichess_dataset.load_dataset", lambda **kwargs: fake
+    )
+    dataset = LichessDataset(
+        min_avg_elo=2000,
+        split="train",
+        train_start_month="2025-07",
+        train_end_month="2025-07",
+        train_shuffle_buffer_size=5000,
+        train_month_shuffle_seed=123,
+    )
+    games = list(dataset.stream())
+
+    assert games
+    assert fake.shuffle_calls == [{"seed": 123, "buffer_size": 5000}]
+
+
+def test_stream_does_not_shuffle_val_split(monkeypatch):
+    fake = _FakeStream([_row(WhiteElo="2200", BlackElo="2200")])
+    monkeypatch.setattr(
+        "imba_chess.data.lichess_dataset.load_dataset", lambda **kwargs: fake
+    )
+    dataset = LichessDataset(
+        min_avg_elo=2000,
+        split="val",
+        val_start_month="2025-08",
+        val_end_month="2025-08",
+        train_shuffle_buffer_size=5000,
+    )
+    games = list(dataset.stream())
+
+    assert games
+    assert fake.shuffle_calls == []
 
 
 def test_temporal_mode_uses_reverse_month_order(monkeypatch):

@@ -56,7 +56,6 @@ def main() -> None:
         cache_dir=repo_config.dataset.cache_dir,
         parquet_batch_size=repo_config.dataset.parquet_batch_size,
         max_seq_len=repo_config.dataset.max_seq_len,
-        return_dataclasses=repo_config.dataset.return_dataclasses,
         board_state_config=repo_config.board_state,
     )
 
