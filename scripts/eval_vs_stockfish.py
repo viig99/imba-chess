@@ -15,7 +15,7 @@ import chess.pgn
 import torch
 import torch.nn.functional as F
 
-from imba_chess.config import DEFAULT_CONFIG_PATH, load_repo_config
+from imba_chess.config import DEFAULT_CONFIG_PATH, RepoConfig, load_repo_config
 from imba_chess.data.board_state import BoardStateEncoder
 from imba_chess.data.event_builder import (
     BOS_TOKEN_ID,
@@ -388,7 +388,7 @@ def _load_model(
     return model, compile_enabled
 
 
-def _load_value_net(path: Path, repo_config, device: torch.device) -> ValueNet:
+def _load_value_net(path: Path, repo_config: RepoConfig, device: torch.device) -> ValueNet:
     payload = torch.load(path, map_location="cpu")
     state_dict = payload.get("model", payload) if isinstance(payload, dict) else payload
     saved = payload.get("config", {}) if isinstance(payload, dict) else {}
@@ -631,11 +631,11 @@ class CachedPositionEvaluator:
                 net_probs = torch.softmax(net_logits, dim=-1)
                 net_scalars = net_probs[:, 2] - net_probs[:, 0]
 
+        alpha = self._value_net_alpha
         results = []
         for row, board in enumerate(boards):
             value_stm = _value_scalar_from_logits(value_logits[row])
             if net_scalars is not None:
-                alpha = self._value_net_alpha
                 value_stm = (1.0 - alpha) * value_stm + alpha * float(net_scalars[row])
             try:
                 legal_logits, legal_moves, _, _ = _project_legal_logits(

@@ -41,6 +41,9 @@ def train_step(model, batch, optimizer, *, grad_clip_norm: float, autocast_ctx=N
 
 @torch.no_grad()
 def validate(model, loader, *, max_batches: int, device) -> tuple[float, float]:
+    # The streaming val loader restarts from the stream head each call, so
+    # this scores a fixed leading slice of the holdout — a consistent
+    # tracking metric, not a full-holdout average.
     model.eval()
     losses, correct, total = [], 0, 0
     for i, batch in enumerate(loader):
