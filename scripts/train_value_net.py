@@ -26,7 +26,9 @@ def soft_cross_entropy(logits: torch.Tensor, targets: torch.Tensor) -> torch.Ten
     return -(targets * torch.log_softmax(logits.float(), dim=-1)).sum(dim=-1).mean()
 
 
-def train_step(model, batch, optimizer, *, grad_clip_norm: float, autocast_ctx=None) -> float:
+def train_step(
+    model, batch, optimizer, *, grad_clip_norm: float, autocast_ctx=None
+) -> float:
     model.train()
     optimizer.zero_grad(set_to_none=True)
     ctx = autocast_ctx if autocast_ctx is not None else contextlib.nullcontext()
@@ -137,7 +139,9 @@ def main() -> None:
         from optimi import StableAdamW
 
         optimizer = StableAdamW(
-            model.parameters(), lr=cfg.max_lr, weight_decay=cfg.weight_decay,
+            model.parameters(),
+            lr=cfg.max_lr,
+            weight_decay=cfg.weight_decay,
             kahan_sum=True,
         )
     except ImportError:
@@ -148,7 +152,7 @@ def main() -> None:
         optimizer,
         max_lr=cfg.max_lr,
         total_steps=steps,
-        pct_start=0.05,
+        pct_start=0.03,
         # StableAdamW doesn't expose momentum/beta1 the way momentum cycling
         # expects (same reason scripts/train.py disables it).
         cycle_momentum=False,
@@ -163,7 +167,9 @@ def main() -> None:
 
     writer = SummaryWriter(log_dir=str(checkpoint_dir / "tb"))
     model_config_payload = {
-        "dim": cfg.dim, "num_heads": cfg.num_heads, "num_layers": cfg.num_layers
+        "dim": cfg.dim,
+        "num_heads": cfg.num_heads,
+        "num_layers": cfg.num_layers,
     }
 
     def save(name: str, step: int, val_loss: float) -> None:
@@ -183,8 +189,11 @@ def main() -> None:
     while step < steps:
         for batch in train_loader:
             loss = train_step(
-                model, batch, optimizer,
-                grad_clip_norm=cfg.grad_clip_norm, autocast_ctx=autocast_ctx,
+                model,
+                batch,
+                optimizer,
+                grad_clip_norm=cfg.grad_clip_norm,
+                autocast_ctx=autocast_ctx,
             )
             scheduler.step()
             step += 1
@@ -194,7 +203,9 @@ def main() -> None:
                     {
                         "loss": f"{loss:.4f}",
                         "lr": f"{scheduler.get_last_lr()[0]:.1e}",
-                        "best_val": "--" if best_val == float("inf") else f"{best_val:.4f}",
+                        "best_val": "--"
+                        if best_val == float("inf")
+                        else f"{best_val:.4f}",
                     }
                 )
                 writer.add_scalar("train/loss", loss, step)
