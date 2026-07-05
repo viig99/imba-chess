@@ -15,7 +15,7 @@ import chess
 import torch
 
 from datasets import load_dataset
-from torch.utils.data import IterableDataset, get_worker_info
+from torch.utils.data import IterableDataset
 
 from ..model.value_net import board_material_count, cp_to_wdl
 from .board_state import BoardStateEncoder
@@ -95,10 +95,12 @@ class PositionEvalDataset(IterableDataset):
                 yield sample
 
     def __iter__(self) -> Iterator[Dict[str, torch.Tensor]]:
+        # datasets' streaming IterableDataset auto-splits its file shards
+        # across torch DataLoader workers; sharding manually on top of that
+        # double-shards and starves all but a couple of workers ("Too many
+        # dataloader workers" warning). Useful num_workers is capped by the
+        # dataset's file count (20 for the hub dataset).
         rows = load_dataset(self.dataset_name, split="train", streaming=True)
-        worker = get_worker_info()
-        if worker is not None and worker.num_workers > 1:
-            rows = rows.shard(num_shards=worker.num_workers, index=worker.id)
         if self.split == "train" and self.shuffle_buffer_size > 0:
             rows = rows.shuffle(seed=self.seed, buffer_size=self.shuffle_buffer_size)
         yield from self.samples_from_rows(rows)
