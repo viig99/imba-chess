@@ -223,15 +223,16 @@ Setup: checkpoint `best_hr10_checkpoint_12` (hr@10 = 0.9349), Stockfish `UCI_Elo
 | `value_search_halving` config | W / D / L | Score rate | ≈ Elo vs SF1800 |
 |---|---|---|---|
 | budget 256, depth 4 (defaults) | 38 / 17 / 45 | 0.465 | −24 |
-| budget 512, depth 6 | 45 / 22 / 33 | **0.560** | +42 |
+| budget 512, depth 6 | 45 / 22 / 33 | 0.560 | +42 |
+| budget 1024, depth 6 (ckpt_13, hr@10 0.9361) | 48 / 23 / 29 | **0.595** | +67 |
 
 What we understand so far:
 
-- **Search is doing most of the lifting, and search compute still converts into strength.** The full progression on v3 checkpoints vs SF1400 is greedy 0.21 → d2 0.34 → halving-256 0.915; at SF1800, doubling the budget and deepening the tree adds another ~+0.10 (~1.4σ at 100 games each — directionally consistent, pending the 1024 point). A pure imitation policy plays ~1170-Elo-equivalent chess; the same network under budgeted value search plays ~1800+.
-- **The value head is not yet the proven bottleneck.** The decision rule: keep doubling budget while the curve climbs; the first flat doubling is the signal to stop buying search and start improving the value oracle (engine-annotated value labels). budget 1024/depth 6 (~25 s/game) is the next measurement.
-- Budget and depth moved together in the 512/d6 run, so their individual contributions aren't separated yet; a 512/depth-4 or 1024/depth-6 run disambiguates.
-- The 512/d6 color split (White 0.43, Black 0.69) is noisy at 50 games/color and reversed from every earlier run — treat as variance until it repeats.
-- Draws grow with opponent strength (17–22 at 1800 vs 7 at 1400): converting drawn endgames is exactly where noisy outcome-based value labels hurt most, and the concrete motivation for distillation in the next training run.
+- **Search does most of the lifting.** The full progression on v3 checkpoints vs SF1400 is greedy 0.21 → d2 0.34 → halving-256 0.915. A pure imitation policy plays ~1170-Elo-equivalent chess; the same network under budgeted value search plays ~1800+.
+- **The budget curve is flattening — the value oracle is becoming the bottleneck.** 256→512(+depth) bought +0.095; 512→1024 bought only +0.035 (well inside noise, and the 1024 run even had a slightly newer checkpoint in its favor). Per the decision rule (stop buying search at the first flat doubling), further budget scaling is no longer the lever: the next Elo lives in **better value labels** — engine-annotated (distilled) targets instead of noisy whole-game outcomes.
+- Draws grow with opponent strength (17–23 at 1800 vs 7 at 1400): converting drawn endgames is exactly where outcome-label noise hurts most — consistent with the flattening curve.
+- Per-color splits at 1800 fluctuate across runs (e.g. 0.43/0.69 at 512/d6) — 50 games/color is noisy; treat asymmetries as variance until they repeat.
+- A v4 training run (768d × 8-layer trunk, `value_loss_weight` 1.0) is underway; the distillation pipeline is the planned follow-up. Older checkpoints remain evaluable via `--config config/imba_chess_v3.toml` after the architecture change.
 
 ### Historical: the λ sweep (v2 checkpoint)
 

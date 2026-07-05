@@ -34,18 +34,18 @@ path = "artifacts/move_vocab_static_uci.json"
 include_unk = false
 
 [dataloader]
-max_tokens_per_batch = 40960
-num_workers = 12
+max_tokens_per_batch = 24576
+num_workers = 2
 pin_memory = true
 prefetch_factor = 2
 persistent_workers = true
 
 [model]
-model_dim = 768
+model_dim = 512
 linear_hidden_dim = 64
 attention_dim = 64
-num_heads = 12
-num_layers = 8
+num_heads = 8
+num_layers = 6
 dropout = 0.0
 max_position_embeddings = 513
 halfmove_vocab_size = 128
@@ -71,7 +71,7 @@ log_every_steps = 10
 full_val_every_epochs = 1
 fast_val_max_games = 10000
 fast_test_max_games = 10000
-max_lr = 7e-4
+max_lr = 1e-3
 # Start at full LR: StableAdamW's update clipping + grad_clip_norm cover early
 # second-moment instability, and warmup wastes the most sample-efficient steps.
 lr_start_factor = 1.0
