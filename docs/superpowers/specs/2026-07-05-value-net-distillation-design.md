@@ -94,15 +94,23 @@ Per row (`fen`, `cp`, `mate`, `depth`, ...):
 
 Holdout split: deterministic FEN-hash (e.g. `hash(fen) % 1000 < 5` → val).
 
-### cp→WDL calibration — `scripts/fit_cp_to_wdl.py` (one-off)
+### cp→WDL conversion — Stockfish's own win-rate model, hardcoded
 
-Sample ~100k positions from the existing games stream (which carry real
-outcomes), annotate each with the local Stockfish at a fixed depth
-(~1 CPU-hour; no join against the 41 GB eval DB needed), fit a multinomial
-logistic `P(W/D/L | cp, ply)`, and save the coefficients to
-`artifacts/cp_to_wdl.json`. The dataset loads this artifact; the eval-DB
-`cp` values pass through it to produce calibrated soft targets matched to
-our own outcome distribution.
+A pure function `cp_to_wdl(cp, fullmove) -> (p_loss, p_draw, p_win)` using
+the published Stockfish `win_rate_model` polynomial (constants vendored
+with a comment naming the SF version they came from): `p_win` from the
+polynomial at `cp`, `p_loss` from the same polynomial at `-cp` (symmetry),
+`p_draw = 1 − p_win − p_loss`. No annotation run, no fitted artifact.
+
+Rationale: the search consumes values ordinally, so any monotone curve
+preserves arm ranking — calibration precision only matters where net values
+meet exact terminal values and in draw-vs-slightly-worse comparisons.
+Fitting against our own game outcomes was rejected: it would calibrate cp
+to *human* conversion rates, re-importing exactly the label noise this
+project removes. SF's model is calibrated on engine self-play ("value
+under strong play"), which is the intended semantics. Empirical
+re-calibration is a future refinement only if eval evidence shows
+miscalibration at the seams.
 
 ## Part 3: Training — `scripts/train_value_net.py`
 
@@ -116,7 +124,7 @@ Lean standalone script (plain loop, no Ignite):
   best checkpoint by val soft-CE, last by cadence; TensorBoard logging.
 - Config section `[value_net]` in `config/imba_chess.toml`: model dims,
   `depth_min`, batch size, lr, steps, workers, checkpoint dir
-  (`artifacts/value_net/`), calibration artifact path.
+  (`artifacts/value_net/`).
 
 ## Part 4: Inference integration
 
@@ -150,7 +158,8 @@ their exact values (the blend applies only to value-head evaluations).
 - POV flip: mirrored FENs (same position, colors swapped) must produce
   sign-flipped cp→target conversions; a Black-to-move mate-in-1 row maps
   to the correct saturated side.
-- cp→WDL: monotonicity in cp; probabilities sum to 1; mate rows bypass the
+- cp→WDL: monotone in cp; probabilities sum to 1; symmetric
+  (`cp_to_wdl(cp)` reversed equals `cp_to_wdl(-cp)`); mate rows bypass the
   curve.
 - Dataset streaming: a scripted parquet fixture through filter/encode/
   target path.
@@ -169,6 +178,7 @@ held-out val soft-CE of the net itself during training.
 
 - Mate-distance auxiliary head (exact moves-left labels) — noted future.
 - Depth-weighted loss (depth filter only).
+- Empirically fitted cp→WDL calibration (hardcoded SF win-rate model only).
 - Syzygy tablebase integration (separate, orthogonal quick win).
 - Any change to the big model, its training run, or the search module.
 - Shared-trunk mixed-stream training (kept open as a later option).
