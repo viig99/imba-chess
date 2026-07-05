@@ -21,6 +21,7 @@ Inspiration:
 - Ignite-based training loop (StableAdamW + OneCycleLR, mixed precision, periodic fast val/test + periodic full val, TensorBoard logging, best/last checkpointing).
 - Head-to-head engine evaluation (`scripts/eval_vs_stockfish.py`) with pluggable value-guided search at inference (`src/imba_chess/eval/search.py`): depth-2 minimax and budgeted sequential-halving tree search (MCTS-lite).
 - Per-game PGN + self-contained HTML replay viewer (board animation, clickable move list) for traced eval games.
+- Standalone Stockfish-distilled value network (`src/imba_chess/model/value_net.py` + `scripts/train_value_net.py`), blendable into search at eval time.
 
 ## Data and training flow
 
@@ -238,6 +239,64 @@ What we understand so far:
 
 An earlier sweep on a pre-v3 checkpoint (not comparable to the numbers above) established two durable design facts, both baked into the current defaults: **value-dominant scoring beats policy-dominant scoring** by ~+140 Elo inference-only (0.23 → 0.405 vs SF1400), and **λ = 0 collapses** (0.12) — optimizing purely against the learned value head over-exploits its noise (Goodhart), so the policy log-prob prior is a necessary regularizer, not a cosmetic tiebreak. Score was flat across λ ∈ [0.05, 0.2]; `value_rerank_lambda = 0.05` has been the default since.
 
+## Standalone value network (Stockfish distillation)
+
+The big model's value head learns from whole-game outcomes — noisy labels (a
+won position later thrown away is labeled "loss", and the label encodes
+*human* conversion ability). Once the search's budget-scaling curve flattened
+at SF1800, those labels became the binding constraint. The fix is a second,
+independent value oracle trained on engine evaluations.
+
+`ValueNet` (`src/imba_chess/model/value_net.py`, ~5M params) is a
+**position-only** WDL network: the same joint (piece, square) embedding and
+`BoardSquareEncoder` body as the big model, scaled up (256d × 6 layers over
+the 64 squares), with turn/castling/en-passant features broadcast-added to
+the square tokens. It sees no game history and no clocks — deliberately, so
+it exactly matches its training data and has zero train/serve skew.
+
+Training data is `Lichess/chess-position-evaluations` (388M Stockfish-
+evaluated FENs, CC0, streamed from Hugging Face). Each row's centipawn eval
+becomes a soft win/draw/loss target via Stockfish 17's own `win_rate_model`
+polynomial (value under strong play — deliberately *not* calibrated to human
+outcomes); mate-in-N rows get near-saturated targets. Evals are White-POV in
+the source and flipped to side-to-move POV. A deterministic FEN-hash holdout
+provides validation.
+
+### The three-stage pipeline
+
+1. **Pretrain the big model** on high-Elo human games (`scripts/train.py`):
+   policy head (imitation) + outcome-value head + moves-left auxiliary.
+2. **Train the value net** on engine evals — fully decoupled from stage 1;
+   either can be retrained without touching the other:
+
+   ```bash
+   python scripts/train_value_net.py            # config from [value_net] in the TOML
+   python scripts/train_value_net.py --steps 50000 --device cuda
+   ```
+
+   Plain supervised learning: flat batches, soft cross-entropy,
+   StableAdamW + OneCycle, best/last checkpoints in `artifacts/value_net/`
+   selected by held-out soft-CE (TensorBoard logs alongside). Notes: the
+   first minutes are download-bound (parquet shards stream from HF and are
+   cached locally); the val slice is materialized once at startup (a
+   one-time scan costing a few minutes); raise `[value_net] num_workers` if
+   the GPU is starved — sample preparation is CPU-bound at ~24k rows/s per
+   worker.
+3. **Blend at search time** — the eval script loads the net optionally and
+   every search evaluation becomes
+   `value = (1 − α) · model_value_head + α · value_net`:
+
+   ```bash
+   POLICIES="value_search_halving" ELO=1800 TAG=vnet ./eval_best_checkpoint.sh \
+     --search-budget 1024 --search-max-depth 6 \
+     --value-net-checkpoint artifacts/value_net/value_net_best.pt   # alpha defaults to 1.0
+   ```
+
+   `--value-net-alpha` sweeps the blend (0 = pure model head, 1 = pure net);
+   both knobs are recorded in the output JSON's `run_config.value_net`. With
+   no checkpoint configured, eval behavior is unchanged. Terminal positions
+   (mate/stalemate/claimable draws) keep their exact values regardless.
+
 ## Configuration
 
 All runtime settings are in `config/imba_chess.toml`:
@@ -282,7 +341,7 @@ uv run --python .venv/bin/python --with pytest pytest -q
 - Training is single-process (no end-to-end DDP launcher yet).
 - No legal-move masking in the prediction head during training (full-vocab classification); legality is enforced at inference.
 - Prefix K/V caching is per-turn only: the cache is rebuilt each model turn (no cross-turn reuse) and games are played sequentially (no cross-game batching).
-- Value labels are raw game outcomes, not engine evaluations (noisy for early positions).
+- The big model's value labels are raw game outcomes (noisy); the standalone value net mitigates this at inference, but the trunk itself still trains on outcome labels.
 - Checkpoints trained before the placement-aware board encoding / 1,970-token vocab are incompatible with current code (check out an older commit to evaluate them; keep a copy of the old `[model]` block and pass `--config` when evaluating old checkpoints after architecture changes).
 
 ## References

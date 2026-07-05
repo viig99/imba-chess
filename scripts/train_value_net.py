@@ -40,15 +40,12 @@ def train_step(model, batch, optimizer, *, grad_clip_norm: float, autocast_ctx=N
 
 
 @torch.no_grad()
-def validate(model, loader, *, max_batches: int, device) -> tuple[float, float]:
-    # The streaming val loader restarts from the stream head each call, so
-    # this scores a fixed leading slice of the holdout — a consistent
+def validate(model, batches) -> tuple[float, float]:
+    # Scores the fixed val slice materialized at startup — a consistent
     # tracking metric, not a full-holdout average.
     model.eval()
     losses, correct, total = [], 0, 0
-    for i, batch in enumerate(loader):
-        if i >= max_batches:
-            break
+    for batch in batches:
         logits = model(batch)
         targets = batch["wdl_target"].to(logits.device)
         losses.append(float(soft_cross_entropy(logits, targets)))
@@ -69,10 +66,9 @@ def main() -> None:
     cfg = load_repo_config(args.config).value_net
     steps = int(args.steps if args.steps is not None else cfg.train_steps)
     device_arg = args.device or cfg.device
-    device = torch.device(
-        "cuda" if (device_arg == "auto" and torch.cuda.is_available()) else
-        device_arg if device_arg != "auto" else "cpu"
-    )
+    if device_arg == "auto":
+        device_arg = "cuda" if torch.cuda.is_available() else "cpu"
+    device = torch.device(device_arg)
     torch.manual_seed(cfg.seed)
 
     model = ValueNet(
@@ -98,7 +94,18 @@ def main() -> None:
         )
 
     train_loader = make_loader("train")
-    val_loader = make_loader("val")
+
+    # Materialize the fixed val slice once. The val stream keeps only
+    # val_permille/1000 of rows, so filling it scans ~200x its size — minutes
+    # of one-time work; re-scanning on every validate() call would cost that
+    # every 5k steps. ~50 MB of tensors buys ~1 s validations instead.
+    print("materializing val slice (one-time stream scan) ...")
+    val_batches = []
+    for batch in make_loader("val"):
+        val_batches.append(batch)
+        if len(val_batches) >= cfg.val_batches:
+            break
+    print(f"val slice ready: {len(val_batches)} batches of {cfg.batch_size}")
 
     try:
         from optimi import StableAdamW
@@ -156,9 +163,7 @@ def main() -> None:
                 print(f"step {step}/{steps} loss {loss:.4f} lr {scheduler.get_last_lr()[0]:.2e} ({rate:.1f} it/s)")
                 writer.add_scalar("train/loss", loss, step)
             if step % cfg.val_every_steps == 0 or step == steps:
-                val_loss, val_acc = validate(
-                    model, val_loader, max_batches=cfg.val_batches, device=device
-                )
+                val_loss, val_acc = validate(model, val_batches)
                 print(f"  val loss {val_loss:.4f} acc {val_acc:.3f}")
                 writer.add_scalar("val/loss", val_loss, step)
                 writer.add_scalar("val/acc", val_acc, step)
