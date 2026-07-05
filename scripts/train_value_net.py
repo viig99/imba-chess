@@ -145,7 +145,13 @@ def main() -> None:
             model.parameters(), lr=cfg.max_lr, weight_decay=cfg.weight_decay
         )
     scheduler = torch.optim.lr_scheduler.OneCycleLR(
-        optimizer, max_lr=cfg.max_lr, total_steps=steps, pct_start=0.05
+        optimizer,
+        max_lr=cfg.max_lr,
+        total_steps=steps,
+        pct_start=0.05,
+        # StableAdamW doesn't expose momentum/beta1 the way momentum cycling
+        # expects (same reason scripts/train.py disables it).
+        cycle_momentum=False,
     )
 
     use_amp = device.type == "cuda" and cfg.dtype in {"bfloat16", "float16"}
