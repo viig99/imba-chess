@@ -289,3 +289,222 @@ def test_model_decode_mixed_depth_wave():
     torch.testing.assert_close(
         wave["value_logits"][1], full_b["value_logits"][T + 1], atol=ATOL, rtol=RTOL
     )
+
+
+import importlib.util
+import sys
+from pathlib import Path
+
+import chess
+
+from imba_chess.data.board_state import BoardStateEncoder
+from imba_chess.data.move_vocab import MoveVocab, MoveVocabConfig
+from imba_chess.eval.search import PositionEval, select_value_search_d2
+
+
+def _load_eval_script_module():
+    script_path = (
+        Path(__file__).resolve().parents[1] / "scripts" / "eval_vs_stockfish.py"
+    )
+    spec = importlib.util.spec_from_file_location(
+        "eval_vs_stockfish_script_pd", script_path
+    )
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = module
+    spec.loader.exec_module(module)
+    return module
+
+
+class _FullForwardReferenceEvaluator:
+    """Reference PositionEvaluator: rebuilds every sequence and runs a full
+    forward — the uncached ground truth the cached path must reproduce."""
+
+    def __init__(self, *, module, model, move_vocab, board_state_encoder, played):
+        self._module = module
+        self._model = model
+        self._move_vocab = move_vocab
+        self._encoder = board_state_encoder
+        self._played = played  # list[(board_before, move_uci)] real game so far
+
+    def _fresh_history(self):
+        history = self._module._SequenceHistory(
+            move_vocab=self._move_vocab, board_state_encoder=self._encoder
+        )
+        for board_before, move_uci in self._played:
+            history.append_observed_position(board_before)
+            history.record_played_move(move_uci)
+        return history
+
+    def extend(self, handle, board_before, move):
+        line = list(handle) if handle is not None else []
+        return line + [(board_before.copy(stack=False), move.uci())]
+
+    def evaluate(self, batch):
+        results = []
+        for handle, board in batch:
+            history = self._fresh_history()
+            for board_before, move_uci in handle:
+                history.append_observed_position(board_before)
+                history.record_played_move(move_uci)
+            full_batch = history.build_batch_for_current_position(board)
+            with torch.no_grad():
+                out = self._model(full_batch, return_loss=False)
+            logits = out["logits"][-1]
+            value_stm = self._module._value_scalar_from_logits(
+                out["value_logits"][-1]
+            )
+            try:
+                legal_logits, legal_moves, _, _ = self._module._project_legal_logits(
+                    logits=logits, board=board, move_vocab=self._move_vocab
+                )
+                log_priors = torch.log_softmax(legal_logits.float(), dim=0).tolist()
+            except RuntimeError:
+                legal_moves, log_priors = [], []
+            results.append(PositionEval(value_stm, legal_moves, log_priors))
+        return results
+
+
+def _static_vocab():
+    from imba_chess.data.move_vocab import all_possible_uci_moves
+
+    return MoveVocab.build(
+        all_possible_uci_moves(), config=MoveVocabConfig(include_unk=False)
+    )
+
+
+def test_cached_evaluator_matches_full_forward_reference():
+    module = _load_eval_script_module()
+    move_vocab = _static_vocab()
+    model = _tiny_model(vocab_size=len(move_vocab))
+    encoder = BoardStateEncoder()
+
+    board = chess.Board()
+    played = []
+    history = module._SequenceHistory(
+        move_vocab=move_vocab, board_state_encoder=encoder
+    )
+    for move_uci in ["e2e4", "e7e5", "g1f3"]:
+        played.append((board.copy(stack=False), move_uci))
+        history.append_observed_position(board)
+        history.record_played_move(move_uci)
+        board.push_uci(move_uci)
+
+    root_batch = history.build_batch_for_current_position(board)
+    with torch.no_grad():
+        prefill = model(root_batch, return_loss=False, return_kv=True)
+
+    cached = module.CachedPositionEvaluator(
+        model=model,
+        move_vocab=move_vocab,
+        board_state_encoder=encoder,
+        device=torch.device("cpu"),
+        dtype=torch.float32,
+        prefix_kv=prefill["kv_caches"],
+        prefix_len=int(root_batch["total_tokens"]),
+    )
+    reference = _FullForwardReferenceEvaluator(
+        module=module,
+        model=model,
+        move_vocab=move_vocab,
+        board_state_encoder=encoder,
+        played=played,
+    )
+
+    # Depth 1: two candidate moves. Depth 2: one reply under each.
+    candidates = [chess.Move.from_uci("b8c6"), chess.Move.from_uci("d7d6")]
+    cached_handles = [cached.extend(None, board, move) for move in candidates]
+    ref_handles = [reference.extend(None, board, move) for move in candidates]
+    boards1 = []
+    for move in candidates:
+        board1 = board.copy()
+        board1.push(move)
+        boards1.append(board1)
+
+    cached_evals = cached.evaluate(list(zip(cached_handles, boards1)))
+    ref_evals = reference.evaluate(list(zip(ref_handles, boards1)))
+    for got, want in zip(cached_evals, ref_evals):
+        assert abs(got.value_stm - want.value_stm) < 1e-5
+        assert [m.uci() for m in got.legal_moves] == [
+            m.uci() for m in want.legal_moves
+        ]
+        for a, b in zip(got.legal_log_priors, want.legal_log_priors):
+            assert abs(a - b) < 1e-5
+
+    # One depth-2 node under each candidate, evaluated in a single wave.
+    replies = [list(b1.legal_moves)[0] for b1 in boards1]
+    cached2 = [
+        cached.extend(handle, b1, reply)
+        for handle, b1, reply in zip(cached_handles, boards1, replies)
+    ]
+    ref2 = [
+        reference.extend(handle, b1, reply)
+        for handle, b1, reply in zip(ref_handles, boards1, replies)
+    ]
+    boards2 = []
+    for b1, reply in zip(boards1, replies):
+        b2 = b1.copy()
+        b2.push(reply)
+        boards2.append(b2)
+    cached_evals2 = cached.evaluate(list(zip(cached2, boards2)))
+    ref_evals2 = reference.evaluate(list(zip(ref2, boards2)))
+    for got, want in zip(cached_evals2, ref_evals2):
+        assert abs(got.value_stm - want.value_stm) < 1e-5
+        for a, b in zip(got.legal_log_priors, want.legal_log_priors):
+            assert abs(a - b) < 1e-5
+
+
+def test_strategy_picks_identical_move_cached_vs_reference():
+    module = _load_eval_script_module()
+    move_vocab = _static_vocab()
+    model = _tiny_model(vocab_size=len(move_vocab))
+    encoder = BoardStateEncoder()
+
+    board = chess.Board()
+    history = module._SequenceHistory(
+        move_vocab=move_vocab, board_state_encoder=encoder
+    )
+    root_batch = history.build_batch_for_current_position(board)
+    with torch.no_grad():
+        prefill = model(root_batch, return_loss=False, return_kv=True)
+        root_logits = prefill["logits"][-1]
+    legal_logits, legal_moves, _, _ = module._project_legal_logits(
+        logits=root_logits, board=board, move_vocab=move_vocab
+    )
+    log_priors = torch.log_softmax(legal_logits.float(), dim=0).tolist()
+
+    cached = module.CachedPositionEvaluator(
+        model=model,
+        move_vocab=move_vocab,
+        board_state_encoder=encoder,
+        device=torch.device("cpu"),
+        dtype=torch.float32,
+        prefix_kv=prefill["kv_caches"],
+        prefix_len=int(root_batch["total_tokens"]),
+    )
+    reference = _FullForwardReferenceEvaluator(
+        module=module,
+        model=model,
+        move_vocab=move_vocab,
+        board_state_encoder=encoder,
+        played=[],
+    )
+
+    chosen_cached, _ = select_value_search_d2(
+        evaluator=cached,
+        root_handle=None,
+        board=board,
+        legal_moves=legal_moves,
+        legal_log_priors=log_priors,
+        top_k=4,
+        lam=0.05,
+    )
+    chosen_ref, _ = select_value_search_d2(
+        evaluator=reference,
+        root_handle=None,
+        board=board,
+        legal_moves=legal_moves,
+        legal_log_priors=log_priors,
+        top_k=4,
+        lam=0.05,
+    )
+    assert legal_moves[chosen_cached].uci() == legal_moves[chosen_ref].uci()
