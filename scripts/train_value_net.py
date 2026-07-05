@@ -10,12 +10,12 @@ from __future__ import annotations
 
 import argparse
 import contextlib
-import time
 from pathlib import Path
 
 import torch
 from torch.utils.data import DataLoader
 from torch.utils.tensorboard import SummaryWriter
+from tqdm.auto import tqdm
 
 from imba_chess.config import DEFAULT_CONFIG_PATH, load_repo_config
 from imba_chess.data.position_eval_dataset import PositionEvalDataset
@@ -97,15 +97,41 @@ def main() -> None:
 
     # Materialize the fixed val slice once. The val stream keeps only
     # val_permille/1000 of rows, so filling it scans ~200x its size — minutes
-    # of one-time work; re-scanning on every validate() call would cost that
-    # every 5k steps. ~50 MB of tensors buys ~1 s validations instead.
-    print("materializing val slice (one-time stream scan) ...")
-    val_batches = []
-    for batch in make_loader("val"):
-        val_batches.append(batch)
-        if len(val_batches) >= cfg.val_batches:
-            break
-    print(f"val slice ready: {len(val_batches)} batches of {cfg.batch_size}")
+    # of work (single-threaded on purpose: the slice must not depend on
+    # worker count). Cached to disk so the scan happens once ever, not once
+    # per run; re-scanning on every validate() call would cost it every 5k
+    # steps. ~50 MB of tensors buys ~1 s validations instead.
+    checkpoint_dir = Path(cfg.checkpoint_dir)
+    checkpoint_dir.mkdir(parents=True, exist_ok=True)
+    val_cache = checkpoint_dir / "val_slice.pt"
+    val_meta = {
+        "dataset": cfg.dataset_name,
+        "depth_min": cfg.depth_min,
+        "val_permille": cfg.val_permille,
+        "val_batches": cfg.val_batches,
+        "batch_size": cfg.batch_size,
+    }
+    val_batches = None
+    if val_cache.exists():
+        payload = torch.load(val_cache)
+        if payload.get("meta") == val_meta:
+            val_batches = payload["batches"]
+            print(f"val slice loaded from cache: {len(val_batches)} batches")
+    if val_batches is None:
+        val_batches = []
+        with tqdm(
+            total=cfg.val_batches,
+            desc="val-slice (one-time scan, cached after)",
+            unit="batch",
+            dynamic_ncols=True,
+        ) as bar:
+            for batch in make_loader("val"):
+                val_batches.append(batch)
+                bar.update(1)
+                if len(val_batches) >= cfg.val_batches:
+                    break
+        torch.save({"meta": val_meta, "batches": val_batches}, val_cache)
+        print(f"val slice cached to {val_cache}")
 
     try:
         from optimi import StableAdamW
@@ -129,8 +155,6 @@ def main() -> None:
         else None
     )
 
-    checkpoint_dir = Path(cfg.checkpoint_dir)
-    checkpoint_dir.mkdir(parents=True, exist_ok=True)
     writer = SummaryWriter(log_dir=str(checkpoint_dir / "tb"))
     model_config_payload = {
         "dim": cfg.dim, "num_heads": cfg.num_heads, "num_layers": cfg.num_layers
@@ -149,7 +173,7 @@ def main() -> None:
 
     best_val = float("inf")
     step = 0
-    t0 = time.time()
+    progress = tqdm(total=steps, desc="train", unit="step", dynamic_ncols=True)
     while step < steps:
         for batch in train_loader:
             loss = train_step(
@@ -158,13 +182,19 @@ def main() -> None:
             )
             scheduler.step()
             step += 1
+            progress.update(1)
             if step % cfg.log_every_steps == 0:
-                rate = step / (time.time() - t0)
-                print(f"step {step}/{steps} loss {loss:.4f} lr {scheduler.get_last_lr()[0]:.2e} ({rate:.1f} it/s)")
+                progress.set_postfix(
+                    {
+                        "loss": f"{loss:.4f}",
+                        "lr": f"{scheduler.get_last_lr()[0]:.1e}",
+                        "best_val": "--" if best_val == float("inf") else f"{best_val:.4f}",
+                    }
+                )
                 writer.add_scalar("train/loss", loss, step)
             if step % cfg.val_every_steps == 0 or step == steps:
                 val_loss, val_acc = validate(model, val_batches)
-                print(f"  val loss {val_loss:.4f} acc {val_acc:.3f}")
+                tqdm.write(f"step {step}: val loss {val_loss:.4f} acc {val_acc:.3f}")
                 writer.add_scalar("val/loss", val_loss, step)
                 writer.add_scalar("val/acc", val_acc, step)
                 save("value_net_last.pt", step, val_loss)
@@ -173,6 +203,7 @@ def main() -> None:
                     save("value_net_best.pt", step, val_loss)
             if step >= steps:
                 break
+    progress.close()
     writer.close()
     print(f"done: best val loss {best_val:.4f}")
 
