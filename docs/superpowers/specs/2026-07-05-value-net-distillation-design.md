@@ -74,11 +74,13 @@ Streams `Lichess/chess-position-evaluations` with the same
 `load_dataset(path="parquet", streaming=True)` + file-level worker
 sharding idioms as `lichess_dataset.py`.
 
-Per row (`fen`, `line`, `depth`, `knodes`, `cp`, `mate`):
+Per row — verified parquet schema (the dataset card's field descriptions
+are partly wrong; these types were read from the builder metadata):
+`fen` string, `line` string, `depth` uint8, `knodes` int32, `cp` int16,
+`mate` int8 (cp/mate nullable, mutually exclusive).
 
-1. Filter: `int(depth) >= depth_min` (config, default 12 — `depth` arrives
-   as a string). Rows with neither cp nor mate are dropped; `line` (the
-   PV) is unused in v1. The FEN is 4-field (pieces, active color,
+1. Filter: `depth >= depth_min` (config, default 12). Rows with neither
+   cp nor mate are dropped; `line` (the PV) is unused in v1. The FEN is 4-field (pieces, active color,
    castling, ep only); `chess.Board(fen)` parses it, filling clock
    defaults the net never reads (Part 1). No dedup (repeat evaluations of popular
    positions act as mild importance weighting; accepted for v1).
