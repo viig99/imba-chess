@@ -171,6 +171,9 @@ class SequentialTransductionUnitJagged(torch.nn.Module):
 
         Returns (x_out [B, D], k_new [B, H, 1, d_qk], v_new [B, H, 1, d_v]).
         """
+        assert (suffix_k is None) == (suffix_v is None) == (
+            suffix_positions is None
+        ) == (suffix_mask is None), "suffix tensors must be provided together"
         batch_size = x_new.size(0)
         x = x_new.unsqueeze(1)  # [B, 1, D]
         normed_x = self._norm_input(x)

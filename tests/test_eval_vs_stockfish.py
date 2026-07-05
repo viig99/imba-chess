@@ -197,7 +197,6 @@ def test_value_rerank_selects_move_using_batched_value_lookahead():
     move, debug = module._select_model_move(
         model=model,
         batch=batch,
-        history=history,
         board=board,
         move_vocab=move_vocab,
         board_state_encoder=BoardStateEncoder(),
@@ -232,7 +231,6 @@ def test_value_rerank_requires_value_logits():
         module._select_model_move(
             model=model,
             batch=batch,
-            history=history,
             board=board,
             move_vocab=move_vocab,
             board_state_encoder=BoardStateEncoder(),
@@ -283,7 +281,6 @@ def test_value_search_d2_selects_move_using_opponent_best_reply():
     move, debug = module._select_model_move(
         model=model,
         batch=batch,
-        history=history,
         board=board,
         move_vocab=move_vocab,
         board_state_encoder=BoardStateEncoder(),
@@ -359,7 +356,6 @@ def test_value_rerank_prefers_mate_in_one_over_higher_logit_move():
     move, _ = module._select_model_move(
         model=model,
         batch=batch,
-        history=history,
         board=board,
         move_vocab=move_vocab,
         board_state_encoder=BoardStateEncoder(),
@@ -383,7 +379,6 @@ def test_value_search_d2_plays_mate_in_one_immediately():
     move, _ = module._select_model_move(
         model=model,
         batch=batch,
-        history=history,
         board=board,
         move_vocab=move_vocab,
         board_state_encoder=BoardStateEncoder(),
@@ -419,7 +414,6 @@ def test_value_search_d2_requires_value_logits():
         module._select_model_move(
             model=model,
             batch=batch,
-            history=history,
             board=board,
             move_vocab=move_vocab,
             board_state_encoder=BoardStateEncoder(),
@@ -563,7 +557,6 @@ def test_value_search_halving_end_to_end_picks_value_backed_move():
     move, debug = module._select_model_move(
         model=model,
         batch=batch,
-        history=history,
         board=board,
         move_vocab=move_vocab,
         board_state_encoder=BoardStateEncoder(),

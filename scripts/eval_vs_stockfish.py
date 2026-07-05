@@ -649,7 +649,6 @@ def _select_model_move(
     *,
     model: torch.nn.Module,
     batch: dict[str, Any],
-    history: _SequenceHistory,
     board: chess.Board,
     move_vocab: MoveVocab,
     board_state_encoder: BoardStateEncoder,
@@ -666,7 +665,7 @@ def _select_model_move(
         batch=batch,
         device=device,
         dtype=dtype,
-        return_kv=True,
+        return_kv=policy != "greedy",
     )
 
     logits = output["logits"][-1]
@@ -676,15 +675,17 @@ def _select_model_move(
         move_vocab=move_vocab,
     )
     legal_log_priors = torch.log_softmax(legal_logits.float(), dim=0).tolist()
-    evaluator = CachedPositionEvaluator(
-        model=model,
-        move_vocab=move_vocab,
-        board_state_encoder=board_state_encoder,
-        device=device,
-        dtype=dtype,
-        prefix_kv=output["kv_caches"],
-        prefix_len=int(batch["total_tokens"]),
-    )
+    evaluator = None
+    if policy != "greedy":
+        evaluator = CachedPositionEvaluator(
+            model=model,
+            move_vocab=move_vocab,
+            board_state_encoder=board_state_encoder,
+            device=device,
+            dtype=dtype,
+            prefix_kv=output["kv_caches"],
+            prefix_len=int(batch["total_tokens"]),
+        )
     rerank_rows: list[dict[str, Any]] = []
     search_rows: list[dict[str, Any]] = []
     halving_rows: list[dict[str, Any]] = []
@@ -1111,7 +1112,6 @@ def _run_segment(
                     move, debug_info = _select_model_move(
                         model=model,
                         batch=batch,
-                        history=history,
                         board=board,
                         move_vocab=move_vocab,
                         board_state_encoder=board_state_encoder,
