@@ -154,6 +154,33 @@ class EvalVsStockfishConfig:
 
 
 @dataclass(frozen=True)
+class ValueNetSection:
+    # Model (ValueNetConfig fields)
+    dim: int = 256
+    num_heads: int = 4
+    num_layers: int = 6
+    # Data
+    dataset_name: str = "Lichess/chess-position-evaluations"
+    depth_min: int = 12
+    shuffle_buffer_size: int = 10_000
+    val_permille: int = 5
+    # Training
+    batch_size: int = 1024
+    num_workers: int = 2
+    max_lr: float = 3e-4
+    weight_decay: float = 0.01
+    train_steps: int = 200_000
+    log_every_steps: int = 100
+    val_every_steps: int = 5_000
+    val_batches: int = 50
+    grad_clip_norm: float = 1.0
+    seed: int = 42
+    device: str = "auto"
+    dtype: str = "bfloat16"
+    checkpoint_dir: str = "artifacts/value_net"
+
+
+@dataclass(frozen=True)
 class RepoConfig:
     dataset: DatasetConfig = field(default_factory=DatasetConfig)
     board_state: BoardStateConfig = field(default_factory=BoardStateConfig)
@@ -164,6 +191,7 @@ class RepoConfig:
     eval_vs_stockfish: EvalVsStockfishConfig = field(
         default_factory=EvalVsStockfishConfig
     )
+    value_net: ValueNetSection = field(default_factory=ValueNetSection)
 
 
 def load_repo_config(path: str | Path | None = None) -> RepoConfig:
@@ -185,6 +213,9 @@ def load_repo_config(path: str | Path | None = None) -> RepoConfig:
             EvalVsStockfishConfig,
             payload.get("eval_vs_stockfish", {}),
             "eval_vs_stockfish",
+        ),
+        value_net=_read_section(
+            ValueNetSection, payload.get("value_net", {}), "value_net"
         ),
     )
 

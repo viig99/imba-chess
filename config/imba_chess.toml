@@ -131,3 +131,18 @@ debug_trace_max_plies = 80
 debug_topk = 5
 save_games = true
 save_games_dir = "artifacts/eval/games"
+
+[value_net]
+# Standalone position-only WDL net distilled from Stockfish evals
+# (Lichess/chess-position-evaluations). Trained by scripts/train_value_net.py;
+# consumed at eval time via [eval_vs_stockfish] value_net_checkpoint.
+dim = 256
+num_heads = 4
+num_layers = 6
+depth_min = 12
+batch_size = 1024
+num_workers = 2
+max_lr = 3e-4
+train_steps = 200000
+val_every_steps = 5000
+checkpoint_dir = "artifacts/value_net"
