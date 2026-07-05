@@ -33,7 +33,7 @@ class PositionEvalDataset(IterableDataset):
         dataset_name: str = "Lichess/chess-position-evaluations",
         shuffle_buffer_size: int = 10_000,
         seed: int = 0,
-        val_permille: int = 5,
+        val_permille: int = 50,
     ) -> None:
         if split not in {"train", "val"}:
             raise ValueError("split must be 'train' or 'val'")

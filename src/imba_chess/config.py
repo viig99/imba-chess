@@ -165,7 +165,10 @@ class ValueNetSection:
     dataset_name: str = "Lichess/chess-position-evaluations"
     depth_min: int = 12
     shuffle_buffer_size: int = 10_000
-    val_permille: int = 5
+    # 5% holdout: each val sample costs ~1000/val_permille scanned rows, so
+    # small values make the one-time val-slice scan painfully slow; losing
+    # 5% of 388M training rows is free.
+    val_permille: int = 50
     # Training
     batch_size: int = 1024
     num_workers: int = 2
