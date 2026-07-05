@@ -200,19 +200,22 @@ The script reports wins/draws/losses (with color split), completed/incomplete ga
 
 ### Results vs Stockfish 1400 (current run, v3 pipeline)
 
-Setup: checkpoint `best_hr10_checkpoint_6` (hr@10 = 0.9131, epoch 6 of a run still in progress), Stockfish `UCI_Elo` 1400 at 0.05s/move, 100 games per configuration, seed 42, colors alternating. Score = (wins + 0.5 × draws) / games; ±~0.05 standard error at 100 games.
+Setup: `greedy` / `value_search_d2` on checkpoint `best_hr10_checkpoint_6` (hr@10 = 0.9131, epoch 6); `value_search_halving` on the run's eventual best checkpoint, `best_hr10_checkpoint_10` (hr@10 = 0.9304). Stockfish `UCI_Elo` 1400 at 0.05s/move, 100 games per configuration, seed 42, colors alternating. Score = (wins + 0.5 × draws) / games; ±~0.05 standard error at 100 games.
 
 | Move selection | W / D / L | Score rate |
 |---|---|---|
 | `greedy` | 7 / 28 / 65 | 0.21 |
 | `value_search_d2` (K=16, λ=0.05) | 22 / 16 / 47 @ 85 games | 0.34 (final, 100 games) |
-| `value_search_halving` (N=256, defaults) | *eval in progress* | *early: 4W/0D/1L @ 5 games* |
+| `value_search_halving` (N=256, `halving_rounds=0` auto) | 88 / 7 / 5 | **0.915** |
 
-Takeaways so far:
+By color (`value_search_halving`): white 46/2/2 (score 0.94), black 42/5/3 (score 0.89) — the black-side weakness visible under `greedy`/`d2` is essentially gone.
+
+Takeaways:
 
 - The raw policy is markedly stronger than the previous run's (greedy 0.145 → 0.21) — attributable to the v3 changes: placement-aware board encoding, game-level shuffle buffer, corrupt-game rejection.
 - Search still multiplies the policy: d2 adds +0.13 over greedy on the same checkpoint, clearing the +0.05 gate that justified building the halving search.
-- Halving's full 100-game result, plus the `halving_rounds=1` beam attribution run and a 1600/1800/2000 ladder, will be added here as they complete. Early games look strong but 5 games carry ~±0.2 standard error — not yet evidence.
+- Halving search adds another large jump over d2 (0.34 → 0.915, ~+330 Elo over the same opponent at the two checkpoints tested) — SF1400 is now essentially saturated as an eval opponent for this policy; future sweeps should move to SF1600+.
+- Remaining work: the `halving_rounds=1` beam-vs-halving attribution run (does the gain come from the deeper tree or the reallocation feedback loop?) and a 1600/1800/2000 ladder, to find where the model's actual ceiling is.
 
 ### Results vs Stockfish 1400 (earlier v2 checkpoint, historical)
 
