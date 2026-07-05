@@ -115,7 +115,7 @@ Special cases bypass the network:
 
 Search evaluations use a prefix-cache decode path: the once-per-turn root forward doubles as a prefill whose per-layer K/V become a shared cache, and every search position is then evaluated as a single new token attending to that cache — O(1) new work per evaluation instead of re-encoding the full game history.
 
-Cost: 3 model calls and ~K² positions per turn instead of 1 call — roughly 30–50s per game instead of ~2s, buying back the consequence-checking that pure imitation lacks.
+Cost: ~K² position evaluations per turn instead of 1 — but with the prefix-cache decode path each evaluation is a single new token against the cached game history, so even the much larger halving budgets run at ~12 s/game (vs ~44 s/game these budgets cost uncached).
 
 `value_rerank` is the depth-1 version of the same idea (grade positions immediately after our move, no opponent response), with the same value-dominant scoring.
 
@@ -214,27 +214,28 @@ Takeaways:
 
 - The raw policy is markedly stronger than the previous run's (greedy 0.145 → 0.21) — attributable to the v3 changes: placement-aware board encoding, game-level shuffle buffer, corrupt-game rejection.
 - Search still multiplies the policy: d2 adds +0.13 over greedy on the same checkpoint, clearing the +0.05 gate that justified building the halving search.
-- Halving search adds another large jump over d2 (0.34 → 0.915, ~+330 Elo over the same opponent at the two checkpoints tested) — SF1400 is now essentially saturated as an eval opponent for this policy; future sweeps should move to SF1600+.
-- Remaining work: the `halving_rounds=1` beam-vs-halving attribution run (does the gain come from the deeper tree or the reallocation feedback loop?) and a 1600/1800/2000 ladder, to find where the model's actual ceiling is.
+- Halving search adds another large jump over d2 (0.34 → 0.915, ~+330 Elo over the same opponent at the two checkpoints tested) — SF1400 is saturated as an eval opponent for this policy; the ladder continues at SF1800 below.
 
-### Results vs Stockfish 1400 (earlier v2 checkpoint, historical)
+### Results vs Stockfish 1800 (budget scaling)
 
-Setup: checkpoint `best_hr10_checkpoint_5` (hr@10 = 0.9208, pre-v3 data pipeline — not directly comparable to the table above), Stockfish `UCI_Elo` 1400 at 0.05s/move, 100 games per configuration, seed 42, colors alternating.
+Setup: checkpoint `best_hr10_checkpoint_12` (hr@10 = 0.9349), Stockfish `UCI_Elo` 1800 at 0.05s/move, 100 games per configuration, seed 42, colors alternating. Run on the prefix-cache decode path (~12 s/game at budget 512/depth 6 — vs ~44 s/game the uncached path needed for budget 256/depth 4).
 
-| Move selection | λ | W / D / L | Score rate |
+| `value_search_halving` config | W / D / L | Score rate | ≈ Elo vs SF1800 |
 |---|---|---|---|
-| `value_search_d2`, value only (no policy prior) | 0.00 | 1 / 22 / 77 | 0.120 |
-| `value_search_d2`, value-dominant scoring, K=16 | 0.05 | 20 / 41 / 39 | **0.405** |
-| `value_search_d2`, value-dominant scoring, K=16 | 0.10 | 27 / 26 / 47 | 0.400 |
-| `value_search_d2`, value-dominant scoring, K=16 | 0.20 | 27 / 24 / 49 | 0.390 |
-| `value_rerank`, old policy-dominant scoring (best of λ sweep) | 0.35 | 12 / 22 / 66 | 0.230 |
+| budget 256, depth 4 (defaults) | 38 / 17 / 45 | 0.465 | −24 |
+| budget 512, depth 6 | 45 / 22 / 33 | **0.560** | +42 |
 
-Takeaways:
+What we understand so far:
 
-- Value-dominant scoring nearly doubles the score rate over the old policy-dominant scoring (0.23 → 0.40, ~+140 Elo vs the same opponent), inference-only: same checkpoint, fixed search scoring, exact terminal handling, forcing-move opponent replies.
-- The score is flat across λ ∈ [0.05, 0.2]; larger λ trades draws for decisive games at equal expected score.
-- The λ = 0 control collapses (0.12): optimizing purely against the learned value head over-exploits its noise (Goodhart). The policy log-prob prior is a necessary regularizer that keeps candidates human-plausible, not a cosmetic tiebreak.
-- Draw share roughly doubled at λ = 0.05 vs the old scoring — the search stops losing many previously lost games; converting draws into wins (value-head endgame quality) is the next frontier.
+- **Search is doing most of the lifting, and search compute still converts into strength.** The full progression on v3 checkpoints vs SF1400 is greedy 0.21 → d2 0.34 → halving-256 0.915; at SF1800, doubling the budget and deepening the tree adds another ~+0.10 (~1.4σ at 100 games each — directionally consistent, pending the 1024 point). A pure imitation policy plays ~1170-Elo-equivalent chess; the same network under budgeted value search plays ~1800+.
+- **The value head is not yet the proven bottleneck.** The decision rule: keep doubling budget while the curve climbs; the first flat doubling is the signal to stop buying search and start improving the value oracle (engine-annotated value labels). budget 1024/depth 6 (~25 s/game) is the next measurement.
+- Budget and depth moved together in the 512/d6 run, so their individual contributions aren't separated yet; a 512/depth-4 or 1024/depth-6 run disambiguates.
+- The 512/d6 color split (White 0.43, Black 0.69) is noisy at 50 games/color and reversed from every earlier run — treat as variance until it repeats.
+- Draws grow with opponent strength (17–22 at 1800 vs 7 at 1400): converting drawn endgames is exactly where noisy outcome-based value labels hurt most, and the concrete motivation for distillation in the next training run.
+
+### Historical: the λ sweep (v2 checkpoint)
+
+An earlier sweep on a pre-v3 checkpoint (not comparable to the numbers above) established two durable design facts, both baked into the current defaults: **value-dominant scoring beats policy-dominant scoring** by ~+140 Elo inference-only (0.23 → 0.405 vs SF1400), and **λ = 0 collapses** (0.12) — optimizing purely against the learned value head over-exploits its noise (Goodhart), so the policy log-prob prior is a necessary regularizer, not a cosmetic tiebreak. Score was flat across λ ∈ [0.05, 0.2]; `value_rerank_lambda = 0.05` has been the default since.
 
 ## Configuration
 
@@ -281,8 +282,7 @@ uv run --python .venv/bin/python --with pytest pytest -q
 - No legal-move masking in the prediction head during training (full-vocab classification); legality is enforced at inference.
 - Prefix K/V caching is per-turn only: the cache is rebuilt each model turn (no cross-turn reuse) and games are played sequentially (no cross-game batching).
 - Value labels are raw game outcomes, not engine evaluations (noisy for early positions).
-- Streaming order is temporal by month window (newest first); month-level file order can be shuffled at process start via `[dataset].shuffle_train_month_files_on_start`.
-- Checkpoints trained before the placement-aware board encoding / 1,970-token vocab are incompatible with current code (check out an older commit to evaluate them).
+- Checkpoints trained before the placement-aware board encoding / 1,970-token vocab are incompatible with current code (check out an older commit to evaluate them; keep a copy of the old `[model]` block and pass `--config` when evaluating old checkpoints after architecture changes).
 
 ## References
 

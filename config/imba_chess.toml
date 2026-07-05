@@ -113,7 +113,7 @@ ladder_games_per_segment = 100
 device = "auto"
 dtype = "bfloat16"
 compile = true
-model_move_policy = "value_search_d2"
+model_move_policy = "value_search_halving"
 value_rerank_top_k = 16
 # Weight of the log-prob policy prior added to the value score (value-dominant scoring).
 # Sweep vs SF1400: flat 0.40 across 0.05-0.2; lambda=0 collapses to 0.12.
