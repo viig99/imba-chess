@@ -115,24 +115,6 @@ class _SequenceHistory:
     def record_played_move(self, move_uci: str) -> None:
         self._prev_move_id_for_next_token = int(self._move_vocab.encode(move_uci))
 
-    def clone(self) -> "_SequenceHistory":
-        clone = _SequenceHistory(
-            move_vocab=self._move_vocab,
-            board_state_encoder=self._board_state_encoder,
-        )
-        clone.seq_token_id = list(self.seq_token_id)
-        clone.piece_ids = [list(row) for row in self.piece_ids]
-        clone.turn_id = list(self.turn_id)
-        clone.castle_id = list(self.castle_id)
-        clone.ep_file_id = list(self.ep_file_id)
-        clone.halfmove_bucket_id = list(self.halfmove_bucket_id)
-        clone.fullmove_bucket_id = list(self.fullmove_bucket_id)
-        clone.prev_move_id = list(self.prev_move_id)
-        clone.target_move_id = list(self.target_move_id)
-        clone.played_by_elo = list(self.played_by_elo)
-        clone._prev_move_id_for_next_token = self._prev_move_id_for_next_token
-        return clone
-
     def _append_from_state(self, state) -> None:
         self.seq_token_id.append(EVENT_TOKEN_ID)
         self.piece_ids.append(list(state.piece_ids))
@@ -435,6 +417,7 @@ def _forward_model(
     batch: dict[str, Any],
     device: torch.device,
     dtype: torch.dtype,
+    return_kv: bool = False,
 ) -> dict[str, torch.Tensor]:
     seq_offsets = batch["seq_offsets"].to(
         device=device, dtype=torch.long, non_blocking=True
@@ -451,7 +434,9 @@ def _forward_model(
         else contextlib.nullcontext()
     )
     with torch.inference_mode(), autocast_ctx:
-        return model(batch, block_mask=block_mask, return_loss=False)
+        return model(
+            batch, block_mask=block_mask, return_loss=False, return_kv=return_kv
+        )
 
 
 def _value_scalar_from_logits(value_logits_last: torch.Tensor) -> float:
@@ -487,130 +472,168 @@ def _project_legal_logits(
     return legal_logits, legal_moves_with_ids, total_legal, mapped_legal
 
 
-def _merge_single_sequence_batches(
-    batches: list[dict[str, Any]],
-) -> dict[str, Any]:
-    if not batches:
-        raise ValueError("_merge_single_sequence_batches requires at least one batch")
+class _CachedNode:
+    """Search-node handle: parent link + the move that led here.
 
-    seq_lens = [int(batch["total_tokens"]) for batch in batches]
-    offsets = [0]
-    for length in seq_lens:
-        offsets.append(offsets[-1] + length)
-
-    return {
-        "game_id": [batch["game_id"][0] for batch in batches],
-        "game_result_white": torch.cat(
-            [batch["game_result_white"] for batch in batches], dim=0
-        ),
-        "num_games": len(batches),
-        "total_tokens": offsets[-1],
-        "seq_lens": torch.tensor(seq_lens, dtype=torch.long),
-        "seq_offsets": torch.tensor(offsets, dtype=torch.long),
-        "piece_ids": torch.cat([batch["piece_ids"] for batch in batches], dim=0),
-        "seq_token_id": torch.cat([batch["seq_token_id"] for batch in batches], dim=0),
-        "turn_id": torch.cat([batch["turn_id"] for batch in batches], dim=0),
-        "castle_id": torch.cat([batch["castle_id"] for batch in batches], dim=0),
-        "ep_file_id": torch.cat([batch["ep_file_id"] for batch in batches], dim=0),
-        "halfmove_bucket_id": torch.cat(
-            [batch["halfmove_bucket_id"] for batch in batches], dim=0
-        ),
-        "fullmove_bucket_id": torch.cat(
-            [batch["fullmove_bucket_id"] for batch in batches], dim=0
-        ),
-        "prev_move_id": torch.cat([batch["prev_move_id"] for batch in batches], dim=0),
-        "target_move_id": torch.cat(
-            [batch["target_move_id"] for batch in batches], dim=0
-        ),
-        "played_by_elo": torch.cat([batch["played_by_elo"] for batch in batches], dim=0),
-    }
-
-
-# Cap tokens per merged search forward: the eager (non-compiled) flex-attention
-# fallback materializes O(T^2) score/mask tensors, so one huge merged batch OOMs.
-_SEARCH_EVAL_MAX_TOKENS_PER_CHUNK = 4096
-
-
-def _forward_last_token_outputs(
-    *,
-    model: torch.nn.Module,
-    batches: list[dict[str, Any]],
-    device: torch.device,
-    dtype: torch.dtype,
-    policy_name: str,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    """Batch-evaluate single-sequence batches in token-budgeted chunks.
-
-    Returns (policy_logits, value_logits) at each sequence's last token,
-    stacked in input order.
+    kv is filled after this node is evaluated: one (k [H,1,d_qk], v [H,1,d_v])
+    per trunk layer. Parents are always evaluated before children in every
+    strategy, so ancestor chains are complete at evaluate() time.
     """
-    policy_rows: list[torch.Tensor] = []
-    value_rows: list[torch.Tensor] = []
-    idx = 0
-    while idx < len(batches):
-        chunk = [batches[idx]]
-        chunk_tokens = int(batches[idx]["total_tokens"])
-        idx += 1
-        while (
-            idx < len(batches)
-            and chunk_tokens + int(batches[idx]["total_tokens"])
-            <= _SEARCH_EVAL_MAX_TOKENS_PER_CHUNK
-        ):
-            chunk_tokens += int(batches[idx]["total_tokens"])
-            chunk.append(batches[idx])
-            idx += 1
-        merged = _merge_single_sequence_batches(chunk)
-        output = _forward_model(model=model, batch=merged, device=device, dtype=dtype)
-        value_logits = output.get("value_logits")
-        if value_logits is None:
-            raise RuntimeError(
-                f"model_move_policy={policy_name} requires value_logits in model output."
-            )
-        last_positions = merged["seq_offsets"][1:] - 1
-        policy_rows.append(output["logits"][last_positions])
-        value_rows.append(value_logits[last_positions])
-    return torch.cat(policy_rows, dim=0), torch.cat(value_rows, dim=0)
+
+    __slots__ = ("parent", "move_id", "depth", "kv")
+
+    def __init__(self, parent: "_CachedNode | None", move_id: int, depth: int) -> None:
+        self.parent = parent
+        self.move_id = move_id
+        self.depth = depth
+        self.kv: list[tuple[torch.Tensor, torch.Tensor]] | None = None
 
 
-class _HistoryPositionEvaluator:
-    """PositionEvaluator over _SequenceHistory handles and the chunked forward."""
+class CachedPositionEvaluator:
+    """PositionEvaluator over a per-turn prefix K/V cache + one-token decodes.
 
-    def __init__(self, *, model, move_vocab, device, dtype, policy_name: str) -> None:
+    The root forward's last token is the current-position token every
+    candidate sequence starts from, so its kv_caches are the shared prefix
+    and each search node adds exactly one token relative to its parent.
+    Constructed fresh each model turn.
+    """
+
+    def __init__(
+        self,
+        *,
+        model,
+        move_vocab: MoveVocab,
+        board_state_encoder: BoardStateEncoder,
+        device: torch.device,
+        dtype: torch.dtype,
+        prefix_kv,
+        prefix_len: int,
+    ) -> None:
         self._model = model
         self._move_vocab = move_vocab
+        self._board_state_encoder = board_state_encoder
         self._device = device
         self._dtype = dtype
-        self._policy_name = policy_name
+        self._prefix_kv = prefix_kv
+        self._prefix_len = int(prefix_len)
 
     def extend(self, handle, board_before: chess.Board, move: chess.Move):
-        new_handle = handle.clone()
-        new_handle.append_observed_position(board_before)
-        new_handle.record_played_move(move.uci())
-        return new_handle
+        parent = handle if isinstance(handle, _CachedNode) else None
+        depth = parent.depth + 1 if parent is not None else 0
+        return _CachedNode(parent, int(self._move_vocab.encode(move.uci())), depth)
 
     def evaluate(self, batch):
-        batches = [
-            handle.build_batch_for_current_position(board) for handle, board in batch
-        ]
-        policy_rows, value_rows = _forward_last_token_outputs(
-            model=self._model,
-            batches=batches,
-            device=self._device,
-            dtype=self._dtype,
-            policy_name=self._policy_name,
+        nodes: list[_CachedNode] = [handle for handle, _ in batch]
+        boards = [board for _, board in batch]
+        states = [self._board_state_encoder.encode(board) for board in boards]
+        wave_size = len(batch)
+
+        new_token_batch = {
+            "piece_ids": torch.tensor(
+                [state.piece_ids for state in states], dtype=torch.long
+            ),
+            "seq_token_id": torch.full((wave_size,), EVENT_TOKEN_ID, dtype=torch.long),
+            "turn_id": torch.tensor([state.turn_id for state in states], dtype=torch.long),
+            "castle_id": torch.tensor(
+                [state.castle_id for state in states], dtype=torch.long
+            ),
+            "ep_file_id": torch.tensor(
+                [state.ep_file_id for state in states], dtype=torch.long
+            ),
+            "halfmove_bucket_id": torch.tensor(
+                [state.halfmove_bucket_id for state in states], dtype=torch.long
+            ),
+            "fullmove_bucket_id": torch.tensor(
+                [state.fullmove_bucket_id for state in states], dtype=torch.long
+            ),
+            "prev_move_id": torch.tensor(
+                [node.move_id for node in nodes], dtype=torch.long
+            ),
+        }
+        positions = torch.tensor(
+            [self._prefix_len + node.depth for node in nodes], dtype=torch.long
         )
+
+        chains: list[list[_CachedNode]] = []
+        for node in nodes:
+            chain: list[_CachedNode] = []
+            ancestor = node.parent
+            while ancestor is not None:
+                chain.append(ancestor)
+                ancestor = ancestor.parent
+            chain.reverse()  # oldest first; chain[i].depth == i
+            chains.append(chain)
+        max_suffix = max(len(chain) for chain in chains)
+
+        suffix_kv = suffix_positions = suffix_mask = None
+        if max_suffix > 0:
+            num_layers = len(self._prefix_kv)
+            suffix_kv = []
+            for layer_idx in range(num_layers):
+                ref_k, ref_v = self._prefix_kv[layer_idx]
+                heads = ref_k.size(0)
+                layer_k = torch.zeros(
+                    wave_size, heads, max_suffix, ref_k.size(-1),
+                    dtype=ref_k.dtype, device=ref_k.device,
+                )
+                layer_v = torch.zeros(
+                    wave_size, heads, max_suffix, ref_v.size(-1),
+                    dtype=ref_v.dtype, device=ref_v.device,
+                )
+                for row, chain in enumerate(chains):
+                    for i, ancestor in enumerate(chain):
+                        ancestor_k, ancestor_v = ancestor.kv[layer_idx]
+                        layer_k[row, :, i : i + 1] = ancestor_k
+                        layer_v[row, :, i : i + 1] = ancestor_v
+                suffix_kv.append((layer_k, layer_v))
+            suffix_positions = (
+                torch.arange(max_suffix).view(1, -1) + self._prefix_len
+            ).expand(wave_size, -1).to(self._device)
+            suffix_mask = torch.tensor(
+                [
+                    [i < len(chain) for i in range(max_suffix)]
+                    for chain in chains
+                ],
+                dtype=torch.bool,
+                device=self._device,
+            )
+
+        use_amp = self._device.type == "cuda" and self._dtype in (
+            torch.float16,
+            torch.bfloat16,
+        )
+        autocast_ctx = (
+            torch.autocast(device_type="cuda", dtype=self._dtype)
+            if use_amp
+            else contextlib.nullcontext()
+        )
+        with torch.inference_mode(), autocast_ctx:
+            out = self._model.forward_decode(
+                new_token_batch=new_token_batch,
+                positions=positions,
+                prefix_kv=self._prefix_kv,
+                suffix_kv=suffix_kv,
+                suffix_positions=suffix_positions,
+                suffix_mask=suffix_mask,
+            )
+
+        for row, node in enumerate(nodes):
+            node.kv = [
+                (k[row : row + 1].squeeze(0), v[row : row + 1].squeeze(0))
+                for k, v in out["kv"]
+            ]
+
+        logits = out["logits"]
+        value_logits = out["value_logits"]
         results = []
-        for row_idx, (_, board) in enumerate(batch):
-            value_stm = _value_scalar_from_logits(value_rows[row_idx])
+        for row, board in enumerate(boards):
+            value_stm = _value_scalar_from_logits(value_logits[row])
             try:
                 legal_logits, legal_moves, _, _ = _project_legal_logits(
-                    logits=policy_rows[row_idx],
-                    board=board,
-                    move_vocab=self._move_vocab,
+                    logits=logits[row], board=board, move_vocab=self._move_vocab
                 )
                 log_priors = torch.log_softmax(legal_logits.float(), dim=0).tolist()
             except RuntimeError:
-                # No legal move maps to the vocab: value-only leaf.
                 legal_moves, log_priors = [], []
             results.append(
                 PositionEval(
@@ -629,6 +652,7 @@ def _select_model_move(
     history: _SequenceHistory,
     board: chess.Board,
     move_vocab: MoveVocab,
+    board_state_encoder: BoardStateEncoder,
     device: torch.device,
     dtype: torch.dtype,
     policy: str,
@@ -642,6 +666,7 @@ def _select_model_move(
         batch=batch,
         device=device,
         dtype=dtype,
+        return_kv=True,
     )
 
     logits = output["logits"][-1]
@@ -651,12 +676,14 @@ def _select_model_move(
         move_vocab=move_vocab,
     )
     legal_log_priors = torch.log_softmax(legal_logits.float(), dim=0).tolist()
-    evaluator = _HistoryPositionEvaluator(
+    evaluator = CachedPositionEvaluator(
         model=model,
         move_vocab=move_vocab,
+        board_state_encoder=board_state_encoder,
         device=device,
         dtype=dtype,
-        policy_name=policy,
+        prefix_kv=output["kv_caches"],
+        prefix_len=int(batch["total_tokens"]),
     )
     rerank_rows: list[dict[str, Any]] = []
     search_rows: list[dict[str, Any]] = []
@@ -670,7 +697,7 @@ def _select_model_move(
             )
         chosen_index, rerank_rows = select_value_rerank(
             evaluator=evaluator,
-            root_handle=history,
+            root_handle=None,
             board=board,
             legal_moves=legal_moves_with_ids,
             legal_log_priors=legal_log_priors,
@@ -684,7 +711,7 @@ def _select_model_move(
             )
         chosen_index, search_rows = select_value_search_d2(
             evaluator=evaluator,
-            root_handle=history,
+            root_handle=None,
             board=board,
             legal_moves=legal_moves_with_ids,
             legal_log_priors=legal_log_priors,
@@ -700,7 +727,7 @@ def _select_model_move(
             raise ValueError("policy=value_search_halving requires halving_config")
         chosen_index, halving_rows = select_value_search_halving(
             evaluator=evaluator,
-            root_handle=history,
+            root_handle=None,
             board=board,
             legal_moves=legal_moves_with_ids,
             legal_log_priors=legal_log_priors,
@@ -1087,6 +1114,7 @@ def _run_segment(
                         history=history,
                         board=board,
                         move_vocab=move_vocab,
+                        board_state_encoder=board_state_encoder,
                         device=device,
                         dtype=dtype,
                         policy=model_move_policy,
