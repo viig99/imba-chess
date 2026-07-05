@@ -95,7 +95,7 @@ Per model turn, `value_search_d2` runs three batched forward passes:
 
 1. **Propose (1 sequence).** Encode the real game history, take the policy logits at the last token, mask to legal moves, `log_softmax`. The top `value_rerank_top_k` moves are our candidates.
 2. **Opponent responses (≤ K sequences, 1 batch).** For each candidate, simulate playing it (copy the board, append the move token to a copy of the history) and run the model once over all candidates to get the opponent's move distribution in each hypothetical position. Opponent responses considered per position: their policy top-K **plus every capture, check, and promotion** — the refutation of a bad move is often a move the human-imitation policy ranks low, so probability-based pruning alone would hide exactly what we are testing for.
-3. **Grade (~K × (K + forcing) sequences, chunked batches).** Apply each response, evaluate all resulting positions with the value head, and collapse each to a scalar `v = p(win) - p(loss)` from our perspective.
+3. **Grade (~K × (K + forcing) sequences, one decode wave).** Apply each response, evaluate all resulting positions with the value head, and collapse each to a scalar `v = p(win) - p(loss)` from our perspective.
 
 Each candidate is then scored pessimistically — assume the opponent picks their best response — with the policy prior as a tiebreaker:
 
@@ -113,7 +113,7 @@ Special cases bypass the network:
 - If a candidate move immediately wins the game, it is played without further search.
 - Child boards keep the move stack so repetition draws are actually detected in simulated lines.
 
-Batched evaluations are chunked to at most 4096 tokens per forward (`_SEARCH_EVAL_MAX_TOKENS_PER_CHUNK`): the non-compiled attention fallback materializes O(T²) tensors, and one merged batch of ~300 sequences OOMs on an 8 GB GPU.
+Search evaluations use a prefix-cache decode path: the once-per-turn root forward doubles as a prefill whose per-layer K/V become a shared cache, and every search position is then evaluated as a single new token attending to that cache — O(1) new work per evaluation instead of re-encoding the full game history.
 
 Cost: 3 model calls and ~K² positions per turn instead of 1 call — roughly 30–50s per game instead of ~2s, buying back the consequence-checking that pure imitation lacks.
 
@@ -279,7 +279,7 @@ uv run --python .venv/bin/python --with pytest pytest -q
 
 - Training is single-process (no end-to-end DDP launcher yet).
 - No legal-move masking in the prediction head during training (full-vocab classification); legality is enforced at inference.
-- Search evaluations re-encode the full game history per position (no prefix/KV caching), so per-move search cost grows with game length; caching is the planned next step if `value_search_halving` holds up.
+- Prefix K/V caching is per-turn only: the cache is rebuilt each model turn (no cross-turn reuse) and games are played sequentially (no cross-game batching).
 - Value labels are raw game outcomes, not engine evaluations (noisy for early positions).
 - Streaming order is temporal by month window (newest first); month-level file order can be shuffled at process start via `[dataset].shuffle_train_month_files_on_start`.
 - Checkpoints trained before the placement-aware board encoding / 1,970-token vocab are incompatible with current code (check out an older commit to evaluate them).

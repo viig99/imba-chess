@@ -324,6 +324,7 @@ class HSTUChessModel(nn.Module):
         *,
         block_mask: BlockMask | None = None,
         return_loss: bool = True,
+        return_kv: bool = False,
     ) -> dict[str, torch.Tensor]:
         device = self.piece_square_embedding.weight.device
         seq_offsets = batch["seq_offsets"].to(
@@ -339,8 +340,13 @@ class HSTUChessModel(nn.Module):
                 device=x.device,
             )
 
+        kv_caches: list[tuple[torch.Tensor, torch.Tensor]] = []
         for layer in self.layers:
-            x = layer(x=x, block_mask=block_mask)
+            if return_kv:
+                x, layer_kv = layer(x=x, block_mask=block_mask, return_kv=True)
+                kv_caches.append(layer_kv)
+            else:
+                x = layer(x=x, block_mask=block_mask)
 
         x = self.final_norm(x)
         policy_logits = self.prediction_head(x)
@@ -348,6 +354,8 @@ class HSTUChessModel(nn.Module):
             "logits": policy_logits,
             "policy_logits": policy_logits,
         }
+        if return_kv:
+            output["kv_caches"] = kv_caches  # type: ignore[assignment]
         value_logits: torch.Tensor | None = None
         if self.value_head is not None:
             value_logits = self.value_head(x)
@@ -452,4 +460,55 @@ class HSTUChessModel(nn.Module):
 
             output["loss"] = total_loss
 
+        return output
+
+    def forward_decode(
+        self,
+        *,
+        new_token_batch: dict[str, Any],
+        positions: torch.Tensor,
+        prefix_kv: list[tuple[torch.Tensor, torch.Tensor]],
+        suffix_kv: list[tuple[torch.Tensor, torch.Tensor]] | None = None,
+        suffix_positions: torch.Tensor | None = None,
+        suffix_mask: torch.Tensor | None = None,
+    ) -> dict[str, Any]:
+        """Decode one new token per batch row against per-layer cached K/V.
+
+        Inference-only companion to forward(return_kv=True): new_token_batch
+        carries the per-token id tensors _build_content reads; positions are
+        absolute (prefix_len + suffix depth). Returns logits/value_logits at
+        the new tokens plus each layer's (k, v) for growing suffix caches.
+        """
+        assert not self.training, "forward_decode is inference-only"
+        device = self.piece_square_embedding.weight.device
+        positions = positions.to(device=device, dtype=torch.long)
+        content = self._build_content(new_token_batch)
+        x = self.position_embedding.at_positions(content, positions)
+
+        new_kv: list[tuple[torch.Tensor, torch.Tensor]] = []
+        for layer_idx, layer in enumerate(self.layers):
+            prefix_k, prefix_v = prefix_kv[layer_idx]
+            if suffix_kv is not None:
+                layer_suffix_k, layer_suffix_v = suffix_kv[layer_idx]
+            else:
+                layer_suffix_k = layer_suffix_v = None
+            x, k_new, v_new = layer.forward_decode(
+                x,
+                prefix_k=prefix_k,
+                prefix_v=prefix_v,
+                q_positions=positions,
+                suffix_k=layer_suffix_k,
+                suffix_v=layer_suffix_v,
+                suffix_positions=suffix_positions,
+                suffix_mask=suffix_mask,
+            )
+            new_kv.append((k_new, v_new))
+
+        x = self.final_norm(x)
+        output: dict[str, Any] = {
+            "logits": self.prediction_head(x),
+            "kv": new_kv,
+        }
+        if self.value_head is not None:
+            output["value_logits"] = self.value_head(x)
         return output

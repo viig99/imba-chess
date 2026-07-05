@@ -48,3 +48,15 @@ class PositionEmbedding(nn.Module):
 
         x = content * (self._embedding_dim**0.5) + self.embedding(positions)
         return self.dropout(x)
+
+    def at_positions(
+        self, content: torch.Tensor, positions: torch.Tensor
+    ) -> torch.Tensor:
+        """Same combine as forward() but with caller-supplied absolute positions.
+
+        Used by the decode path, where positions are prefix_len + suffix depth
+        rather than derived from jagged offsets.
+        """
+        positions = torch.clamp(positions, max=self.max_seq_len - 1)
+        x = content * (self._embedding_dim**0.5) + self.embedding(positions)
+        return self.dropout(x)

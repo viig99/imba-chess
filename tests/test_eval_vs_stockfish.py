@@ -26,36 +26,54 @@ def _load_eval_script_module():
     return module
 
 
+def _dummy_kv(total_tokens: int) -> list[tuple[torch.Tensor, torch.Tensor]]:
+    # One fake layer; the evaluator only threads shapes through.
+    return [(torch.zeros(1, total_tokens, 1), torch.zeros(1, total_tokens, 1))]
+
+
+def _dummy_decode_kv(batch_size: int) -> list[tuple[torch.Tensor, torch.Tensor]]:
+    return [(torch.zeros(batch_size, 1, 1, 1), torch.zeros(batch_size, 1, 1, 1))]
+
+
 class _DummyValueRerankModel(torch.nn.Module):
+    """Root prefers e2e4; value head favors positions reached via d2d4."""
+
     def __init__(self, move_vocab: MoveVocab) -> None:
         super().__init__()
         self.move_vocab = move_vocab
         self.forward_calls = 0
 
-    def forward(self, batch, *, block_mask=None, return_loss=False):  # type: ignore[no-untyped-def]
+    def forward(self, batch, *, block_mask=None, return_loss=False, return_kv=False):  # type: ignore[no-untyped-def]
         self.forward_calls += 1
         total_tokens = int(batch["total_tokens"])
-        vocab_size = len(self.move_vocab)
-        logits = torch.zeros((total_tokens, vocab_size), dtype=torch.float32)
+        logits = torch.zeros((total_tokens, len(self.move_vocab)), dtype=torch.float32)
         value_logits = torch.zeros((total_tokens, 3), dtype=torch.float32)
+        last = total_tokens - 1
+        logits[last, self.move_vocab.token_to_id["e2e4"]] = 4.0
+        logits[last, self.move_vocab.token_to_id["d2d4"]] = 3.0
+        value_logits[last, 1] = 1.0
+        out = {"logits": logits, "value_logits": value_logits}
+        if return_kv:
+            out["kv_caches"] = _dummy_kv(total_tokens)
+        return out
 
-        if int(batch["num_games"]) == 1:
-            last = total_tokens - 1
-            logits[last, self.move_vocab.token_to_id["e2e4"]] = 4.0
-            logits[last, self.move_vocab.token_to_id["d2d4"]] = 3.0
-            value_logits[last, 1] = 1.0
-        else:
-            seq_offsets = batch["seq_offsets"]
-            last_positions = seq_offsets[1:] - 1
-            prev_ids = batch["prev_move_id"][last_positions]
-            for row_idx, last_pos in enumerate(last_positions.tolist()):
-                move_id = int(prev_ids[row_idx].item())
-                if move_id == self.move_vocab.token_to_id["e2e4"]:
-                    value_logits[last_pos] = torch.tensor([0.0, 0.0, 4.0])
-                elif move_id == self.move_vocab.token_to_id["d2d4"]:
-                    value_logits[last_pos] = torch.tensor([4.0, 0.0, 0.0])
-
-        return {"logits": logits, "value_logits": value_logits}
+    def forward_decode(self, *, new_token_batch, positions, prefix_kv, suffix_kv=None, suffix_positions=None, suffix_mask=None):  # type: ignore[no-untyped-def]
+        self.forward_calls += 1
+        batch_size = int(positions.numel())
+        logits = torch.zeros((batch_size, len(self.move_vocab)), dtype=torch.float32)
+        value_logits = torch.zeros((batch_size, 3), dtype=torch.float32)
+        prev_ids = new_token_batch["prev_move_id"]
+        for row in range(batch_size):
+            move_id = int(prev_ids[row].item())
+            if move_id == self.move_vocab.token_to_id["e2e4"]:
+                value_logits[row] = torch.tensor([0.0, 0.0, 4.0])
+            elif move_id == self.move_vocab.token_to_id["d2d4"]:
+                value_logits[row] = torch.tensor([4.0, 0.0, 0.0])
+        return {
+            "logits": logits,
+            "value_logits": value_logits,
+            "kv": _dummy_decode_kv(batch_size),
+        }
 
 
 class _DummyNoValueModel(torch.nn.Module):
@@ -63,84 +81,84 @@ class _DummyNoValueModel(torch.nn.Module):
         super().__init__()
         self.move_vocab = move_vocab
 
-    def forward(self, batch, *, block_mask=None, return_loss=False):  # type: ignore[no-untyped-def]
+    def forward(self, batch, *, block_mask=None, return_loss=False, return_kv=False):  # type: ignore[no-untyped-def]
         total_tokens = int(batch["total_tokens"])
-        vocab_size = len(self.move_vocab)
-        logits = torch.zeros((total_tokens, vocab_size), dtype=torch.float32)
+        logits = torch.zeros((total_tokens, len(self.move_vocab)), dtype=torch.float32)
         last = total_tokens - 1
         logits[last, self.move_vocab.token_to_id["e2e4"]] = 1.0
         logits[last, self.move_vocab.token_to_id["d2d4"]] = 0.5
-        return {"logits": logits}
+        out = {"logits": logits}
+        if return_kv:
+            out["kv_caches"] = _dummy_kv(total_tokens)
+        return out
 
 
 class _DummyValueSearchD2Model(torch.nn.Module):
+    """Depth-1 nodes get opponent priors; depth-2 values depend on the line.
+
+    The root move is recovered from the node's board (piece_ids): after e2e4
+    a white pawn (id 1) sits on e4 (square 28); after d2d4, on d4 (27).
+    """
+
     def __init__(self, move_vocab: MoveVocab) -> None:
         super().__init__()
         self.move_vocab = move_vocab
         self.forward_calls = 0
 
-    def forward(self, batch, *, block_mask=None, return_loss=False):  # type: ignore[no-untyped-def]
+    def forward(self, batch, *, block_mask=None, return_loss=False, return_kv=False):  # type: ignore[no-untyped-def]
         self.forward_calls += 1
         total_tokens = int(batch["total_tokens"])
-        vocab_size = len(self.move_vocab)
-        logits = torch.zeros((total_tokens, vocab_size), dtype=torch.float32)
+        logits = torch.zeros((total_tokens, len(self.move_vocab)), dtype=torch.float32)
         value_logits = torch.zeros((total_tokens, 3), dtype=torch.float32)
-        seq_offsets = batch["seq_offsets"]
-        last_positions = seq_offsets[1:] - 1
-        prev_move_id = batch["prev_move_id"]
+        last = total_tokens - 1
+        logits[last, self.move_vocab.token_to_id["e2e4"]] = 4.0
+        logits[last, self.move_vocab.token_to_id["d2d4"]] = 3.0
+        value_logits[last, 1] = 1.0
+        out = {"logits": logits, "value_logits": value_logits}
+        if return_kv:
+            out["kv_caches"] = _dummy_kv(total_tokens)
+        return out
 
-        if int(batch["num_games"]) == 1:
-            last = int(last_positions[0].item())
-            logits[last, self.move_vocab.token_to_id["e2e4"]] = 4.0
-            logits[last, self.move_vocab.token_to_id["d2d4"]] = 3.0
-            value_logits[last, 1] = 1.0
-            return {"logits": logits, "value_logits": value_logits}
-
-        for game_idx, last_pos_tensor in enumerate(last_positions):
-            start = int(seq_offsets[game_idx].item())
-            end = int(seq_offsets[game_idx + 1].item())
-            last_pos = int(last_pos_tensor.item())
-            seq_prev = prev_move_id[start:end]
-            last_prev = int(seq_prev[-1].item())
-
-            if last_prev in {
-                self.move_vocab.token_to_id["e2e4"],
-                self.move_vocab.token_to_id["d2d4"],
-            }:
-                logits[last_pos, self.move_vocab.token_to_id["e7e5"]] = 3.0
-                logits[last_pos, self.move_vocab.token_to_id["d7d5"]] = 2.5
-                value_logits[last_pos, 1] = 1.0
+    def forward_decode(self, *, new_token_batch, positions, prefix_kv, suffix_kv=None, suffix_positions=None, suffix_mask=None):  # type: ignore[no-untyped-def]
+        self.forward_calls += 1
+        batch_size = int(positions.numel())
+        logits = torch.zeros((batch_size, len(self.move_vocab)), dtype=torch.float32)
+        value_logits = torch.zeros((batch_size, 3), dtype=torch.float32)
+        prev_ids = new_token_batch["prev_move_id"]
+        piece_ids = new_token_batch["piece_ids"]
+        root_moves = {
+            self.move_vocab.token_to_id["e2e4"],
+            self.move_vocab.token_to_id["d2d4"],
+        }
+        for row in range(batch_size):
+            prev = int(prev_ids[row].item())
+            if prev in root_moves:
+                # Depth 1: opponent to move after our root move.
+                logits[row, self.move_vocab.token_to_id["e7e5"]] = 3.0
+                logits[row, self.move_vocab.token_to_id["d7d5"]] = 2.5
+                value_logits[row, 1] = 1.0
                 continue
-
-            if last_prev in {
-                self.move_vocab.token_to_id["e7e5"],
-                self.move_vocab.token_to_id["d7d5"],
-            } and int(seq_prev.numel()) >= 2:
-                root_prev = int(seq_prev[-2].item())
-                if (
-                    root_prev == self.move_vocab.token_to_id["e2e4"]
-                    and last_prev == self.move_vocab.token_to_id["e7e5"]
-                ):
-                    value_logits[last_pos] = torch.tensor([4.0, 0.0, 0.0])
-                elif (
-                    root_prev == self.move_vocab.token_to_id["e2e4"]
-                    and last_prev == self.move_vocab.token_to_id["d7d5"]
-                ):
-                    value_logits[last_pos] = torch.tensor([2.0, 1.0, 0.0])
-                elif (
-                    root_prev == self.move_vocab.token_to_id["d2d4"]
-                    and last_prev == self.move_vocab.token_to_id["e7e5"]
-                ):
-                    value_logits[last_pos] = torch.tensor([0.0, 1.0, 2.0])
-                elif (
-                    root_prev == self.move_vocab.token_to_id["d2d4"]
-                    and last_prev == self.move_vocab.token_to_id["d7d5"]
-                ):
-                    value_logits[last_pos] = torch.tensor([0.0, 0.0, 4.0])
-                else:
-                    value_logits[last_pos, 1] = 1.0
-
-        return {"logits": logits, "value_logits": value_logits}
+            # Depth 2: root move recovered from the board.
+            root_is_e4 = int(piece_ids[row, chess.E4].item()) == 1
+            if prev == self.move_vocab.token_to_id["e7e5"]:
+                value_logits[row] = (
+                    torch.tensor([4.0, 0.0, 0.0])
+                    if root_is_e4
+                    else torch.tensor([0.0, 1.0, 2.0])
+                )
+            elif prev == self.move_vocab.token_to_id["d7d5"]:
+                value_logits[row] = (
+                    torch.tensor([2.0, 1.0, 0.0])
+                    if root_is_e4
+                    else torch.tensor([0.0, 0.0, 4.0])
+                )
+            else:
+                value_logits[row, 1] = 1.0
+        return {
+            "logits": logits,
+            "value_logits": value_logits,
+            "kv": _dummy_decode_kv(batch_size),
+        }
 
 
 def _mini_repo_config() -> RepoConfig:
@@ -179,9 +197,9 @@ def test_value_rerank_selects_move_using_batched_value_lookahead():
     move, debug = module._select_model_move(
         model=model,
         batch=batch,
-        history=history,
         board=board,
         move_vocab=move_vocab,
+        board_state_encoder=BoardStateEncoder(),
         device=torch.device("cpu"),
         dtype=torch.float32,
         policy="value_rerank",
@@ -191,7 +209,7 @@ def test_value_rerank_selects_move_using_batched_value_lookahead():
     )
 
     assert move.uci() == "d2d4"
-    assert model.forward_calls == 2  # current-state + single batched candidate eval
+    assert model.forward_calls == 2  # prefill + 1 decode wave
     assert debug["policy"] == "value_rerank"
     assert len(debug["value_rerank_candidates"]) == 2
 
@@ -213,9 +231,9 @@ def test_value_rerank_requires_value_logits():
         module._select_model_move(
             model=model,
             batch=batch,
-            history=history,
             board=board,
             move_vocab=move_vocab,
+            board_state_encoder=BoardStateEncoder(),
             device=torch.device("cpu"),
             dtype=torch.float32,
             policy="value_rerank",
@@ -263,9 +281,9 @@ def test_value_search_d2_selects_move_using_opponent_best_reply():
     move, debug = module._select_model_move(
         model=model,
         batch=batch,
-        history=history,
         board=board,
         move_vocab=move_vocab,
+        board_state_encoder=BoardStateEncoder(),
         device=torch.device("cpu"),
         dtype=torch.float32,
         policy="value_search_d2",
@@ -275,7 +293,7 @@ def test_value_search_d2_selects_move_using_opponent_best_reply():
     )
 
     assert move.uci() == "d2d4"
-    assert model.forward_calls == 3  # root + batched depth-1 + batched depth-2
+    assert model.forward_calls == 3  # prefill + depth-1 decode wave + depth-2 decode wave
     assert debug["policy"] == "value_search_d2"
     rows = debug["value_search_d2_candidates"]
     assert len(rows) == 2
@@ -293,16 +311,27 @@ class _DummyMatePreferenceModel(torch.nn.Module):
         self.move_vocab = move_vocab
         self.forward_calls = 0
 
-    def forward(self, batch, *, block_mask=None, return_loss=False):  # type: ignore[no-untyped-def]
+    def forward(self, batch, *, block_mask=None, return_loss=False, return_kv=False):  # type: ignore[no-untyped-def]
         self.forward_calls += 1
         total_tokens = int(batch["total_tokens"])
         logits = torch.zeros((total_tokens, len(self.move_vocab)), dtype=torch.float32)
         value_logits = torch.zeros((total_tokens, 3), dtype=torch.float32)
-        seq_offsets = batch["seq_offsets"]
-        for last in (seq_offsets[1:] - 1).tolist():
-            logits[last, self.move_vocab.token_to_id["a1b1"]] = 4.0
-            logits[last, self.move_vocab.token_to_id["a1a8"]] = 1.0
-        return {"logits": logits, "value_logits": value_logits}
+        last = total_tokens - 1
+        logits[last, self.move_vocab.token_to_id["a1b1"]] = 4.0
+        logits[last, self.move_vocab.token_to_id["a1a8"]] = 1.0
+        out = {"logits": logits, "value_logits": value_logits}
+        if return_kv:
+            out["kv_caches"] = _dummy_kv(total_tokens)
+        return out
+
+    def forward_decode(self, *, new_token_batch, positions, prefix_kv, suffix_kv=None, suffix_positions=None, suffix_mask=None):  # type: ignore[no-untyped-def]
+        self.forward_calls += 1
+        batch_size = int(positions.numel())
+        return {
+            "logits": torch.zeros((batch_size, len(self.move_vocab)), dtype=torch.float32),
+            "value_logits": torch.zeros((batch_size, 3), dtype=torch.float32),
+            "kv": _dummy_decode_kv(batch_size),
+        }
 
 
 def _mate_in_one_setup():
@@ -327,9 +356,9 @@ def test_value_rerank_prefers_mate_in_one_over_higher_logit_move():
     move, _ = module._select_model_move(
         model=model,
         batch=batch,
-        history=history,
         board=board,
         move_vocab=move_vocab,
+        board_state_encoder=BoardStateEncoder(),
         device=torch.device("cpu"),
         dtype=torch.float32,
         policy="value_rerank",
@@ -339,8 +368,8 @@ def test_value_rerank_prefers_mate_in_one_over_higher_logit_move():
     )
 
     assert move.uci() == "a1a8"
-    # Root eval only: finding the mate short-circuits before any candidate
-    # batch, so the value head is never consulted.
+    # prefill + 0 decode waves: finding the mate short-circuits before any
+    # candidate batch, so the value head is never consulted.
     assert model.forward_calls == 1
 
 
@@ -350,9 +379,9 @@ def test_value_search_d2_plays_mate_in_one_immediately():
     move, _ = module._select_model_move(
         model=model,
         batch=batch,
-        history=history,
         board=board,
         move_vocab=move_vocab,
+        board_state_encoder=BoardStateEncoder(),
         device=torch.device("cpu"),
         dtype=torch.float32,
         policy="value_search_d2",
@@ -362,7 +391,8 @@ def test_value_search_d2_plays_mate_in_one_immediately():
     )
 
     assert move.uci() == "a1a8"
-    # Mate short-circuits before any depth-1/depth-2 batched evals.
+    # prefill + 0 decode waves: mate short-circuits before any depth-1/depth-2
+    # decode waves.
     assert model.forward_calls == 1
 
 
@@ -384,9 +414,9 @@ def test_value_search_d2_requires_value_logits():
         module._select_model_move(
             model=model,
             batch=batch,
-            history=history,
             board=board,
             move_vocab=move_vocab,
+            board_state_encoder=BoardStateEncoder(),
             device=torch.device("cpu"),
             dtype=torch.float32,
             policy="value_search_d2",
@@ -466,8 +496,8 @@ def test_save_traced_game_writes_pgn_and_html(tmp_path):
 class _DummyHalvingModel(torch.nn.Module):
     """Root policy prefers e2e4; value head says the d2d4 subtree is winning.
 
-    Value is read from the side-to-move POV, so the dummy uses the last
-    token's turn_id to keep the signal consistent at every depth.
+    Value is read from the side-to-move POV, so the sign is keyed on the new
+    token's turn_id; the root move is recovered from the board's d4 square.
     """
 
     def __init__(self, move_vocab: MoveVocab) -> None:
@@ -475,29 +505,40 @@ class _DummyHalvingModel(torch.nn.Module):
         self.move_vocab = move_vocab
         self.forward_calls = 0
 
-    def forward(self, batch, *, block_mask=None, return_loss=False):  # type: ignore[no-untyped-def]
+    def forward(self, batch, *, block_mask=None, return_loss=False, return_kv=False):  # type: ignore[no-untyped-def]
         self.forward_calls += 1
         total_tokens = int(batch["total_tokens"])
         logits = torch.zeros((total_tokens, len(self.move_vocab)), dtype=torch.float32)
         value_logits = torch.zeros((total_tokens, 3), dtype=torch.float32)
-        seq_offsets = batch["seq_offsets"]
-        prev_move_id = batch["prev_move_id"]
-        turn_id = batch["turn_id"]
-        d2d4_id = self.move_vocab.token_to_id["d2d4"]
-        for game_idx in range(int(batch["num_games"])):
-            start = int(seq_offsets[game_idx].item())
-            end = int(seq_offsets[game_idx + 1].item())
-            last = end - 1
-            logits[last, self.move_vocab.token_to_id["e2e4"]] = 4.0
-            logits[last, self.move_vocab.token_to_id["d2d4"]] = 3.0
-            contains_d2d4 = bool((prev_move_id[start:end] == d2d4_id).any().item())
-            good_for_white = contains_d2d4
-            stm_is_white = int(turn_id[last].item()) == 0
+        last = total_tokens - 1
+        logits[last, self.move_vocab.token_to_id["e2e4"]] = 4.0
+        logits[last, self.move_vocab.token_to_id["d2d4"]] = 3.0
+        out = {"logits": logits, "value_logits": value_logits}
+        if return_kv:
+            out["kv_caches"] = _dummy_kv(total_tokens)
+        return out
+
+    def forward_decode(self, *, new_token_batch, positions, prefix_kv, suffix_kv=None, suffix_positions=None, suffix_mask=None):  # type: ignore[no-untyped-def]
+        self.forward_calls += 1
+        batch_size = int(positions.numel())
+        logits = torch.zeros((batch_size, len(self.move_vocab)), dtype=torch.float32)
+        value_logits = torch.zeros((batch_size, 3), dtype=torch.float32)
+        piece_ids = new_token_batch["piece_ids"]
+        turn_ids = new_token_batch["turn_id"]
+        for row in range(batch_size):
+            logits[row, self.move_vocab.token_to_id["e2e4"]] = 4.0
+            logits[row, self.move_vocab.token_to_id["d2d4"]] = 3.0
+            good_for_white = int(piece_ids[row, chess.D4].item()) == 1
+            stm_is_white = int(turn_ids[row].item()) == 0
             if good_for_white == stm_is_white:
-                value_logits[last] = torch.tensor([0.0, 0.0, 3.0])  # stm winning
+                value_logits[row] = torch.tensor([0.0, 0.0, 3.0])
             else:
-                value_logits[last] = torch.tensor([3.0, 0.0, 0.0])  # stm losing
-        return {"logits": logits, "value_logits": value_logits}
+                value_logits[row] = torch.tensor([3.0, 0.0, 0.0])
+        return {
+            "logits": logits,
+            "value_logits": value_logits,
+            "kv": _dummy_decode_kv(batch_size),
+        }
 
 
 def test_value_search_halving_end_to_end_picks_value_backed_move():
@@ -516,9 +557,9 @@ def test_value_search_halving_end_to_end_picks_value_backed_move():
     move, debug = module._select_model_move(
         model=model,
         batch=batch,
-        history=history,
         board=board,
         move_vocab=move_vocab,
+        board_state_encoder=BoardStateEncoder(),
         device=torch.device("cpu"),
         dtype=torch.float32,
         policy="value_search_halving",
