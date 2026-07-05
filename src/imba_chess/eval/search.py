@@ -1,8 +1,8 @@
 """Move-selection strategies for eval play, decoupled from the model.
 
 Strategies consume a PositionEvaluator: `handle` is opaque (the eval script
-uses a _SequenceHistory clone; tests use whatever they need), `extend` derives
-the handle for the position after a move, and `evaluate` batch-scores
+uses a parent-linked cache node; tests use whatever they need), `extend`
+derives the handle for the position after a move, and `evaluate` batch-scores
 positions, returning the value-head scalar (side-to-move POV) plus the legal
 moves that map to the move vocab and their log-softmax policy priors.
 

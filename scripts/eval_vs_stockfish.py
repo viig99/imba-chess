@@ -13,6 +13,7 @@ import chess
 import chess.engine
 import chess.pgn
 import torch
+import torch.nn.functional as F
 
 from imba_chess.config import DEFAULT_CONFIG_PATH, load_repo_config
 from imba_chess.data.board_state import BoardStateEncoder
@@ -475,18 +476,20 @@ def _project_legal_logits(
 class _CachedNode:
     """Search-node handle: parent link + the move that led here.
 
-    kv is filled after this node is evaluated: one (k [H,1,d_qk], v [H,1,d_v])
-    per trunk layer. Parents are always evaluated before children in every
-    strategy, so ancestor chains are complete at evaluate() time.
+    path_kv is filled after this node is evaluated: the stacked per-layer
+    K/V of every token on the root->self line, shapes [L, H, depth+1, d].
+    A child's decode suffix is exactly its parent's path_kv. Parents are
+    always evaluated before children in every strategy, so the path is
+    complete at evaluate() time.
     """
 
-    __slots__ = ("parent", "move_id", "depth", "kv")
+    __slots__ = ("parent", "move_id", "depth", "path_kv")
 
     def __init__(self, parent: "_CachedNode | None", move_id: int, depth: int) -> None:
         self.parent = parent
         self.move_id = move_id
         self.depth = depth
-        self.kv: list[tuple[torch.Tensor, torch.Tensor]] | None = None
+        self.path_kv: tuple[torch.Tensor, torch.Tensor] | None = None
 
 
 class CachedPositionEvaluator:
@@ -523,6 +526,8 @@ class CachedPositionEvaluator:
         return _CachedNode(parent, int(self._move_vocab.encode(move.uci())), depth)
 
     def evaluate(self, batch):
+        if not batch:
+            return []
         nodes: list[_CachedNode] = [handle for handle, _ in batch]
         boards = [board for _, board in batch]
         states = [self._board_state_encoder.encode(board) for board in boards]
@@ -553,50 +558,7 @@ class CachedPositionEvaluator:
         positions = torch.tensor(
             [self._prefix_len + node.depth for node in nodes], dtype=torch.long
         )
-
-        chains: list[list[_CachedNode]] = []
-        for node in nodes:
-            chain: list[_CachedNode] = []
-            ancestor = node.parent
-            while ancestor is not None:
-                chain.append(ancestor)
-                ancestor = ancestor.parent
-            chain.reverse()  # oldest first; chain[i].depth == i
-            chains.append(chain)
-        max_suffix = max(len(chain) for chain in chains)
-
-        suffix_kv = suffix_positions = suffix_mask = None
-        if max_suffix > 0:
-            num_layers = len(self._prefix_kv)
-            suffix_kv = []
-            for layer_idx in range(num_layers):
-                ref_k, ref_v = self._prefix_kv[layer_idx]
-                heads = ref_k.size(0)
-                layer_k = torch.zeros(
-                    wave_size, heads, max_suffix, ref_k.size(-1),
-                    dtype=ref_k.dtype, device=ref_k.device,
-                )
-                layer_v = torch.zeros(
-                    wave_size, heads, max_suffix, ref_v.size(-1),
-                    dtype=ref_v.dtype, device=ref_v.device,
-                )
-                for row, chain in enumerate(chains):
-                    for i, ancestor in enumerate(chain):
-                        ancestor_k, ancestor_v = ancestor.kv[layer_idx]
-                        layer_k[row, :, i : i + 1] = ancestor_k
-                        layer_v[row, :, i : i + 1] = ancestor_v
-                suffix_kv.append((layer_k, layer_v))
-            suffix_positions = (
-                torch.arange(max_suffix).view(1, -1) + self._prefix_len
-            ).expand(wave_size, -1).to(self._device)
-            suffix_mask = torch.tensor(
-                [
-                    [i < len(chain) for i in range(max_suffix)]
-                    for chain in chains
-                ],
-                dtype=torch.bool,
-                device=self._device,
-            )
+        max_suffix = max(node.depth for node in nodes)
 
         use_amp = self._device.type == "cuda" and self._dtype in (
             torch.float16,
@@ -608,6 +570,11 @@ class CachedPositionEvaluator:
             else contextlib.nullcontext()
         )
         with torch.inference_mode(), autocast_ctx:
+            suffix_kv = suffix_positions = suffix_mask = None
+            if max_suffix > 0:
+                suffix_kv, suffix_positions, suffix_mask = self._wave_suffixes(
+                    nodes, max_suffix
+                )
             out = self._model.forward_decode(
                 new_token_batch=new_token_batch,
                 positions=positions,
@@ -616,15 +583,24 @@ class CachedPositionEvaluator:
                 suffix_positions=suffix_positions,
                 suffix_mask=suffix_mask,
             )
+            # Stack the wave's per-layer (k, v) once, then extend each node's
+            # root->self path cache so descendants get their suffix for free.
+            k_all = torch.stack([k for k, _ in out["kv"]], dim=0)  # [L, B, H, 1, d]
+            v_all = torch.stack([v for _, v in out["kv"]], dim=0)
+            for row, node in enumerate(nodes):
+                own_k, own_v = k_all[:, row], v_all[:, row]
+                if node.parent is None:
+                    node.path_kv = (own_k, own_v)
+                else:
+                    parent_k, parent_v = node.parent.path_kv
+                    node.path_kv = (
+                        torch.cat([parent_k, own_k], dim=2),
+                        torch.cat([parent_v, own_v], dim=2),
+                    )
+            # One device->host transfer per wave instead of two syncs per node.
+            logits = out["logits"].float().cpu()
+            value_logits = out["value_logits"].float().cpu()
 
-        for row, node in enumerate(nodes):
-            node.kv = [
-                (k[row : row + 1].squeeze(0), v[row : row + 1].squeeze(0))
-                for k, v in out["kv"]
-            ]
-
-        logits = out["logits"]
-        value_logits = out["value_logits"]
         results = []
         for row, board in enumerate(boards):
             value_stm = _value_scalar_from_logits(value_logits[row])
@@ -643,6 +619,43 @@ class CachedPositionEvaluator:
                 )
             )
         return results
+
+    def _wave_suffixes(self, nodes, max_suffix: int):
+        """Padded per-layer ancestor K/V for one wave.
+
+        Each node's suffix is its parent's path_kv ([L, H, depth, d]); rows
+        are padded on the token dim to the wave max and stacked, then split
+        back into the per-layer [B, H, s, d] pairs forward_decode expects.
+        """
+        ref_k, ref_v = self._prefix_kv[0]
+        num_layers = len(self._prefix_kv)
+        heads = ref_k.size(0)
+        zero_k = ref_k.new_zeros((num_layers, heads, max_suffix, ref_k.size(-1)))
+        zero_v = ref_v.new_zeros((num_layers, heads, max_suffix, ref_v.size(-1)))
+        rows_k: list[torch.Tensor] = []
+        rows_v: list[torch.Tensor] = []
+        for node in nodes:
+            if node.parent is None:
+                rows_k.append(zero_k)
+                rows_v.append(zero_v)
+                continue
+            path_k, path_v = node.parent.path_kv
+            pad = max_suffix - node.depth
+            rows_k.append(F.pad(path_k, (0, 0, 0, pad)) if pad else path_k)
+            rows_v.append(F.pad(path_v, (0, 0, 0, pad)) if pad else path_v)
+        stacked_k = torch.stack(rows_k, dim=0)  # [B, L, H, s, d_qk]
+        stacked_v = torch.stack(rows_v, dim=0)
+        suffix_kv = list(zip(stacked_k.unbind(dim=1), stacked_v.unbind(dim=1)))
+        suffix_positions = (
+            torch.arange(max_suffix, device=self._device).view(1, -1)
+            + self._prefix_len
+        ).expand(len(nodes), -1)
+        suffix_mask = torch.tensor(
+            [[i < node.depth for i in range(max_suffix)] for node in nodes],
+            dtype=torch.bool,
+            device=self._device,
+        )
+        return suffix_kv, suffix_positions, suffix_mask
 
 
 def _select_model_move(
