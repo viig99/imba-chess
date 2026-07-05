@@ -37,8 +37,6 @@ ValueNetConfig (frozen dataclass):
     dim: int = 256          # square-token width
     num_heads: int = 4
     num_layers: int = 6
-    halfmove_vocab_size: int = 128
-    fullmove_vocab_size: int = 128
 ```
 
 `ValueNet(nn.Module)`:
@@ -46,11 +44,15 @@ ValueNetConfig (frozen dataclass):
 - `piece_square_embedding = nn.Embedding(13 * 64, dim)` — same joint
   (piece, square) scheme as `HSTUChessModel._embed_board` (pair id =
   `piece_id * 64 + square`).
-- Scalar state features — turn (2), castle (16), ep file (9), halfmove
-  bucket, fullmove bucket — each an `nn.Embedding(*, dim)` with the same
-  id-clamping the big model uses; their sum is **broadcast-added to all 64
-  square tokens** before the encoder so side-to-move/castling can interact
-  with square content.
+- Scalar state features — turn (2), castle (16), ep file (9) — each an
+  `nn.Embedding(*, dim)` with the same id-clamping the big model uses;
+  their sum is **broadcast-added to all 64 square tokens** before the
+  encoder so side-to-move/castling can interact with square content.
+  **No halfmove/fullmove features**: the eval-DB FEN carries neither
+  (python-chess fills defaults 0/1 at parse), so training would see
+  constants while inference sees real clocks — a train/serve skew. The net
+  is clock-blind by design; 50-move/repetition proximity is already
+  handled exactly by the search's terminal rules.
 - Body: **`BoardSquareEncoder` imported from `hstu_model` and reused
   unchanged** — its constructor is already fully parameterized:
   `BoardSquareEncoder(dim=cfg.dim, num_heads=cfg.num_heads,
@@ -60,9 +62,9 @@ ValueNetConfig (frozen dataclass):
   1 = draw, 2 = win, side-to-move POV).
 - `forward(batch: dict) -> logits [B, 3]` consuming exactly the id-tensor
   keys the eval script already builds for decode waves: `piece_ids
-  [B, 64]`, `turn_id`, `castle_id`, `ep_file_id`, `halfmove_bucket_id`,
-  `fullmove_bucket_id` (all `[B]`). `prev_move_id`/`seq_token_id` are
-  ignored — the net is position-only.
+  [B, 64]`, `turn_id`, `castle_id`, `ep_file_id` (all `[B]`). Other batch
+  keys (`prev_move_id`, `seq_token_id`, clock buckets) are ignored — the
+  net is position-only and clock-blind.
 
 Default size ≈ 5M parameters.
 
@@ -72,10 +74,13 @@ Streams `Lichess/chess-position-evaluations` with the same
 `load_dataset(path="parquet", streaming=True)` + file-level worker
 sharding idioms as `lichess_dataset.py`.
 
-Per row (`fen`, `cp`, `mate`, `depth`, ...):
+Per row (`fen`, `line`, `depth`, `knodes`, `cp`, `mate`):
 
-1. Filter: `depth >= depth_min` (config, default 12). Rows with neither
-   cp nor mate are dropped. No dedup (repeat evaluations of popular
+1. Filter: `int(depth) >= depth_min` (config, default 12 — `depth` arrives
+   as a string). Rows with neither cp nor mate are dropped; `line` (the
+   PV) is unused in v1. The FEN is 4-field (pieces, active color,
+   castling, ep only); `chess.Board(fen)` parses it, filling clock
+   defaults the net never reads (Part 1). No dedup (repeat evaluations of popular
    positions act as mild importance weighting; accepted for v1).
 2. Parse `chess.Board(fen)`; encode via the existing `BoardStateEncoder`
    → the same id fields the model consumes.
@@ -83,24 +88,25 @@ Per row (`fen`, `cp`, `mate`, `depth`, ...):
    - Lichess `cp`/`mate` are **White-POV**; flip sign when the FEN's side
      to move is Black. This conversion gets a dedicated unit test (classic
      silent-bug site).
-   - cp rows: 3-class probabilities from the fitted calibration curve
-     (below).
+   - cp rows: 3-class probabilities from the cp→WDL conversion (below).
    - mate rows: near-saturated target for the mating side — win-side mass
      0.995, remaining 0.005 split evenly across the other two classes,
      from the side-to-move POV; never routed through the cp curve.
-4. Emit `{piece_ids, turn_id, castle_id, ep_file_id, halfmove_bucket_id,
-   fullmove_bucket_id, wdl_target [3]}` — flat tensors, standard
-   fixed-size batches, no packing.
+4. Emit `{piece_ids, turn_id, castle_id, ep_file_id, wdl_target [3]}` —
+   flat tensors, standard fixed-size batches, no packing.
 
 Holdout split: deterministic FEN-hash (e.g. `hash(fen) % 1000 < 5` → val).
 
 ### cp→WDL conversion — Stockfish's own win-rate model, hardcoded
 
-A pure function `cp_to_wdl(cp, fullmove) -> (p_loss, p_draw, p_win)` using
+A pure function `cp_to_wdl(cp, material) -> (p_loss, p_draw, p_win)` using
 the published Stockfish `win_rate_model` polynomial (constants vendored
 with a comment naming the SF version they came from): `p_win` from the
 polynomial at `cp`, `p_loss` from the same polynomial at `-cp` (symmetry),
-`p_draw = 1 − p_win − p_loss`. No annotation run, no fitted artifact.
+`p_draw = 1 − p_win − p_loss`. Modern SF's model conditions on the
+board's material count — derivable from the 4-field FEN, unlike move
+number, which the eval-DB FEN does not carry. No annotation run, no
+fitted artifact.
 
 Rationale: the search consumes values ordinally, so any monotone curve
 preserves arm ranking — calibration precision only matters where net values
