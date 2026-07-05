@@ -573,3 +573,98 @@ def test_value_search_halving_end_to_end_picks_value_backed_move():
     assert debug["policy"] == "value_search_halving"
     rows = debug["value_search_halving_candidates"]
     assert {row["move_uci"] for row in rows} == {"e2e4", "d2d4"}
+
+
+class _StubValueNet(torch.nn.Module):
+    """Constant WDL logits: every position looks equally winning (stm POV)."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.calls = 0
+
+    def forward(self, batch):  # type: ignore[no-untyped-def]
+        self.calls += 1
+        batch_size = int(batch["turn_id"].numel())
+        logits = torch.zeros((batch_size, 3), dtype=torch.float32)
+        logits[:, 2] = 10.0  # p(win) ~ 1 for the side to move, always
+        return logits
+
+
+def _rerank_move_with_net(value_net, alpha):
+    module = _load_eval_script_module()
+    move_vocab = _mini_vocab()
+    model = _DummyValueRerankModel(move_vocab)
+    history = module._SequenceHistory(
+        move_vocab=move_vocab,
+        board_state_encoder=BoardStateEncoder(),
+    )
+    board = chess.Board()
+    batch = history.build_batch_for_current_position(board)
+    move, _ = module._select_model_move(
+        model=model,
+        batch=batch,
+        board=board,
+        move_vocab=move_vocab,
+        board_state_encoder=BoardStateEncoder(),
+        device=torch.device("cpu"),
+        dtype=torch.float32,
+        policy="value_rerank",
+        value_rerank_top_k=2,
+        value_rerank_lambda=0.2,
+        debug_topk=0,
+        value_net=value_net,
+        value_net_alpha=alpha,
+    )
+    return move
+
+
+def test_value_net_alpha_zero_reproduces_model_head():
+    net = _StubValueNet()
+    # alpha=0: model head decides (d2d4 per the dummy's value scheme), and
+    # the net must not even be called.
+    move = _rerank_move_with_net(net, alpha=0.0)
+    assert move.uci() == "d2d4"
+    assert net.calls == 0
+
+
+def test_value_net_alpha_one_uses_net_values():
+    net = _StubValueNet()
+    # alpha=1: the constant net makes all candidates equal; the policy-prior
+    # tiebreak picks the higher-prior move e2e4 instead of the model head's
+    # d2d4 preference.
+    move = _rerank_move_with_net(net, alpha=1.0)
+    assert move.uci() == "e2e4"
+    assert net.calls == 1
+
+
+def test_value_net_alpha_half_blends():
+    module = _load_eval_script_module()
+    # Blend math is checked directly on the evaluator with a stub decode
+    # model: model scalar -1 (loss), net scalar ~+1 (win) -> ~0 at alpha=.5.
+    move_vocab = _mini_vocab()
+    model = _DummyValueRerankModel(move_vocab)
+    encoder = BoardStateEncoder()
+    board = chess.Board()
+    history = module._SequenceHistory(move_vocab=move_vocab, board_state_encoder=encoder)
+    root_batch = history.build_batch_for_current_position(board)
+    prefill = model(root_batch, return_loss=False, return_kv=True)
+    net = _StubValueNet()
+    evaluator = module.CachedPositionEvaluator(
+        model=model,
+        move_vocab=move_vocab,
+        board_state_encoder=encoder,
+        device=torch.device("cpu"),
+        dtype=torch.float32,
+        prefix_kv=prefill["kv_caches"],
+        prefix_len=int(root_batch["total_tokens"]),
+        value_net=net,
+        value_net_alpha=0.5,
+    )
+    move = chess.Move.from_uci("d2d4")
+    handle = evaluator.extend(None, board, move)
+    board1 = board.copy()
+    board1.push(move)
+    (result,) = evaluator.evaluate([(handle, board1)])
+    # Dummy model head: d2d4 node -> value_logits [4,0,0] -> scalar ~ -0.96.
+    # Stub net: scalar ~ +1. Blend at 0.5 ~ 0.02.
+    assert -0.2 < result.value_stm < 0.2

@@ -145,6 +145,8 @@ class EvalVsStockfishConfig:
     search_refutation_top_r: int = 2
     search_expand_top: int = 3
     search_max_depth: int = 4
+    value_net_checkpoint: Optional[str] = None
+    value_net_alpha: float = 1.0
     opening_random_plies: int = 0
     debug_trace_games: int = 0
     debug_trace_max_plies: int = 80

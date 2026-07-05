@@ -155,3 +155,9 @@ train_steps = 500
     assert config.value_net.dim == 128
     assert config.value_net.train_steps == 500
     assert config.value_net.num_layers == 6
+
+
+def test_eval_vs_stockfish_value_net_defaults():
+    config = EvalVsStockfishConfig()
+    assert config.value_net_checkpoint is None
+    assert config.value_net_alpha == 1.0

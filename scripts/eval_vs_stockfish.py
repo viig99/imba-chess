@@ -37,6 +37,7 @@ from imba_chess.model import (
     build_hstu_chess_config,
     create_batch_block_mask,
 )
+from imba_chess.model.value_net import ValueNet, ValueNetConfig
 from tqdm.auto import tqdm
 
 
@@ -261,6 +262,8 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--search-refutation-top-r", type=int, default=None)
     parser.add_argument("--search-expand-top", type=int, default=None)
     parser.add_argument("--search-max-depth", type=int, default=None)
+    parser.add_argument("--value-net-checkpoint", type=Path, default=None)
+    parser.add_argument("--value-net-alpha", type=float, default=None)
     parser.add_argument(
         "--opening-random-plies",
         type=int,
@@ -383,6 +386,23 @@ def _load_model(
             model = torch.compile(model, dynamic=True, fullgraph=False)
             compile_enabled = True
     return model, compile_enabled
+
+
+def _load_value_net(path: Path, repo_config, device: torch.device) -> ValueNet:
+    payload = torch.load(path, map_location="cpu")
+    state_dict = payload.get("model", payload) if isinstance(payload, dict) else payload
+    saved = payload.get("config", {}) if isinstance(payload, dict) else {}
+    vn_cfg = repo_config.value_net
+    net = ValueNet(
+        ValueNetConfig(
+            dim=int(saved.get("dim", vn_cfg.dim)),
+            num_heads=int(saved.get("num_heads", vn_cfg.num_heads)),
+            num_layers=int(saved.get("num_layers", vn_cfg.num_layers)),
+        )
+    ).to(device)
+    net.load_state_dict(state_dict, strict=True)
+    net.eval()
+    return net
 
 
 def _build_engine_limit(args: argparse.Namespace) -> chess.engine.Limit:
@@ -511,6 +531,8 @@ class CachedPositionEvaluator:
         dtype: torch.dtype,
         prefix_kv,
         prefix_len: int,
+        value_net=None,
+        value_net_alpha: float = 1.0,
     ) -> None:
         self._model = model
         self._move_vocab = move_vocab
@@ -519,6 +541,8 @@ class CachedPositionEvaluator:
         self._dtype = dtype
         self._prefix_kv = prefix_kv
         self._prefix_len = int(prefix_len)
+        self._value_net = value_net
+        self._value_net_alpha = value_net_alpha
 
     def extend(self, handle, board_before: chess.Board, move: chess.Move):
         parent = handle if isinstance(handle, _CachedNode) else None
@@ -601,9 +625,18 @@ class CachedPositionEvaluator:
             logits = out["logits"].float().cpu()
             value_logits = out["value_logits"].float().cpu()
 
+            net_scalars = None
+            if self._value_net is not None and self._value_net_alpha > 0.0:
+                net_logits = self._value_net(new_token_batch).float().cpu()
+                net_probs = torch.softmax(net_logits, dim=-1)
+                net_scalars = net_probs[:, 2] - net_probs[:, 0]
+
         results = []
         for row, board in enumerate(boards):
             value_stm = _value_scalar_from_logits(value_logits[row])
+            if net_scalars is not None:
+                alpha = self._value_net_alpha
+                value_stm = (1.0 - alpha) * value_stm + alpha * float(net_scalars[row])
             try:
                 legal_logits, legal_moves, _, _ = _project_legal_logits(
                     logits=logits[row], board=board, move_vocab=self._move_vocab
@@ -672,6 +705,8 @@ def _select_model_move(
     value_rerank_lambda: float,
     debug_topk: int = 0,
     halving_config: Optional[HalvingConfig] = None,
+    value_net=None,
+    value_net_alpha: float = 1.0,
 ) -> tuple[chess.Move, dict[str, Any]]:
     output = _forward_model(
         model=model,
@@ -698,6 +733,8 @@ def _select_model_move(
             dtype=dtype,
             prefix_kv=output["kv_caches"],
             prefix_len=int(batch["total_tokens"]),
+            value_net=value_net,
+            value_net_alpha=value_net_alpha,
         )
     rerank_rows: list[dict[str, Any]] = []
     search_rows: list[dict[str, Any]] = []
@@ -841,6 +878,8 @@ def _summary_to_payload(
     value_rerank_lambda: float,
     opening_random_plies: int,
     search_knobs: dict[str, int],
+    value_net_checkpoint: Path | None = None,
+    value_net_alpha: float = 1.0,
 ) -> dict[str, Any]:
     if summary.completed_games > 0:
         win_rate = summary.wins / summary.completed_games
@@ -909,6 +948,10 @@ def _summary_to_payload(
             "value_rerank_lambda": float(value_rerank_lambda),
             "opening_random_plies": int(opening_random_plies),
             "search": search_knobs,
+            "value_net": {
+                "checkpoint": str(value_net_checkpoint) if value_net_checkpoint else None,
+                "alpha": value_net_alpha,
+            },
         },
     }
 
@@ -1087,6 +1130,8 @@ def _run_segment(
     stockfish_label: str,
     save_games_dir: Path | None,
     halving_config: "HalvingConfig | None" = None,
+    value_net=None,
+    value_net_alpha: float = 1.0,
 ) -> EvalSummary:
     summary = EvalSummary()
     with tqdm(
@@ -1135,6 +1180,8 @@ def _run_segment(
                         value_rerank_lambda=value_rerank_lambda,
                         debug_topk=debug_topk,
                         halving_config=halving_config,
+                        value_net=value_net,
+                        value_net_alpha=value_net_alpha,
                     )
                     summary.model_turns += 1
                     summary.legal_moves_total += int(debug_info["total_legal_moves"])
@@ -1395,6 +1442,16 @@ def main() -> None:
         if args.search_max_depth is None
         else args.search_max_depth
     )
+    args.value_net_checkpoint = (
+        eval_cfg.value_net_checkpoint
+        if args.value_net_checkpoint is None
+        else args.value_net_checkpoint
+    )
+    args.value_net_alpha = float(
+        eval_cfg.value_net_alpha
+        if args.value_net_alpha is None
+        else args.value_net_alpha
+    )
     args.opening_random_plies = int(
         eval_cfg.opening_random_plies
         if args.opening_random_plies is None
@@ -1462,6 +1519,8 @@ def main() -> None:
         raise ValueError("--search-expand-top must be >= 1")
     if args.search_max_depth < 1:
         raise ValueError("--search-max-depth must be >= 1")
+    if not 0.0 <= args.value_net_alpha <= 1.0:
+        raise ValueError("--value-net-alpha must be in [0, 1]")
     if not args.stockfish_path.exists():
         raise FileNotFoundError(f"Stockfish binary not found: {args.stockfish_path}")
 
@@ -1491,6 +1550,13 @@ def main() -> None:
             in {"value_rerank", "value_search_d2", "value_search_halving"}
         ),
     )
+    value_net = (
+        _load_value_net(Path(args.value_net_checkpoint), repo_config, device)
+        if args.value_net_checkpoint
+        else None
+    )
+    if value_net is not None:
+        print(f"  value_net={args.value_net_checkpoint} alpha={args.value_net_alpha}")
     engine_limit = _build_engine_limit(args)
     segment_specs = _build_segment_specs(args)
     print("Running model vs Stockfish")
@@ -1553,6 +1619,8 @@ def main() -> None:
                     max_depth=int(args.search_max_depth),
                     lam=float(args.value_rerank_lambda),
                 ),
+                value_net=value_net,
+                value_net_alpha=float(args.value_net_alpha),
             )
             segment_payload = _summary_to_payload(
                 summary=segment_summary,
@@ -1577,6 +1645,8 @@ def main() -> None:
                     "search_expand_top": int(args.search_expand_top),
                     "search_max_depth": int(args.search_max_depth),
                 },
+                value_net_checkpoint=args.value_net_checkpoint,
+                value_net_alpha=float(args.value_net_alpha),
             )
             _print_segment_summary(segment_name=spec.name, payload=segment_payload)
             segment_summaries.append(segment_summary)
@@ -1625,6 +1695,8 @@ def main() -> None:
             "search_expand_top": int(args.search_expand_top),
             "search_max_depth": int(args.search_max_depth),
         },
+        value_net_checkpoint=args.value_net_checkpoint,
+        value_net_alpha=float(args.value_net_alpha),
     )
     _print_segment_summary(segment_name="aggregate", payload=aggregate_payload)
 
