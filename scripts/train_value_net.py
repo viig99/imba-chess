@@ -74,7 +74,9 @@ def main() -> None:
         "optimizer moments rebuild within ~100 steps.",
     )
     parser.add_argument(
-        "--fresh", action="store_true", help="Ignore existing checkpoints and start from scratch."
+        "--fresh",
+        action="store_true",
+        help="Ignore existing checkpoints and start from scratch.",
     )
     args = parser.parse_args()
 
@@ -104,21 +106,29 @@ def main() -> None:
     if resume_path is not None:
         payload = torch.load(resume_path, map_location="cpu")
         saved_cfg = payload.get("config", {})
-        expected = {"dim": cfg.dim, "num_heads": cfg.num_heads, "num_layers": cfg.num_layers}
+        expected = {
+            "dim": cfg.dim,
+            "num_heads": cfg.num_heads,
+            "num_layers": cfg.num_layers,
+        }
         if saved_cfg != expected:
             raise ValueError(
                 f"checkpoint config {saved_cfg} does not match [value_net] {expected}"
             )
         model.load_state_dict(payload["model"])
         start_step = int(payload["step"])
-        print(f"resumed from {resume_path}: step {start_step}, val {payload['val_loss']:.4f}")
+        print(
+            f"resumed from {resume_path}: step {start_step}, val {payload['val_loss']:.4f}"
+        )
         # Don't clobber a better existing best checkpoint after the restart.
         best_path = Path(cfg.checkpoint_dir) / "value_net_best.pt"
         if best_path.exists():
             best_val = float(torch.load(best_path, map_location="cpu")["val_loss"])
             print(f"existing best val: {best_val:.4f}")
         if start_step >= steps:
-            raise SystemExit(f"nothing to do: resume step {start_step} >= train_steps {steps}")
+            raise SystemExit(
+                f"nothing to do: resume step {start_step} >= train_steps {steps}"
+            )
 
     def make_loader(split: str) -> DataLoader:
         dataset = PositionEvalDataset(
@@ -194,6 +204,8 @@ def main() -> None:
         max_lr=cfg.max_lr,
         total_steps=steps,
         pct_start=0.03,
+        div_factor=8,
+        final_div_factor=2,
         # StableAdamW doesn't expose momentum/beta1 the way momentum cycling
         # expects (same reason scripts/train.py disables it).
         cycle_momentum=False,
