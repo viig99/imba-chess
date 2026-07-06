@@ -177,6 +177,30 @@ the system scores below 0.5.
   picks over a full-strength search — measured depth 9–12, ~30–85k
   nodes/move at our settings, Stockfish 18).
 
+### SF2200, second round: epoch-14 trunk + budget 2048 / depth 8
+
+v4 `best_hr10_checkpoint_14` (hr@10 = 0.9500, two epochs newer), budget
+2048, depth 8 (first depth-8 run; the even-horizon rule kept):
+
+| α | W / D / L | Score rate |
+|---|---|---|
+| 0 | 37 / 28 / 35 | 0.510 |
+| 0.15 | 38 / 27 / 35 | **0.515** |
+
+- First score above 0.5 at this rung — but the combined lever pull
+  (budget ×2 + depth 6→8 + two more trunk epochs + hr@10 0.9468→0.9500)
+  bought only +0.025 over the e12/1024/d6 α=0.15 result (0.490), inside
+  noise. Diminishing returns on every axis at once around ~2200.
+- The blend edge vanished at this config: α=0.15 ≈ α=0 (+0.005). Pattern
+  across the ladder: the better the trunk's own value head, the less the
+  distilled net adds (+0.115 @2000/e12 → +0.035 @2200/e12 → ~0 @2200/e14).
+  Consistent with trunk scale progressively eating the net's margin.
+- Draw share rose with the deeper search (27–28 vs 21–24 at 1024/d6) —
+  the usual signature of two more accurate players.
+- Attribution between checkpoint/budget/depth was not decomposed (an
+  e14 @ 1024/d6 leg would separate them); with the combined gain this
+  small, the decomposition was judged not worth the eval time.
+
 ## Historical: the λ sweep (v2 checkpoint)
 
 An earlier sweep on a pre-v3 checkpoint (not comparable to the numbers
