@@ -263,6 +263,22 @@ What this taught us:
 - **Light mixing wins; heavy mixing loses.** Pure net (α=1.0) is catastrophic even fully trained in the 256/d4 round: Stockfish's win-rate targets encode *value under near-perfect play*, which rounds small advantages to draws — the wrong semantics against a fallible opponent — and the net sees history-free analysis positions, off-distribution from the search tree. At α=0.25 the model head stays in charge and the net acts as a second opinion: **more wins, not more draws** (62/15/23 vs 56/19/25), and the best score the project has produced (0.695, ≈ +140 Elo vs SF1800).
 - This is the λ=0 lesson again from a new angle: offline label accuracy is not in-search usefulness; oracles must be judged by play.
 
+### Results vs Stockfish 2000 (full α grid)
+
+Same setup (v4 `checkpoint_12`, finished net, 1024/depth 6, 100 games, seed 42), next rung of the ladder:
+
+| α | W / D / L | Score rate | ≈ Elo vs SF2000 |
+|---|---|---|---|
+| 0 | 41 / 22 / 37 | 0.520 | +14 |
+| 0.25 | 49 / 29 / 22 | **0.635** | **+96** |
+| 0.5 | 39 / 28 / 33 | 0.530 | +21 |
+| 1.0 | 24 / 29 / 47 | 0.385 | −81 |
+
+- **The blend's edge grows with opponent strength**: +0.040 over pure model head at SF1800, **+0.115 at SF2000** (~2.3 SE — no longer a noise candidate). A clean humped curve peaking at α=0.25 in both settings.
+- The likely mechanism: against stronger opponents there are fewer free wins from blunders, so value accuracy matters more — and the net's "value under strong play" semantics become *more* correct as the opponent approaches the play its labels assume. If this holds, the optimal α rises with opponent Elo.
+- Even pure net (α=1.0, finished, 1024/d6) is respectable now at 0.385 — the earlier 0.280 collapse was substantially the underfit checkpoint, not the concept.
+- Net position: **the α=0.25 system scores 0.635 vs SF2000** (0.05s/move) — roughly a 2100-Elo-equivalent player on this ladder, built from a 27M-param imitation policy, a 3.5M distilled value net, and a 1024-node search.
+
 ### Historical: the λ sweep (v2 checkpoint)
 
 An earlier sweep on a pre-v3 checkpoint (not comparable to the numbers above) established two durable design facts, both baked into the current defaults: **value-dominant scoring beats policy-dominant scoring** by ~+140 Elo inference-only (0.23 → 0.405 vs SF1400), and **λ = 0 collapses** (0.12) — optimizing purely against the learned value head over-exploits its noise (Goodhart), so the policy log-prob prior is a necessary regularizer, not a cosmetic tiebreak. Score was flat across λ ∈ [0.05, 0.2]; `value_rerank_lambda = 0.05` has been the default since.
