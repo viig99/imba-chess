@@ -14,11 +14,11 @@
 # same seed — a like-for-like anchor for the rest of the grid.
 set -euo pipefail
 
-ALPHAS="${ALPHAS:-0 0.25 0.5 1.0}"
+ALPHAS="${ALPHAS:-0.15 0}"
 VNET="${VNET:-artifacts/value_net/value_net_best.pt}"
-ELO="${ELO:-1800}"
-BUDGET="${BUDGET:-1024}"
-DEPTH="${DEPTH:-6}"
+ELO="${ELO:-2200}"
+BUDGET="${BUDGET:-2048}"
+DEPTH="${DEPTH:-8}"
 OUT_DIR="${OUT_DIR:-artifacts/eval}"
 
 for alpha in ${ALPHAS}; do
@@ -32,7 +32,7 @@ done
 
 echo
 echo "== alpha sweep summary (SF${ELO}, budget ${BUDGET}, depth ${DEPTH}) =="
-OUT_DIR="${OUT_DIR}" ALPHAS="${ALPHAS}" .venv/bin/python - <<'PY'
+OUT_DIR="${OUT_DIR}" ALPHAS="${ALPHAS}" ELO="${ELO}" BUDGET="${BUDGET}" DEPTH="${DEPTH}" .venv/bin/python - <<'PY'
 import glob, json, os
 
 out_dir = os.environ["OUT_DIR"]

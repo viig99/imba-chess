@@ -58,7 +58,7 @@ elo_weight_max_elo = 2800
 elo_loss_weight_alpha = 1.0
 elo_loss_weight_strength = 1.0
 enable_value_head = true
-value_loss_weight = 0.5
+value_loss_weight = 1.0
 value_weight_alpha = 0.9
 value_label_smoothing = 0.0
 moves_left_loss_weight = 0.05
@@ -140,14 +140,14 @@ save_games_dir = "artifacts/eval/games"
 # Standalone position-only WDL net distilled from Stockfish evals
 # (Lichess/chess-position-evaluations). Trained by scripts/train_value_net.py;
 # consumed at eval time via [eval_vs_stockfish] value_net_checkpoint.
-dim = 256
-num_heads = 4
-num_layers = 6
+dim = 512
+num_heads = 8
+num_layers = 8
 depth_min = 12
-batch_size = 4096
-num_workers = 2
+batch_size = 2048
+num_workers = 8
 max_lr = 7e-4
-train_steps = 50000
-val_every_steps = 1250
-val_permille = 50
+train_steps = 100000
+val_every_steps = 5000
+val_permille = 200
 checkpoint_dir = "artifacts/value_net"
