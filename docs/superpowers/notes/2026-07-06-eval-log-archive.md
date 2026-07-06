@@ -151,6 +151,32 @@ Same setup (v4 `checkpoint_12`, finished net, 1024/depth 6):
   27M-param imitation policy, a 3.5M distilled value net, and a 1024-node
   search.
 
+## Results vs Stockfish 2200 (α probes)
+
+Same setup (v4 `checkpoint_12`, 3.5M net, 1024/depth 6). First rung where
+the system scores below 0.5.
+
+| α | W / D / L | Score rate | as White | as Black |
+|---|---|---|---|---|
+| 0.25 | 35 / 21 / 44 | 0.455 | 17/5/28 (0.39) | 18/16/16 (0.52) |
+| 0.15 | 37 / 24 / 39 | 0.490 | 19/11/20 (0.49) | 18/13/19 (0.49) |
+
+- α=0.15 vs 0.25: +0.035, inside 1 SE — a statistical tie, but the
+  "optimal α rises with opponent Elo" prediction from the 1800→2000 trend
+  called for 0.35 > 0.25 > 0.15 and is not supported. Revised working
+  model: shallow α optimum in [0.1, 0.3], location not predictably tied to
+  opponent strength.
+- The reversed color split in the α=0.25 run (Black 0.52 > White 0.39) did
+  NOT repeat at α=0.15 (0.49/0.49 dead even) — stays classified as
+  variance per the two-runs rule.
+- Implied absolute rating across rungs (score → Elo diff + rung label):
+  ~1943 from SF1800, ~2096 from SF2000, ~2193 from SF2200 — monotone rise,
+  consistent with UCI_Elo rung compression at 0.05s/move (labels are
+  ordinal here, not absolute; SF's UCI_Elo is calibrated at long time
+  controls, and the weakening mechanism is score-weighted random root-move
+  picks over a full-strength search — measured depth 9–12, ~30–85k
+  nodes/move at our settings, Stockfish 18).
+
 ## Historical: the λ sweep (v2 checkpoint)
 
 An earlier sweep on a pre-v3 checkpoint (not comparable to the numbers

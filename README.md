@@ -191,6 +191,7 @@ Protocol: 100 games per configuration, seed 42, colors alternating, Stockfish at
 | SF2000 | halving 1024/d6 + net α=0.5 | v4 e12 | 39 / 28 / 33 | 0.530 |
 | SF2000 | halving 1024/d6 + net α=1.0 (pure net) | v4 e12 | 24 / 29 / 47 | 0.385 |
 | SF2200 | halving 1024/d6 + net α=0.25 | v4 e12 | 35 / 21 / 44 | 0.455 |
+| SF2200 | halving 1024/d6 + net α=0.15 | v4 e12 | 37 / 24 / 39 | 0.490 |
 
 How the components came to be, in order:
 
@@ -202,7 +203,7 @@ How the components came to be, in order:
 6. **The v4 trunk** (768d × 8L, doubled value loss weight) lifted the value oracle: 0.465 → 0.600 at matched 256/d4 search, and revived a budget curve that had flattened under v3.
 7. **The distilled value net + α blend** added an engine-trained second opinion: α=0.25 is the best measured configuration on both rungs tried (0.695 @ SF1800, 0.635 @ SF2000 ≈ a ~2100-Elo-equivalent system).
 
-Reading the table (light hypotheses, not established facts): the budget curve flattening under v3 and reviving under v4 suggests oracle quality sets how well search compute converts; the α curve peaking low (0.25) and the pure net losing suggests engine values' "under strong play" semantics mis-rank small edges against fallible opponents; the blend's edge growing with opponent Elo (+0.04 @ 1800 → +0.115 @ 2000) suggests optimal α may rise with opponent strength. Each of these is one-or-two-datapoint territory — treat as directions to test, not conclusions.
+Reading the table (light hypotheses, not established facts): the budget curve flattening under v3 and reviving under v4 suggests oracle quality sets how well search compute converts; the α curve peaking low and the pure net losing suggests engine values' "under strong play" semantics mis-rank small edges against fallible opponents. The blend's edge grew with opponent Elo from 1800 to 2000 (+0.04 → +0.115), but the corollary that optimal α rises with opponent strength did **not** survive SF2200, where α=0.15 ≥ α=0.25 (0.490 vs 0.455, within noise) — current best guess is a shallow optimum somewhere in α ∈ [0.1, 0.3], tuned per setup rather than extrapolated. Each of these is one-or-two-datapoint territory — treat as directions to test, not conclusions.
 
 ## Configuration
 
