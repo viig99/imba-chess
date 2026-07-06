@@ -233,7 +233,35 @@ What we understand so far:
 - **The budget curve is flattening — the value oracle is becoming the bottleneck.** 256→512(+depth) bought +0.095; 512→1024 bought only +0.035 (well inside noise, and the 1024 run even had a slightly newer checkpoint in its favor). Per the decision rule (stop buying search at the first flat doubling), further budget scaling is no longer the lever: the next Elo lives in **better value labels** — engine-annotated (distilled) targets instead of noisy whole-game outcomes.
 - Draws grow with opponent strength (17–23 at 1800 vs 7 at 1400): converting drawn endgames is exactly where outcome-label noise hurts most — consistent with the flattening curve.
 - Per-color splits at 1800 fluctuate across runs (e.g. 0.43/0.69 at 512/d6) — 50 games/color is noisy; treat asymmetries as variance until they repeat.
-- A v4 training run (768d × 8-layer trunk, `value_loss_weight` 1.0) is underway; the distillation pipeline is the planned follow-up. Older checkpoints remain evaluable via `--config config/imba_chess_v3.toml` after the architecture change.
+- Both follow-ups happened; see the next section. Older (v3) checkpoints remain evaluable via `--config config/imba_chess_v3.toml` after the architecture change.
+
+### Results: v4 trunk + value-net blend (SF1800)
+
+Setup: v4 checkpoint `best_hr10_checkpoint_12` (hr@10 = 0.9468; 768d × 8-layer trunk, `value_loss_weight` 1.0, from a still-running training job) with the distilled value net (3.5M params, one epoch over ~200M engine-evaluated positions). 100 games per configuration, seed 42, 0.05s/move. α = `value_net_alpha`: 0 = pure model value head, 1 = pure distilled net.
+
+α sweep at budget 256/depth 4 — run with a **mid-training** net checkpoint (~45% trained):
+
+| α | W / D / L | Score rate |
+|---|---|---|
+| 0 | 51 / 18 / 31 | 0.600 |
+| 0.25 | 44 / 30 / 26 | 0.590 |
+| 0.5 | 41 / 23 / 36 | 0.525 |
+| 1.0 | 15 / 26 / 59 | 0.280 |
+
+Re-run at budget 1024/depth 6 with the **finished** net:
+
+| α | W / D / L | Score rate |
+|---|---|---|
+| 0 | 56 / 19 / 25 | 0.655 |
+| 0.25 | 62 / 15 / 23 | **0.695** |
+
+What this taught us:
+
+- **Trunk scale beat label distillation to the punch.** v4's own value head (bigger trunk, doubled value loss weight) already fixed most of what the distillation was built to fix: at matched search (256/d4), v3 scored 0.465 and v4 scores 0.600 — above v3's best-ever 0.595 that needed 4× the budget.
+- **Oracle quality sets the search's exchange rate for compute.** v3's budget curve flattened (+0.035 for the last doubling); v4's is alive again (0.600 @ 256/d4 → 0.655 @ 1024/d6). The flattening was the value head, not the search.
+- **An underfit oracle is worse than none.** The mid-training net degraded play monotonically in α (a probe showed it scoring a clean knight-up at +0.44 when its own training target says ≈ +1.0). Never evaluate a half-trained oracle and conclude anything about the method.
+- **Light mixing wins; heavy mixing loses.** Pure net (α=1.0) is catastrophic even fully trained in the 256/d4 round: Stockfish's win-rate targets encode *value under near-perfect play*, which rounds small advantages to draws — the wrong semantics against a fallible opponent — and the net sees history-free analysis positions, off-distribution from the search tree. At α=0.25 the model head stays in charge and the net acts as a second opinion: **more wins, not more draws** (62/15/23 vs 56/19/25), and the best score the project has produced (0.695, ≈ +140 Elo vs SF1800).
+- This is the λ=0 lesson again from a new angle: offline label accuracy is not in-search usefulness; oracles must be judged by play.
 
 ### Historical: the λ sweep (v2 checkpoint)
 
@@ -309,7 +337,10 @@ provides validation.
      --value-net-checkpoint artifacts/value_net/value_net_best.pt   # alpha defaults to 1.0
    ```
 
-   `--value-net-alpha` sweeps the blend (0 = pure model head, 1 = pure net);
+   `sweep_value_net_alpha.sh` loops an α grid with collision-free tags and
+   prints a summary table. `--value-net-alpha` sweeps the blend (0 = pure
+   model head, 1 = pure net) — α = 0.25 is the measured best (see the
+   results section above);
    both knobs are recorded in the output JSON's `run_config.value_net`. With
    no checkpoint configured, eval behavior is unchanged. Terminal positions
    (mate/stalemate/claimable draws) keep their exact values regardless.
