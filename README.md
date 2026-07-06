@@ -59,6 +59,7 @@ When `[model].enable_value_head = true`, a 3-class MLP head (`Linear → SiLU �
 
 - The label for every position in a game is that game's final outcome (`game_result_white`, flipped by `turn_id`). The head therefore learns "among training games that passed through positions like this, how often did the side to move end up winning?"
 - The target itself is not discounted, but the per-token loss is weighted by game progress (`progress ^ [model].value_weight_alpha`, `progress` in `[0, 1]`): the final outcome is a noisy label for early positions and a clean one for late positions, so early positions contribute little gradient and the last positions contribute full gradient.
+- The same Elo weighting as the policy loss (`elo_loss_weight_strength` > 0) also scales the value loss: stronger players' outcomes are lower-noise value labels (they convert winning positions more reliably), so their tokens pull the value gradient harder.
 - 3-class classification is deliberate (rather than a scalar regression head): win/draw/loss outcomes are genuinely 3-modal — a scalar `0.0` cannot distinguish "certain draw" from "unclear, 50/50 win-or-lose" — and cross-entropy on categories optimizes better than MSE on a bounded scalar. A scalar is recovered at inference as `v = p(win) - p(loss)` in `[-1, 1]`.
 
 Known limitation: game outcomes are high-variance Monte-Carlo labels (a winning position that the player later threw away gets labeled "loss"). The separate value net below addresses this at inference time; the trunk itself still trains on outcome labels.

@@ -373,7 +373,10 @@ class HSTUChessModel(nn.Module):
                 reduction="none",
                 label_smoothing=self.config.label_smoothing,
             )
-            policy_token_weights = valid_mask.to(per_token_policy_loss.dtype)
+            # Shared Elo weighting: stronger players' tokens pull harder on
+            # both losses — their moves are better policy targets, and their
+            # game outcomes are lower-noise value labels (better conversion).
+            elo_scale: torch.Tensor | None = None
             if self.config.elo_loss_weight_strength > 0.0:
                 played_by_elo = batch["played_by_elo"].to(
                     device=policy_logits.device,
@@ -387,6 +390,9 @@ class HSTUChessModel(nn.Module):
                 )
                 elo_curve = elo_norm.pow(self.config.elo_loss_weight_alpha)
                 elo_scale = 1.0 + self.config.elo_loss_weight_strength * elo_curve
+
+            policy_token_weights = valid_mask.to(per_token_policy_loss.dtype)
+            if elo_scale is not None:
                 policy_token_weights = policy_token_weights * elo_scale
 
             policy_loss_sum = (per_token_policy_loss * policy_token_weights).sum()
@@ -427,6 +433,8 @@ class HSTUChessModel(nn.Module):
                 ).clamp_min(1.0)
                 value_weights = progress.pow(self.config.value_weight_alpha)
                 value_weights = value_weights * valid_mask.to(value_weights.dtype)
+                if elo_scale is not None:
+                    value_weights = value_weights * elo_scale.to(value_weights.dtype)
 
                 per_token_value_loss = F.cross_entropy(
                     value_logits.float(),
