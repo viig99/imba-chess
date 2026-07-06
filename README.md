@@ -61,305 +61,147 @@ When `[model].enable_value_head = true`, a 3-class MLP head (`Linear → SiLU �
 - The target itself is not discounted, but the per-token loss is weighted by game progress (`progress ^ [model].value_weight_alpha`, `progress` in `[0, 1]`): the final outcome is a noisy label for early positions and a clean one for late positions, so early positions contribute little gradient and the last positions contribute full gradient.
 - 3-class classification is deliberate (rather than a scalar regression head): win/draw/loss outcomes are genuinely 3-modal — a scalar `0.0` cannot distinguish "certain draw" from "unclear, 50/50 win-or-lose" — and cross-entropy on categories optimizes better than MSE on a bounded scalar. A scalar is recovered at inference as `v = p(win) - p(loss)` in `[-1, 1]`.
 
-Known limitation: game outcomes are high-variance Monte-Carlo labels (a winning position that the player later threw away gets labeled "loss"). Replacing them with engine-annotated position evaluations is the planned upgrade.
+Known limitation: game outcomes are high-variance Monte-Carlo labels (a winning position that the player later threw away gets labeled "loss"). The separate value net below addresses this at inference time; the trunk itself still trains on outcome labels.
 
 Training logs include `total_loss`, `policy_loss`, and `value_loss`.
 
+### Standalone value net: Stockfish distillation (separate model)
+
+A second, independent value oracle trained on engine evaluations instead of game outcomes, blended into search at eval time.
+
+`ValueNet` (`src/imba_chess/model/value_net.py`, ~3.5M params) is a **position-only** WDL network: the same joint (piece, square) embedding and `BoardSquareEncoder` body as the big model (256d × 6 layers over the 64 squares), with turn/castling/en-passant features broadcast-added to the square tokens. It sees no game history and no clocks — deliberately, so it exactly matches its training data and has zero train/serve skew.
+
+Training data is `Lichess/chess-position-evaluations` (388M Stockfish-evaluated FENs, CC0, Hugging Face). Each row's centipawn eval becomes a soft win/draw/loss target via Stockfish 17's own `win_rate_model` polynomial (value under strong play — deliberately *not* calibrated to human outcomes); mate-in-N rows get near-saturated targets. Evals are White-POV in the source and flipped to side-to-move POV. A deterministic FEN-hash holdout provides validation.
+
+Three-stage pipeline:
+
+1. **Pretrain the big model** on high-Elo human games (`scripts/train.py`): policy head (imitation) + outcome-value head + moves-left auxiliary.
+2. **Train the value net** on engine evals (`python scripts/train_value_net.py`, config in `[value_net]`) — fully decoupled from stage 1; either side retrains without touching the other. Plain supervised learning: flat batches, soft cross-entropy, StableAdamW + OneCycle; best/last checkpoints in `artifacts/value_net/` selected by held-out soft-CE; auto-resumes from `value_net_last.pt` (`--fresh` to opt out).
+3. **Blend at search time**: with `--value-net-checkpoint` (or config), every search evaluation becomes `value = (1 − α) · model_value_head + α · value_net`. `--value-net-alpha` sets α (0 = pure model head, 1 = pure net; **0.25 is the measured best** — see Results). Both knobs land in the output JSON's `run_config.value_net`; with no checkpoint configured, eval behavior is unchanged; terminal positions keep their exact values regardless. `sweep_value_net_alpha.sh` loops an α grid with collision-free tags and prints a summary table.
+
+Training recipe (field-tested):
+
+- **Download the data once instead of streaming**: set `HF_TOKEN` (unauthenticated hub requests are rate-limited), `hf download Lichess/chess-position-evaluations --repo-type dataset --local-dir <dir>`, then point `[value_net] dataset_name` at that directory.
+- The val slice is built once (a few-minute scan with a progress bar) and cached to `artifacts/value_net/val_slice.pt`; the cache key includes the data/batch config, so changing those triggers one rebuild.
+- Sample prep is CPU-bound (~24k rows/s per worker); raise `[value_net] num_workers` if the GPU is starved — useful workers cap at the dataset's file count (20; the loader auto-splits files across workers).
+- A ~3.5M net can't saturate a big GPU at batch 1024 (per-step Python overhead dominates) — use large batches. Scaling batch N×: scale `max_lr` by ~√N and divide `train_steps` by N to keep the sample budget fixed. Reference: batch 6144, `max_lr 7e-4`, ~27k samples/s on a 24 GB card ⇒ one ~200M-sample epoch in ~2 h.
+
 ## Evaluation during training
 
-- `fast_val` / `fast_test`: every `[training].eval_every_steps` over the first `fast_val_max_games` / `fast_test_max_games`.
-- `full_val`: every `[training].full_val_every_epochs` over `[dataset].val_max_games`.
-- `full_test`: in `--eval-only` mode over `[dataset].test_max_games`.
-
-Metrics: `loss_ce`, `ppl`, `top1/top3/top5_acc`, `hr@10`, `mrr`, `token_count`, `game_count`.
-
-Best checkpoints are selected by `hr@10` from `full_val`; last checkpoints are saved by step cadence. On `--resume`, model/optimizer/scheduler/scaler/trainer state are restored and an immediate `fast_val`/`fast_test` health check runs.
+Held-out next-move prediction: `fast_val`/`fast_test` on a fixed prefix of games every `eval_every_steps`, `full_val` per epoch (checkpoint selection by `hr@10`), `full_test` in `--eval-only` mode. Metrics: `loss_ce`, `ppl`, `top1/3/5_acc`, `hr@10`, `mrr`. `--resume` restores full trainer state and runs an immediate health check. Config-key details: `docs/superpowers/notes/2026-07-06-eval-log-archive.md`.
 
 ## Playing against Stockfish
 
-`scripts/eval_vs_stockfish.py` plays full games against Stockfish over UCI, either at full strength or Elo-limited, single-segment or as a ladder across several Elo levels. Defaults come from `[eval_vs_stockfish]` in `config/imba_chess.toml`; CLI flags override.
+`scripts/eval_vs_stockfish.py` plays full games against Stockfish over UCI, at full strength or Elo-limited, single-segment or as a ladder. Defaults come from `[eval_vs_stockfish]` in `config/imba_chess.toml`; CLI flags override. Search strategies live in `src/imba_chess/eval/search.py` behind a model-agnostic `PositionEvaluator` interface (unit-testable without a checkpoint). Traced games (first `debug_trace_games` per segment) are saved as PGN + a self-contained HTML replay viewer under `save_games_dir`.
 
-`model_move_policy` modes:
+All search evaluations run on a prefix-cache decode path: the once-per-turn root forward doubles as a prefill whose per-layer K/V become a shared cache, and each search position is evaluated as a single new token attending to that cache — O(1) new work per evaluation instead of re-encoding the game history (~12 s/game at budget 512/depth 6, vs ~44 s/game uncached at a quarter of that budget).
 
-- `greedy`: play the highest-logit legal move.
-- `value_rerank`: propose top-K moves with the policy head, grade each by the value head after the move, pick the best grade.
-- `value_search_d2`: same, but each proposal is stress-tested against the opponent's best response before grading (see below).
-- `value_search_halving`: budgeted tree search — candidate moves compete for a fixed number of value-head evaluations via sequential halving, growing deeper trees under the promising moves (see below).
+Shared rules across all value-guided modes: game-over positions (checkmate, stalemate, claimable draws by repetition/50-move rule) are scored with the exact result instead of the value head (final positions never occur as training inputs, so the head is undefined there); a move that mates on the spot is played immediately without search; simulated boards keep their move stacks so repetition draws are detected inside lines. All modes except `greedy` need a checkpoint trained with the value head enabled.
 
-All modes except `greedy` require a checkpoint trained with the value head enabled. Search strategies live in `src/imba_chess/eval/search.py` behind a model-agnostic `PositionEvaluator` interface (unit-testable without a checkpoint); the eval script supplies the batched-inference adapter. Traced games (first `debug_trace_games` per segment) are saved as PGN plus a self-contained HTML replay viewer under `save_games_dir` for post-hoc inspection.
+### `greedy`
 
-### How value-guided move selection works
+Play the highest-logit legal move. Pure policy — a single forward pass, nothing ever checks consequences, so a human-looking move that loses material to a tactic gets played anyway. The baseline everything else is measured against.
 
-The policy head alone is autocomplete: every move is a single forward pass and nothing ever checks the consequences, so a human-looking move that loses material to a tactic gets played anyway. The search adds the most basic form of thinking ahead: **"if I play this, what is the worst thing my opponent can do to me right after?"**
+### `value_rerank`
 
-Per model turn, `value_search_d2` runs three batched forward passes:
-
-1. **Propose (1 sequence).** Encode the real game history, take the policy logits at the last token, mask to legal moves, `log_softmax`. The top `value_rerank_top_k` moves are our candidates.
-2. **Opponent responses (≤ K sequences, 1 batch).** For each candidate, simulate playing it (copy the board, append the move token to a copy of the history) and run the model once over all candidates to get the opponent's move distribution in each hypothetical position. Opponent responses considered per position: their policy top-K **plus every capture, check, and promotion** — the refutation of a bad move is often a move the human-imitation policy ranks low, so probability-based pruning alone would hide exactly what we are testing for.
-3. **Grade (~K × (K + forcing) sequences, one decode wave).** Apply each response, evaluate all resulting positions with the value head, and collapse each to a scalar `v = p(win) - p(loss)` from our perspective.
-
-Each candidate is then scored pessimistically — assume the opponent picks their best response — with the policy prior as a tiebreaker:
+Propose the top `value_rerank_top_k` moves by policy prior, evaluate the position after each with the value head, play the best:
 
 ```
-grade(move)  = min over responses of v(position after move, response)
-score(move)  = grade(move) + lambda * log_prob(move)      # lambda = value_rerank_lambda
-play argmax(score)
+score(move) = v(position after move) + lambda * log_prob(move)
 ```
 
-The value head decides; the policy log-prob (default `lambda = 0.1`) breaks near-ties toward moves strong humans actually play, which also guards against value-head noise.
+Value-dominant scoring with the policy log-prob (`value_rerank_lambda`) as a near-tie breaker — λ = 0 measurably collapses (the search over-exploits value-head noise; Goodhart), so the prior is a necessary regularizer, not a cosmetic tiebreak.
 
-Special cases bypass the network:
+### `value_search_d2`
 
-- Game-over positions (checkmate, stalemate, claimable draws by repetition or the 50-move rule) are scored with the exact result (+1 / 0 / −1) instead of the value head — final positions never occur as training inputs, so the head's output there is undefined.
-- If a candidate move immediately wins the game, it is played without further search.
-- Child boards keep the move stack so repetition draws are actually detected in simulated lines.
+`value_rerank` plus one level of adversarial lookahead: *"if I play this, what is the worst thing my opponent can do right after?"* Three batched passes per turn:
 
-Search evaluations use a prefix-cache decode path: the once-per-turn root forward doubles as a prefill whose per-layer K/V become a shared cache, and every search position is then evaluated as a single new token attending to that cache — O(1) new work per evaluation instead of re-encoding the full game history.
+1. **Propose** — top-K candidates by policy prior at the root.
+2. **Opponent responses** — for each candidate, the opponent's policy top-K **plus every capture, check, and promotion**: the refutation of a bad move is often a move the human-imitation policy ranks low, so probability-based pruning alone would hide exactly what is being tested.
+3. **Grade** — evaluate all resulting positions (~K × (K + forcing)); each candidate is scored pessimistically, `grade = min over responses of v`, then `score = grade + λ·log_prob` as above.
 
-Cost: ~K² position evaluations per turn instead of 1 — but with the prefix-cache decode path each evaluation is a single new token against the cached game history, so even the much larger halving budgets run at ~12 s/game (vs ~44 s/game these budgets cost uncached).
+### `value_search_halving` (MCTS-lite)
 
-`value_rerank` is the depth-1 version of the same idea (grade positions immediately after our move, no opponent response), with the same value-dominant scoring.
+d2 spends its budget uniformly — the obviously losing move gets as much attention as the two moves the decision hinges on. Halving fixes the *allocation*: choosing the root move is treated as best-arm identification, using sequential halving (the root allocation of Gumbel MCTS). Per turn:
 
-### How `value_search_halving` works (MCTS-lite)
+1. **Arms** = top `search_top_m` moves by prior, plus any capture/check/promotion outside that set.
+2. **Rounds** — `search_budget` value evaluations split evenly across rounds and surviving arms; after each round the worst-scoring half of the arms is eliminated and their unspent budget flows to the survivors. Obvious losers die after a handful of evaluations; the final two candidates get deep trees.
+3. **Tree growth (beam by plausibility)** — each arm owns a priority queue of unevaluated positions ordered by cumulative policy log-prob of the line (both sides). Expansion: top `search_expand_top` moves at our nodes; top `search_refutation_top_r` replies **plus every forcing reply** at opponent nodes, with forcing replies inheriting their parent's queue priority (a refutation must compete at the plausibility of the line it refutes, or the beam prunes exactly the move that disproves the arm). Depth caps at `search_max_depth` plies; *where* the tree deepens within the cap is decided entirely by the queue — forced lines go deep, wide quiet positions stay shallow.
+4. **Scoring** — negamax backup over the realized tree (terminals exact, frontier leaves on their value estimate) + `λ·log_prob(root move)`. **Value never chooses what to expand** — the queue is ordered by prior alone; value enters only at backup and arm comparison. Ranking the beam by value estimates would retain lines where the opponent cooperatively blunders (max-over-noise selection bias — the λ=0 failure in tree form).
 
-`value_search_d2` spends its evaluations uniformly: every candidate gets one opponent level, no more, no less — the obviously losing move gets as much attention as the two moves the decision actually hinges on. `value_search_halving` fixes the *allocation*: choosing the root move is treated as a best-arm-identification problem (which arm is best, not how good is each arm), and sequential halving — the root allocation used by Gumbel MCTS — is the canonical algorithm for that.
-
-The mechanics, per model turn:
-
-1. **Arms.** Candidates = top `search_top_m` legal moves by policy prior, plus any capture/check/promotion outside that set. A move that mates on the spot is played immediately, spending nothing.
-2. **Rounds.** A fixed budget of `search_budget` value-head evaluations is split evenly across `halving_rounds` rounds, and within a round evenly across surviving arms. After each round the worst-scoring half of the arms is eliminated; their unspent budget flows to the survivors. Obvious losers die after a handful of evaluations; the final two candidates get deep trees.
-3. **Tree growth (beam by plausibility).** Each arm owns a priority queue of unevaluated positions, ordered by the cumulative policy log-prob of the moves leading there (both sides). Its round budget is spent popping the most plausible positions, evaluating them in one batched forward per wave, and pushing their continuations: at our nodes the top `search_expand_top` moves by prior; at opponent nodes the top `search_refutation_top_r` replies **plus every forcing reply**. Forcing replies inherit their parent's queue priority rather than their own (usually tiny) prior — a refutation must compete at the plausibility of the line it refutes, or the beam prunes exactly the move that disproves the arm. Depth is capped at `search_max_depth` plies; where the tree deepens within that cap is decided entirely by the queue, so forced lines go deep while wide quiet positions stay shallow.
-4. **Scoring.** Arm score = negamax backup over the arm's realized tree (terminal positions exact, frontier leaves stand on their value-head estimate) + `value_rerank_lambda × log_prob(root move)`. **Value never chooses what to expand** — the queue is ordered by prior alone, and value enters only at backup and arm comparison. This is deliberate: ranking the beam by value estimates retains lines where the opponent cooperatively blunders (max-over-noise selection bias, the same failure the λ=0 control exposes).
-
-`halving_rounds` is the open-loop/closed-loop dial: `1` disables elimination entirely (pure prior-guided beam — all allocation decided upfront), `0` (default) auto-selects `ceil(log2(#arms))` rounds (full sequential halving — reallocation after every round). Comparing the two on the same budget attributes the gain between the deeper tree and the feedback loop.
-
-Everything is deterministic (no sampling; ties break by insertion order), the budget is a hard cap on evaluator calls, and the same terminal-exactness rules as d2 apply. See `BEAM_SEARCH_PLAN.md` for the design rationale and `docs/superpowers/specs/2026-07-04-mcts-lite-search-design.md` for the full spec.
+`halving_rounds` is the open-loop/closed-loop dial: `1` = pure prior-guided beam (all allocation upfront), `0` (default) = auto `ceil(log2(#arms))` rounds (full reallocation); comparing the two on one budget attributes the gain between tree depth and the feedback loop. Everything is deterministic (no sampling, ties by insertion order) and the budget is a hard cap on evaluator calls. Design rationale: `BEAM_SEARCH_PLAN.md`; full spec: `docs/superpowers/specs/2026-07-04-mcts-lite-search-design.md`.
 
 ### Tuning the halving knobs
 
 | Knob | Default | What it controls | How to tune |
 |---|---|---|---|
-| `search_budget` | 256 | Total value-head evaluations per move — the strength ↔ wall-clock dial (cost is roughly linear) | The biggest lever. 256 ≈ d2's per-move cost (fair A/B). Raise to 512+ only after the algorithm has proven itself at 256; each search evaluation re-encodes the full game history, so budget is expensive late-game. |
-| `halving_rounds` | 0 (auto) | How often budget is reallocated by observed value | Keep auto. Run `--halving-rounds 1` (pure beam) once at the same budget: if beam ≈ halving, the feedback loop isn't earning its keep and prior-allocation suffices; if halving wins, more rounds concentrate budget where it matters. |
-| `search_refutation_top_r` | 2 | Opponent replies always expanded besides forcing moves | Raise to 3 if `--debug-trace-games` shows arms scored well whose refutation was never evaluated ("believed for the wrong reason"). Raising it costs queue slots everywhere, so pay for it with budget. |
-| `search_expand_top` | 3 | Our-side branching per expanded node | Lower (2) = deeper, narrower trees; higher = wider, shallower. Only worth sweeping after budget and rounds are settled. |
-| `search_max_depth` | 4 | Max plies below each candidate move | Keep it **even** — an odd horizon ends on our own move and grades unanswered threats optimistically. 6 needs a bigger budget to be meaningful. |
-| `search_top_m` | 16 | Root candidates entering the bandit | Rarely binding (forcing moves are added regardless). Raising it dilutes early-round per-arm budget; lower it only if round-1 budgets get starved. |
-| `value_rerank_lambda` | 0.05 | Policy-prior weight in the arm score | Same role and sweep as d2: flat across 0.05–0.2, collapses at 0 (Goodhart on value-head noise). Leave fixed while tuning the knobs above. |
+| `search_budget` | 256 | Total value evaluations per move — the strength ↔ wall-clock dial (cost ≈ linear) | The biggest lever; raise first. |
+| `halving_rounds` | 0 (auto) | How often budget is reallocated by observed value | Keep auto. A/B against `1` (pure beam) at the same budget to check the feedback loop earns its keep. |
+| `search_refutation_top_r` | 2 | Opponent replies always expanded besides forcing moves | Raise to 3 if `--debug-trace-games` shows arms scored well whose refutation was never evaluated; costs queue slots everywhere, so pay with budget. |
+| `search_expand_top` | 3 | Our-side branching per node | Lower = deeper/narrower; sweep only after budget and rounds settle. |
+| `search_max_depth` | 4 | Max plies below each candidate | Keep it **even** — an odd horizon ends on our own move and grades unanswered threats optimistically. 6 needs a bigger budget to be meaningful. |
+| `search_top_m` | 16 | Root candidates entering the bandit | Rarely binding (forcing moves added regardless); raising dilutes early-round per-arm budget. |
+| `value_rerank_lambda` | 0.05 | Policy-prior weight in scores | Flat across 0.05–0.2, collapses at 0; leave fixed while tuning the rest. |
 
-Recommended order: budget (strength/time trade) → rounds 1-vs-auto A/B (attribution) → refutation floor (only if traces demand it) → depth/branching. Change one knob per eval run — 100 games has ±0.05 standard error, so small simultaneous changes are unreadable.
+Recommended order: budget → rounds A/B → refutation floor (only if traces demand it) → depth/branching. One knob per eval run — 100 games has ±0.05 SE.
 
 ### Usage
 
-Basic match (policy defaults from TOML):
-
 ```bash
+# Basic match (policy + all knobs from TOML)
 python scripts/eval_vs_stockfish.py \
   --checkpoint artifacts/checkpoints/best_hr10_*.pt \
-  --games 1000 \
-  --output-json artifacts/eval/stockfish_eval.json
-```
+  --games 1000 --output-json artifacts/eval/stockfish_eval.json
 
-Value search against Elo-limited Stockfish:
-
-```bash
-python scripts/eval_vs_stockfish.py \
-  --checkpoint artifacts/checkpoints/best_hr10_*.pt \
-  --model-move-policy value_search_d2 \
-  --value-rerank-top-k 16 \
-  --value-rerank-lambda 0.1 \
-  --stockfish-limit-strength --stockfish-elo 1400 \
-  --games 100
-```
-
-Halving search (defaults from `[eval_vs_stockfish]`; shown with the beam-attribution override):
-
-```bash
+# Halving search + value-net blend vs Elo-limited Stockfish
 python scripts/eval_vs_stockfish.py \
   --checkpoint artifacts/checkpoints/best_hr10_*.pt \
   --model-move-policy value_search_halving \
-  --search-budget 256 \
-  --halving-rounds 1 \
-  --stockfish-limit-strength --stockfish-elo 1400 \
-  --games 100
-```
+  --search-budget 1024 --search-max-depth 6 \
+  --value-net-checkpoint artifacts/value_net/value_net_best.pt --value-net-alpha 0.25 \
+  --stockfish-limit-strength --stockfish-elo 2000 --games 100
 
-For the standard best-checkpoint A/B there is a wrapper: `POLICIES="value_search_halving" ./eval_best_checkpoint.sh` (picks the best hr@10 checkpoint, runs 100 games vs SF1400 per policy, writes JSON + per-policy game replays, skips already-existing outputs).
-
-Ladder eval across several Stockfish levels:
-
-```bash
+# Ladder across several Stockfish levels
 python scripts/eval_vs_stockfish.py \
   --checkpoint artifacts/checkpoints/best_hr10_*.pt \
-  --ladder-elos 1400,1600,1800,2000,2200 \
-  --ladder-games-per-segment 200 \
-  --include-full-strength-segment \
-  --output-json artifacts/eval/stockfish_ladder.json
+  --ladder-elos 1400,1600,1800,2000,2200 --ladder-games-per-segment 200 \
+  --include-full-strength-segment --output-json artifacts/eval/stockfish_ladder.json
 ```
 
-The script reports wins/draws/losses (with color split), completed/incomplete games, average game length, score rate, legal-move vocab coverage, and per-segment plus aggregate summaries in ladder mode.
+Wrappers: `POLICIES="value_search_halving" ELO=1800 TAG=mytag ./eval_best_checkpoint.sh [flags...]` picks the best hr@10 checkpoint, runs 100 games, writes JSON + replays, and skips already-existing outputs; `sweep_value_net_alpha.sh` runs an α grid and prints a summary table. Reports include W/D/L with color split, completed/incomplete games, average game length, score rate, and legal-move vocab coverage (per-segment + aggregate in ladder mode).
 
-### Results vs Stockfish 1400 (current run, v3 pipeline)
+## Results vs Stockfish
 
-Setup: `greedy` / `value_search_d2` on checkpoint `best_hr10_checkpoint_6` (hr@10 = 0.9131, epoch 6); `value_search_halving` on the run's eventual best checkpoint, `best_hr10_checkpoint_10` (hr@10 = 0.9304). Stockfish `UCI_Elo` 1400 at 0.05s/move, 100 games per configuration, seed 42, colors alternating. Score = (wins + 0.5 × draws) / games; ±~0.05 standard error at 100 games.
+Protocol: 100 games per configuration, seed 42, colors alternating, Stockfish at 0.05s/move with `UCI_Elo` per rung. Score = (wins + 0.5 × draws) / games; ±~0.05 SE at 100 games. "Net α" = the distilled value net blended at that α; model v3 = 512d × 6L (~10M), v4 = 768d × 8L (~27M, `value_loss_weight` 1.0). Full per-run diaries, color splits, and period interpretations: `docs/superpowers/notes/2026-07-06-eval-log-archive.md`.
 
-| Move selection | W / D / L | Score rate |
-|---|---|---|
-| `greedy` | 7 / 28 / 65 | 0.21 |
-| `value_search_d2` (K=16, λ=0.05) | 22 / 16 / 47 @ 85 games | 0.34 (final, 100 games) |
-| `value_search_halving` (N=256, `halving_rounds=0` auto) | 88 / 7 / 5 | **0.915** |
+| Opponent | Move selection | Model | W / D / L | Score |
+|---|---|---|---|---|
+| SF1400 | `greedy` | v3 e6 | 7 / 28 / 65 | 0.21 |
+| SF1400 | `value_rerank` (pre-v3 ckpt, λ sweep — not comparable) | v2 | — | 0.405 |
+| SF1400 | `value_search_d2` (K=16, λ=0.05) | v3 e6 | 22 / 16 / 47 @ 85 | 0.34 |
+| SF1400 | halving 256/d4 | v3 e10 | 88 / 7 / 5 | **0.915** |
+| SF1800 | halving 256/d4 | v3 e12 | 38 / 17 / 45 | 0.465 |
+| SF1800 | halving 512/d6 | v3 e12 | 45 / 22 / 33 | 0.560 |
+| SF1800 | halving 1024/d6 | v3 e13 | 48 / 23 / 29 | 0.595 |
+| SF1800 | halving 256/d4 | v4 e12 | 51 / 18 / 31 | 0.600 |
+| SF1800 | halving 1024/d6 | v4 e12 | 56 / 19 / 25 | 0.655 |
+| SF1800 | halving 1024/d6 + net α=0.25 | v4 e12 | 62 / 15 / 23 | **0.695** |
+| SF2000 | halving 1024/d6 | v4 e12 | 41 / 22 / 37 | 0.520 |
+| SF2000 | halving 1024/d6 + net α=0.25 | v4 e12 | 49 / 29 / 22 | **0.635** |
+| SF2000 | halving 1024/d6 + net α=0.5 | v4 e12 | 39 / 28 / 33 | 0.530 |
+| SF2000 | halving 1024/d6 + net α=1.0 (pure net) | v4 e12 | 24 / 29 / 47 | 0.385 |
 
-By color (`value_search_halving`): white 46/2/2 (score 0.94), black 42/5/3 (score 0.89) — the black-side weakness visible under `greedy`/`d2` is essentially gone.
+How the components came to be, in order:
 
-Takeaways:
+1. **`greedy`** established the imitation baseline (0.21 vs SF1400 ≈ ~1170-Elo-equivalent play).
+2. **`value_rerank`** added inference-time value scoring; its λ sweep fixed two durable design facts — value-dominant scoring beats policy-dominant by ~+140 Elo, and λ = 0 collapses (Goodhart on value-head noise), so the prior term is load-bearing.
+3. **`value_search_d2`** added one level of adversarial lookahead with forcing-move refutations: +0.13 over greedy on the same checkpoint, clearing the pre-registered gate for building a real search.
+4. **`value_search_halving`** replaced uniform allocation with sequential halving + prior-ordered tree growth: 0.34 → 0.915 vs SF1400 (~+330 Elo), saturating that rung.
+5. **Prefix-cache decode** made bigger budgets affordable (O(1) work per evaluation; ~3.7× faster), enabling the 512/1024 rows.
+6. **The v4 trunk** (768d × 8L, doubled value loss weight) lifted the value oracle: 0.465 → 0.600 at matched 256/d4 search, and revived a budget curve that had flattened under v3.
+7. **The distilled value net + α blend** added an engine-trained second opinion: α=0.25 is the best measured configuration on both rungs tried (0.695 @ SF1800, 0.635 @ SF2000 ≈ a ~2100-Elo-equivalent system).
 
-- The raw policy is markedly stronger than the previous run's (greedy 0.145 → 0.21) — attributable to the v3 changes: placement-aware board encoding, game-level shuffle buffer, corrupt-game rejection.
-- Search still multiplies the policy: d2 adds +0.13 over greedy on the same checkpoint, clearing the +0.05 gate that justified building the halving search.
-- Halving search adds another large jump over d2 (0.34 → 0.915, ~+330 Elo over the same opponent at the two checkpoints tested) — SF1400 is saturated as an eval opponent for this policy; the ladder continues at SF1800 below.
-
-### Results vs Stockfish 1800 (budget scaling)
-
-Setup: checkpoint `best_hr10_checkpoint_12` (hr@10 = 0.9349), Stockfish `UCI_Elo` 1800 at 0.05s/move, 100 games per configuration, seed 42, colors alternating. Run on the prefix-cache decode path (~12 s/game at budget 512/depth 6 — vs ~44 s/game the uncached path needed for budget 256/depth 4).
-
-| `value_search_halving` config | W / D / L | Score rate | ≈ Elo vs SF1800 |
-|---|---|---|---|
-| budget 256, depth 4 (defaults) | 38 / 17 / 45 | 0.465 | −24 |
-| budget 512, depth 6 | 45 / 22 / 33 | 0.560 | +42 |
-| budget 1024, depth 6 (ckpt_13, hr@10 0.9361) | 48 / 23 / 29 | **0.595** | +67 |
-
-What we understand so far:
-
-- **Search does most of the lifting.** The full progression on v3 checkpoints vs SF1400 is greedy 0.21 → d2 0.34 → halving-256 0.915. A pure imitation policy plays ~1170-Elo-equivalent chess; the same network under budgeted value search plays ~1800+.
-- **The budget curve is flattening — the value oracle is becoming the bottleneck.** 256→512(+depth) bought +0.095; 512→1024 bought only +0.035 (well inside noise, and the 1024 run even had a slightly newer checkpoint in its favor). Per the decision rule (stop buying search at the first flat doubling), further budget scaling is no longer the lever: the next Elo lives in **better value labels** — engine-annotated (distilled) targets instead of noisy whole-game outcomes.
-- Draws grow with opponent strength (17–23 at 1800 vs 7 at 1400): converting drawn endgames is exactly where outcome-label noise hurts most — consistent with the flattening curve.
-- Per-color splits at 1800 fluctuate across runs (e.g. 0.43/0.69 at 512/d6) — 50 games/color is noisy; treat asymmetries as variance until they repeat.
-- Both follow-ups happened; see the next section. Older (v3) checkpoints remain evaluable via `--config config/imba_chess_v3.toml` after the architecture change.
-
-### Results: v4 trunk + value-net blend (SF1800)
-
-Setup: v4 checkpoint `best_hr10_checkpoint_12` (hr@10 = 0.9468; 768d × 8-layer trunk, `value_loss_weight` 1.0, from a still-running training job) with the distilled value net (3.5M params, one epoch over ~200M engine-evaluated positions). 100 games per configuration, seed 42, 0.05s/move. α = `value_net_alpha`: 0 = pure model value head, 1 = pure distilled net.
-
-α sweep at budget 256/depth 4 — run with a **mid-training** net checkpoint (~45% trained):
-
-| α | W / D / L | Score rate |
-|---|---|---|
-| 0 | 51 / 18 / 31 | 0.600 |
-| 0.25 | 44 / 30 / 26 | 0.590 |
-| 0.5 | 41 / 23 / 36 | 0.525 |
-| 1.0 | 15 / 26 / 59 | 0.280 |
-
-Re-run at budget 1024/depth 6 with the **finished** net:
-
-| α | W / D / L | Score rate |
-|---|---|---|
-| 0 | 56 / 19 / 25 | 0.655 |
-| 0.25 | 62 / 15 / 23 | **0.695** |
-
-What this taught us:
-
-- **Trunk scale beat label distillation to the punch.** v4's own value head (bigger trunk, doubled value loss weight) already fixed most of what the distillation was built to fix: at matched search (256/d4), v3 scored 0.465 and v4 scores 0.600 — above v3's best-ever 0.595 that needed 4× the budget.
-- **Oracle quality sets the search's exchange rate for compute.** v3's budget curve flattened (+0.035 for the last doubling); v4's is alive again (0.600 @ 256/d4 → 0.655 @ 1024/d6). The flattening was the value head, not the search.
-- **An underfit oracle is worse than none.** The mid-training net degraded play monotonically in α (a probe showed it scoring a clean knight-up at +0.44 when its own training target says ≈ +1.0). Never evaluate a half-trained oracle and conclude anything about the method.
-- **Light mixing wins; heavy mixing loses.** Pure net (α=1.0) is catastrophic even fully trained in the 256/d4 round: Stockfish's win-rate targets encode *value under near-perfect play*, which rounds small advantages to draws — the wrong semantics against a fallible opponent — and the net sees history-free analysis positions, off-distribution from the search tree. At α=0.25 the model head stays in charge and the net acts as a second opinion: **more wins, not more draws** (62/15/23 vs 56/19/25), and the best score the project has produced (0.695, ≈ +140 Elo vs SF1800).
-- This is the λ=0 lesson again from a new angle: offline label accuracy is not in-search usefulness; oracles must be judged by play.
-
-### Results vs Stockfish 2000 (full α grid)
-
-Same setup (v4 `checkpoint_12`, finished net, 1024/depth 6, 100 games, seed 42), next rung of the ladder:
-
-| α | W / D / L | Score rate | ≈ Elo vs SF2000 |
-|---|---|---|---|
-| 0 | 41 / 22 / 37 | 0.520 | +14 |
-| 0.25 | 49 / 29 / 22 | **0.635** | **+96** |
-| 0.5 | 39 / 28 / 33 | 0.530 | +21 |
-| 1.0 | 24 / 29 / 47 | 0.385 | −81 |
-
-- **The blend's edge grows with opponent strength**: +0.040 over pure model head at SF1800, **+0.115 at SF2000** (~2.3 SE — no longer a noise candidate). A clean humped curve peaking at α=0.25 in both settings.
-- The likely mechanism: against stronger opponents there are fewer free wins from blunders, so value accuracy matters more — and the net's "value under strong play" semantics become *more* correct as the opponent approaches the play its labels assume. If this holds, the optimal α rises with opponent Elo.
-- Even pure net (α=1.0, finished, 1024/d6) is respectable now at 0.385 — the earlier 0.280 collapse was substantially the underfit checkpoint, not the concept.
-- Net position: **the α=0.25 system scores 0.635 vs SF2000** (0.05s/move) — roughly a 2100-Elo-equivalent player on this ladder, built from a 27M-param imitation policy, a 3.5M distilled value net, and a 1024-node search.
-
-### Historical: the λ sweep (v2 checkpoint)
-
-An earlier sweep on a pre-v3 checkpoint (not comparable to the numbers above) established two durable design facts, both baked into the current defaults: **value-dominant scoring beats policy-dominant scoring** by ~+140 Elo inference-only (0.23 → 0.405 vs SF1400), and **λ = 0 collapses** (0.12) — optimizing purely against the learned value head over-exploits its noise (Goodhart), so the policy log-prob prior is a necessary regularizer, not a cosmetic tiebreak. Score was flat across λ ∈ [0.05, 0.2]; `value_rerank_lambda = 0.05` has been the default since.
-
-## Standalone value network (Stockfish distillation)
-
-The big model's value head learns from whole-game outcomes — noisy labels (a
-won position later thrown away is labeled "loss", and the label encodes
-*human* conversion ability). Once the search's budget-scaling curve flattened
-at SF1800, those labels became the binding constraint. The fix is a second,
-independent value oracle trained on engine evaluations.
-
-`ValueNet` (`src/imba_chess/model/value_net.py`, ~5M params) is a
-**position-only** WDL network: the same joint (piece, square) embedding and
-`BoardSquareEncoder` body as the big model, scaled up (256d × 6 layers over
-the 64 squares), with turn/castling/en-passant features broadcast-added to
-the square tokens. It sees no game history and no clocks — deliberately, so
-it exactly matches its training data and has zero train/serve skew.
-
-Training data is `Lichess/chess-position-evaluations` (388M Stockfish-
-evaluated FENs, CC0, streamed from Hugging Face). Each row's centipawn eval
-becomes a soft win/draw/loss target via Stockfish 17's own `win_rate_model`
-polynomial (value under strong play — deliberately *not* calibrated to human
-outcomes); mate-in-N rows get near-saturated targets. Evals are White-POV in
-the source and flipped to side-to-move POV. A deterministic FEN-hash holdout
-provides validation.
-
-### The three-stage pipeline
-
-1. **Pretrain the big model** on high-Elo human games (`scripts/train.py`):
-   policy head (imitation) + outcome-value head + moves-left auxiliary.
-2. **Train the value net** on engine evals — fully decoupled from stage 1;
-   either can be retrained without touching the other:
-
-   ```bash
-   python scripts/train_value_net.py            # config from [value_net] in the TOML
-   python scripts/train_value_net.py --steps 50000 --device cuda
-   ```
-
-   Plain supervised learning: flat batches, soft cross-entropy,
-   StableAdamW + OneCycle, best/last checkpoints in `artifacts/value_net/`
-   selected by held-out soft-CE (TensorBoard logs alongside).
-
-   Practical recipe (from the first real run):
-
-   - **Download the data once instead of streaming it** — set `HF_TOKEN`
-     (unauthenticated hub requests are rate-limited) and run
-     `hf download Lichess/chess-position-evaluations --repo-type dataset
-     --local-dir <dir>`, then point `[value_net] dataset_name` at that
-     directory. "Streaming" becomes local disk reads.
-   - The val slice is built once (a few-minute scan, with a progress bar)
-     and **cached to `artifacts/value_net/val_slice.pt`** — later runs load
-     it instantly. The cache key includes the data/batch config, so changing
-     those triggers one rebuild.
-   - Sample preparation is CPU-bound (~24k rows/s per worker); raise
-     `[value_net] num_workers` if the GPU is starved. Useful workers are
-     capped by the dataset's file count (20) — the loader auto-splits files
-     across workers.
-   - A ~3.5M-param net can't saturate a big GPU at batch 1024 (per-step
-     Python overhead dominates); larger batches raise throughput. When
-     scaling batch N×, scale `max_lr` by ~√N and divide `train_steps` by N
-     to keep the sample budget fixed. Reference point: batch 6144,
-     `max_lr 7e-4`, ~27k samples/s on a 24 GB card — one ~200M-sample epoch
-     in about 2 hours.
-3. **Blend at search time** — the eval script loads the net optionally and
-   every search evaluation becomes
-   `value = (1 − α) · model_value_head + α · value_net`:
-
-   ```bash
-   POLICIES="value_search_halving" ELO=1800 TAG=vnet ./eval_best_checkpoint.sh \
-     --search-budget 1024 --search-max-depth 6 \
-     --value-net-checkpoint artifacts/value_net/value_net_best.pt   # alpha defaults to 1.0
-   ```
-
-   `sweep_value_net_alpha.sh` loops an α grid with collision-free tags and
-   prints a summary table. `--value-net-alpha` sweeps the blend (0 = pure
-   model head, 1 = pure net) — α = 0.25 is the measured best (see the
-   results section above);
-   both knobs are recorded in the output JSON's `run_config.value_net`. With
-   no checkpoint configured, eval behavior is unchanged. Terminal positions
-   (mate/stalemate/claimable draws) keep their exact values regardless.
+Reading the table (light hypotheses, not established facts): the budget curve flattening under v3 and reviving under v4 suggests oracle quality sets how well search compute converts; the α curve peaking low (0.25) and the pure net losing suggests engine values' "under strong play" semantics mis-rank small edges against fallible opponents; the blend's edge growing with opponent Elo (+0.04 @ 1800 → +0.115 @ 2000) suggests optimal α may rise with opponent strength. Each of these is one-or-two-datapoint territory — treat as directions to test, not conclusions.
 
 ## Configuration
 
@@ -371,7 +213,8 @@ All runtime settings are in `config/imba_chess.toml`:
 - `[dataloader]` max tokens per jagged batch, workers
 - `[model]` HSTU dimensions/layers + label smoothing + Elo loss weighting + value head knobs
 - `[training]` optimizer/scheduler/eval cadence/checkpointing/device/precision
-- `[eval_vs_stockfish]` engine path/limits, ladder settings, move-selection policy and knobs, debug controls
+- `[eval_vs_stockfish]` engine path/limits, ladder settings, move-selection policy and knobs, value-net blend, debug controls
+- `[value_net]` standalone value net dims, data filters, and trainer settings
 
 ## Quickstart
 
@@ -415,3 +258,4 @@ uv run --python .venv/bin/python --with pytest pytest -q
 - `TRAINING_EVENT_SCHEMA.md` for input schema details.
 - `FEN_TO_BOARD_STATE.md` for board-state encoding details.
 - `VALUE_HEAD_OPTIONS.md` for value-head design notes.
+- `docs/superpowers/notes/2026-07-06-eval-log-archive.md` for the full eval diaries, per-color splits, and superseded usage examples.
