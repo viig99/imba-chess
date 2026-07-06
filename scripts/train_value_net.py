@@ -67,10 +67,14 @@ def main() -> None:
         "--resume",
         nargs="?",
         const="auto",
-        default=None,
-        help="Warm-restart from a checkpoint (default: <checkpoint_dir>/value_net_last.pt). "
+        default="auto",
+        help="Checkpoint to warm-restart from (default: auto — resume from "
+        "<checkpoint_dir>/value_net_last.pt when it exists, else start fresh). "
         "Restores weights and fast-forwards the LR schedule to the saved step; "
         "optimizer moments rebuild within ~100 steps.",
+    )
+    parser.add_argument(
+        "--fresh", action="store_true", help="Ignore existing checkpoints and start from scratch."
     )
     args = parser.parse_args()
 
@@ -90,12 +94,14 @@ def main() -> None:
 
     start_step = 0
     best_val = float("inf")
-    if args.resume is not None:
-        resume_path = (
-            Path(cfg.checkpoint_dir) / "value_net_last.pt"
-            if args.resume == "auto"
-            else Path(args.resume)
-        )
+    resume_path = (
+        Path(cfg.checkpoint_dir) / "value_net_last.pt"
+        if args.resume == "auto"
+        else Path(args.resume)
+    )
+    if args.fresh or (args.resume == "auto" and not resume_path.exists()):
+        resume_path = None
+    if resume_path is not None:
         payload = torch.load(resume_path, map_location="cpu")
         saved_cfg = payload.get("config", {})
         expected = {"dim": cfg.dim, "num_heads": cfg.num_heads, "num_layers": cfg.num_layers}
