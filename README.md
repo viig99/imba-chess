@@ -276,12 +276,29 @@ provides validation.
 
    Plain supervised learning: flat batches, soft cross-entropy,
    StableAdamW + OneCycle, best/last checkpoints in `artifacts/value_net/`
-   selected by held-out soft-CE (TensorBoard logs alongside). Notes: the
-   first minutes are download-bound (parquet shards stream from HF and are
-   cached locally); the val slice is materialized once at startup (a
-   one-time scan costing a few minutes); raise `[value_net] num_workers` if
-   the GPU is starved — sample preparation is CPU-bound at ~24k rows/s per
-   worker.
+   selected by held-out soft-CE (TensorBoard logs alongside).
+
+   Practical recipe (from the first real run):
+
+   - **Download the data once instead of streaming it** — set `HF_TOKEN`
+     (unauthenticated hub requests are rate-limited) and run
+     `hf download Lichess/chess-position-evaluations --repo-type dataset
+     --local-dir <dir>`, then point `[value_net] dataset_name` at that
+     directory. "Streaming" becomes local disk reads.
+   - The val slice is built once (a few-minute scan, with a progress bar)
+     and **cached to `artifacts/value_net/val_slice.pt`** — later runs load
+     it instantly. The cache key includes the data/batch config, so changing
+     those triggers one rebuild.
+   - Sample preparation is CPU-bound (~24k rows/s per worker); raise
+     `[value_net] num_workers` if the GPU is starved. Useful workers are
+     capped by the dataset's file count (20) — the loader auto-splits files
+     across workers.
+   - A ~3.5M-param net can't saturate a big GPU at batch 1024 (per-step
+     Python overhead dominates); larger batches raise throughput. When
+     scaling batch N×, scale `max_lr` by ~√N and divide `train_steps` by N
+     to keep the sample budget fixed. Reference point: batch 6144,
+     `max_lr 7e-4`, ~27k samples/s on a 24 GB card — one ~200M-sample epoch
+     in about 2 hours.
 3. **Blend at search time** — the eval script loads the net optionally and
    every search evaluation becomes
    `value = (1 − α) · model_value_head + α · value_net`:
