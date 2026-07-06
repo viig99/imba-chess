@@ -63,6 +63,15 @@ def main() -> None:
     parser.add_argument("--config", type=Path, default=DEFAULT_CONFIG_PATH)
     parser.add_argument("--steps", type=int, default=None)
     parser.add_argument("--device", choices=["auto", "cpu", "cuda"], default=None)
+    parser.add_argument(
+        "--resume",
+        nargs="?",
+        const="auto",
+        default=None,
+        help="Warm-restart from a checkpoint (default: <checkpoint_dir>/value_net_last.pt). "
+        "Restores weights and fast-forwards the LR schedule to the saved step; "
+        "optimizer moments rebuild within ~100 steps.",
+    )
     args = parser.parse_args()
 
     cfg = load_repo_config(args.config).value_net
@@ -78,6 +87,32 @@ def main() -> None:
     ).to(device)
     num_params = sum(p.numel() for p in model.parameters())
     print(f"ValueNet params: {num_params / 1e6:.2f}M | device: {device}")
+
+    start_step = 0
+    best_val = float("inf")
+    if args.resume is not None:
+        resume_path = (
+            Path(cfg.checkpoint_dir) / "value_net_last.pt"
+            if args.resume == "auto"
+            else Path(args.resume)
+        )
+        payload = torch.load(resume_path, map_location="cpu")
+        saved_cfg = payload.get("config", {})
+        expected = {"dim": cfg.dim, "num_heads": cfg.num_heads, "num_layers": cfg.num_layers}
+        if saved_cfg != expected:
+            raise ValueError(
+                f"checkpoint config {saved_cfg} does not match [value_net] {expected}"
+            )
+        model.load_state_dict(payload["model"])
+        start_step = int(payload["step"])
+        print(f"resumed from {resume_path}: step {start_step}, val {payload['val_loss']:.4f}")
+        # Don't clobber a better existing best checkpoint after the restart.
+        best_path = Path(cfg.checkpoint_dir) / "value_net_best.pt"
+        if best_path.exists():
+            best_val = float(torch.load(best_path, map_location="cpu")["val_loss"])
+            print(f"existing best val: {best_val:.4f}")
+        if start_step >= steps:
+            raise SystemExit(f"nothing to do: resume step {start_step} >= train_steps {steps}")
 
     def make_loader(split: str) -> DataLoader:
         dataset = PositionEvalDataset(
@@ -157,6 +192,10 @@ def main() -> None:
         # expects (same reason scripts/train.py disables it).
         cycle_momentum=False,
     )
+    # Warm restart: fast-forward the schedule to the resume step (each step
+    # is O(1) math; optimizer state itself is intentionally not restored).
+    for _ in range(start_step):
+        scheduler.step()
 
     use_amp = device.type == "cuda" and cfg.dtype in {"bfloat16", "float16"}
     autocast_ctx = (
@@ -183,9 +222,10 @@ def main() -> None:
             checkpoint_dir / name,
         )
 
-    best_val = float("inf")
-    step = 0
-    progress = tqdm(total=steps, desc="train", unit="step", dynamic_ncols=True)
+    step = start_step
+    progress = tqdm(
+        total=steps, initial=start_step, desc="train", unit="step", dynamic_ncols=True
+    )
     while step < steps:
         for batch in train_loader:
             loss = train_step(
