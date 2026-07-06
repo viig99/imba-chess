@@ -22,7 +22,7 @@ DEPTH="${DEPTH:-6}"
 OUT_DIR="${OUT_DIR:-artifacts/eval}"
 
 for alpha in ${ALPHAS}; do
-  tag="vneta${alpha//./}"
+  tag="vneta${alpha//./}_${ELO}_${BUDGET}_${DEPTH}"
   echo "== value_net_alpha=${alpha} (TAG=${tag}) =="
   POLICIES="value_search_halving" ELO="${ELO}" TAG="${tag}" OUT_DIR="${OUT_DIR}" \
     ./eval_best_checkpoint.sh \
@@ -38,7 +38,7 @@ import glob, json, os
 out_dir = os.environ["OUT_DIR"]
 print(f"{'alpha':>6}  {'W':>3} {'D':>3} {'L':>3}  {'score':>6}  file")
 for alpha in os.environ["ALPHAS"].split():
-    tag = "vneta" + alpha.replace(".", "")
+    tag = "vneta" + alpha.replace(".", "") + f"_{os.environ['ELO']}_{os.environ['BUDGET']}_{os.environ['DEPTH']}"
     paths = sorted(glob.glob(os.path.join(out_dir, f"*_{tag}.json")))
     if not paths:
         print(f"{alpha:>6}  (no output found for TAG={tag})")
