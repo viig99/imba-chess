@@ -190,6 +190,7 @@ Protocol: 100 games per configuration, seed 42, colors alternating, Stockfish at
 | SF2000 | halving 1024/d6 + net α=0.25 | v4 e12 | 49 / 29 / 22 | **0.635** |
 | SF2000 | halving 1024/d6 + net α=0.5 | v4 e12 | 39 / 28 / 33 | 0.530 |
 | SF2000 | halving 1024/d6 + net α=1.0 (pure net) | v4 e12 | 24 / 29 / 47 | 0.385 |
+| SF2200 | halving 1024/d6 + net α=0.25 | v4 e12 | 35 / 21 / 44 | 0.455 |
 
 How the components came to be, in order:
 
