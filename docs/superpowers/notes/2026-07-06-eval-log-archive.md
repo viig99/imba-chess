@@ -201,6 +201,40 @@ v4 `best_hr10_checkpoint_14` (hr@10 = 0.9500, two epochs newer), budget
   e14 @ 1024/d6 leg would separate them); with the combined gain this
   small, the decomposition was judged not worth the eval time.
 
+### SF2200, third round: epoch-23 trunk (Elo-weighted value loss) + budget 2048 / depth 8
+
+v4 `best_hr10_checkpoint_23` (hr@10 = 0.9564), same 2048/depth-8 search as
+the e14 round. This checkpoint is the first one trained past the
+Elo-weighted value loss change (d45abc2): training resumed from epoch 18
+with the same per-token Elo scale that weights policy CE now also
+multiplying the progress-weighted value CE (`elo_loss_weight_strength`/
+`alpha` unchanged, so stronger players' outcomes count as lower-noise value
+labels).
+
+| α | W / D / L | Score rate |
+|---|---|---|
+| 0 | 44 / 31 / 25 | **0.595** |
+| 0.15 | 46 / 20 / 34 | 0.560 |
+
+- Pure-head score jumped 0.510 → 0.595 (+0.085) over the e14 checkpoint at
+  the *identical* search config — the largest single-lever gain measured at
+  this rung, and the first clear evidence the Elo-weighted value loss (or
+  the extra epochs, not decomposed) is paying off, not just holding flat.
+- The blend flipped sign: at e14 it was a wash (α=0.15 ≈ α=0, +0.005); at
+  e23 it actively costs 0.035 (0.560 vs 0.595). Full trend across the
+  ladder: +0.115 @2000/e12 → +0.035 @2200/e12 → ~0 @2200/e14 → **−0.035
+  @2200/e23**. The distilled net's value has now crossed from neutral to
+  net-negative as the trunk's own head strengthens — worth revisiting
+  whether α=0.15 is still the right default, or whether the net should be
+  dropped for this checkpoint family.
+- Draw share fell back to 20 at α=0.15 (from 27 @e14) despite rising to 31
+  at α=0 — the two configs are no longer just "same players, more draws";
+  the α=0 line is now both scoring higher and drawing more, consistent with
+  a genuinely stronger, more decisive pure head.
+- Not decomposed: how much of the +0.085 comes from the Elo-weighted value
+  loss specifically vs. five more epochs of plain training — an e18 (the
+  resume point) @ 2048/d8 leg would isolate it.
+
 ## Historical: the λ sweep (v2 checkpoint)
 
 An earlier sweep on a pre-v3 checkpoint (not comparable to the numbers
