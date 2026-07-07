@@ -27,6 +27,74 @@ external oracle involved). This design distills that per-position estimate
 back into the trunk's own value-head training, replacing/blending the
 constant per-game label with a position-resolved one.
 
+## Relationship to prior work: Expert Iteration (Anthony et al.)
+
+This design is inspired by "Thinking Fast and Slow with Deep Learning and
+Tree Search" (Anthony, Tian & Barber, 2017, arXiv:1705.08439) but deviates
+from it in one specific, deliberate way — worth being explicit about so the
+deviation reads as a considered choice, not an oversight.
+
+**Policy target — matches the paper.** Their Tree-Policy Target (§5.1)
+comes from a **single position**: MCTS with ~10,000 simulations from that
+state, target = normalized visit counts `n(s,a)/n(s)`. No full game is
+played to generate this target — self-play games are only used to sample a
+diverse set of *starting* positions, one per game. Our Phase 1b design
+(§Part 5: `evals_spent`-normalized distribution from one
+`value_search_halving` call) is the same shape, at a smaller budget (2048
+vs ~10,000 evals per position).
+
+**Value target — deliberately deviates from the paper.** Their value
+network (§5.2) is trained on `z`, the outcome of playing a full game to
+completion with the raw apprentice policy — a cheap Monte Carlo estimate of
+`V^π̂` standing in for the more expensive `V^π*`. Structurally that's the
+*same kind of signal* as our **current** constant-per-game label
+(`game_result_white`) — not the bounded-depth search backup Phase 1a
+proposes below. The paper doesn't need to fix a "one noisy label per game"
+problem the way we do: their games come from self-play with a
+continually-improving apprentice, resampled every iteration, so the
+correlation between mid-game position quality and final outcome tightens
+organically as training progresses — value labels get less noisy for free
+as the loop iterates. We're not (yet) running a self-play loop; Phase 1a is
+scoped to the existing static, high-blunder-rate human Lichess dataset
+(real amateur games, not self-play by an improving apprentice), so that
+self-correcting mechanism isn't available to us. The search-backed value
+target (Part 3) is a substitute, engineered fix for a data-source problem
+the paper's self-play loop doesn't have — it is an adaptation motivated by
+our constraint, not a direct replica of §5.2.
+
+### Batch vs. Online ExIt, and where Phase 1a sits
+
+The paper distinguishes two ways of running the ExIt loop (§6.1):
+
+- **Batch ExIt**: each iteration generates a fresh self-play dataset `D_i`
+  with the current apprentice, and trains a **new** apprentice on `D_i`
+  alone — prior iterations' data is discarded, training restarts each
+  round (their reported run: 3 iterations, 243,000 moves generated per
+  iteration).
+- **Online ExIt** (§3.3): trains on the union of all data so far (`D =
+  ∪_{j≤i} D_j`), either a rolling window of the most recent moves or a
+  growing accumulated set, with more frequent, continuous apprentice
+  updates rather than discrete from-scratch retrains.
+
+Neither category applies cleanly to Phase 1a as scoped: both describe an
+**ongoing self-play data-generation loop**, and Phase 1a is a single
+relabeling pass over a **static** dataset — there's no round 2 to be
+"batch" or "online" about yet.
+
+If/when this extends to multiple rounds (regenerating rollouts from an
+improved checkpoint — currently listed under Out of scope), the choice
+matters, and this codebase's existing pattern points at **online-style**,
+not batch: every training change so far in this repo has been a warm-start
+resume from an existing checkpoint (`--resume`; e.g. "resumed v4 from
+epoch 18" for the Elo-weighted loss change) — never a from-scratch retrain.
+A batch-style fresh-retrain-per-round would be a real, expensive departure
+from that pattern. The concrete online-style shape for a future iterative
+extension: accumulate rollout batches across rounds (all rounds, or a
+rolling window of the most recent N), keep warm-starting/fine-tuning the
+same running checkpoint rather than resetting, and let each new round's
+rollouts — generated from the now-improved checkpoint — fold into the
+training mix rather than replacing it outright.
+
 ## Roadmap
 
 This doc specs **Phase 1a** in full and documents Phase 1b/2 as scoped
@@ -115,6 +183,12 @@ checkpoint: str                   # which checkpoint generated this rollout
 ```
 
 ## Part 3: Value target construction (Phase 1a)
+
+This is the part of the design that deviates from Anthony et al.'s own
+value-network methodology (see §Relationship to prior work above) — their
+value target is a full-game Monte Carlo outcome, ours is a bounded-depth
+search backup, because our data source (static human games, not an
+evolving self-play loop) doesn't get the paper's free noise reduction.
 
 Two things need blending: the *scalar* backed value (`[-1, 1]`, no draw
 information — same `p(win) − p(loss)` convention as the rest of the search)
@@ -239,7 +313,10 @@ stage before any live-eval compute is spent.
 - Self-play generation and any RL/policy-gradient update (Phase 2).
 - Iterative rounds (regenerating rollouts from an improved checkpoint and
   retraining again) — this doc covers one round; iteration is a follow-up
-  once round 1 validates the approach.
+  once round 1 validates the approach. If pursued, the online-style shape
+  sketched under §Batch vs. Online ExIt above (accumulate rollout batches
+  across rounds, keep warm-starting the same checkpoint) is the leading
+  candidate over a batch-style fresh-retrain-per-round.
 - Rollout sampling from val/test splits.
 - Any change to the standalone value net or its inference-time blend
   (`value_net_alpha`) — orthogonal, already-shipped infrastructure.
