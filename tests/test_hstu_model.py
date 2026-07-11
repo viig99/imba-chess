@@ -502,3 +502,203 @@ def test_optimizer_decay_groups_exclude_embeddings_norms_and_biases():
     assert id(named["layers.0._uvqk.weight"]) in decay_ids
     assert id(named["value_head.0.weight"]) in decay_ids
     assert id(named["board_encoder.blocks.0.qkv.weight"]) in decay_ids
+
+
+def test_hstu_chess_model_value_loss_uses_soft_ce_for_gated_tokens():
+    config = HSTUChessConfig(
+        move_vocab_size=128,
+        model_dim=64,
+        linear_hidden_dim=16,
+        attention_dim=16,
+        num_heads=2,
+        num_layers=0,
+        max_position_embeddings=32,
+        enable_value_head=True,
+        value_loss_weight=0.1,
+    )
+    model = HSTUChessModel(config)
+    batch = _batch()
+    total_tokens = batch["seq_token_id"].numel()
+
+    value_target_soft = torch.zeros((total_tokens, 3), dtype=torch.float32)
+    value_target_soft[1] = torch.tensor([0.1, 0.2, 0.7])
+    has_rollout_value_target = torch.zeros(total_tokens, dtype=torch.bool)
+    has_rollout_value_target[1] = True
+    batch["value_target_soft"] = value_target_soft
+    batch["has_rollout_value_target"] = has_rollout_value_target
+
+    out = model(batch, return_loss=True)
+    assert torch.isfinite(out["value_loss"])
+
+    # Manually recompute expected per-token loss: soft CE at token 1, hard CE elsewhere.
+    value_logits = out["value_logits"]
+    seq_offsets = batch["seq_offsets"].to(dtype=torch.long)
+    counts = seq_offsets[1:] - seq_offsets[:-1]
+    token_game_id = torch.repeat_interleave(torch.arange(batch["num_games"]), counts)
+    z_token = batch["game_result_white"].to(dtype=torch.long)[token_game_id]
+    turn_id = batch["turn_id"].to(dtype=torch.long)
+    value_target = (torch.where(turn_id == 0, z_token, -z_token) + 1).clamp(min=0, max=2)
+    hard_loss = F.cross_entropy(value_logits.float(), value_target, reduction="none")
+    soft_loss = -(value_target_soft * F.log_softmax(value_logits.float(), dim=-1)).sum(dim=-1)
+    expected_per_token = torch.where(has_rollout_value_target, soft_loss, hard_loss)
+
+    token_pos = torch.arange(value_logits.shape[0]) - seq_offsets[token_game_id]
+    seq_len = counts[token_game_id].clamp_min(1)
+    progress = token_pos.to(torch.float32) / (seq_len.to(torch.float32) - 1.0).clamp_min(1.0)
+    valid_mask = batch["target_move_id"].to(dtype=torch.long) != config.ignore_index
+    value_weights = progress.pow(config.value_weight_alpha) * valid_mask.to(torch.float32)
+    expected = (expected_per_token * value_weights).sum() / value_weights.sum().clamp_min(1.0)
+
+    assert torch.allclose(out["value_loss"], expected, atol=1e-6, rtol=1e-6)
+
+
+def test_hstu_chess_model_value_loss_beta_zero_soft_target_matches_hard_ce():
+    # A one-hot soft target must produce numerically the same per-token loss
+    # as the existing hard-CE path (this is what beta=0 relies on).
+    config = HSTUChessConfig(
+        move_vocab_size=128,
+        model_dim=64,
+        linear_hidden_dim=16,
+        attention_dim=16,
+        num_heads=2,
+        num_layers=0,
+        max_position_embeddings=32,
+        enable_value_head=True,
+        value_loss_weight=0.1,
+    )
+    torch.manual_seed(0)
+    model = HSTUChessModel(config)
+    batch = _batch()
+    total_tokens = batch["seq_token_id"].numel()
+
+    out_baseline = model(batch, return_loss=True)
+
+    # one_hot(value_target) as the soft target, gated everywhere valid.
+    seq_offsets = batch["seq_offsets"].to(dtype=torch.long)
+    counts = seq_offsets[1:] - seq_offsets[:-1]
+    token_game_id = torch.repeat_interleave(torch.arange(batch["num_games"]), counts)
+    z_token = batch["game_result_white"].to(dtype=torch.long)[token_game_id]
+    turn_id = batch["turn_id"].to(dtype=torch.long)
+    value_target = (torch.where(turn_id == 0, z_token, -z_token) + 1).clamp(min=0, max=2)
+    batch["value_target_soft"] = F.one_hot(value_target, num_classes=3).to(torch.float32)
+    batch["has_rollout_value_target"] = torch.ones(total_tokens, dtype=torch.bool)
+
+    torch.manual_seed(0)
+    model_gated = HSTUChessModel(config)
+    out_gated = model_gated(batch, return_loss=True)
+
+    assert torch.allclose(out_gated["value_loss"], out_baseline["value_loss"], atol=1e-6, rtol=1e-6)
+
+
+def test_hstu_chess_model_value_loss_soft_ce_applies_label_smoothing():
+    # The soft-CE branch must smooth its (non-one-hot) targets the same way
+    # F.cross_entropy's label_smoothing would smooth a hard target, so that
+    # rollout-gated and non-gated tokens train against consistently-smoothed
+    # targets when value_label_smoothing > 0.
+    config = HSTUChessConfig(
+        move_vocab_size=128,
+        model_dim=64,
+        linear_hidden_dim=16,
+        attention_dim=16,
+        num_heads=2,
+        num_layers=0,
+        max_position_embeddings=32,
+        enable_value_head=True,
+        value_loss_weight=0.1,
+        value_label_smoothing=0.1,
+    )
+    model = HSTUChessModel(config)
+    batch = _batch()
+    total_tokens = batch["seq_token_id"].numel()
+
+    # Non-trivial (non-one-hot) soft targets, gated on every token.
+    value_target_soft = torch.tensor(
+        [
+            [0.2, 0.3, 0.5],
+            [0.1, 0.2, 0.7],
+            [0.6, 0.3, 0.1],
+            [0.05, 0.85, 0.10],
+            [0.33, 0.33, 0.34],
+        ],
+        dtype=torch.float32,
+    )
+    has_rollout_value_target = torch.ones(total_tokens, dtype=torch.bool)
+    batch["value_target_soft"] = value_target_soft
+    batch["has_rollout_value_target"] = has_rollout_value_target
+
+    out = model(batch, return_loss=True)
+    assert torch.isfinite(out["value_loss"])
+
+    value_logits = out["value_logits"]
+    eps = config.value_label_smoothing
+    num_classes = value_target_soft.shape[-1]
+    smoothed_soft_targets = (1.0 - eps) * value_target_soft + eps / num_classes
+    expected_per_token = -(
+        smoothed_soft_targets * F.log_softmax(value_logits.float(), dim=-1)
+    ).sum(dim=-1)
+
+    seq_offsets = batch["seq_offsets"].to(dtype=torch.long)
+    counts = seq_offsets[1:] - seq_offsets[:-1]
+    token_game_id = torch.repeat_interleave(torch.arange(batch["num_games"]), counts)
+    token_pos = torch.arange(value_logits.shape[0]) - seq_offsets[token_game_id]
+    seq_len = counts[token_game_id].clamp_min(1)
+    progress = token_pos.to(torch.float32) / (seq_len.to(torch.float32) - 1.0).clamp_min(1.0)
+    valid_mask = batch["target_move_id"].to(dtype=torch.long) != config.ignore_index
+    value_weights = progress.pow(config.value_weight_alpha) * valid_mask.to(torch.float32)
+    expected = (expected_per_token * value_weights).sum() / value_weights.sum().clamp_min(1.0)
+
+    assert torch.allclose(out["value_loss"], expected, atol=1e-6, rtol=1e-6)
+
+    # Sanity: without smoothing (eps=0) the loss must differ, proving the
+    # smoothing transform actually has an effect (not a no-op formula).
+    config_unsmoothed = HSTUChessConfig(
+        move_vocab_size=128,
+        model_dim=64,
+        linear_hidden_dim=16,
+        attention_dim=16,
+        num_heads=2,
+        num_layers=0,
+        max_position_embeddings=32,
+        enable_value_head=True,
+        value_loss_weight=0.1,
+        value_label_smoothing=0.0,
+    )
+    torch.manual_seed(0)
+    model_unsmoothed = HSTUChessModel(config_unsmoothed)
+    torch.manual_seed(0)
+    model_smoothed = HSTUChessModel(config)
+    out_unsmoothed = model_unsmoothed(batch, return_loss=True)
+    out_smoothed = model_smoothed(batch, return_loss=True)
+    assert not torch.allclose(out_unsmoothed["value_loss"], out_smoothed["value_loss"])
+
+
+def test_hstu_chess_model_value_loss_without_rollout_keys_unchanged():
+    # Regression: a batch entirely lacking the two optional keys must behave
+    # exactly as before this change.
+    config = HSTUChessConfig(
+        move_vocab_size=128,
+        model_dim=64,
+        linear_hidden_dim=16,
+        attention_dim=16,
+        num_heads=2,
+        num_layers=0,
+        max_position_embeddings=32,
+        enable_value_head=True,
+        value_loss_weight=0.1,
+    )
+    torch.manual_seed(0)
+    model_a = HSTUChessModel(config)
+    torch.manual_seed(0)
+    model_b = HSTUChessModel(config)
+    batch = _batch()
+
+    # Reseed immediately before each forward so the two calls draw identical
+    # dropout masks; without this, model_a's forward advances the global RNG
+    # and model_b's forward would (legitimately, for unrelated reasons) see a
+    # different dropout stream even though both models have identical
+    # weights. That would confound the invariant under test.
+    torch.manual_seed(1)
+    out_a = model_a(batch, return_loss=True)
+    torch.manual_seed(1)
+    out_b = model_b(batch, return_loss=True)
+    assert torch.allclose(out_a["value_loss"], out_b["value_loss"], atol=1e-12)

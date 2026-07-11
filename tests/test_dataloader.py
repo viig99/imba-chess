@@ -130,3 +130,58 @@ def test_build_event_dataloader_bos_rows_match_num_games_and_targets():
     assert torch.all(prev_move_id[bos_positions] == vocab.start_id)
     assert torch.all(target_move_id[bos_positions] == TARGET_IGNORE_INDEX)
     assert torch.all(target_move_id[seq_token_id != BOS_TOKEN_ID] != TARGET_IGNORE_INDEX)
+
+
+def test_build_event_dataloader_threads_rollout_lookup_into_event_builder():
+    from imba_chess.data.rollout_store import RolloutRow
+
+    games = [_game("g1", "e2e4", "e7e5")]
+    vocab = MoveVocab.build_from_games(games)
+    dataset = DummyLichessDataset(games)
+    rollout_row = RolloutRow(
+        game_id="g1",
+        ply=0,
+        human_move_uci="e2e4",
+        human_move_backed_value=0.2,
+        real_outcome_stm=1,
+        best_arm_move_uci="e2e4",
+        best_arm_backed_value=0.6,
+        root_wdl_unsearched=(0.2, 0.3, 0.5),
+        arm_move_uci=("e2e4",),
+        arm_backed_value=(0.6,),
+        arm_evals_spent=(50,),
+        arm_log_prior=(-0.1,),
+        search_budget=256,
+        search_top_m=1,
+        search_max_depth=4,
+        checkpoint="dummy.pt",
+    )
+
+    loader = build_event_dataloader(
+        lichess_dataset=dataset,
+        config=RepoConfig(dataloader=DataloaderConfig(max_tokens_per_batch=1024)),
+        move_vocab=vocab,
+        rollout_lookup={("g1", 0): rollout_row},
+        rollout_beta=1.0,
+    )
+
+    batch = next(iter(loader))
+    assert "value_target_soft" in batch
+    assert "has_rollout_value_target" in batch
+    assert bool(batch["has_rollout_value_target"][1].item()) is True
+
+
+def test_build_event_dataloader_without_rollout_lookup_omits_fields():
+    games = [_game("g1", "e2e4", "e7e5")]
+    vocab = MoveVocab.build_from_games(games)
+    dataset = DummyLichessDataset(games)
+
+    loader = build_event_dataloader(
+        lichess_dataset=dataset,
+        config=RepoConfig(dataloader=DataloaderConfig(max_tokens_per_batch=1024)),
+        move_vocab=vocab,
+    )
+
+    batch = next(iter(loader))
+    assert "value_target_soft" not in batch
+    assert "has_rollout_value_target" not in batch

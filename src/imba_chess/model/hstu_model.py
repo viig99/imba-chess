@@ -442,6 +442,30 @@ class HSTUChessModel(nn.Module):
                     reduction="none",
                     label_smoothing=self.config.value_label_smoothing,
                 )
+
+                has_rollout_value_target = batch.get("has_rollout_value_target")
+                value_target_soft = batch.get("value_target_soft")
+                if has_rollout_value_target is not None and value_target_soft is not None:
+                    rollout_mask = has_rollout_value_target.to(
+                        device=policy_logits.device, dtype=torch.bool
+                    )
+                    if bool(rollout_mask.any()):
+                        soft_targets = value_target_soft.to(
+                            device=policy_logits.device, dtype=torch.float32
+                        )
+                        value_eps = self.config.value_label_smoothing
+                        if value_eps > 0.0:
+                            num_value_classes = soft_targets.shape[-1]
+                            soft_targets = (
+                                1.0 - value_eps
+                            ) * soft_targets + value_eps / num_value_classes
+                        per_token_soft_loss = -(
+                            soft_targets * F.log_softmax(value_logits.float(), dim=-1)
+                        ).sum(dim=-1)
+                        per_token_value_loss = torch.where(
+                            rollout_mask, per_token_soft_loss, per_token_value_loss
+                        )
+
                 value_loss_sum = (per_token_value_loss * value_weights).sum()
                 value_weight_sum = value_weights.sum().clamp_min(1.0)
                 value_loss = value_loss_sum / value_weight_sum

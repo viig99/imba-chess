@@ -7,6 +7,7 @@ from .metrics import (
     NextMoveTopKAccuracy,
     normalize_topk,
 )
+from .position_evaluator import CachedPositionEvaluator, load_hstu_checkpoint
 
 try:  # pragma: no cover - optional runtime dependency
     from .ignite_evaluator import create_next_move_evaluator
@@ -22,4 +23,6 @@ __all__ = [
     "NextMoveTokenCount",
     "BatchCount",
     "GameCount",
+    "CachedPositionEvaluator",
+    "load_hstu_checkpoint",
 ]

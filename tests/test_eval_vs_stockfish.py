@@ -257,7 +257,7 @@ def test_load_model_fails_fast_when_value_rerank_requested_without_value_head(
     with pytest.raises(
         ValueError, match="requires a checkpoint with value_head parameters"
     ):
-        module._load_model(
+        module.load_hstu_checkpoint(
             checkpoint_path=checkpoint_path,
             repo_config=repo_config,
             move_vocab=move_vocab,

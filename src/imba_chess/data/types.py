@@ -3,7 +3,12 @@ from __future__ import annotations
 from typing import Any, TypedDict
 
 
-class EventSequence(TypedDict):
+class _RolloutEventFields(TypedDict, total=False):
+    value_target_soft: list[list[float]]
+    has_rollout_value_target: list[int]
+
+
+class EventSequence(_RolloutEventFields):
     game_id: str
     game_result_white: int
     seq_token_id: list[int]
@@ -18,7 +23,12 @@ class EventSequence(TypedDict):
     played_by_elo: list[int]
 
 
-class JaggedBatch(TypedDict):
+class _RolloutJaggedFields(TypedDict, total=False):
+    value_target_soft: Any
+    has_rollout_value_target: Any
+
+
+class JaggedBatch(_RolloutJaggedFields):
     game_id: list[str]
     game_result_white: Any
     num_games: int
