@@ -1,6 +1,9 @@
+import pytest
+
 from imba_chess.data.event_builder import BOS_TOKEN_ID, EventBuilder, TARGET_IGNORE_INDEX
 from imba_chess.data.lichess_dataset import LichessDataset
 from imba_chess.data.move_vocab import MoveVocab
+from imba_chess.data.rollout_store import RolloutRow
 
 
 def _row():
@@ -40,3 +43,60 @@ def test_event_builder_builds_bos_plus_plies():
     assert sample["played_by_elo"][0] == 0
     assert len(sample["played_by_elo"]) == len(sample["seq_token_id"])
     assert len(sample["piece_ids"][1]) == 64
+
+
+def test_event_builder_without_rollout_lookup_omits_new_keys():
+    dataset = LichessDataset(min_avg_elo=2000)
+    game = list(dataset.stream_from_rows([_row()]))[0]
+    vocab = MoveVocab.build_from_games([game])
+
+    builder = EventBuilder(vocab)
+    sample = builder.build_game(game)
+
+    assert "value_target_soft" not in sample
+    assert "has_rollout_value_target" not in sample
+
+
+def test_event_builder_with_rollout_lookup_blends_value_target():
+    dataset = LichessDataset(min_avg_elo=2000)
+    game = list(dataset.stream_from_rows([_row()]))[0]
+    vocab = MoveVocab.build_from_games([game])
+    game_id = game["game_id"]
+
+    # Rollout for ply 1 (the second play, token index 2) only.
+    rollout_row = RolloutRow(
+        game_id=game_id,
+        ply=1,
+        human_move_uci=game["plays"][1]["move_uci"],
+        human_move_backed_value=0.2,
+        real_outcome_stm=1,
+        best_arm_move_uci=game["plays"][1]["move_uci"],
+        best_arm_backed_value=0.6,
+        root_wdl_unsearched=(0.2, 0.3, 0.5),
+        arm_move_uci=(game["plays"][1]["move_uci"],),
+        arm_backed_value=(0.6,),
+        arm_evals_spent=(100,),
+        arm_log_prior=(-0.1,),
+        search_budget=256,
+        search_top_m=1,
+        search_max_depth=4,
+        checkpoint="dummy.pt",
+    )
+    lookup = {(game_id, 1): rollout_row}
+
+    builder = EventBuilder(vocab, rollout_lookup=lookup, beta=1.0)
+    sample = builder.build_game(game)
+
+    assert len(sample["value_target_soft"]) == len(sample["seq_token_id"])
+    assert len(sample["has_rollout_value_target"]) == len(sample["seq_token_id"])
+    # Only token 2 (== ply 1) has a rollout row; every other token (BOS at 0,
+    # ply 0 at 1, ply 2 at 3, ply 3 at 4) must be untouched.
+    for token_idx in range(len(sample["seq_token_id"])):
+        if token_idx == 2:
+            continue
+        assert sample["has_rollout_value_target"][token_idx] == 0
+        assert sample["value_target_soft"][token_idx] == [0.0, 0.0, 0.0]
+    # Token 2 == ply 1 gets the blended target (beta=1.0 -> pure searched_vec).
+    assert sample["has_rollout_value_target"][2] == 1
+    assert abs(sum(sample["value_target_soft"][2]) - 1.0) < 1e-9
+    assert sample["value_target_soft"][2][1] == pytest.approx(0.3)
