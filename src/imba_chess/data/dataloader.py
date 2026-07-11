@@ -37,6 +37,8 @@ def build_event_dataloader(
     lichess_dataset: Any,
     config: Optional[RepoConfig] = None,
     move_vocab: Optional[MoveVocab] = None,
+    rollout_lookup: Optional[dict] = None,
+    rollout_beta: float = 0.0,
 ) -> Any:
     if not TORCH_AVAILABLE:  # pragma: no cover
         raise ImportError("torch is required to build DataLoader")
@@ -67,7 +69,9 @@ def build_event_dataloader(
         rank=runtime.dataloader.rank,
         world_size=runtime.dataloader.world_size,
     )
-    event_builder = EventBuilder(resolved_move_vocab)
+    event_builder = EventBuilder(
+        resolved_move_vocab, rollout_lookup=rollout_lookup, beta=rollout_beta
+    )
     event_dataset = ChessEventIterableDataset(game_iterable_dataset, event_builder)
     packed_dataset = MaxTokensJaggedBatchDataset(
         event_dataset=event_dataset,
