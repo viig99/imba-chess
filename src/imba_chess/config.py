@@ -186,6 +186,16 @@ class ValueNetSection:
 
 
 @dataclass(frozen=True)
+class ExpertIterationConfig:
+    # Path to a rollout parquet written by scripts/generate_search_rollouts.py.
+    # Unset (default) => training is byte-identical to today.
+    rollout_path: Optional[str] = None
+    # blend(real_outcome, searched_value; beta). 0 = today's exact target,
+    # 1 = pure searched estimate.
+    beta: float = 0.0
+
+
+@dataclass(frozen=True)
 class RepoConfig:
     dataset: DatasetConfig = field(default_factory=DatasetConfig)
     board_state: BoardStateConfig = field(default_factory=BoardStateConfig)
@@ -197,6 +207,9 @@ class RepoConfig:
         default_factory=EvalVsStockfishConfig
     )
     value_net: ValueNetSection = field(default_factory=ValueNetSection)
+    expert_iteration: ExpertIterationConfig = field(
+        default_factory=ExpertIterationConfig
+    )
 
 
 def load_repo_config(path: str | Path | None = None) -> RepoConfig:
@@ -221,6 +234,9 @@ def load_repo_config(path: str | Path | None = None) -> RepoConfig:
         ),
         value_net=_read_section(
             ValueNetSection, payload.get("value_net", {}), "value_net"
+        ),
+        expert_iteration=_read_section(
+            ExpertIterationConfig, payload.get("expert_iteration", {}), "expert_iteration"
         ),
     )
 

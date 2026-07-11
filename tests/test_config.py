@@ -1,6 +1,6 @@
 import pytest
 
-from imba_chess.config import EvalVsStockfishConfig, load_repo_config
+from imba_chess.config import EvalVsStockfishConfig, RepoConfig, load_repo_config
 
 
 def test_load_repo_config_reads_sections(tmp_path):
@@ -161,3 +161,23 @@ def test_eval_vs_stockfish_value_net_defaults():
     config = EvalVsStockfishConfig()
     assert config.value_net_checkpoint is None
     assert config.value_net_alpha == 1.0
+
+
+def test_expert_iteration_config_defaults():
+    config = RepoConfig()
+    assert config.expert_iteration.rollout_path is None
+    assert config.expert_iteration.beta == 0.0
+
+
+def test_load_repo_config_reads_expert_iteration_section(tmp_path):
+    config_path = tmp_path / "config.toml"
+    config_path.write_text(
+        """
+[expert_iteration]
+rollout_path = "artifacts/rollouts/ckpt23.parquet"
+beta = 0.3
+"""
+    )
+    config = load_repo_config(config_path)
+    assert config.expert_iteration.rollout_path == "artifacts/rollouts/ckpt23.parquet"
+    assert config.expert_iteration.beta == 0.3
