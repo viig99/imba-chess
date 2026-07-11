@@ -2,34 +2,25 @@
 from __future__ import annotations
 
 import argparse
-import contextlib
 import json
 import random
-from dataclasses import dataclass, replace
+from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any
 
 import chess
 import chess.engine
 import chess.pgn
 import torch
-import torch.nn.functional as F
 
 from imba_chess.config import DEFAULT_CONFIG_PATH, RepoConfig, load_repo_config
 from imba_chess.data.board_state import BoardStateEncoder
-from imba_chess.data.event_builder import (
-    BOS_TOKEN_ID,
-    EVENT_TOKEN_ID,
-    TARGET_IGNORE_INDEX,
-)
 from imba_chess.data.move_vocab import MoveVocab, load_or_create_static_move_vocab
 from imba_chess.eval.game_animation import render_game_html
 from imba_chess.eval.position_evaluator import (
     CachedPositionEvaluator,
-    _CachedNode,
     _SequenceHistory,
     _forward_model,
-    _is_power_of_two,
     _project_legal_logits,
     _value_scalar_from_logits,
     load_hstu_checkpoint,
@@ -42,16 +33,8 @@ from imba_chess.eval.search import (
     select_value_search_d2,
     select_value_search_halving,
 )
-from imba_chess.model import (
-    HSTUChessModel,
-    build_hstu_chess_config,
-    create_batch_block_mask,
-)
 from imba_chess.model.value_net import ValueNet, ValueNetConfig
 from tqdm.auto import tqdm
-
-# Backward compatibility alias for tests
-_load_model = load_hstu_checkpoint
 
 
 @dataclass

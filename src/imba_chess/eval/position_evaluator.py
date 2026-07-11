@@ -3,7 +3,7 @@ from __future__ import annotations
 import contextlib
 from dataclasses import replace
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any
 
 import chess
 import torch
