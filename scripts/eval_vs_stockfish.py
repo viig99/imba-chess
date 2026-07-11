@@ -282,7 +282,7 @@ def _select_model_move(
     value_rerank_top_k: int,
     value_rerank_lambda: float,
     debug_topk: int = 0,
-    halving_config: Optional[HalvingConfig] = None,
+    halving_config: HalvingConfig | None = None,
     value_net=None,
     value_net_alpha: float = 1.0,
 ) -> tuple[chess.Move, dict[str, Any]]:

@@ -453,6 +453,12 @@ class HSTUChessModel(nn.Module):
                         soft_targets = value_target_soft.to(
                             device=policy_logits.device, dtype=torch.float32
                         )
+                        value_eps = self.config.value_label_smoothing
+                        if value_eps > 0.0:
+                            num_value_classes = soft_targets.shape[-1]
+                            soft_targets = (
+                                1.0 - value_eps
+                            ) * soft_targets + value_eps / num_value_classes
                         per_token_soft_loss = -(
                             soft_targets * F.log_softmax(value_logits.float(), dim=-1)
                         ).sum(dim=-1)
