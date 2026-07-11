@@ -17,6 +17,7 @@ from .move_vocab import (
 from .packing import MaxTokensJaggedBatchDataset
 from .torch_iterable import TorchLichessIterableDataset
 from .types import EventSequence, JaggedBatch
+from .value_target_blend import compute_blended_value_target
 
 __all__ = [
     "build_event_dataloader",
@@ -37,4 +38,5 @@ __all__ = [
     "BoardTokenConfig",
     "BoardState",
     "TorchLichessIterableDataset",
+    "compute_blended_value_target",
 ]
