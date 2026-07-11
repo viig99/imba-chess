@@ -231,6 +231,18 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--search-refutation-top-r", type=int, default=None)
     parser.add_argument("--search-expand-top", type=int, default=None)
     parser.add_argument("--search-lam", type=float, default=None)
+    parser.add_argument(
+        "--shard-id",
+        type=int,
+        default=None,
+        help="This process's shard index, for running N parallel processes "
+        "over disjoint game files. Requires --num-shards. Sharding happens "
+        "at the parquet-file level (LichessDataset._shard_data_files), so "
+        "the achievable parallelism is capped by how many source files "
+        "cover the requested month range -- a single-month window with few "
+        "underlying files won't split evenly across many shards.",
+    )
+    parser.add_argument("--num-shards", type=int, default=None)
     return parser.parse_args()
 
 
@@ -294,9 +306,13 @@ def main() -> None:
         board_state_config=repo_config.board_state,
     )
 
+    if (args.shard_id is None) != (args.num_shards is None):
+        raise ValueError("--shard-id and --num-shards must both be set or both be None")
+
     all_rows: list[RolloutRow] = []
     games_processed = 0
-    for game in tqdm(lichess_dataset.stream(), desc="rollout-generation", unit="game"):
+    game_stream = lichess_dataset.stream(shard_id=args.shard_id, num_shards=args.num_shards)
+    for game in tqdm(game_stream, desc="rollout-generation", unit="game"):
         rows = _process_game(
             game,
             model=model,
