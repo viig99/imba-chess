@@ -230,6 +230,7 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--halving-rounds", type=int, default=None)
     parser.add_argument("--search-refutation-top-r", type=int, default=None)
     parser.add_argument("--search-expand-top", type=int, default=None)
+    parser.add_argument("--search-lam", type=float, default=None)
     return parser.parse_args()
 
 
@@ -276,6 +277,7 @@ def main() -> None:
         max_depth=int(
             args.search_max_depth if args.search_max_depth is not None else eval_cfg.search_max_depth
         ),
+        lam=float(args.search_lam if args.search_lam is not None else eval_cfg.value_rerank_lambda),
     )
 
     dataset_cfg = repo_config.dataset
