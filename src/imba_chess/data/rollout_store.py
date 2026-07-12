@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -74,7 +75,13 @@ def write_rollout_parquet(rows: list[RolloutRow], path: str | Path) -> None:
     output_path = Path(path)
     output_path.parent.mkdir(parents=True, exist_ok=True)
     table = pa.Table.from_pylist([_row_to_record(row) for row in rows], schema=_ROLLOUT_SCHEMA)
-    pq.write_table(table, output_path)
+    # Write to a sibling temp file then atomically rename into place, so a
+    # process killed mid-write (e.g. a scheduled overnight stop) can never
+    # leave a truncated/corrupt file at `output_path` -- callers always see
+    # either the previous complete write or the new one, never a partial one.
+    tmp_path = output_path.with_suffix(output_path.suffix + ".tmp")
+    pq.write_table(table, tmp_path)
+    os.replace(tmp_path, output_path)
 
 
 def load_rollout_lookup(path: str | Path) -> dict[tuple[str, int], RolloutRow]:

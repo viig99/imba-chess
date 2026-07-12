@@ -14,6 +14,8 @@ Usage: python scripts/generate_search_rollouts.py --checkpoint <path> --output-p
 from __future__ import annotations
 
 import argparse
+import json
+import os
 import random
 from pathlib import Path
 
@@ -36,6 +38,32 @@ from imba_chess.eval.position_evaluator import (
 from imba_chess.eval.search import HalvingConfig, select_value_search_halving
 
 _RESULT_TO_WHITE_OUTCOME = {"1-0": 1, "0-1": -1, "1/2-1/2": 0}
+
+
+def _progress_sidecar_path(output_path: Path) -> Path:
+    return output_path.with_suffix(output_path.suffix + ".progress.json")
+
+
+def _write_progress_sidecar(
+    output_path: Path, *, games_skipped: int, games_processed: int, rows: int
+) -> None:
+    """Atomically records exactly how far this run got.
+
+    A process killed mid-run (e.g. a scheduled overnight stop) never gets to
+    print or return its final summary -- external tooling that needs to know
+    the correct --skip-games value for the next session reads this file
+    instead of parsing logs or the process's exit state.
+    """
+    payload = {
+        "games_skipped": games_skipped,
+        "games_processed": games_processed,
+        "total_games_covered": games_skipped + games_processed,
+        "rows": rows,
+    }
+    sidecar_path = _progress_sidecar_path(output_path)
+    tmp_path = sidecar_path.with_suffix(sidecar_path.suffix + ".tmp")
+    tmp_path.write_text(json.dumps(payload))
+    os.replace(tmp_path, sidecar_path)
 
 
 def _result_to_white_outcome(result: str) -> int:
@@ -359,6 +387,12 @@ def main() -> None:
             and games_processed % args.flush_every_games == 0
         ):
             write_rollout_parquet(all_rows, args.output_path)
+            _write_progress_sidecar(
+                args.output_path,
+                games_skipped=games_skipped,
+                games_processed=games_processed,
+                rows=len(all_rows),
+            )
             tqdm.write(
                 f"[checkpoint] flushed {len(all_rows)} rollout rows from "
                 f"{games_processed} games to {args.output_path}"
@@ -367,6 +401,12 @@ def main() -> None:
             break
 
     write_rollout_parquet(all_rows, args.output_path)
+    _write_progress_sidecar(
+        args.output_path,
+        games_skipped=games_skipped,
+        games_processed=games_processed,
+        rows=len(all_rows),
+    )
     print(
         f"wrote {len(all_rows)} rollout rows from {games_processed} games "
         f"(skipped {games_skipped}) to {args.output_path}"
