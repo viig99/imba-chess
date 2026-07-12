@@ -243,6 +243,25 @@ def _parse_args() -> argparse.Namespace:
         "underlying files won't split evenly across many shards.",
     )
     parser.add_argument("--num-shards", type=int, default=None)
+    parser.add_argument(
+        "--skip-games",
+        type=int,
+        default=0,
+        help="Skip this many games at the front of the (deterministic, "
+        "unshuffled) stream before recording rollouts -- lets a later "
+        "invocation continue past games an earlier one already covered, "
+        "e.g. for a multi-session run stopped and resumed across days.",
+    )
+    parser.add_argument(
+        "--flush-every-games",
+        type=int,
+        default=200,
+        help="Write accumulated rows to --output-path every N processed "
+        "games, not just once at the end -- so a kill mid-run (e.g. "
+        "stopping an overnight session) only loses games since the last "
+        "flush, not the whole run. Set to 0 to disable and write once at "
+        "the end (the old behavior).",
+    )
     return parser.parse_args()
 
 
@@ -311,8 +330,16 @@ def main() -> None:
 
     all_rows: list[RolloutRow] = []
     games_processed = 0
+    games_skipped = 0
     game_stream = lichess_dataset.stream(shard_id=args.shard_id, num_shards=args.num_shards)
     for game in tqdm(game_stream, desc="rollout-generation", unit="game"):
+        if games_skipped < args.skip_games:
+            # Cheap skip: never calls _process_game (the expensive search
+            # path), so resuming past already-covered games is fast rather
+            # than re-running search on them just to discard the result.
+            games_skipped += 1
+            continue
+
         rows = _process_game(
             game,
             model=model,
@@ -327,12 +354,22 @@ def main() -> None:
         )
         all_rows.extend(rows)
         games_processed += 1
+        if (
+            args.flush_every_games > 0
+            and games_processed % args.flush_every_games == 0
+        ):
+            write_rollout_parquet(all_rows, args.output_path)
+            tqdm.write(
+                f"[checkpoint] flushed {len(all_rows)} rollout rows from "
+                f"{games_processed} games to {args.output_path}"
+            )
         if args.max_games is not None and games_processed >= args.max_games:
             break
 
     write_rollout_parquet(all_rows, args.output_path)
     print(
-        f"wrote {len(all_rows)} rollout rows from {games_processed} games to {args.output_path}"
+        f"wrote {len(all_rows)} rollout rows from {games_processed} games "
+        f"(skipped {games_skipped}) to {args.output_path}"
     )
 
 
