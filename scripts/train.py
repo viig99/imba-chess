@@ -78,6 +78,18 @@ def parse_args() -> argparse.Namespace:
         default=None,
         help="Optional cap for eval iterations per run.",
     )
+    parser.add_argument(
+        "--max-steps",
+        type=int,
+        default=None,
+        help=(
+            "Stop training after this many additional iterations past the "
+            "--resume checkpoint's iteration (or from 0 if not resuming), "
+            "saving a final checkpoint at that exact step. Does not affect "
+            "the OneCycleLR schedule, which still spans "
+            "training.epochs * training.steps_per_epoch."
+        ),
+    )
     return parser.parse_args()
 
 
@@ -694,6 +706,29 @@ def main() -> None:
         ),
         last_ckpt_handler,
     )
+
+    if args.max_steps is not None:
+        stop_at_iteration = int(getattr(trainer.state, "iteration", 0)) + int(
+            args.max_steps
+        )
+
+        @trainer.on(Events.ITERATION_COMPLETED)
+        def _stop_after_max_steps(engine: Engine) -> None:
+            if engine.state.iteration >= stop_at_iteration:
+                # Force a checkpoint at the exact requested stop point --
+                # save_last_every_steps may not divide max_steps evenly, and
+                # a wall-clock `timeout` kill (the previous stopping
+                # mechanism) could leave the last checkpoint several steps
+                # short of what was actually requested. Skip the redundant
+                # call when the periodic handler already saved this exact
+                # iteration: calling `last_ckpt_handler` twice in the same
+                # ITERATION_COMPLETED dispatch corrupts `engine.last_event_name`
+                # (the first call's internal SAVED_CHECKPOINT fire overwrites
+                # it), crashing the second call's global_step lookup.
+                save_every = int(repo_config.training.save_last_every_steps)
+                if engine.state.iteration % save_every != 0:
+                    last_ckpt_handler(engine)
+                engine.terminate()
 
     @trainer.on(Events.ITERATION_COMPLETED(every=repo_config.training.eval_every_steps))
     def _run_periodic_fast_evals(engine: Engine) -> None:
