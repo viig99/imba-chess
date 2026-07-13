@@ -21,7 +21,7 @@ Inspiration:
 - Ignite-based training loop (StableAdamW + OneCycleLR, mixed precision, periodic fast val/test + periodic full val, TensorBoard logging, best/last checkpointing).
 - Head-to-head engine evaluation (`scripts/eval_vs_stockfish.py`) with pluggable value-guided search at inference (`src/imba_chess/eval/search.py`): depth-2 minimax and budgeted sequential-halving tree search (MCTS-lite).
 - Per-game PGN + self-contained HTML replay viewer (board animation, clickable move list) for traced eval games.
-- Standalone Stockfish-distilled value network (`src/imba_chess/model/value_net.py` + `scripts/train_value_net.py`), blendable into search at eval time.
+- Search-backed rollout generation (`scripts/generate_search_rollouts.py`) for Expert-Iteration-style value-target distillation experiments.
 
 ## Data and training flow
 
@@ -62,30 +62,9 @@ When `[model].enable_value_head = true`, a 3-class MLP head (`Linear → SiLU �
 - The same Elo weighting as the policy loss (`elo_loss_weight_strength` > 0) also scales the value loss: stronger players' outcomes are lower-noise value labels (they convert winning positions more reliably), so their tokens pull the value gradient harder.
 - 3-class classification is deliberate (rather than a scalar regression head): win/draw/loss outcomes are genuinely 3-modal — a scalar `0.0` cannot distinguish "certain draw" from "unclear, 50/50 win-or-lose" — and cross-entropy on categories optimizes better than MSE on a bounded scalar. A scalar is recovered at inference as `v = p(win) - p(loss)` in `[-1, 1]`.
 
-Known limitation: game outcomes are high-variance Monte-Carlo labels (a winning position that the player later threw away gets labeled "loss"). The separate value net below addresses this at inference time; the trunk itself still trains on outcome labels.
+Known limitation: game outcomes are high-variance Monte-Carlo labels (a winning position that the player later threw away gets labeled "loss"). `value_weight_alpha` (recency discount on early/mid-game positions, where this noise is worst) is the main lever tuned so far — see `docs/superpowers/notes/2026-07-12-value-tuning-and-exit-phase1a-review.md`. A standalone Stockfish-distilled value net was tried as a second opinion blended in at inference; removed after an audit found it had never actually been wired into any shipped config (trained, but a silent no-op in practice) — see that same note for what superseded it (search-backed rollout distillation, also not yet a net win).
 
 Training logs include `total_loss`, `policy_loss`, and `value_loss`.
-
-### Standalone value net: Stockfish distillation (separate model)
-
-A second, independent value oracle trained on engine evaluations instead of game outcomes, blended into search at eval time.
-
-`ValueNet` (`src/imba_chess/model/value_net.py`, ~3.5M params) is a **position-only** WDL network: the same joint (piece, square) embedding and `BoardSquareEncoder` body as the big model (256d × 6 layers over the 64 squares), with turn/castling/en-passant features broadcast-added to the square tokens. It sees no game history and no clocks — deliberately, so it exactly matches its training data and has zero train/serve skew.
-
-Training data is `Lichess/chess-position-evaluations` (388M Stockfish-evaluated FENs, CC0, Hugging Face). Each row's centipawn eval becomes a soft win/draw/loss target via Stockfish 17's own `win_rate_model` polynomial (value under strong play — deliberately *not* calibrated to human outcomes); mate-in-N rows get near-saturated targets. Evals are White-POV in the source and flipped to side-to-move POV. A deterministic FEN-hash holdout provides validation.
-
-Three-stage pipeline:
-
-1. **Pretrain the big model** on high-Elo human games (`scripts/train.py`): policy head (imitation) + outcome-value head + moves-left auxiliary.
-2. **Train the value net** on engine evals (`python scripts/train_value_net.py`, config in `[value_net]`) — fully decoupled from stage 1; either side retrains without touching the other. Plain supervised learning: flat batches, soft cross-entropy, StableAdamW + OneCycle; best/last checkpoints in `artifacts/value_net/` selected by held-out soft-CE; auto-resumes from `value_net_last.pt` (`--fresh` to opt out).
-3. **Blend at search time**: with `--value-net-checkpoint` (or config), every search evaluation becomes `value = (1 − α) · model_value_head + α · value_net`. `--value-net-alpha` sets α (0 = pure model head, 1 = pure net; **0.25 is the measured best** — see Results). Both knobs land in the output JSON's `run_config.value_net`; with no checkpoint configured, eval behavior is unchanged; terminal positions keep their exact values regardless. `sweep_value_net_alpha.sh` loops an α grid with collision-free tags and prints a summary table.
-
-Training recipe (field-tested):
-
-- **Download the data once instead of streaming**: set `HF_TOKEN` (unauthenticated hub requests are rate-limited), `hf download Lichess/chess-position-evaluations --repo-type dataset --local-dir <dir>`, then point `[value_net] dataset_name` at that directory.
-- The val slice is built once (a few-minute scan with a progress bar) and cached to `artifacts/value_net/val_slice.pt`; the cache key includes the data/batch config, so changing those triggers one rebuild.
-- Sample prep is CPU-bound (~24k rows/s per worker); raise `[value_net] num_workers` if the GPU is starved — useful workers cap at the dataset's file count (20; the loader auto-splits files across workers).
-- A ~3.5M net can't saturate a big GPU at batch 1024 (per-step Python overhead dominates) — use large batches. Scaling batch N×: scale `max_lr` by ~√N and divide `train_steps` by N to keep the sample budget fixed. Reference: batch 6144, `max_lr 7e-4`, ~27k samples/s on a 24 GB card ⇒ one ~200M-sample epoch in ~2 h.
 
 ## Evaluation during training
 
@@ -154,12 +133,11 @@ python scripts/eval_vs_stockfish.py \
   --checkpoint artifacts/checkpoints/best_hr10_*.pt \
   --games 1000 --output-json artifacts/eval/stockfish_eval.json
 
-# Halving search + value-net blend vs Elo-limited Stockfish
+# Halving search vs Elo-limited Stockfish
 python scripts/eval_vs_stockfish.py \
   --checkpoint artifacts/checkpoints/best_hr10_*.pt \
   --model-move-policy value_search_halving \
   --search-budget 1024 --search-max-depth 6 \
-  --value-net-checkpoint artifacts/value_net/value_net_best.pt --value-net-alpha 0.25 \
   --stockfish-limit-strength --stockfish-elo 2000 --games 100
 
 # Ladder across several Stockfish levels
@@ -169,11 +147,11 @@ python scripts/eval_vs_stockfish.py \
   --include-full-strength-segment --output-json artifacts/eval/stockfish_ladder.json
 ```
 
-Wrappers: `POLICIES="value_search_halving" ELO=1800 TAG=mytag ./eval_best_checkpoint.sh [flags...]` picks the best hr@10 checkpoint, runs 100 games, writes JSON + replays, and skips already-existing outputs; `sweep_value_net_alpha.sh` runs an α grid and prints a summary table. Reports include W/D/L with color split, completed/incomplete games, average game length, score rate, and legal-move vocab coverage (per-segment + aggregate in ladder mode).
+Wrappers: `POLICIES="value_search_halving" ELO=1800 TAG=mytag ./eval_best_checkpoint.sh [flags...]` picks the best hr@10 checkpoint, runs 100 games, writes JSON + replays, and skips already-existing outputs. Reports include W/D/L with color split, completed/incomplete games, average game length, score rate, and legal-move vocab coverage (per-segment + aggregate in ladder mode).
 
 ## Results vs Stockfish
 
-Protocol: 100 games per configuration, seed 42, colors alternating, Stockfish at 0.05s/move with `UCI_Elo` per rung. Score = (wins + 0.5 × draws) / games; ±~0.05 SE at 100 games. "Net α" = the distilled value net blended at that α; model v3 = 512d × 6L (~10M), v4 = 768d × 8L (~27M, `value_loss_weight` 1.0). Full per-run diaries, color splits, and period interpretations: `docs/superpowers/notes/2026-07-06-eval-log-archive.md`.
+Protocol: 100 games per configuration, seed 42, colors alternating, Stockfish at 0.05s/move with `UCI_Elo` per rung. Score = (wins + 0.5 × draws) / games; ±~0.05 SE at 100 games. "Net α" = the distilled value net blended at that α (**historical**: this feature was later removed as dead code, see Current limitations — rows referencing it are not reproducible against current code); model v3 = 512d × 6L (~10M), v4 = 768d × 8L (~27M, `value_loss_weight` 1.0). Full per-run diaries, color splits, and period interpretations: `docs/superpowers/notes/2026-07-06-eval-log-archive.md`.
 
 | Opponent | Move selection | Model | W / D / L | Score |
 |---|---|---|---|---|
@@ -220,8 +198,8 @@ All runtime settings are in `config/imba_chess.toml`:
 - `[dataloader]` max tokens per jagged batch, workers
 - `[model]` HSTU dimensions/layers + label smoothing + Elo loss weighting + value head knobs
 - `[training]` optimizer/scheduler/eval cadence/checkpointing/device/precision
-- `[eval_vs_stockfish]` engine path/limits, ladder settings, move-selection policy and knobs, value-net blend, debug controls
-- `[value_net]` standalone value net dims, data filters, and trainer settings
+- `[eval_vs_stockfish]` engine path/limits, ladder settings, move-selection policy and knobs, debug controls
+- `[expert_iteration]` rollout parquet path and value-target blend weight (`beta`) for search-backed distillation experiments
 
 ## Quickstart
 
@@ -255,7 +233,7 @@ uv run --python .venv/bin/python --with pytest pytest -q
 - Training is single-process (no end-to-end DDP launcher yet).
 - No legal-move masking in the prediction head during training (full-vocab classification); legality is enforced at inference.
 - Prefix K/V caching is per-turn only: the cache is rebuilt each model turn (no cross-turn reuse) and games are played sequentially (no cross-game batching).
-- The big model's value labels are raw game outcomes (noisy); the standalone value net mitigates this at inference, but the trunk itself still trains on outcome labels.
+- The big model's value labels are raw game outcomes (noisy). A standalone Stockfish-distilled value net previously mitigated this at inference (see "Results vs Stockfish" below for its historical numbers) but was removed as dead code — it had never been wired into any shipped config. Search-backed value distillation (ExIt Phase 1a) was tried as a replacement approach and is not yet a net win; see `docs/superpowers/notes/2026-07-12-value-tuning-and-exit-phase1a-review.md`.
 - Checkpoints trained before the placement-aware board encoding / 1,970-token vocab are incompatible with current code (check out an older commit to evaluate them; keep a copy of the old `[model]` block and pass `--config` when evaluating old checkpoints after architecture changes).
 
 ## References
@@ -266,3 +244,4 @@ uv run --python .venv/bin/python --with pytest pytest -q
 - `FEN_TO_BOARD_STATE.md` for board-state encoding details.
 - `VALUE_HEAD_OPTIONS.md` for value-head design notes.
 - `docs/superpowers/notes/2026-07-06-eval-log-archive.md` for the full eval diaries, per-color splits, and superseded usage examples.
+- `docs/superpowers/notes/2026-07-12-value-tuning-and-exit-phase1a-review.md` for the `value_weight_alpha` tuning methodology, why search-backed value distillation (ExIt Phase 1a) hasn't paid off yet (with literature review), the visit-adaptive search-lambda experiment and its revert, and the staged plan going forward.
