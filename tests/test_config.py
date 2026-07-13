@@ -126,7 +126,6 @@ def test_eval_vs_stockfish_search_knob_defaults():
     assert config.search_refutation_top_r == 2
     assert config.search_expand_top == 3
     assert config.search_max_depth == 4
-    assert config.search_c_visit is None
 
 
 def test_expert_iteration_config_defaults():

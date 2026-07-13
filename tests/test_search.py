@@ -186,63 +186,6 @@ def test_mate_in_one_short_circuits_with_zero_evals():
     assert len(rows) == 1 and rows[0]["search_score"] == 1.0
 
 
-def test_c_visit_none_leaves_lam_fixed_regardless_of_evals_spent():
-    # Regression: the default (c_visit=None) must reproduce today's exact
-    # fixed-lam scoring, so a "surprising" (low-prior) arm with a small value
-    # edge still loses to a "safe" (high-prior) arm with a small value deficit.
-    board = chess.Board()
-    legal_moves = [chess.Move.from_uci("e2e4"), chess.Move.from_uci("d2d4")]
-    legal_log_priors = [-1.0, -0.1]
-    evaluator = _ArmValueEvaluator({"e2e4": 0.5, "d2d4": 0.45})
-    config = HalvingConfig(budget=80, top_m=2, rounds=2, lam=0.1, c_visit=None)
-
-    chosen, rows = select_value_search_halving(
-        evaluator=evaluator,
-        root_handle=(),
-        board=board,
-        legal_moves=legal_moves,
-        legal_log_priors=legal_log_priors,
-        config=config,
-    )
-
-    assert legal_moves[chosen].uci() == "d2d4"
-    by_move = {row["move_uci"]: row for row in rows}
-    assert by_move["e2e4"]["evals_spent"] >= 15  # enough evals to matter, if adaptive
-    expected_e4_score = 0.5 + 0.1 * (-1.0)
-    expected_d4_score = 0.45 + 0.1 * (-0.1)
-    assert math.isclose(by_move["e2e4"]["search_score"], expected_e4_score, abs_tol=1e-9)
-    assert math.isclose(by_move["d2d4"]["search_score"], expected_d4_score, abs_tol=1e-9)
-
-
-def test_c_visit_lets_evidenced_low_prior_arm_overturn_fixed_lam_result():
-    # Same value/prior setup as above, but with c_visit set: once an arm has
-    # accumulated enough evals_spent, the prior's tiebreak weight shrinks
-    # enough that the low-prior arm's small value edge now wins instead.
-    board = chess.Board()
-    legal_moves = [chess.Move.from_uci("e2e4"), chess.Move.from_uci("d2d4")]
-    legal_log_priors = [-1.0, -0.1]
-    evaluator = _ArmValueEvaluator({"e2e4": 0.5, "d2d4": 0.45})
-    config = HalvingConfig(budget=80, top_m=2, rounds=2, lam=0.1, c_visit=10.0)
-
-    chosen, rows = select_value_search_halving(
-        evaluator=evaluator,
-        root_handle=(),
-        board=board,
-        legal_moves=legal_moves,
-        legal_log_priors=legal_log_priors,
-        config=config,
-    )
-
-    assert legal_moves[chosen].uci() == "e2e4"
-    by_move = {row["move_uci"]: row for row in rows}
-    evals_spent = by_move["e2e4"]["evals_spent"]
-    assert evals_spent >= 15
-    effective_lam = 0.1 * 10.0 / (10.0 + evals_spent)
-    assert effective_lam < 0.1  # actually shrank from the fixed lam=0.1
-    expected_e4_score = 0.5 + effective_lam * (-1.0)
-    assert math.isclose(by_move["e2e4"]["search_score"], expected_e4_score, abs_tol=1e-9)
-
-
 def test_refutation_floor_catches_low_prior_forcing_refutation():
     # White Qd2, black Nb4. Qd3?? hangs the queen to Nxd3 — a capture the
     # priors rank last. Qh6 is safe. Only the forcing-reply floor finds Nxd3.

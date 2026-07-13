@@ -169,14 +169,6 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--search-expand-top", type=int, default=None)
     parser.add_argument("--search-max-depth", type=int, default=None)
     parser.add_argument(
-        "--search-c-visit",
-        type=float,
-        default=None,
-        help="Shrinks value_rerank_lambda's prior weight as an arm's "
-        "evals_spent grows within one search (None = fixed lambda, today's "
-        "behavior).",
-    )
-    parser.add_argument(
         "--opening-random-plies",
         type=int,
         default=None,
@@ -439,7 +431,7 @@ def _summary_to_payload(
     value_rerank_top_k: int,
     value_rerank_lambda: float,
     opening_random_plies: int,
-    search_knobs: dict[str, Any],
+    search_knobs: dict[str, int],
 ) -> dict[str, Any]:
     if summary.completed_games > 0:
         win_rate = summary.wins / summary.completed_games
@@ -994,9 +986,6 @@ def main() -> None:
         if args.search_max_depth is None
         else args.search_max_depth
     )
-    args.search_c_visit = (
-        eval_cfg.search_c_visit if args.search_c_visit is None else args.search_c_visit
-    )
     args.opening_random_plies = int(
         eval_cfg.opening_random_plies
         if args.opening_random_plies is None
@@ -1064,8 +1053,6 @@ def main() -> None:
         raise ValueError("--search-expand-top must be >= 1")
     if args.search_max_depth < 1:
         raise ValueError("--search-max-depth must be >= 1")
-    if args.search_c_visit is not None and args.search_c_visit <= 0.0:
-        raise ValueError("--search-c-visit must be > 0 if set")
     if not args.stockfish_path.exists():
         raise FileNotFoundError(f"Stockfish binary not found: {args.stockfish_path}")
 
@@ -1156,11 +1143,6 @@ def main() -> None:
                     expand_top=int(args.search_expand_top),
                     max_depth=int(args.search_max_depth),
                     lam=float(args.value_rerank_lambda),
-                    c_visit=(
-                        float(args.search_c_visit)
-                        if args.search_c_visit is not None
-                        else None
-                    ),
                 ),
             )
             segment_payload = _summary_to_payload(
@@ -1185,7 +1167,6 @@ def main() -> None:
                     "search_refutation_top_r": int(args.search_refutation_top_r),
                     "search_expand_top": int(args.search_expand_top),
                     "search_max_depth": int(args.search_max_depth),
-                    "search_c_visit": args.search_c_visit,
                 },
             )
             _print_segment_summary(segment_name=spec.name, payload=segment_payload)
