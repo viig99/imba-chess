@@ -13,7 +13,7 @@ import chess.engine
 import chess.pgn
 import torch
 
-from imba_chess.config import DEFAULT_CONFIG_PATH, RepoConfig, load_repo_config
+from imba_chess.config import DEFAULT_CONFIG_PATH, load_repo_config
 from imba_chess.data.board_state import BoardStateEncoder
 from imba_chess.data.move_vocab import MoveVocab, load_or_create_static_move_vocab
 from imba_chess.eval.game_animation import render_game_html
@@ -33,7 +33,6 @@ from imba_chess.eval.search import (
     select_value_search_d2,
     select_value_search_halving,
 )
-from imba_chess.model.value_net import ValueNet, ValueNetConfig
 from tqdm.auto import tqdm
 
 
@@ -169,8 +168,14 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--search-refutation-top-r", type=int, default=None)
     parser.add_argument("--search-expand-top", type=int, default=None)
     parser.add_argument("--search-max-depth", type=int, default=None)
-    parser.add_argument("--value-net-checkpoint", type=Path, default=None)
-    parser.add_argument("--value-net-alpha", type=float, default=None)
+    parser.add_argument(
+        "--search-c-visit",
+        type=float,
+        default=None,
+        help="Shrinks value_rerank_lambda's prior weight as an arm's "
+        "evals_spent grows within one search (None = fixed lambda, today's "
+        "behavior).",
+    )
     parser.add_argument(
         "--opening-random-plies",
         type=int,
@@ -225,23 +230,6 @@ def _resolve_dtype(dtype_arg: str) -> torch.dtype:
     }[dtype_arg]
 
 
-def _load_value_net(path: Path, repo_config: RepoConfig, device: torch.device) -> ValueNet:
-    payload = torch.load(path, map_location="cpu")
-    state_dict = payload.get("model", payload) if isinstance(payload, dict) else payload
-    saved = payload.get("config", {}) if isinstance(payload, dict) else {}
-    vn_cfg = repo_config.value_net
-    net = ValueNet(
-        ValueNetConfig(
-            dim=int(saved.get("dim", vn_cfg.dim)),
-            num_heads=int(saved.get("num_heads", vn_cfg.num_heads)),
-            num_layers=int(saved.get("num_layers", vn_cfg.num_layers)),
-        )
-    ).to(device)
-    net.load_state_dict(state_dict, strict=True)
-    net.eval()
-    return net
-
-
 def _build_engine_limit(args: argparse.Namespace) -> chess.engine.Limit:
     kwargs: dict[str, float | int] = {}
     if args.stockfish_time_sec is not None:
@@ -283,8 +271,6 @@ def _select_model_move(
     value_rerank_lambda: float,
     debug_topk: int = 0,
     halving_config: HalvingConfig | None = None,
-    value_net=None,
-    value_net_alpha: float = 1.0,
 ) -> tuple[chess.Move, dict[str, Any]]:
     output = _forward_model(
         model=model,
@@ -311,8 +297,6 @@ def _select_model_move(
             dtype=dtype,
             prefix_kv=output["kv_caches"],
             prefix_len=int(batch["total_tokens"]),
-            value_net=value_net,
-            value_net_alpha=value_net_alpha,
         )
     rerank_rows: list[dict[str, Any]] = []
     search_rows: list[dict[str, Any]] = []
@@ -455,9 +439,7 @@ def _summary_to_payload(
     value_rerank_top_k: int,
     value_rerank_lambda: float,
     opening_random_plies: int,
-    search_knobs: dict[str, int],
-    value_net_checkpoint: Path | None = None,
-    value_net_alpha: float = 1.0,
+    search_knobs: dict[str, Any],
 ) -> dict[str, Any]:
     if summary.completed_games > 0:
         win_rate = summary.wins / summary.completed_games
@@ -526,10 +508,6 @@ def _summary_to_payload(
             "value_rerank_lambda": float(value_rerank_lambda),
             "opening_random_plies": int(opening_random_plies),
             "search": search_knobs,
-            "value_net": {
-                "checkpoint": str(value_net_checkpoint) if value_net_checkpoint else None,
-                "alpha": value_net_alpha,
-            },
         },
     }
 
@@ -708,8 +686,6 @@ def _run_segment(
     stockfish_label: str,
     save_games_dir: Path | None,
     halving_config: "HalvingConfig | None" = None,
-    value_net=None,
-    value_net_alpha: float = 1.0,
 ) -> EvalSummary:
     summary = EvalSummary()
     with tqdm(
@@ -758,8 +734,6 @@ def _run_segment(
                         value_rerank_lambda=value_rerank_lambda,
                         debug_topk=debug_topk,
                         halving_config=halving_config,
-                        value_net=value_net,
-                        value_net_alpha=value_net_alpha,
                     )
                     summary.model_turns += 1
                     summary.legal_moves_total += int(debug_info["total_legal_moves"])
@@ -1020,15 +994,8 @@ def main() -> None:
         if args.search_max_depth is None
         else args.search_max_depth
     )
-    args.value_net_checkpoint = (
-        eval_cfg.value_net_checkpoint
-        if args.value_net_checkpoint is None
-        else args.value_net_checkpoint
-    )
-    args.value_net_alpha = float(
-        eval_cfg.value_net_alpha
-        if args.value_net_alpha is None
-        else args.value_net_alpha
+    args.search_c_visit = (
+        eval_cfg.search_c_visit if args.search_c_visit is None else args.search_c_visit
     )
     args.opening_random_plies = int(
         eval_cfg.opening_random_plies
@@ -1097,8 +1064,8 @@ def main() -> None:
         raise ValueError("--search-expand-top must be >= 1")
     if args.search_max_depth < 1:
         raise ValueError("--search-max-depth must be >= 1")
-    if not 0.0 <= args.value_net_alpha <= 1.0:
-        raise ValueError("--value-net-alpha must be in [0, 1]")
+    if args.search_c_visit is not None and args.search_c_visit <= 0.0:
+        raise ValueError("--search-c-visit must be > 0 if set")
     if not args.stockfish_path.exists():
         raise FileNotFoundError(f"Stockfish binary not found: {args.stockfish_path}")
 
@@ -1128,13 +1095,6 @@ def main() -> None:
             in {"value_rerank", "value_search_d2", "value_search_halving"}
         ),
     )
-    value_net = (
-        _load_value_net(Path(args.value_net_checkpoint), repo_config, device)
-        if args.value_net_checkpoint
-        else None
-    )
-    if value_net is not None:
-        print(f"  value_net={args.value_net_checkpoint} alpha={args.value_net_alpha}")
     engine_limit = _build_engine_limit(args)
     segment_specs = _build_segment_specs(args)
     print("Running model vs Stockfish")
@@ -1196,9 +1156,12 @@ def main() -> None:
                     expand_top=int(args.search_expand_top),
                     max_depth=int(args.search_max_depth),
                     lam=float(args.value_rerank_lambda),
+                    c_visit=(
+                        float(args.search_c_visit)
+                        if args.search_c_visit is not None
+                        else None
+                    ),
                 ),
-                value_net=value_net,
-                value_net_alpha=float(args.value_net_alpha),
             )
             segment_payload = _summary_to_payload(
                 summary=segment_summary,
@@ -1222,9 +1185,8 @@ def main() -> None:
                     "search_refutation_top_r": int(args.search_refutation_top_r),
                     "search_expand_top": int(args.search_expand_top),
                     "search_max_depth": int(args.search_max_depth),
+                    "search_c_visit": args.search_c_visit,
                 },
-                value_net_checkpoint=args.value_net_checkpoint,
-                value_net_alpha=float(args.value_net_alpha),
             )
             _print_segment_summary(segment_name=spec.name, payload=segment_payload)
             segment_summaries.append(segment_summary)
@@ -1273,8 +1235,6 @@ def main() -> None:
             "search_expand_top": int(args.search_expand_top),
             "search_max_depth": int(args.search_max_depth),
         },
-        value_net_checkpoint=args.value_net_checkpoint,
-        value_net_alpha=float(args.value_net_alpha),
     )
     _print_segment_summary(segment_name="aggregate", payload=aggregate_payload)
 

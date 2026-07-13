@@ -126,41 +126,7 @@ def test_eval_vs_stockfish_search_knob_defaults():
     assert config.search_refutation_top_r == 2
     assert config.search_expand_top == 3
     assert config.search_max_depth == 4
-
-
-def test_value_net_config_defaults():
-    from imba_chess.config import ValueNetSection
-
-    section = ValueNetSection()
-    assert section.dim == 256
-    assert section.num_heads == 4
-    assert section.num_layers == 6
-    assert section.depth_min == 12
-    assert section.batch_size == 1024
-    assert section.checkpoint_dir == "artifacts/value_net"
-
-
-def test_load_repo_config_reads_value_net_section(tmp_path):
-    config_path = tmp_path / "imba_chess.toml"
-    config_path.write_text(
-        """
-[value_net]
-dim = 128
-train_steps = 500
-        """.strip()
-        + "\n",
-        encoding="utf-8",
-    )
-    config = load_repo_config(config_path)
-    assert config.value_net.dim == 128
-    assert config.value_net.train_steps == 500
-    assert config.value_net.num_layers == 6
-
-
-def test_eval_vs_stockfish_value_net_defaults():
-    config = EvalVsStockfishConfig()
-    assert config.value_net_checkpoint is None
-    assert config.value_net_alpha == 1.0
+    assert config.search_c_visit is None
 
 
 def test_expert_iteration_config_defaults():

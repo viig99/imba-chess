@@ -145,44 +145,13 @@ class EvalVsStockfishConfig:
     search_refutation_top_r: int = 2
     search_expand_top: int = 3
     search_max_depth: int = 4
-    value_net_checkpoint: Optional[str] = None
-    value_net_alpha: float = 1.0
+    search_c_visit: Optional[float] = None
     opening_random_plies: int = 0
     debug_trace_games: int = 0
     debug_trace_max_plies: int = 80
     debug_topk: int = 5
     save_games: bool = True
     save_games_dir: str = "artifacts/eval/games"
-
-
-@dataclass(frozen=True)
-class ValueNetSection:
-    # Model (ValueNetConfig fields)
-    dim: int = 256
-    num_heads: int = 4
-    num_layers: int = 6
-    # Data
-    dataset_name: str = "Lichess/chess-position-evaluations"
-    depth_min: int = 12
-    shuffle_buffer_size: int = 10_000
-    # 5% holdout: each val sample costs ~1000/val_permille scanned rows, so
-    # small values make the one-time val-slice scan painfully slow; losing
-    # 5% of 388M training rows is free.
-    val_permille: int = 50
-    # Training
-    batch_size: int = 1024
-    num_workers: int = 2
-    max_lr: float = 3e-4
-    weight_decay: float = 0.01
-    train_steps: int = 200_000
-    log_every_steps: int = 100
-    val_every_steps: int = 5_000
-    val_batches: int = 50
-    grad_clip_norm: float = 1.0
-    seed: int = 42
-    device: str = "auto"
-    dtype: str = "bfloat16"
-    checkpoint_dir: str = "artifacts/value_net"
 
 
 @dataclass(frozen=True)
@@ -206,7 +175,6 @@ class RepoConfig:
     eval_vs_stockfish: EvalVsStockfishConfig = field(
         default_factory=EvalVsStockfishConfig
     )
-    value_net: ValueNetSection = field(default_factory=ValueNetSection)
     expert_iteration: ExpertIterationConfig = field(
         default_factory=ExpertIterationConfig
     )
@@ -231,9 +199,6 @@ def load_repo_config(path: str | Path | None = None) -> RepoConfig:
             EvalVsStockfishConfig,
             payload.get("eval_vs_stockfish", {}),
             "eval_vs_stockfish",
-        ),
-        value_net=_read_section(
-            ValueNetSection, payload.get("value_net", {}), "value_net"
         ),
         expert_iteration=_read_section(
             ExpertIterationConfig, payload.get("expert_iteration", {}), "expert_iteration"

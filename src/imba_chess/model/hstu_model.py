@@ -453,6 +453,16 @@ class HSTUChessModel(nn.Module):
                     # key structure (the outer `is not None` check above,
                     # which Dynamo handles via guards). torch.where with an
                     # all-False mask is already a correct, cheap no-op.
+                    #
+                    # Rollout-covered tokens keep the same progress^alpha
+                    # weight as everyone else: the search backing them is a
+                    # fixed max_depth lookahead, which resolves a much
+                    # smaller fraction of "what's left" early in a game than
+                    # late, so it is noisier early for the same reason the
+                    # raw outcome label is -- an earlier attempt to give
+                    # these tokens a constant weight instead made held-out
+                    # value_loss worse (especially at higher beta), so their
+                    # label quality is not actually progress-independent.
                     rollout_mask = has_rollout_value_target.to(
                         device=policy_logits.device, dtype=torch.bool
                     )

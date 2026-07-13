@@ -45,6 +45,13 @@ class HalvingConfig:
     expand_top: int = 3
     max_depth: int = 4
     lam: float = 0.05
+    # None (default) = lam stays fixed at every round, today's behavior.
+    # Set to shrink lam's prior-tiebreak weight as an arm accumulates
+    # evals_spent within this search: effective_lam = lam * c_visit /
+    # (c_visit + evals_spent), so an arm that has survived several halving
+    # rounds (and so has a well-evidenced backed_value) leans on that value
+    # over the prior more than a freshly-created arm with few evals does.
+    c_visit: float | None = None
 
 
 def _auto_rounds(num_arms: int) -> int:
@@ -399,7 +406,7 @@ def _backed_stm(node: _TreeNode) -> float:
     return node.value_stm
 
 
-def _score_arm(arm: _Arm, lam: float) -> None:
+def _score_arm(arm: _Arm, lam: float, c_visit: float | None = None) -> None:
     if arm.terminal_value_root is not None:
         backed_root = float(arm.terminal_value_root)
     elif arm.root_node is not None and arm.root_node.scored:
@@ -409,7 +416,10 @@ def _score_arm(arm: _Arm, lam: float) -> None:
         arm.score = float("-inf")
         return
     arm.backed_value = backed_root
-    arm.score = backed_root + lam * arm.root_log_prior
+    effective_lam = (
+        lam * c_visit / (c_visit + arm.evals_spent) if c_visit is not None else lam
+    )
+    arm.score = backed_root + effective_lam * arm.root_log_prior
 
 
 def _push_children(
@@ -561,7 +571,7 @@ def select_value_search_halving(
                     arm, node, position_eval, evaluator, config, counter, root_color
                 )
         for arm in survivors:
-            _score_arm(arm, config.lam)
+            _score_arm(arm, config.lam, config.c_visit)
         if round_idx < rounds - 1 and len(survivors) > 1:
             survivors.sort(key=lambda arm: arm.score, reverse=True)
             keep = math.ceil(len(survivors) / 2)
@@ -570,7 +580,7 @@ def select_value_search_halving(
             survivors = survivors[:keep]
 
     for arm in arms:
-        _score_arm(arm, config.lam)
+        _score_arm(arm, config.lam, config.c_visit)
         # Survivors are already scored; this pass only fills backed_value /
         # score on eliminated arms so their debug rows are informative.
 

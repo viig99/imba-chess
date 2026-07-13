@@ -278,8 +278,6 @@ class CachedPositionEvaluator:
         dtype: torch.dtype,
         prefix_kv,
         prefix_len: int,
-        value_net=None,
-        value_net_alpha: float = 1.0,
     ) -> None:
         self._model = model
         self._move_vocab = move_vocab
@@ -288,8 +286,6 @@ class CachedPositionEvaluator:
         self._dtype = dtype
         self._prefix_kv = prefix_kv
         self._prefix_len = int(prefix_len)
-        self._value_net = value_net
-        self._value_net_alpha = value_net_alpha
 
     def extend(self, handle, board_before: chess.Board, move: chess.Move):
         parent = handle if isinstance(handle, _CachedNode) else None
@@ -372,18 +368,9 @@ class CachedPositionEvaluator:
             logits = out["logits"].float().cpu()
             value_logits = out["value_logits"].float().cpu()
 
-            net_scalars = None
-            if self._value_net is not None and self._value_net_alpha > 0.0:
-                net_logits = self._value_net(new_token_batch).float().cpu()
-                net_probs = torch.softmax(net_logits, dim=-1)
-                net_scalars = net_probs[:, 2] - net_probs[:, 0]
-
-        alpha = self._value_net_alpha
         results = []
         for row, board in enumerate(boards):
             value_stm = _value_scalar_from_logits(value_logits[row])
-            if net_scalars is not None:
-                value_stm = (1.0 - alpha) * value_stm + alpha * float(net_scalars[row])
             try:
                 legal_logits, legal_moves, _, _ = _project_legal_logits(
                     logits=logits[row], board=board, move_vocab=self._move_vocab
