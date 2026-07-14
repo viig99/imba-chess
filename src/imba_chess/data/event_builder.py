@@ -3,6 +3,7 @@ from __future__ import annotations
 from typing import Any, Dict
 
 from .move_vocab import MoveVocab
+from .policy_target_kl import POLICY_KL_MAX_ARMS, arm_vocab_ids_and_qhat
 from .rollout_store import RolloutRow
 from .types import EventSequence
 from .value_target_blend import compute_blended_value_target
@@ -88,6 +89,16 @@ class EventBuilder:
             value_target_soft, has_rollout_value_target = self._build_rollout_value_targets(game)
             result["value_target_soft"] = value_target_soft
             result["has_rollout_value_target"] = has_rollout_value_target
+            (
+                policy_kl_arm_ids,
+                policy_kl_arm_qhat,
+                policy_kl_arm_mask,
+                has_rollout_policy_target,
+            ) = self._build_rollout_policy_targets(game)
+            result["policy_kl_arm_ids"] = policy_kl_arm_ids
+            result["policy_kl_arm_qhat"] = policy_kl_arm_qhat
+            result["policy_kl_arm_mask"] = policy_kl_arm_mask
+            result["has_rollout_policy_target"] = has_rollout_policy_target
         return result
 
     def _build_rollout_value_targets(
@@ -113,3 +124,40 @@ class EventBuilder:
             has_rollout_value_target[token_idx] = 1
 
         return value_target_soft, has_rollout_value_target
+
+    def _build_rollout_policy_targets(
+        self, game: Dict[str, Any]
+    ) -> tuple[list[list[int]], list[list[float]], list[list[bool]], list[int]]:
+        assert self.rollout_lookup is not None
+        num_tokens = len(game["plays"]) + 1
+        policy_kl_arm_ids: list[list[int]] = [
+            [0] * POLICY_KL_MAX_ARMS for _ in range(num_tokens)
+        ]
+        policy_kl_arm_qhat: list[list[float]] = [
+            [0.0] * POLICY_KL_MAX_ARMS for _ in range(num_tokens)
+        ]
+        policy_kl_arm_mask: list[list[bool]] = [
+            [False] * POLICY_KL_MAX_ARMS for _ in range(num_tokens)
+        ]
+        has_rollout_policy_target = [0] * num_tokens
+        game_id = game["game_id"]
+
+        for ply_idx in range(len(game["plays"])):
+            row = self.rollout_lookup.get((game_id, ply_idx))
+            if row is None:
+                continue
+            arm_ids, arm_qhat, arm_mask = arm_vocab_ids_and_qhat(row, self.move_vocab)
+            if not any(arm_mask):
+                # Every arm was excluded (unmappable move) -- leave this
+                # token as "no target" rather than flag a row whose softmax
+                # would be over an all-masked (all -inf) row, which
+                # hstu_model.py's forward() assumes never happens for a
+                # has_rollout_policy_target=True token.
+                continue
+            token_idx = ply_idx + 1
+            policy_kl_arm_ids[token_idx] = arm_ids
+            policy_kl_arm_qhat[token_idx] = arm_qhat
+            policy_kl_arm_mask[token_idx] = arm_mask
+            has_rollout_policy_target[token_idx] = 1
+
+        return policy_kl_arm_ids, policy_kl_arm_qhat, policy_kl_arm_mask, has_rollout_policy_target

@@ -55,6 +55,10 @@ def test_event_builder_without_rollout_lookup_omits_new_keys():
 
     assert "value_target_soft" not in sample
     assert "has_rollout_value_target" not in sample
+    assert "policy_kl_arm_ids" not in sample
+    assert "policy_kl_arm_qhat" not in sample
+    assert "policy_kl_arm_mask" not in sample
+    assert "has_rollout_policy_target" not in sample
 
 
 def test_event_builder_with_rollout_lookup_blends_value_target():
@@ -100,3 +104,56 @@ def test_event_builder_with_rollout_lookup_blends_value_target():
     assert sample["has_rollout_value_target"][2] == 1
     assert abs(sum(sample["value_target_soft"][2]) - 1.0) < 1e-9
     assert sample["value_target_soft"][2][1] == pytest.approx(0.3)
+
+
+def test_event_builder_with_rollout_lookup_builds_policy_kl_arm_targets():
+    dataset = LichessDataset(min_avg_elo=2000)
+    game = list(dataset.stream_from_rows([_row()]))[0]
+    vocab = MoveVocab.build_from_games([game])
+    game_id = game["game_id"]
+
+    rollout_row = RolloutRow(
+        game_id=game_id,
+        ply=1,
+        human_move_uci=game["plays"][1]["move_uci"],
+        human_move_backed_value=0.2,
+        real_outcome_stm=1,
+        best_arm_move_uci=game["plays"][1]["move_uci"],
+        best_arm_backed_value=0.6,
+        root_wdl_unsearched=(0.2, 0.3, 0.5),
+        arm_move_uci=(game["plays"][1]["move_uci"], game["plays"][0]["move_uci"]),
+        arm_backed_value=(0.6, -0.2),
+        arm_evals_spent=(100, 50),
+        arm_log_prior=(-0.1, -0.4),
+        search_budget=256,
+        search_top_m=2,
+        search_max_depth=4,
+        checkpoint="dummy.pt",
+    )
+    lookup = {(game_id, 1): rollout_row}
+
+    builder = EventBuilder(vocab, rollout_lookup=lookup, beta=1.0)
+    sample = builder.build_game(game)
+
+    seq_len = len(sample["seq_token_id"])
+    assert len(sample["policy_kl_arm_ids"]) == seq_len
+    assert len(sample["policy_kl_arm_qhat"]) == seq_len
+    assert len(sample["policy_kl_arm_mask"]) == seq_len
+    assert len(sample["has_rollout_policy_target"]) == seq_len
+
+    # Only token 2 (== ply 1) has a rollout row.
+    for token_idx in range(seq_len):
+        if token_idx == 2:
+            continue
+        assert sample["has_rollout_policy_target"][token_idx] == 0
+        assert sample["policy_kl_arm_mask"][token_idx] == [False] * 24
+
+    assert sample["has_rollout_policy_target"][2] == 1
+    assert sample["policy_kl_arm_mask"][2][:2] == [True, True]
+    assert sample["policy_kl_arm_mask"][2][2:] == [False] * 22
+    expected_id_0 = vocab.token_to_id[game["plays"][1]["move_uci"]]
+    expected_id_1 = vocab.token_to_id[game["plays"][0]["move_uci"]]
+    assert sample["policy_kl_arm_ids"][2][0] == expected_id_0
+    assert sample["policy_kl_arm_ids"][2][1] == expected_id_1
+    assert sample["policy_kl_arm_qhat"][2][0] == pytest.approx(0.6)
+    assert sample["policy_kl_arm_qhat"][2][1] == pytest.approx(-0.2)
