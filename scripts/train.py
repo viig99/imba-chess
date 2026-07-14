@@ -26,7 +26,10 @@ from imba_chess.data import (
     build_event_dataloader,
     load_or_create_static_move_vocab,
 )
-from imba_chess.data.rollout_store import load_rollout_lookup
+from imba_chess.data.rollout_store import (
+    assert_rollout_checkpoint_consistency,
+    load_rollout_lookup,
+)
 from imba_chess.eval import create_next_move_evaluator
 from imba_chess.model import HSTUChessModel, build_hstu_chess_config
 
@@ -508,10 +511,12 @@ def main() -> None:
     rollout_lookup = None
     if repo_config.expert_iteration.rollout_path:
         rollout_lookup = load_rollout_lookup(repo_config.expert_iteration.rollout_path)
+        assert_rollout_checkpoint_consistency(rollout_lookup, args.resume)
         print(
             f"Loaded {len(rollout_lookup)} rollout value targets from "
             f"{repo_config.expert_iteration.rollout_path} "
-            f"(beta={repo_config.expert_iteration.beta})"
+            f"(beta={repo_config.expert_iteration.beta}, "
+            f"policy_kl_weight={repo_config.expert_iteration.policy_kl_weight})"
         )
 
     train_loader = build_event_dataloader(

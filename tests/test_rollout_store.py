@@ -4,6 +4,7 @@ pytest.importorskip("pyarrow")
 
 from imba_chess.data.rollout_store import (
     RolloutRow,
+    assert_rollout_checkpoint_consistency,
     load_rollout_lookup,
     write_rollout_parquet,
 )
@@ -54,3 +55,42 @@ def test_load_handles_null_human_move_backed_value(tmp_path):
     lookup = load_rollout_lookup(path)
 
     assert lookup[("g1", 0)].human_move_backed_value is None
+
+
+def test_assert_rollout_checkpoint_consistency_noop_on_empty_lookup():
+    assert_rollout_checkpoint_consistency({}, resume_checkpoint=None) is None
+    assert_rollout_checkpoint_consistency({}, resume_checkpoint="anything.pt") is None
+
+
+def test_assert_rollout_checkpoint_consistency_passes_on_matching_checkpoint(tmp_path):
+    checkpoint_path = tmp_path / "checkpoint_23.pt"
+    checkpoint_path.write_text("dummy")
+    row = _row("g1", 0)
+    row = RolloutRow(**{**row.__dict__, "checkpoint": str(checkpoint_path)})
+    lookup = {("g1", 0): row}
+
+    # No exception, and resolving via a different relative/absolute spelling
+    # of the same file still matches.
+    assert_rollout_checkpoint_consistency(lookup, resume_checkpoint=checkpoint_path)
+    assert_rollout_checkpoint_consistency(lookup, resume_checkpoint=str(checkpoint_path))
+
+
+def test_assert_rollout_checkpoint_consistency_raises_on_mismatch(tmp_path):
+    checkpoint_a = tmp_path / "checkpoint_a.pt"
+    checkpoint_b = tmp_path / "checkpoint_b.pt"
+    row = _row("g1", 0)
+    row = RolloutRow(**{**row.__dict__, "checkpoint": str(checkpoint_a)})
+    lookup = {("g1", 0): row}
+
+    with pytest.raises(ValueError, match="Rollout checkpoint mismatch"):
+        assert_rollout_checkpoint_consistency(lookup, resume_checkpoint=checkpoint_b)
+
+
+def test_assert_rollout_checkpoint_consistency_raises_when_resume_missing(tmp_path):
+    checkpoint_path = tmp_path / "checkpoint_23.pt"
+    row = _row("g1", 0)
+    row = RolloutRow(**{**row.__dict__, "checkpoint": str(checkpoint_path)})
+    lookup = {("g1", 0): row}
+
+    with pytest.raises(ValueError, match="no --resume checkpoint"):
+        assert_rollout_checkpoint_consistency(lookup, resume_checkpoint=None)

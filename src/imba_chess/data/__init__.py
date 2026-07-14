@@ -15,7 +15,12 @@ from .move_vocab import (
     load_or_create_static_move_vocab,
 )
 from .packing import MaxTokensJaggedBatchDataset
-from .rollout_store import RolloutRow, load_rollout_lookup, write_rollout_parquet
+from .rollout_store import (
+    RolloutRow,
+    assert_rollout_checkpoint_consistency,
+    load_rollout_lookup,
+    write_rollout_parquet,
+)
 from .torch_iterable import TorchLichessIterableDataset
 from .types import EventSequence, JaggedBatch
 from .value_target_blend import compute_blended_value_target
@@ -41,6 +46,7 @@ __all__ = [
     "TorchLichessIterableDataset",
     "compute_blended_value_target",
     "RolloutRow",
+    "assert_rollout_checkpoint_consistency",
     "load_rollout_lookup",
     "write_rollout_parquet",
 ]
