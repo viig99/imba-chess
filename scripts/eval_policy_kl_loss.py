@@ -10,6 +10,12 @@ at a given --sigma. Cheap, fast first-pass filter for comparing sigma
 candidates before spending live-eval compute -- see docs/superpowers/specs/
 2026-07-13-phase1b-policy-distillation-design.md Part 5.
 
+This holdout slice is a hash-based partition of rollout rows, not a
+guarantee: it does not by itself ensure that a later real sigma-sweep
+training run avoided training on these exact rows. Whoever runs that
+training must independently exclude the same held-out (game_id, ply)
+rows from that run's rollout_path to keep the comparison uncontaminated.
+
 Usage: python scripts/eval_policy_kl_loss.py --checkpoint <path> \
     --rollout-path <path> --sigma 1.0
 """
