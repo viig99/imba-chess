@@ -157,3 +157,45 @@ def test_event_builder_with_rollout_lookup_builds_policy_kl_arm_targets():
     assert sample["policy_kl_arm_ids"][2][1] == expected_id_1
     assert sample["policy_kl_arm_qhat"][2][0] == pytest.approx(0.6)
     assert sample["policy_kl_arm_qhat"][2][1] == pytest.approx(-0.2)
+
+
+def test_event_builder_with_rollout_lookup_all_arms_unmappable_leaves_no_target():
+    dataset = LichessDataset(min_avg_elo=2000)
+    game = list(dataset.stream_from_rows([_row()]))[0]
+    vocab = MoveVocab.build_from_games([game])
+    game_id = game["game_id"]
+
+    # Both arms use moves that never appear in this game's plies, so
+    # MoveVocab.build_from_games([game]) never added them -- they are
+    # genuinely unmappable to the vocab.
+    rollout_row = RolloutRow(
+        game_id=game_id,
+        ply=1,
+        human_move_uci=game["plays"][1]["move_uci"],
+        human_move_backed_value=0.2,
+        real_outcome_stm=1,
+        best_arm_move_uci="z9z9",
+        best_arm_backed_value=0.6,
+        root_wdl_unsearched=(0.2, 0.3, 0.5),
+        arm_move_uci=("z9z9", "a1a1"),
+        arm_backed_value=(0.6, -0.2),
+        arm_evals_spent=(100, 50),
+        arm_log_prior=(-0.1, -0.4),
+        search_budget=256,
+        search_top_m=2,
+        search_max_depth=4,
+        checkpoint="dummy.pt",
+    )
+    lookup = {(game_id, 1): rollout_row}
+
+    builder = EventBuilder(vocab, rollout_lookup=lookup, beta=1.0)
+    sample = builder.build_game(game)
+
+    seq_len = len(sample["seq_token_id"])
+    # Token 2 (== ply 1) has a rollout row, but every arm is unmappable, so
+    # it must NOT be flagged as having a policy target.
+    assert sample["has_rollout_policy_target"][2] == 0
+    assert sample["policy_kl_arm_mask"][2] == [False] * 24
+    for token_idx in range(seq_len):
+        assert sample["has_rollout_policy_target"][token_idx] == 0
+        assert sample["policy_kl_arm_mask"][token_idx] == [False] * 24
