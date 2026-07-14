@@ -170,9 +170,19 @@ def test_end_to_end_training_step_with_both_value_and_policy_rollout_targets(tmp
         p.grad.norm().item() for p in model.value_head.parameters() if p.grad is not None
     ]
     assert any(norm > 0.0 for norm in value_grad_norms)
-    policy_grad_norms = [
-        p.grad.norm().item()
-        for p in model.prediction_head.parameters()
-        if p.grad is not None
-    ]
-    assert any(norm > 0.0 for norm in policy_grad_norms)
+    # The prediction_head always gets gradient from the base human-move
+    # policy_loss term regardless of whether policy_kl_loss is wired
+    # correctly (total_loss = policy_loss + ... unconditionally) -- so a
+    # combined-loss gradient check alone can't prove the KL term itself
+    # contributes anything. Isolate policy_kl_loss's own gradient directly
+    # to prove the KL wiring from Tasks 1-6 actually produces a real signal,
+    # not a silent no-op.
+    out_check = model(batch, return_loss=True)
+    policy_kl_grads = torch.autograd.grad(
+        out_check["policy_kl_loss"],
+        model.prediction_head.parameters(),
+        retain_graph=False,
+        allow_unused=True,
+    )
+    policy_kl_grad_norms = [g.norm().item() for g in policy_kl_grads if g is not None]
+    assert any(norm > 0.0 for norm in policy_kl_grad_norms)
