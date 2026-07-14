@@ -6,6 +6,10 @@ from typing import Any, TypedDict
 class _RolloutEventFields(TypedDict, total=False):
     value_target_soft: list[list[float]]
     has_rollout_value_target: list[int]
+    policy_kl_arm_ids: list[list[int]]
+    policy_kl_arm_qhat: list[list[float]]
+    policy_kl_arm_mask: list[list[bool]]
+    has_rollout_policy_target: list[int]
 
 
 class EventSequence(_RolloutEventFields):
@@ -26,6 +30,10 @@ class EventSequence(_RolloutEventFields):
 class _RolloutJaggedFields(TypedDict, total=False):
     value_target_soft: Any
     has_rollout_value_target: Any
+    policy_kl_arm_ids: Any
+    policy_kl_arm_qhat: Any
+    policy_kl_arm_mask: Any
+    has_rollout_policy_target: Any
 
 
 class JaggedBatch(_RolloutJaggedFields):

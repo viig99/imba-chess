@@ -72,8 +72,17 @@ def test_collate_jagged_batch_raises_on_mismatched_scalar_lengths():
         collate_jagged_batch(batch)
 
 
-def _sample_with_rollout(game_id, seq_len, value_target_soft, has_rollout):
-    return {
+def _sample_with_rollout(
+    game_id,
+    seq_len,
+    value_target_soft,
+    has_rollout,
+    policy_kl_arm_ids=None,
+    policy_kl_arm_qhat=None,
+    policy_kl_arm_mask=None,
+    has_rollout_policy_target=None,
+):
+    sample = {
         "game_id": game_id,
         "game_result_white": 1,
         "seq_token_id": [1] + [0] * (seq_len - 1),
@@ -89,6 +98,12 @@ def _sample_with_rollout(game_id, seq_len, value_target_soft, has_rollout):
         "value_target_soft": value_target_soft,
         "has_rollout_value_target": has_rollout,
     }
+    max_arms = 4
+    sample["policy_kl_arm_ids"] = policy_kl_arm_ids or [[0] * max_arms for _ in range(seq_len)]
+    sample["policy_kl_arm_qhat"] = policy_kl_arm_qhat or [[0.0] * max_arms for _ in range(seq_len)]
+    sample["policy_kl_arm_mask"] = policy_kl_arm_mask or [[False] * max_arms for _ in range(seq_len)]
+    sample["has_rollout_policy_target"] = has_rollout_policy_target or [0] * seq_len
+    return sample
 
 
 def test_collate_includes_rollout_fields_when_present_on_every_sample():
@@ -132,8 +147,46 @@ def test_collate_without_rollout_fields_unchanged():
     batch = [
         _sample_with_rollout("g1", 2, [[0.0, 0.0, 0.0], [0.2, 0.3, 0.5]], [0, 1])
     ]
-    del batch[0]["value_target_soft"]
-    del batch[0]["has_rollout_value_target"]
+    for key in (
+        "value_target_soft",
+        "has_rollout_value_target",
+        "policy_kl_arm_ids",
+        "policy_kl_arm_qhat",
+        "policy_kl_arm_mask",
+        "has_rollout_policy_target",
+    ):
+        del batch[0][key]
     out = collate_jagged_batch(batch)
-    assert "value_target_soft" not in out
-    assert "has_rollout_value_target" not in out
+    for key in (
+        "value_target_soft",
+        "has_rollout_value_target",
+        "policy_kl_arm_ids",
+        "policy_kl_arm_qhat",
+        "policy_kl_arm_mask",
+        "has_rollout_policy_target",
+    ):
+        assert key not in out
+
+
+def test_collate_includes_policy_kl_fields_when_present_on_every_sample():
+    batch = [
+        _sample_with_rollout(
+            "g1", 2, [[0.0, 0.0, 0.0], [0.2, 0.3, 0.5]], [0, 1],
+            policy_kl_arm_ids=[[0, 0, 0, 0], [5, 7, 0, 0]],
+            policy_kl_arm_qhat=[[0.0, 0.0, 0.0, 0.0], [0.4, -0.1, 0.0, 0.0]],
+            policy_kl_arm_mask=[[False] * 4, [True, True, False, False]],
+            has_rollout_policy_target=[0, 1],
+        ),
+        _sample_with_rollout("g2", 2, [[0.0, 0.0, 0.0], [0.0, 0.0, 0.0]], [0, 0]),
+    ]
+    out = collate_jagged_batch(batch)
+    assert out["policy_kl_arm_ids"].shape == (4, 4)
+    assert out["policy_kl_arm_qhat"].shape == (4, 4)
+    assert out["policy_kl_arm_mask"].shape == (4, 4)
+    assert out["has_rollout_policy_target"].shape == (4,)
+    assert out["has_rollout_policy_target"].dtype == torch.bool
+    assert out["has_rollout_policy_target"].tolist() == [False, True, False, False]
+    assert out["policy_kl_arm_ids"][1].tolist() == [5, 7, 0, 0]
+    assert out["policy_kl_arm_mask"][1].tolist() == [True, True, False, False]
+    assert out["policy_kl_arm_qhat"].dtype == torch.float32
+    assert out["policy_kl_arm_ids"].dtype == torch.long
