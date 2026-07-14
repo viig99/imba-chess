@@ -15,6 +15,7 @@ from .move_vocab import (
     load_or_create_static_move_vocab,
 )
 from .packing import MaxTokensJaggedBatchDataset
+from .policy_target_kl import POLICY_KL_MAX_ARMS, arm_vocab_ids_and_qhat
 from .rollout_store import (
     RolloutRow,
     assert_rollout_checkpoint_consistency,
@@ -45,6 +46,8 @@ __all__ = [
     "BoardState",
     "TorchLichessIterableDataset",
     "compute_blended_value_target",
+    "POLICY_KL_MAX_ARMS",
+    "arm_vocab_ids_and_qhat",
     "RolloutRow",
     "assert_rollout_checkpoint_consistency",
     "load_rollout_lookup",
