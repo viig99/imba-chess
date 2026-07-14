@@ -871,6 +871,46 @@ def test_hstu_chess_model_policy_kl_masks_padding_and_uncovered_tokens():
     assert out["policy_kl_loss"].item() == pytest.approx(0.0, abs=1e-6)
 
 
+def test_hstu_chess_model_policy_kl_weight_zero_skips_computation_entirely():
+    # policy_kl_weight=0.0 must short-circuit the whole policy-KL block --
+    # not just zero out its contribution to total_loss -- so
+    # output["policy_kl_loss"] must not even be a key, mirroring
+    # elo_loss_weight_strength's precedent in this same file. This holds
+    # even when the batch carries real (non-empty) policy-KL rollout data.
+    config = HSTUChessConfig(
+        move_vocab_size=128,
+        model_dim=64,
+        linear_hidden_dim=16,
+        attention_dim=16,
+        num_heads=2,
+        num_layers=0,
+        max_position_embeddings=32,
+        policy_kl_weight=0.0,
+        policy_kl_sigma=1.0,
+    )
+    model = HSTUChessModel(config)
+    batch = _batch()
+    total_tokens = batch["seq_token_id"].numel()
+    max_arms = 4
+
+    arm_ids = torch.zeros((total_tokens, max_arms), dtype=torch.long)
+    arm_ids[1, 0] = 10
+    arm_qhat = torch.zeros((total_tokens, max_arms), dtype=torch.float32)
+    arm_qhat[1, 0] = 0.4
+    arm_mask = torch.zeros((total_tokens, max_arms), dtype=torch.bool)
+    arm_mask[1, 0] = True
+    has_rollout_policy_target = torch.zeros(total_tokens, dtype=torch.bool)
+    has_rollout_policy_target[1] = True
+
+    batch["policy_kl_arm_ids"] = arm_ids
+    batch["policy_kl_arm_qhat"] = arm_qhat
+    batch["policy_kl_arm_mask"] = arm_mask
+    batch["has_rollout_policy_target"] = has_rollout_policy_target
+
+    out = model(batch, return_loss=True)
+    assert "policy_kl_loss" not in out
+
+
 def test_hstu_chess_model_policy_kl_weight_zero_matches_no_rollout_keys():
     # Backward-compat invariant: policy_kl_weight=0.0 (the default) must
     # produce byte-identical total_loss/gradients to a batch that never had

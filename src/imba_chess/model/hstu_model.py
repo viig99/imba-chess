@@ -509,7 +509,8 @@ class HSTUChessModel(nn.Module):
             policy_kl_arm_qhat = batch.get("policy_kl_arm_qhat")
             policy_kl_arm_mask = batch.get("policy_kl_arm_mask")
             if (
-                has_rollout_policy_target is not None
+                self.config.policy_kl_weight != 0.0
+                and has_rollout_policy_target is not None
                 and policy_kl_arm_ids is not None
                 and policy_kl_arm_qhat is not None
                 and policy_kl_arm_mask is not None
@@ -542,8 +543,8 @@ class HSTUChessModel(nn.Module):
                 )
 
                 student_arm_logits = torch.gather(
-                    policy_logits.float(), dim=-1, index=arm_ids
-                )
+                    policy_logits, dim=-1, index=arm_ids
+                ).float()
                 # detach(): the target's base must not receive gradient
                 # through the student -- otherwise this becomes a
                 # self-referential/degenerate loss (target chasing itself).
@@ -569,8 +570,8 @@ class HSTUChessModel(nn.Module):
                 policy_kl_loss_sum = (
                     per_token_policy_kl_loss * policy_kl_token_weights
                 ).sum()
-                policy_kl_weight_sum = policy_kl_token_weights.sum().clamp_min(1.0)
-                policy_kl_loss = policy_kl_loss_sum / policy_kl_weight_sum
+                policy_kl_mask_sum = policy_kl_token_weights.sum().clamp_min(1.0)
+                policy_kl_loss = policy_kl_loss_sum / policy_kl_mask_sum
                 output["policy_kl_loss"] = policy_kl_loss
                 total_loss = total_loss + self.config.policy_kl_weight * policy_kl_loss
 

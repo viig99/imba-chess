@@ -113,7 +113,16 @@ def main() -> None:
     # forward()-time scalar only (never baked into any layer's shape/
     # weights), so overriding it on the already-constructed frozen config is
     # safe and avoids needing load_hstu_checkpoint to grow a new parameter.
-    model.config = replace(model.config, policy_kl_sigma=float(args.sigma))
+    # policy_kl_weight also needs overriding here: HSTUChessModel.forward
+    # now short-circuits the entire policy-KL block (skipping
+    # output["policy_kl_loss"] entirely) when policy_kl_weight == 0.0, which
+    # is always the case on a freshly-loaded checkpoint (that's
+    # build_hstu_chess_config's default). This script never reads
+    # total_loss, only policy_kl_loss directly, so the exact value doesn't
+    # matter -- it just needs to be nonzero to open the gate.
+    model.config = replace(
+        model.config, policy_kl_sigma=float(args.sigma), policy_kl_weight=1.0
+    )
 
     full_rollout_lookup = load_rollout_lookup(args.rollout_path)
     holdout_lookup = {
