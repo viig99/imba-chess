@@ -14,6 +14,7 @@ from __future__ import annotations
 import heapq
 import itertools
 import math
+import random
 from dataclasses import dataclass, field
 from typing import Any, NamedTuple, Optional, Protocol
 
@@ -45,6 +46,7 @@ class HalvingConfig:
     expand_top: int = 3
     max_depth: int = 4
     lam: float = 0.05
+    gumbel_root_sampling: bool = False
 
 
 def _auto_rounds(num_arms: int) -> int:
@@ -86,6 +88,26 @@ def _prior_order(legal_log_priors: list[float]) -> list[int]:
         key=legal_log_priors.__getitem__,
         reverse=True,
     )
+
+
+def _gumbel_top_k_order(legal_log_priors: list[float], *, rng: random.Random) -> list[int]:
+    """Sample move indices without replacement via the Gumbel-Top-k trick.
+
+    Adds i.i.d. Gumbel(0) noise to each move's log-prior and orders by the
+    perturbed score. This is an unbiased sample-without-replacement from the
+    policy distribution (Danihelka et al., ICLR 2022) -- unlike a plain
+    top-k-by-prior cut, which can permanently and systematically exclude a
+    genuinely good but low-prior move from ever being searched (their
+    Example 1 constructs exactly this failure: a deterministic top-2 cut
+    that misses the only good action and scores worse than the raw prior).
+    """
+    def gumbel_noise() -> float:
+        u = max(rng.random(), 1e-12)
+        return -math.log(-math.log(u))
+
+    scored = [(log_prior + gumbel_noise(), idx) for idx, log_prior in enumerate(legal_log_priors)]
+    scored.sort(key=lambda pair: pair[0], reverse=True)
+    return [idx for _, idx in scored]
 
 
 def _search_copy(board: chess.Board) -> chess.Board:
@@ -471,14 +493,23 @@ def select_value_search_halving(
     legal_moves: list[chess.Move],
     legal_log_priors: list[float],
     config: HalvingConfig,
+    rng: Optional[random.Random] = None,
 ) -> tuple[int, list[dict[str, Any]]]:
     """Pick a root move by sequential halving over value-backed subtrees.
 
     Precondition: legal_moves is non-empty (the caller projects legal moves
     and raises before dispatch when none map to the vocab).
+
+    rng is only consulted when config.gumbel_root_sampling is set; live
+    Stockfish-eval play should leave it False (today's validated,
+    deterministic top-m-by-prior behavior) and only rollout generation for
+    future policy distillation should opt in -- see HalvingConfig.
     """
     root_color = board.turn
-    order = _prior_order(legal_log_priors)
+    if config.gumbel_root_sampling:
+        order = _gumbel_top_k_order(legal_log_priors, rng=rng if rng is not None else random.Random())
+    else:
+        order = _prior_order(legal_log_priors)
     picks = list(order[: min(config.top_m, len(order))])
     seen = set(picks)
     for idx, move in enumerate(legal_moves):

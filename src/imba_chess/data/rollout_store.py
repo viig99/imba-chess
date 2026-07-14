@@ -26,6 +26,9 @@ class RolloutRow:
     search_top_m: int
     search_max_depth: int
     checkpoint: str
+    search_refutation_top_r: int = 2
+    search_expand_top: int = 3
+    search_lam: float = 0.05
 
 
 _ROLLOUT_SCHEMA = pa.schema(
@@ -46,6 +49,9 @@ _ROLLOUT_SCHEMA = pa.schema(
         pa.field("search_top_m", pa.int64()),
         pa.field("search_max_depth", pa.int64()),
         pa.field("checkpoint", pa.string()),
+        pa.field("search_refutation_top_r", pa.int64()),
+        pa.field("search_expand_top", pa.int64()),
+        pa.field("search_lam", pa.float64()),
     ]
 )
 
@@ -68,6 +74,9 @@ def _row_to_record(row: RolloutRow) -> dict:
         "search_top_m": row.search_top_m,
         "search_max_depth": row.search_max_depth,
         "checkpoint": row.checkpoint,
+        "search_refutation_top_r": row.search_refutation_top_r,
+        "search_expand_top": row.search_expand_top,
+        "search_lam": row.search_lam,
     }
 
 
@@ -109,6 +118,9 @@ def load_rollout_lookup(path: str | Path) -> dict[tuple[str, int], RolloutRow]:
             search_top_m=int(record["search_top_m"]),
             search_max_depth=int(record["search_max_depth"]),
             checkpoint=record["checkpoint"],
+            search_refutation_top_r=int(record["search_refutation_top_r"]),
+            search_expand_top=int(record["search_expand_top"]),
+            search_lam=float(record["search_lam"]),
         )
         lookup[(row.game_id, row.ply)] = row
     return lookup

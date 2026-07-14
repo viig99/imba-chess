@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import math
+import random
 
 import chess
 
@@ -8,6 +9,7 @@ from imba_chess.eval.search import (
     HalvingConfig,
     PositionEval,
     _auto_rounds,
+    _gumbel_top_k_order,
     select_greedy,
     select_value_search_halving,
     terminal_value_for_color,
@@ -46,6 +48,53 @@ def test_halving_config_defaults_match_spec():
     assert config.expand_top == 3
     assert config.max_depth == 4
     assert config.lam == 0.05
+    assert config.gumbel_root_sampling is False
+
+
+def test_gumbel_top_k_order_is_a_valid_permutation():
+    priors = [-0.1, -2.0, -5.0, -0.5, -3.0]
+    order = _gumbel_top_k_order(priors, rng=random.Random(0))
+    assert sorted(order) == list(range(len(priors)))
+
+
+def test_gumbel_top_k_order_is_reproducible_given_same_rng_state():
+    priors = [-0.1, -2.0, -5.0, -0.5, -3.0]
+    first = _gumbel_top_k_order(priors, rng=random.Random(123))
+    second = _gumbel_top_k_order(priors, rng=random.Random(123))
+    assert first == second
+
+
+def test_gumbel_top_k_order_can_surface_low_prior_index_unlike_deterministic_cut():
+    # Mirrors the paper's Example 1 (Danihelka et al., ICLR 2022, Sec 3.2):
+    # a low-prior action can still be worth searching, and a deterministic
+    # top-k-by-prior cut can never place it in the top-k regardless of seed.
+    # Gumbel-Top-k must, for at least some seeds, place a low-prior index
+    # ahead of a higher-prior one (softmax([-0.1,-0.3,-3.0])[2] ~= 0.03, so
+    # 500 trials gives an expected ~15 occurrences -- not a coin-flip test).
+    priors = [-0.1, -0.3, -3.0]  # index 2 is low prior but not vanishingly so
+    surfaced = any(
+        _gumbel_top_k_order(priors, rng=random.Random(seed))[0] == 2 for seed in range(500)
+    )
+    assert surfaced
+
+
+def test_gumbel_root_sampling_disabled_matches_deterministic_order():
+    board = chess.Board()
+    legal_moves = [chess.Move.from_uci("e2e4"), chess.Move.from_uci("d2d4")]
+    legal_log_priors = [-0.5, -0.6]
+    evaluator = _ArmValueEvaluator({"e2e4": 0.6, "d2d4": -0.6})
+    config = HalvingConfig(budget=8, top_m=2, rounds=2, lam=0.05, gumbel_root_sampling=False)
+
+    chosen, _ = select_value_search_halving(
+        evaluator=evaluator,
+        root_handle=(),
+        board=board,
+        legal_moves=legal_moves,
+        legal_log_priors=legal_log_priors,
+        config=config,
+        rng=random.Random(0),
+    )
+    assert legal_moves[chosen].uci() == "e2e4"
 
 
 _PIECE_VALUES = {

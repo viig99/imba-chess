@@ -41,37 +41,39 @@ def test_sample_ply_indices_empty_game():
     assert module._sample_ply_indices(0, every_n=8, seed=42, game_id="g1") == []
 
 
-def test_pad_or_truncate_arms_pads_short_lists():
-    module = _load_script_module()
-    rows = [
-        {"move_uci": "e2e4", "backed_value": 0.3, "evals_spent": 100, "policy_log_prob": -0.2},
-    ]
-    padded = module._pad_or_truncate_arms(rows, top_m=3)
-    assert len(padded) == 3
-    assert padded[0]["move_uci"] == "e2e4"
-    assert padded[1]["move_uci"] == ""
-    assert padded[1]["backed_value"] == 0.0
-    assert padded[1]["evals_spent"] == 0
-
-
-def test_pad_or_truncate_arms_truncates_long_lists():
+def test_arm_rows_to_dicts_keeps_every_row_no_padding_or_truncation():
     module = _load_script_module()
     rows = [
         {"move_uci": f"m{i}", "backed_value": float(i), "evals_spent": i, "policy_log_prob": -float(i)}
         for i in range(5)
     ]
-    truncated = module._pad_or_truncate_arms(rows, top_m=3)
-    assert len(truncated) == 3
-    assert [r["move_uci"] for r in truncated] == ["m0", "m1", "m2"]
+    projected = module._arm_rows_to_dicts(rows)
+    assert [r["move_uci"] for r in projected] == ["m0", "m1", "m2", "m3", "m4"]
 
 
-def test_pad_or_truncate_arms_maps_none_backed_value_to_zero():
+def test_arm_rows_to_dicts_keeps_forcing_floor_arms_beyond_top_m():
+    # select_value_search_halving can return more rows than top_m when the
+    # root-level forcing floor appends captures/checks/promotions that
+    # weren't already in the top-m-by-prior cut. Those must survive into
+    # the stored rollout row, not get truncated away.
+    module = _load_script_module()
+    rows = [
+        {"move_uci": "e2e4", "backed_value": 0.1, "evals_spent": 50, "policy_log_prob": -0.2},
+        {"move_uci": "d2d4", "backed_value": 0.2, "evals_spent": 50, "policy_log_prob": -0.3},
+        {"move_uci": "f3g5", "backed_value": -0.4, "evals_spent": 10, "policy_log_prob": -4.0},
+    ]
+    projected = module._arm_rows_to_dicts(rows)
+    assert len(projected) == 3
+    assert projected[-1]["move_uci"] == "f3g5"
+
+
+def test_arm_rows_to_dicts_maps_none_backed_value_to_zero():
     module = _load_script_module()
     rows = [
         {"move_uci": "e2e4", "backed_value": None, "evals_spent": 0, "policy_log_prob": -0.1},
     ]
-    padded = module._pad_or_truncate_arms(rows, top_m=1)
-    assert padded[0]["backed_value"] == 0.0
+    projected = module._arm_rows_to_dicts(rows)
+    assert projected[0]["backed_value"] == 0.0
 
 
 def test_process_game_end_to_end_with_tiny_model(tmp_path):
@@ -129,6 +131,15 @@ def test_process_game_end_to_end_with_tiny_model(tmp_path):
     for row in rows:
         assert row.game_id == "https://lichess.org/smoketest"
         assert 0 <= row.ply < 4
-        assert len(row.arm_move_uci) == 4
+        # >= top_m, not ==: the root-level forcing floor in
+        # select_value_search_halving can append extra capture/check/promo
+        # arms beyond the top-m-by-prior cut, and those must not be dropped.
+        assert len(row.arm_move_uci) >= 4
+        assert len(row.arm_backed_value) == len(row.arm_move_uci)
+        assert len(row.arm_evals_spent) == len(row.arm_move_uci)
+        assert len(row.arm_log_prior) == len(row.arm_move_uci)
         assert len(row.root_wdl_unsearched) == 3
         assert abs(sum(row.root_wdl_unsearched) - 1.0) < 1e-4
+        assert row.search_refutation_top_r == module.HalvingConfig().refutation_top_r
+        assert row.search_expand_top == module.HalvingConfig().expand_top
+        assert row.search_lam == module.HalvingConfig().lam

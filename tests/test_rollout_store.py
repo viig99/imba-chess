@@ -27,6 +27,9 @@ def _row(game_id: str, ply: int) -> RolloutRow:
         search_top_m=4,
         search_max_depth=8,
         checkpoint="artifacts/checkpoints/best_hr10_checkpoint_23.pt",
+        search_refutation_top_r=2,
+        search_expand_top=3,
+        search_lam=0.05,
     )
 
 

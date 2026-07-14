@@ -59,7 +59,7 @@ elo_loss_weight_alpha = 1.0
 elo_loss_weight_strength = 1.0
 enable_value_head = true
 value_loss_weight = 1.0
-value_weight_alpha = 0.1
+value_weight_alpha = 0.9
 value_label_smoothing = 0.0
 moves_left_loss_weight = 0.05
 
@@ -107,7 +107,7 @@ stockfish_limit_strength = false
 # stockfish_nodes = 1000
 # stockfish_depth = 10
 # Optional ladder mode.
-ladder_elos = "1320,1600,1800,2000"
+ladder_elos = "2200"
 ladder_games_per_segment = 100
 # include_full_strength_segment = true
 device = "auto"

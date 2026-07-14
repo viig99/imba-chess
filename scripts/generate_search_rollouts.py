@@ -1,12 +1,18 @@
 #!/usr/bin/env python3
-"""Generate search-backed value-target rollouts from the training split.
+"""Generate search-backed rollouts from the training split.
 
 Replays games from LichessDataset(split="train") and, at a sampled subset of
-plies per game, calls the same value_search_halving search used at inference
-to record a position-resolved value estimate. Writes one row per sampled
-position to a rollout parquet consumed by scripts/train.py via
-[expert_iteration].rollout_path. Generates data only; trains nothing (mirrors
-scripts/train_value_net.py's role as a small, focused, non-Ignite script).
+plies per game, calls the same value_search_halving search used at inference.
+Each row records both the scalar value-distillation target inputs
+(best/human-move backed_value, root_wdl_unsearched, real_outcome_stm) and the
+full per-arm data needed for policy distillation (every searched arm's
+move_uci, negamax-backed q-hat, evals spent, and policy log-prior) -- which
+target(s) a training run actually uses is a downstream config choice
+([expert_iteration].beta for value, a future policy-KL weight for policy),
+not a generation-time one, so this script always records both. Writes one
+row per sampled position to a rollout parquet consumed by scripts/train.py.
+Generates data only; trains nothing (mirrors scripts/train_value_net.py's
+role as a small, focused, non-Ignite script).
 
 Usage: python scripts/generate_search_rollouts.py --checkpoint <path> --output-path <path>
 """
@@ -83,12 +89,19 @@ def _sample_ply_indices(num_plies: int, *, every_n: int, seed: int, game_id: str
     return list(range(offset, num_plies, every_n))
 
 
-def _pad_or_truncate_arms(rows: list[dict], *, top_m: int) -> list[dict]:
-    selected = list(rows[:top_m])
-    while len(selected) < top_m:
-        selected.append(
-            {"move_uci": "", "backed_value": 0.0, "evals_spent": 0, "policy_log_prob": 0.0}
-        )
+def _arm_rows_to_dicts(rows: list[dict]) -> list[dict]:
+    """Project every searched root arm to its minimal storage fields.
+
+    Stores all arms search actually produced -- up to top_m by policy prior
+    plus any forcing (capture/check/promotion) moves the root-level floor in
+    select_value_search_halving appended beyond that cut. A fixed top_m
+    truncation here would silently drop exactly those forcing arms (they're
+    appended to `rows` after the top_m prior-ranked ones), discarding the
+    tactical candidates a future policy-distillation target most needs.
+    Rollout parquet columns are variable-length lists, so no padding is
+    needed either -- a fake all-zero placeholder arm has no real move_uci
+    and would corrupt any softmax-over-arms target built from this data.
+    """
     return [
         {
             "move_uci": row["move_uci"],
@@ -98,7 +111,7 @@ def _pad_or_truncate_arms(rows: list[dict], *, top_m: int) -> list[dict]:
             "evals_spent": int(row["evals_spent"]),
             "policy_log_prob": float(row["policy_log_prob"]),
         }
-        for row in selected
+        for row in rows
     ]
 
 
@@ -117,6 +130,7 @@ def _generate_rollout_row(
     human_move_uci: str,
     real_outcome_stm: int,
     checkpoint_path: str,
+    rng: random.Random,
 ) -> RolloutRow | None:
     batch = history.build_batch_for_current_position(board)
     output = _forward_model(model=model, batch=batch, device=device, dtype=dtype, return_kv=True)
@@ -151,6 +165,7 @@ def _generate_rollout_row(
         legal_moves=legal_moves,
         legal_log_priors=legal_log_priors,
         config=halving_config,
+        rng=rng,
     )
     best_move_uci = legal_moves[best_local_idx].uci()
     best_row = next((row for row in rows if row["move_uci"] == best_move_uci), None)
@@ -164,7 +179,7 @@ def _generate_rollout_row(
         else None
     )
 
-    arms = _pad_or_truncate_arms(rows, top_m=halving_config.top_m)
+    arms = _arm_rows_to_dicts(rows)
     return RolloutRow(
         game_id=game_id,
         ply=ply,
@@ -182,6 +197,9 @@ def _generate_rollout_row(
         search_top_m=halving_config.top_m,
         search_max_depth=halving_config.max_depth,
         checkpoint=checkpoint_path,
+        search_refutation_top_r=halving_config.refutation_top_r,
+        search_expand_top=halving_config.expand_top,
+        search_lam=halving_config.lam,
     )
 
 
@@ -229,6 +247,7 @@ def _process_game(
                 human_move_uci=play["move_uci"],
                 real_outcome_stm=real_outcome_stm,
                 checkpoint_path=checkpoint_path,
+                rng=random.Random(f"{sample_seed}:{game['game_id']}:{ply_idx}:gumbel"),
             )
             if row is not None:
                 rows.append(row)
@@ -259,6 +278,19 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--search-refutation-top-r", type=int, default=None)
     parser.add_argument("--search-expand-top", type=int, default=None)
     parser.add_argument("--search-lam", type=float, default=None)
+    parser.add_argument(
+        "--gumbel-root-sampling",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Sample root arms via the Gumbel-Top-k trick instead of a "
+        "deterministic top-m-by-prior cut (Danihelka et al., ICLR 2022). "
+        "Default True for rollout generation, since a deterministic cut can "
+        "permanently exclude a genuinely good but low-prior move from ever "
+        "being searched -- exactly the blind spot a future policy-"
+        "distillation target would inherit. Live eval play (scripts/"
+        "eval_vs_stockfish.py) does not expose this flag and keeps the "
+        "validated deterministic behavior unchanged.",
+    )
     parser.add_argument(
         "--shard-id",
         type=int,
@@ -337,6 +369,7 @@ def main() -> None:
             args.search_max_depth if args.search_max_depth is not None else eval_cfg.search_max_depth
         ),
         lam=float(args.search_lam if args.search_lam is not None else eval_cfg.value_rerank_lambda),
+        gumbel_root_sampling=bool(args.gumbel_root_sampling),
     )
 
     dataset_cfg = repo_config.dataset

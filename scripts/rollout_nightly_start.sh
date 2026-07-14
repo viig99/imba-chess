@@ -2,6 +2,11 @@
 # Idempotent nightly start: safe to call more than once (e.g. a one-off
 # 9:30pm `at` job tonight followed by the recurring 11pm cron entry) --
 # if a session is already running, this is a silent no-op.
+#
+# Bounded to a fixed number of nights (END_DATE, inclusive) rather than
+# running forever: the recurring crontab entry itself has no "stop after N
+# runs" mechanism, so the self-deactivation lives here instead of relying
+# on a future session remembering to remove the crontab.
 set -euo pipefail
 
 REPO_DIR="/home/vigi99/CodeDir/imba-chess"
@@ -10,10 +15,18 @@ PID_FILE="${STATE_DIR}/current.pid"
 STATE_FILE="${STATE_DIR}/state.json"
 CHECKPOINT="${REPO_DIR}/artifacts/checkpoints/best_hr10_checkpoint_23_hr10=0.9564.pt"
 CONFIG="${REPO_DIR}/config/imba_chess_exit_full.toml"
+# 5 nights starting 2026-07-13: last allowed start is 2026-07-17 (its
+# session runs until the 07:00 stop on 2026-07-18).
+END_DATE="2026-07-17"
 
 mkdir -p "${STATE_DIR}"
 cd "${REPO_DIR}"
 source .venv/bin/activate
+
+if [[ "$(date +%Y-%m-%d)" > "${END_DATE}" ]]; then
+    echo "$(date): past END_DATE (${END_DATE}), not starting -- 5-night rollout-generation window is over" >> "${STATE_DIR}/nightly.log"
+    exit 0
+fi
 
 if [[ -f "${PID_FILE}" ]]; then
     old_pid=$(cat "${PID_FILE}")
