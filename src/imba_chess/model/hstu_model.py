@@ -39,12 +39,26 @@ class HSTUChessConfig:
     value_weight_alpha: float = 1.5
     value_label_smoothing: float = 0.0
     moves_left_loss_weight: float = 0.05
+    policy_kl_weight: float = 0.0
+    policy_kl_sigma: float = 1.0
 
 
 def build_hstu_chess_config(
-    model_config: Any, *, move_vocab_size: int
+    model_config: Any,
+    *,
+    move_vocab_size: int,
+    policy_kl_weight: float = 0.0,
+    policy_kl_sigma: float = 1.0,
 ) -> HSTUChessConfig:
-    """Create model config from repo config model section + runtime vocab size."""
+    """Create model config from repo config model section + runtime vocab size.
+
+    policy_kl_weight/policy_kl_sigma come from RepoConfig.expert_iteration
+    (Phase 1b), not model_config -- ExpertIterationConfig is the pipeline
+    section governing rollout-derived training signals, matching where beta
+    (the value-blend weight) already lives. Kept as optional kwargs
+    defaulting to "off" so every existing call site (tests, eval scripts,
+    scripts/generate_search_rollouts.py) needs no changes.
+    """
     return HSTUChessConfig(
         move_vocab_size=move_vocab_size,
         model_dim=int(model_config.model_dim),
@@ -68,6 +82,8 @@ def build_hstu_chess_config(
         value_weight_alpha=float(model_config.value_weight_alpha),
         value_label_smoothing=float(model_config.value_label_smoothing),
         moves_left_loss_weight=float(model_config.moves_left_loss_weight),
+        policy_kl_weight=float(policy_kl_weight),
+        policy_kl_sigma=float(policy_kl_sigma),
     )
 
 
@@ -487,6 +503,76 @@ class HSTUChessModel(nn.Module):
                 value_loss = value_loss_sum / value_weight_sum
                 output["value_loss"] = value_loss
                 total_loss = total_loss + self.config.value_loss_weight * value_loss
+
+            has_rollout_policy_target = batch.get("has_rollout_policy_target")
+            policy_kl_arm_ids = batch.get("policy_kl_arm_ids")
+            policy_kl_arm_qhat = batch.get("policy_kl_arm_qhat")
+            policy_kl_arm_mask = batch.get("policy_kl_arm_mask")
+            if (
+                has_rollout_policy_target is not None
+                and policy_kl_arm_ids is not None
+                and policy_kl_arm_qhat is not None
+                and policy_kl_arm_mask is not None
+            ):
+                # Same no-data-dependent-branching discipline as the
+                # has_rollout_value_target block above: only the batch's
+                # static key structure is checked, never tensor content.
+                #
+                # Invariant relied on here (enforced by event_builder.py's
+                # _build_rollout_policy_targets): every token with
+                # has_rollout_policy_target=True has at least one True in
+                # its arm_mask row. A fully-masked-but-flagged row would
+                # produce an all -inf softmax input -> NaN, silently
+                # corrupting the whole batch's loss via the weighted sum
+                # below; this is a precondition validated at the data layer,
+                # not re-checked here (see the repo's general rule: only
+                # validate at system boundaries, not on internal invariants
+                # already guaranteed upstream).
+                arm_ids = policy_kl_arm_ids.to(
+                    device=policy_logits.device, dtype=torch.long, non_blocking=True
+                )
+                arm_qhat = policy_kl_arm_qhat.to(
+                    device=policy_logits.device, dtype=torch.float32, non_blocking=True
+                )
+                arm_mask = policy_kl_arm_mask.to(
+                    device=policy_logits.device, dtype=torch.bool, non_blocking=True
+                )
+                rollout_policy_mask = has_rollout_policy_target.to(
+                    device=policy_logits.device, dtype=torch.bool, non_blocking=True
+                )
+
+                student_arm_logits = torch.gather(
+                    policy_logits.float(), dim=-1, index=arm_ids
+                )
+                # detach(): the target's base must not receive gradient
+                # through the student -- otherwise this becomes a
+                # self-referential/degenerate loss (target chasing itself).
+                target_arm_logits = (
+                    student_arm_logits.detach()
+                    + self.config.policy_kl_sigma * arm_qhat
+                )
+                neg_inf_fill = torch.finfo(student_arm_logits.dtype).min
+                masked_target_logits = target_arm_logits.masked_fill(
+                    ~arm_mask, neg_inf_fill
+                )
+                masked_student_logits = student_arm_logits.masked_fill(
+                    ~arm_mask, neg_inf_fill
+                )
+                target = F.softmax(masked_target_logits, dim=-1)
+                student_log_probs = F.log_softmax(masked_student_logits, dim=-1)
+                per_token_policy_kl_loss = -(target * student_log_probs).sum(dim=-1)
+
+                policy_kl_token_weights = (
+                    rollout_policy_mask.to(per_token_policy_kl_loss.dtype)
+                    * valid_mask.to(per_token_policy_kl_loss.dtype)
+                )
+                policy_kl_loss_sum = (
+                    per_token_policy_kl_loss * policy_kl_token_weights
+                ).sum()
+                policy_kl_weight_sum = policy_kl_token_weights.sum().clamp_min(1.0)
+                policy_kl_loss = policy_kl_loss_sum / policy_kl_weight_sum
+                output["policy_kl_loss"] = policy_kl_loss
+                total_loss = total_loss + self.config.policy_kl_weight * policy_kl_loss
 
             # log1p compresses the target so errors near the end of the game
             # (where decidedness is informative) dominate errors at move 10.

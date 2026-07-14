@@ -702,3 +702,234 @@ def test_hstu_chess_model_value_loss_without_rollout_keys_unchanged():
     torch.manual_seed(1)
     out_b = model_b(batch, return_loss=True)
     assert torch.allclose(out_a["value_loss"], out_b["value_loss"], atol=1e-12)
+
+
+def test_hstu_chess_model_policy_kl_loss_matches_manual_formula():
+    config = HSTUChessConfig(
+        move_vocab_size=128,
+        model_dim=64,
+        linear_hidden_dim=16,
+        attention_dim=16,
+        num_heads=2,
+        num_layers=0,
+        max_position_embeddings=32,
+        policy_kl_weight=0.2,
+        policy_kl_sigma=1.5,
+    )
+    model = HSTUChessModel(config)
+    batch = _batch()
+    total_tokens = batch["seq_token_id"].numel()
+    max_arms = 4
+
+    arm_ids = torch.zeros((total_tokens, max_arms), dtype=torch.long)
+    arm_qhat = torch.zeros((total_tokens, max_arms), dtype=torch.float32)
+    arm_mask = torch.zeros((total_tokens, max_arms), dtype=torch.bool)
+    has_rollout_policy_target = torch.zeros(total_tokens, dtype=torch.bool)
+
+    # Token 1 gets two real arms (ids 10, 20); token 3 gets one real arm (id 5).
+    arm_ids[1, :2] = torch.tensor([10, 20])
+    arm_qhat[1, :2] = torch.tensor([0.4, -0.3])
+    arm_mask[1, :2] = True
+    has_rollout_policy_target[1] = True
+
+    arm_ids[3, :1] = torch.tensor([5])
+    arm_qhat[3, :1] = torch.tensor([0.9])
+    arm_mask[3, :1] = True
+    has_rollout_policy_target[3] = True
+
+    batch["policy_kl_arm_ids"] = arm_ids
+    batch["policy_kl_arm_qhat"] = arm_qhat
+    batch["policy_kl_arm_mask"] = arm_mask
+    batch["has_rollout_policy_target"] = has_rollout_policy_target
+
+    out = model(batch, return_loss=True)
+    assert torch.isfinite(out["policy_kl_loss"])
+    assert "policy_kl_loss" in out
+
+    # Manually recompute expected per-token loss.
+    policy_logits = out["logits"]
+    student_arm_logits = torch.gather(policy_logits.float(), dim=-1, index=arm_ids)
+    target_arm_logits = student_arm_logits.detach() + config.policy_kl_sigma * arm_qhat
+    neg_inf_fill = torch.finfo(student_arm_logits.dtype).min
+    masked_target = target_arm_logits.masked_fill(~arm_mask, neg_inf_fill)
+    masked_student = student_arm_logits.masked_fill(~arm_mask, neg_inf_fill)
+    target = F.softmax(masked_target, dim=-1)
+    student_log_probs = F.log_softmax(masked_student, dim=-1)
+    expected_per_token = -(target * student_log_probs).sum(dim=-1)
+
+    valid_mask = batch["target_move_id"].to(dtype=torch.long) != config.ignore_index
+    weights = has_rollout_policy_target.to(torch.float32) * valid_mask.to(torch.float32)
+    expected = (expected_per_token * weights).sum() / weights.sum().clamp_min(1.0)
+
+    assert torch.allclose(out["policy_kl_loss"], expected, atol=1e-5, rtol=1e-5)
+
+    # total_loss must include policy_kl_weight * policy_kl_loss.
+    assert torch.allclose(
+        out["loss"],
+        out["policy_loss"]
+        + config.moves_left_loss_weight * out["moves_left_loss"]
+        + config.policy_kl_weight * out["policy_kl_loss"],
+        atol=1e-5,
+        rtol=1e-5,
+    )
+
+
+def test_hstu_chess_model_policy_kl_target_detaches_student_gradient():
+    # The target side must not receive gradient through student_arm_logits --
+    # otherwise this becomes a degenerate/self-referential loss (a classic
+    # self-distillation footgun).
+    #
+    # Isolation matters here: `prediction_head` is shared with the main
+    # next-move policy_loss, which flows real gradient into it independently
+    # of policy_kl_loss (the _batch() fixture has non-ignored targets at
+    # several tokens). Backward()-ing on the combined out["loss"] therefore
+    # can't distinguish a correct vs. broken detach -- prediction_head gets
+    # a large nonzero gradient from policy_loss alone either way. Instead,
+    # backward specifically on out["policy_kl_loss"] to isolate the KL
+    # term's own gradient contribution.
+    #
+    # With arm_qhat == 0 everywhere and a correct detach, target_arm_logits
+    # == student_arm_logits.detach() numerically (detach changes graph
+    # connectivity, not values), so target == softmax(student) exactly. The
+    # cross-entropy gradient w.r.t. logits is softmax(logits) - target,
+    # which is then exactly zero at this point -- so a correctly detached
+    # loss must produce a ~0 (float-noise-level) gradient into
+    # prediction_head via this path alone. A missing detach makes the
+    # target implicitly a function of the student's own weights too, so
+    # backprop picks up an extra, non-vanishing term through that
+    # dependency -- empirically ~3 orders of magnitude larger than the
+    # float-noise floor of the correct version.
+    config = HSTUChessConfig(
+        move_vocab_size=128,
+        model_dim=64,
+        linear_hidden_dim=16,
+        attention_dim=16,
+        num_heads=2,
+        num_layers=0,
+        max_position_embeddings=32,
+        policy_kl_weight=1.0,
+        policy_kl_sigma=1.0,
+    )
+    torch.manual_seed(0)
+    model = HSTUChessModel(config)
+    batch = _batch()
+    total_tokens = batch["seq_token_id"].numel()
+    max_arms = 4
+
+    arm_ids = torch.zeros((total_tokens, max_arms), dtype=torch.long)
+    arm_qhat = torch.zeros((total_tokens, max_arms), dtype=torch.float32)
+    arm_mask = torch.zeros((total_tokens, max_arms), dtype=torch.bool)
+    has_rollout_policy_target = torch.zeros(total_tokens, dtype=torch.bool)
+    arm_ids[1, :2] = torch.tensor([10, 20])
+    arm_mask[1, :2] = True
+    has_rollout_policy_target[1] = True
+
+    batch["policy_kl_arm_ids"] = arm_ids
+    batch["policy_kl_arm_qhat"] = arm_qhat
+    batch["policy_kl_arm_mask"] = arm_mask
+    batch["has_rollout_policy_target"] = has_rollout_policy_target
+
+    out = model(batch, return_loss=True)
+    out["policy_kl_loss"].backward()
+
+    grad_norms = [
+        p.grad.norm().item()
+        for p in model.prediction_head.parameters()
+        if p.grad is not None
+    ]
+    assert grad_norms, "expected prediction_head to accumulate a gradient"
+    assert all(norm < 1e-4 for norm in grad_norms)
+
+
+def test_hstu_chess_model_policy_kl_masks_padding_and_uncovered_tokens():
+    config = HSTUChessConfig(
+        move_vocab_size=128,
+        model_dim=64,
+        linear_hidden_dim=16,
+        attention_dim=16,
+        num_heads=2,
+        num_layers=0,
+        max_position_embeddings=32,
+        policy_kl_weight=1.0,
+        policy_kl_sigma=1.0,
+    )
+    model = HSTUChessModel(config)
+    batch = _batch()
+    total_tokens = batch["seq_token_id"].numel()
+    max_arms = 4
+
+    # No token has has_rollout_policy_target=True -- policy_kl_loss must be
+    # a well-defined finite number (0-weight average, not NaN from an
+    # empty/degenerate reduction).
+    batch["policy_kl_arm_ids"] = torch.zeros((total_tokens, max_arms), dtype=torch.long)
+    batch["policy_kl_arm_qhat"] = torch.zeros((total_tokens, max_arms), dtype=torch.float32)
+    batch["policy_kl_arm_mask"] = torch.zeros((total_tokens, max_arms), dtype=torch.bool)
+    batch["has_rollout_policy_target"] = torch.zeros(total_tokens, dtype=torch.bool)
+
+    out = model(batch, return_loss=True)
+    assert torch.isfinite(out["policy_kl_loss"])
+    assert out["policy_kl_loss"].item() == pytest.approx(0.0, abs=1e-6)
+
+
+def test_hstu_chess_model_policy_kl_weight_zero_matches_no_rollout_keys():
+    # Backward-compat invariant: policy_kl_weight=0.0 (the default) must
+    # produce byte-identical total_loss/gradients to a batch that never had
+    # the policy-KL keys at all -- mirrors the existing beta=0.0 invariant
+    # (test_hstu_chess_model_value_loss_beta_zero_soft_target_matches_hard_ce).
+    config = HSTUChessConfig(
+        move_vocab_size=128,
+        model_dim=64,
+        linear_hidden_dim=16,
+        attention_dim=16,
+        num_heads=2,
+        num_layers=0,
+        max_position_embeddings=32,
+    )
+    assert config.policy_kl_weight == 0.0
+
+    torch.manual_seed(0)
+    model_baseline = HSTUChessModel(config)
+    batch_baseline = _batch()
+
+    torch.manual_seed(0)
+    model_with_keys = HSTUChessModel(config)
+    batch_with_keys = _batch()
+    total_tokens = batch_with_keys["seq_token_id"].numel()
+    max_arms = 4
+    batch_with_keys["policy_kl_arm_ids"] = torch.zeros(
+        (total_tokens, max_arms), dtype=torch.long
+    )
+    batch_with_keys["policy_kl_arm_ids"][1, 0] = 10
+    batch_with_keys["policy_kl_arm_qhat"] = torch.zeros(
+        (total_tokens, max_arms), dtype=torch.float32
+    )
+    batch_with_keys["policy_kl_arm_qhat"][1, 0] = 0.7
+    batch_with_keys["policy_kl_arm_mask"] = torch.zeros(
+        (total_tokens, max_arms), dtype=torch.bool
+    )
+    batch_with_keys["policy_kl_arm_mask"][1, 0] = True
+    batch_with_keys["has_rollout_policy_target"] = torch.zeros(
+        total_tokens, dtype=torch.bool
+    )
+    batch_with_keys["has_rollout_policy_target"][1] = True
+
+    torch.manual_seed(1)
+    out_baseline = model_baseline(batch_baseline, return_loss=True)
+    torch.manual_seed(1)
+    out_with_keys = model_with_keys(batch_with_keys, return_loss=True)
+
+    assert torch.allclose(out_baseline["loss"], out_with_keys["loss"], atol=1e-12)
+
+
+def test_build_hstu_chess_config_threads_policy_kl_fields():
+    model_cfg = build_hstu_chess_config(
+        ModelConfig(), move_vocab_size=64, policy_kl_weight=0.25, policy_kl_sigma=2.0
+    )
+    assert model_cfg.policy_kl_weight == 0.25
+    assert model_cfg.policy_kl_sigma == 2.0
+
+
+def test_build_hstu_chess_config_policy_kl_defaults_are_off():
+    model_cfg = build_hstu_chess_config(ModelConfig(), move_vocab_size=64)
+    assert model_cfg.policy_kl_weight == 0.0
+    assert model_cfg.policy_kl_sigma == 1.0

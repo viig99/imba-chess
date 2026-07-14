@@ -426,7 +426,10 @@ def main() -> None:
     )
 
     model_cfg = build_hstu_chess_config(
-        repo_config.model, move_vocab_size=len(move_vocab)
+        repo_config.model,
+        move_vocab_size=len(move_vocab),
+        policy_kl_weight=float(repo_config.expert_iteration.policy_kl_weight),
+        policy_kl_sigma=float(repo_config.expert_iteration.policy_kl_sigma),
     )
     model: torch.nn.Module = HSTUChessModel(model_cfg).to(device)
     _print_model_summary(model)
