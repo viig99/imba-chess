@@ -161,6 +161,15 @@ class ExpertIterationConfig:
     # blend(real_outcome, searched_value; beta). 0 = today's exact target,
     # 1 = pure searched estimate.
     beta: float = 0.0
+    # Weight of the search-backed policy-KL loss term (Phase 1b). 0.0 (the
+    # default) reproduces today's exact training -- no policy-KL loss is
+    # added regardless of whether rollout_path is set.
+    policy_kl_weight: float = 0.0
+    # Fixed scale on completedQ in the target softmax(logits + sigma*q_hat).
+    # A single constant, deliberately not the visit-adaptive scale Gumbel
+    # MuZero uses -- see docs/superpowers/specs/
+    # 2026-07-13-phase1b-policy-distillation-design.md.
+    policy_kl_sigma: float = 1.0
 
 
 @dataclass(frozen=True)

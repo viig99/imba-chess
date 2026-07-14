@@ -132,6 +132,8 @@ def test_expert_iteration_config_defaults():
     config = RepoConfig()
     assert config.expert_iteration.rollout_path is None
     assert config.expert_iteration.beta == 0.0
+    assert config.expert_iteration.policy_kl_weight == 0.0
+    assert config.expert_iteration.policy_kl_sigma == 1.0
 
 
 def test_load_repo_config_reads_expert_iteration_section(tmp_path):
@@ -141,8 +143,12 @@ def test_load_repo_config_reads_expert_iteration_section(tmp_path):
 [expert_iteration]
 rollout_path = "artifacts/rollouts/ckpt23.parquet"
 beta = 0.3
+policy_kl_weight = 0.1
+policy_kl_sigma = 1.5
 """
     )
     config = load_repo_config(config_path)
     assert config.expert_iteration.rollout_path == "artifacts/rollouts/ckpt23.parquet"
     assert config.expert_iteration.beta == 0.3
+    assert config.expert_iteration.policy_kl_weight == 0.1
+    assert config.expert_iteration.policy_kl_sigma == 1.5
