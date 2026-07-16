@@ -23,6 +23,7 @@ import argparse
 import json
 import os
 import random
+import time
 from pathlib import Path
 
 import chess
@@ -115,6 +116,87 @@ def _arm_rows_to_dicts(rows: list[dict]) -> list[dict]:
     ]
 
 
+class _TimingStats:
+    """Cumulative wall-clock breakdown, coarse enough to say which phase to
+    attack next without touching the hot path's actual logic.
+
+    Buckets:
+      ply_bookkeeping   -- python-chess + board_state_encoder + history
+                           updates, EVERY ply (sampled or not).
+      batch_build       -- history.build_batch_for_current_position's tensor
+                           construction, sampled plies only (pure CPU/Python,
+                           no model call -- separated from ply_bookkeeping
+                           since it's specific to the eval path, not every ply).
+      root_eval         -- the root position's own _forward_model GPU call.
+      search_gpu        -- cumulative time inside CachedPositionEvaluator.
+                           evaluate() (the search's batched forward_decode
+                           GPU calls across all waves of one search).
+      search_bookkeeping -- select_value_search_halving's own time MINUS
+                           search_gpu -- heapq/tree management, board copies
+                           for candidate moves, python-chess calls inside the
+                           search (_is_forcing, terminal_value_for_color, etc).
+    """
+
+    def __init__(self) -> None:
+        self.games = 0
+        self.positions = 0
+        self.ply_bookkeeping = 0.0
+        self.batch_build = 0.0
+        self.root_eval = 0.0
+        self.search_gpu = 0.0
+        self.search_bookkeeping = 0.0
+        self.search_eval_calls = 0
+        self.search_eval_items = 0
+
+    def total(self) -> float:
+        return (
+            self.ply_bookkeeping
+            + self.batch_build
+            + self.root_eval
+            + self.search_gpu
+            + self.search_bookkeeping
+        )
+
+    def report(self) -> str:
+        total = self.total()
+        if total <= 0:
+            return "no timing data yet"
+        buckets = [
+            ("ply_bookkeeping (chess+encode, every ply)", self.ply_bookkeeping),
+            ("batch_build (tensor construction, sampled plies)", self.batch_build),
+            ("root_eval (root forward, GPU)", self.root_eval),
+            ("search_gpu (search forward_decode waves, GPU)", self.search_gpu),
+            ("search_bookkeeping (heap/tree mgmt, CPU)", self.search_bookkeeping),
+        ]
+        lines = [
+            f"timing after {self.games} games / {self.positions} positions "
+            f"({self.search_eval_calls} search waves, {self.search_eval_items} search evals, "
+            f"total {total:.1f}s):"
+        ]
+        for name, seconds in sorted(buckets, key=lambda item: item[1], reverse=True):
+            pct = 100.0 * seconds / total
+            lines.append(f"  {name}: {seconds:.1f}s ({pct:.1f}%)")
+        return "\n".join(lines)
+
+
+class _TimedEvaluator(CachedPositionEvaluator):
+    """CachedPositionEvaluator that times its own evaluate() calls, so the
+    search's GPU time can be separated from its CPU tree/heap bookkeeping
+    without instrumenting search.py (which stays torch-free by design)."""
+
+    def __init__(self, *args, stats: _TimingStats, **kwargs) -> None:
+        super().__init__(*args, **kwargs)
+        self._stats = stats
+
+    def evaluate(self, batch):
+        start = time.perf_counter()
+        result = super().evaluate(batch)
+        self._stats.search_gpu += time.perf_counter() - start
+        self._stats.search_eval_calls += 1
+        self._stats.search_eval_items += len(batch)
+        return result
+
+
 def _generate_rollout_row(
     *,
     model,
@@ -131,9 +213,16 @@ def _generate_rollout_row(
     real_outcome_stm: int,
     checkpoint_path: str,
     rng: random.Random,
+    stats: _TimingStats | None = None,
 ) -> RolloutRow | None:
+    t_batch_start = time.perf_counter()
     batch = history.build_batch_for_current_position(board)
+    t_batch_end = time.perf_counter()
     output = _forward_model(model=model, batch=batch, device=device, dtype=dtype, return_kv=True)
+    t_root_eval_end = time.perf_counter()
+    if stats is not None:
+        stats.batch_build += t_batch_end - t_batch_start
+        stats.root_eval += t_root_eval_end - t_batch_end
 
     logits = output["logits"][-1]
     try:
@@ -149,7 +238,7 @@ def _generate_rollout_row(
         float(v) for v in torch.softmax(output["value_logits"][-1].float(), dim=-1).tolist()
     )
 
-    evaluator = CachedPositionEvaluator(
+    evaluator_kwargs = dict(
         model=model,
         move_vocab=move_vocab,
         board_state_encoder=board_state_encoder,
@@ -158,6 +247,13 @@ def _generate_rollout_row(
         prefix_kv=output["kv_caches"],
         prefix_len=int(batch["total_tokens"]),
     )
+    evaluator = (
+        _TimedEvaluator(**evaluator_kwargs, stats=stats)
+        if stats is not None
+        else CachedPositionEvaluator(**evaluator_kwargs)
+    )
+    t_search_start = time.perf_counter()
+    gpu_before = stats.search_gpu if stats is not None else 0.0
     best_local_idx, rows = select_value_search_halving(
         evaluator=evaluator,
         root_handle=None,
@@ -167,6 +263,10 @@ def _generate_rollout_row(
         config=halving_config,
         rng=rng,
     )
+    if stats is not None:
+        search_total = time.perf_counter() - t_search_start
+        stats.search_bookkeeping += search_total - (stats.search_gpu - gpu_before)
+        stats.positions += 1
     best_move_uci = legal_moves[best_local_idx].uci()
     best_row = next((row for row in rows if row["move_uci"] == best_move_uci), None)
     if best_row is None or best_row["backed_value"] is None:
@@ -215,6 +315,7 @@ def _process_game(
     every_n_plies: int,
     sample_seed: int,
     checkpoint_path: str,
+    stats: _TimingStats | None = None,
 ) -> list[RolloutRow]:
     plays = game["plays"]
     sampled = set(
@@ -248,14 +349,20 @@ def _process_game(
                 real_outcome_stm=real_outcome_stm,
                 checkpoint_path=checkpoint_path,
                 rng=random.Random(f"{sample_seed}:{game['game_id']}:{ply_idx}:gumbel"),
+                stats=stats,
             )
             if row is not None:
                 rows.append(row)
+        t_bookkeeping_start = time.perf_counter()
         move = chess.Move.from_uci(play["move_uci"])
         history.append_observed_position(board)
         history.record_played_move(play["move_uci"])
         board.push(move)
+        if stats is not None:
+            stats.ply_bookkeeping += time.perf_counter() - t_bookkeeping_start
 
+    if stats is not None:
+        stats.games += 1
     return rows
 
 
@@ -321,6 +428,22 @@ def _parse_args() -> argparse.Namespace:
         "stopping an overnight session) only loses games since the last "
         "flush, not the whole run. Set to 0 to disable and write once at "
         "the end (the old behavior).",
+    )
+    parser.add_argument(
+        "--profile",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Track and periodically print a wall-clock breakdown (ply "
+        "bookkeeping / batch build / root eval / search GPU / search "
+        "bookkeeping) via time.perf_counter() -- negligible overhead, off "
+        "by default to keep normal run logs uncluttered.",
+    )
+    parser.add_argument(
+        "--profile-every-games",
+        type=int,
+        default=25,
+        help="Print the running timing breakdown every N processed games "
+        "when --profile is set.",
     )
     return parser.parse_args()
 
@@ -392,6 +515,7 @@ def main() -> None:
     all_rows: list[RolloutRow] = []
     games_processed = 0
     games_skipped = 0
+    stats = _TimingStats() if args.profile else None
     game_stream = lichess_dataset.stream(shard_id=args.shard_id, num_shards=args.num_shards)
     for game in tqdm(game_stream, desc="rollout-generation", unit="game"):
         if games_skipped < args.skip_games:
@@ -412,9 +536,16 @@ def main() -> None:
             every_n_plies=args.sample_every_n_plies,
             sample_seed=args.sample_seed,
             checkpoint_path=str(args.checkpoint),
+            stats=stats,
         )
         all_rows.extend(rows)
         games_processed += 1
+        if (
+            stats is not None
+            and args.profile_every_games > 0
+            and games_processed % args.profile_every_games == 0
+        ):
+            tqdm.write(stats.report())
         if (
             args.flush_every_games > 0
             and games_processed % args.flush_every_games == 0
@@ -444,6 +575,8 @@ def main() -> None:
         f"wrote {len(all_rows)} rollout rows from {games_processed} games "
         f"(skipped {games_skipped}) to {args.output_path}"
     )
+    if stats is not None:
+        print(stats.report())
 
 
 if __name__ == "__main__":
