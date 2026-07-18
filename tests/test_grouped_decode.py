@@ -342,3 +342,135 @@ def test_forward_decode_grouped_multiple_rows_per_group():
             rk, rv = ref["kv"][layer_idx]
             torch.testing.assert_close(gk[i : i + 1], rk, atol=ATOL, rtol=RTOL)
             torch.testing.assert_close(gv[i : i + 1], rv, atol=ATOL, rtol=RTOL)
+
+
+def test_forward_decode_grouped_interleaved_group_index():
+    """Real merged waves interleave games row-by-row, not sorted by group.
+    group_index = [2, 0, 1, 0] over G=3 (different prefix lens, mixed
+    depths, and two rows for game 0 at different depths, non-adjacent in the
+    batch) -- pins the row_idx-based scatter/gather against regressions
+    where a group's output could land at the wrong batch row."""
+    model = _tiny_model()
+    num_layers = len(model.layers)
+    T_list = [8, 5, 6]  # game 0, 1, 2 -- padding exercised (maxP=8)
+
+    prefix_kvs = [
+        _prefill(model, _random_token_ids(T, seed=500 + g), T)
+        for g, T in enumerate(T_list)
+    ]
+
+    # Row order in the merged wave; group_index below must match this order.
+    row_specs = [
+        {"game": 2, "depth": 1, "seed": 601},
+        {"game": 0, "depth": 0, "seed": 602},
+        {"game": 1, "depth": 2, "seed": 603},
+        {"game": 0, "depth": 2, "seed": 604},
+    ]
+    group_index = torch.tensor([r["game"] for r in row_specs], dtype=torch.long)
+    assert list(group_index) != sorted(group_index), (
+        "test must exercise a genuinely non-monotonic group_index"
+    )
+
+    rows = []
+    references = []
+    for spec in row_specs:
+        g, depth = spec["game"], spec["depth"]
+        T = T_list[g]
+        prefix_kv = prefix_kvs[g]
+        ids = _random_token_ids(T + depth + 1, seed=spec["seed"])
+        suffix_kv, suffix_positions, suffix_mask = _decode_chain(
+            model, ids, T, depth, prefix_kv
+        )
+        final_pos = T + depth
+        final_token = {
+            key: value[final_pos : final_pos + 1] for key, value in ids.items()
+        }
+        with torch.no_grad():
+            ref = model.forward_decode(
+                new_token_batch=final_token,
+                positions=torch.tensor([final_pos]),
+                prefix_kv=prefix_kv,
+                suffix_kv=suffix_kv,
+                suffix_positions=suffix_positions,
+                suffix_mask=suffix_mask,
+            )
+        references.append(ref)
+        rows.append(
+            {
+                "T": T,
+                "depth": depth,
+                "suffix_kv": suffix_kv,
+                "suffix_positions": suffix_positions,
+                "suffix_mask": suffix_mask,
+                "final_pos": final_pos,
+                "final_token": final_token,
+            }
+        )
+
+    new_token_batch = {
+        key: torch.cat([r["final_token"][key] for r in rows], dim=0)
+        for key in rows[0]["final_token"]
+    }
+    positions = torch.tensor([r["final_pos"] for r in rows])
+    prefix_kv_grouped, prefix_lens = _pad_prefix_kv_grouped(prefix_kvs, num_layers)
+    s_max = max(r["depth"] for r in rows)
+    suffix_kv, suffix_positions, suffix_mask = _assemble_batch_suffix(
+        model, rows, s_max, num_layers
+    )
+
+    with torch.no_grad():
+        grouped_out = model.forward_decode_grouped(
+            new_token_batch=new_token_batch,
+            positions=positions,
+            group_index=group_index,
+            prefix_kv_grouped=prefix_kv_grouped,
+            prefix_lens=prefix_lens,
+            suffix_kv=suffix_kv,
+            suffix_positions=suffix_positions,
+            suffix_mask=suffix_mask,
+        )
+
+    for i, ref in enumerate(references):
+        torch.testing.assert_close(
+            grouped_out["logits"][i], ref["logits"].squeeze(0), atol=ATOL, rtol=RTOL
+        )
+        torch.testing.assert_close(
+            grouped_out["value_logits"][i],
+            ref["value_logits"].squeeze(0),
+            atol=ATOL,
+            rtol=RTOL,
+        )
+        for layer_idx in range(num_layers):
+            gk, gv = grouped_out["kv"][layer_idx]
+            rk, rv = ref["kv"][layer_idx]
+            torch.testing.assert_close(gk[i : i + 1], rk, atol=ATOL, rtol=RTOL)
+            torch.testing.assert_close(gv[i : i + 1], rv, atol=ATOL, rtol=RTOL)
+
+
+def test_forward_decode_grouped_empty_prefix_lens_raises():
+    """Regression for the guard-hole fix: a non-empty batch with zero groups
+    (G=0, empty prefix_lens) must raise ValueError, not silently let every
+    row skip the per-group loop and return uninitialized (NaN) attn_output.
+    Reviewer repro: prefix_lens=zeros(0), batch=1, group_index=[0] -- with
+    prefix_kv_grouped correctly shaped [0, H, 0, d] per layer (matching
+    num_layers) so the failure mode under test is the guard hole itself,
+    not an unrelated IndexError from a malformed prefix_kv_grouped list."""
+    model = _tiny_model()
+    ids = _random_token_ids(1, seed=700)
+    final_token = {key: value[:1] for key, value in ids.items()}
+    num_heads = model.config.num_heads
+    attn_dim = model.config.attention_dim
+    linear_dim = model.config.linear_hidden_dim
+    prefix_kv_grouped = [
+        (torch.zeros(0, num_heads, 0, attn_dim), torch.zeros(0, num_heads, 0, linear_dim))
+        for _ in range(len(model.layers))
+    ]
+
+    with pytest.raises(ValueError):
+        model.forward_decode_grouped(
+            new_token_batch=final_token,
+            positions=torch.tensor([0]),
+            group_index=torch.tensor([0], dtype=torch.long),
+            prefix_kv_grouped=prefix_kv_grouped,
+            prefix_lens=torch.zeros(0, dtype=torch.long),
+        )

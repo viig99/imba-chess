@@ -695,9 +695,14 @@ class HSTUChessModel(nn.Module):
             raise ValueError(
                 "group_index must have shape [B] matching new_token_batch"
             )
-        if num_groups > 0 and bool(
-            ((group_index < 0) | (group_index >= num_groups)).any()
-        ):
+        # No `num_groups > 0` short-circuit here: a non-empty batch with
+        # zero groups (empty prefix_lens) must still raise below rather than
+        # let every row skip the per-group loop and return uninitialized
+        # (torch.empty) attn_output as silent NaN logits. With num_groups==0
+        # the comparison `group_index >= 0` is already sufficient to catch
+        # any row (since no g in range(0) will ever claim it), and .any() on
+        # an empty group_index (batch_size==0) is correctly False.
+        if bool(((group_index < 0) | (group_index >= num_groups)).any()):
             raise ValueError("group_index values must be in [0, num_groups)")
         x = self.position_embedding.at_positions(content, positions)
 
