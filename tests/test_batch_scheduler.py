@@ -80,6 +80,41 @@ def test_error_isolation_drops_game_and_continues():
     assert done[2] == ("ok", [("ok", 0), ("ok", 1)])
 
 
+def test_zero_yield_game_does_not_starve_later_games():
+    # Regression: a game coroutine that finishes without yielding any
+    # WorkRequest (e.g. a zero-ply game) must not be mistaken for "nothing
+    # left to do" while the factory still has unconsumed games. With
+    # concurrent_games=1, a zero-yield first game must not stall the
+    # second, normal game.
+    log = []
+    ticks = []
+    games = [
+        ("g0", _fake_game("g0", 0, log)),
+        ("g1", _fake_game("g1", 2, log)),
+    ]
+    done = _run(games, concurrent=1, tick_log=ticks)
+    assert done == [("g0", []), ("g1", [("g1", 0), ("g1", 1)])]
+
+
+def test_all_initial_slots_zero_yield_does_not_drop_later_games():
+    # Regression variant: every game that fills the initial G slots is
+    # zero-yield, and only later games (beyond the initial fill) yield
+    # requests. All games must still reach on_game_done, in stream order.
+    log = []
+    ticks = []
+    games = [
+        ("g0", _fake_game("g0", 0, log)),
+        ("g1", _fake_game("g1", 0, log)),
+        ("g2", _fake_game("g2", 2, log)),
+    ]
+    done = _run(games, concurrent=2, tick_log=ticks)
+    assert done == [
+        ("g0", []),
+        ("g1", []),
+        ("g2", [("g2", 0), ("g2", 1)]),
+    ]
+
+
 def test_determinism_same_inputs_same_ticks():
     def run_once():
         log, ticks = [], []

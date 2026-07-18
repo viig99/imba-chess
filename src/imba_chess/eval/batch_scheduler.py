@@ -62,22 +62,35 @@ class BatchScheduler:
     def run(self) -> None:
         slots: dict[int, _Slot] = {}
         self._fill_slots(slots)
-        while slots:
-            # Phase 1: advance every slot lacking a pending request.
-            for slot_id in list(slots):
-                slot = slots.get(slot_id)
-                if slot is not None and slot.pending is None:
-                    self._advance(slot_id, slots, send_value=None, first=True)
-
+        while True:
+            # Phase 1: advance every slot lacking a pending request. A game
+            # coroutine may finish without yielding any WorkRequest (e.g. a
+            # zero-ply game) — that must not be mistaken for "nothing left
+            # to do" while the factory still has unconsumed games. So keep
+            # refilling from the factory and re-advancing the fresh slots
+            # until either some slot ends up with a pending request, or all
+            # live slots have finished *and* the factory has nothing left
+            # to offer (true end of run).
+            while True:
+                for slot_id in list(slots):
+                    slot = slots.get(slot_id)
+                    if slot is not None and slot.pending is None:
+                        self._advance(slot_id, slots, send_value=None, first=True)
+                if slots:
+                    # Every remaining slot now has a pending request: either
+                    # it already had one (untouched above) or it was just
+                    # given one by _advance (finished slots are removed).
+                    break
+                before = len(slots)
+                self._fill_slots(slots)
+                if len(slots) == before:
+                    return  # factory exhausted and no live slots remain
             # Phase 2: group pending requests by kind (stable slot order).
             by_kind: dict[str, list[tuple[int, WorkRequest]]] = defaultdict(list)
             for slot_id in sorted(slots):
                 slot = slots[slot_id]
                 if slot.pending is not None:
                     by_kind[slot.pending.kind].append((slot_id, slot.pending))
-
-            if not by_kind:
-                break
 
             # Phase 3: one merged executor call per kind; scatter results.
             for kind, entries in by_kind.items():
