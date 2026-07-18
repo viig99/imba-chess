@@ -160,3 +160,128 @@ same as today's guard); Python 3.13 wheels exist (repo venv is 3.13; no cp314).
   `cozy-chess-py==0.1.1` wheels.
 - FEN corpus: first 30 games of the training split via `LichessDataset.stream`
   (same config as rollout generation), one FEN per ply, 2,087 positions.
+
+## 6. Results (2026-07-18, branch cozy-chess-hotpaths)
+
+Stage 1 and Stage 2 of the §4 staged plan are implemented and cut over
+(commits `f8df0e9` and `e31504d`). Stage 0 (differential harness,
+`tests/test_cozy_differential.py`) gates both. Each stage's A/B gate below is
+a fixed-seed 20-game rollout (`config/imba_chess_exit_full.toml`,
+`search_budget=2048`, `best_hr10_checkpoint_23_hr10=0.9564.pt`), run
+sequentially with the GPU idle beforehand, `--profile` on. Per this repo's
+run-to-run wall-clock variance (~±10% between separate sessions — compare
+this section's 107.9s baseline in §1 against Task 3's 120.9s py-side run of
+the *same* code path), the paired numbers **within** each task's own A/B are
+the trustworthy comparison; absolute wall time across different sessions is
+not.
+
+HEAD (`e31504d`) is byte-identical to the code that produced Task 5's B-side
+profile run below, so that run stands as the final post-Stage-2 measurement
+— no re-profile was needed for this section. Final full suite check:
+`.venv/bin/pytest -q` → **171 passed**, 81 warnings, matching every stage's
+expected count.
+
+### Stage 1 A/B (Task 3): forcing-move floor on cozy
+
+py (`IMBA_SEARCH_FORCING=py`):
+```
+wrote 169 rollout rows from 20 games (skipped 0) to /tmp/tmp.JfJnGfs7qG/py.parquet
+timing after 20 games / 169 positions (1371 search waves, 346093 search evals, total 120.9s):
+  search_bookkeeping (heap/tree mgmt, CPU): 55.4s (45.8%)
+  search_gpu (search forward_decode waves, GPU): 44.3s (36.6%)
+  root_eval (root forward, GPU): 21.1s (17.5%)
+  batch_build (tensor construction, sampled plies): 0.0s (0.0%)
+  ply_bookkeeping (chess+encode, every ply): 0.0s (0.0%)
+```
+
+cozy (`IMBA_SEARCH_FORCING=cozy`):
+```
+wrote 169 rollout rows from 20 games (skipped 0) to /tmp/tmp.JfJnGfs7qG/cozy.parquet
+timing after 20 games / 169 positions (1371 search waves, 346093 search evals, total 106.8s):
+  search_bookkeeping (heap/tree mgmt, CPU): 42.6s (39.9%)
+  search_gpu (search forward_decode waves, GPU): 41.3s (38.6%)
+  root_eval (root forward, GPU): 22.9s (21.4%)
+  batch_build (tensor construction, sampled plies): 0.0s (0.0%)
+  ply_bookkeeping (chess+encode, every ply): 0.0s (0.0%)
+```
+
+Both runs: identical wave/eval/position counts (1371 waves, 346093 evals, 169
+positions from 20 games, 0 skipped) — the two implementations chose the same
+moves throughout the search tree, not just at the leaves. `search_bookkeeping`
+45.8% → 39.9%; total wall time 120.9s → 106.8s (−11.7%).
+
+Parquet equivalence: `pd.testing.assert_frame_equal(a, b)` raised nothing —
+`EQUAL: 169 rows`, full frame equality including nested list columns.
+
+### Stage 2 A/B (Task 5): dual cozy/python-chess boards threaded through the search tree
+
+A-side (pre-change HEAD `3c0abd5`):
+```
+wrote 169 rollout rows from 20 games (skipped 0) to task5_a.parquet
+timing after 20 games / 169 positions (1371 search waves, 346093 search evals, total 100.2s):
+  search_gpu (search forward_decode waves, GPU): 42.2s (42.1%)
+  search_bookkeeping (heap/tree mgmt, CPU): 39.6s (39.5%)
+  root_eval (root forward, GPU): 18.4s (18.4%)
+  batch_build (tensor construction, sampled plies): 0.0s (0.0%)
+  ply_bookkeeping (chess+encode, every ply): 0.0s (0.0%)
+```
+
+B-side (working tree, Stage 2 changes applied — this is also the final,
+post-cutover measurement, since HEAD is byte-identical to this run):
+```
+wrote 169 rollout rows from 20 games (skipped 0) to task5_b.parquet
+timing after 20 games / 169 positions (1371 search waves, 346093 search evals, total 92.0s):
+  search_gpu (search forward_decode waves, GPU): 41.4s (45.1%)
+  search_bookkeeping (heap/tree mgmt, CPU): 32.2s (35.1%)
+  root_eval (root forward, GPU): 18.2s (19.8%)
+  batch_build (tensor construction, sampled plies): 0.0s (0.0%)
+  ply_bookkeeping (chess+encode, every ply): 0.0s (0.0%)
+```
+
+Total wall time 100.2s → 92.0s (−8.2%). `search_bookkeeping` 39.6s → 32.2s
+(−18.7% absolute, 39.5% → 35.1% of total) — a smaller relative drop than
+Stage 1's, because Stage 2 both removes cost (python-chess `outcome()` calls
+replaced by `terminal_value_fast`) and adds new cost (a cozy `copy.copy()` +
+`.play()` at every tree-expansion site, not just where `_forcing_index_set`
+needed a board). Net effect still a clear win; see Task 5's report for the
+full accounting.
+
+Parquet equivalence: `a.shape == b.shape == (169, 19)`;
+`pd.testing.assert_frame_equal(a, b)` raised nothing — byte-for-byte
+identical including nested list columns (moves/policy/value arrays). Same
+config, checkpoint, and `--max-games 20` on both sides.
+
+### Overall speedup and final bucket shares
+
+Chaining the two tasks' paired runs (both driven from the same 20-game
+fixed-seed workload, same checkpoint, same config): **120.9s (py, Task 3
+A-side) → 92.0s (cozy, Task 5 B-side / final HEAD) ≈ 1.31x faster
+end-to-end.** `search_bookkeeping`'s share of total wall time moved
+45.8% → 39.9% → 35.1% across the two stages, its absolute time dropping
+55.4s → 42.6s → 32.2s (−42% absolute across both stages combined).
+
+Final-state bucket shares (Task 5 B-side, = current HEAD):
+`search_gpu` 45.1%, `search_bookkeeping` 35.1%, `root_eval` 19.8%.
+
+### Stage 3 go/no-go decision: **NO-GO**
+
+The spec's own criterion (§4, Stage 3): "own thin PyO3 crate... only if
+profile still says so" — i.e. justified only if `search_bookkeeping` remains
+the *largest* bucket after Stage 1+2. It no longer is. At the final measured
+state, `search_gpu` (45.1%) is larger than `search_bookkeeping` (35.1%);
+GPU-side forward_decode waves, not Python/cozy CPU bookkeeping, are now the
+single biggest cost. Stage 3's remaining candidates (evaluator-side movegen
+in `_project_legal_logits`, a cozy-native `BoardStateEncoder`) would be
+chasing a bucket that is no longer dominant — applying the criterion
+honestly, there is no case for building the additional PyO3 crate right now.
+
+This matches the spec's own Amdahl note from §1: eliminating *all* Python
+chess cost caps rollout speedup at ~1.85x, and the 12–35x throughput gap
+against the KL-coverage target needs cross-game batched search (the
+lc0-shaped architecture) regardless of how far the CPU-bookkeeping share is
+driven down. Stage 1+2's ~1.31x is real, equivalence-gated progress toward
+that 1.85x ceiling, but the next big lever — for both the remaining Amdahl
+headroom and the now-larger `search_gpu` bucket — is cross-game batched
+search, not a deeper cozy port. Revisit Stage 3 only if a future change
+(e.g. batched search reducing `search_gpu`'s share) makes
+`search_bookkeeping` the largest bucket again.
