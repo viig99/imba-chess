@@ -18,7 +18,7 @@ import math
 import os
 import random
 from dataclasses import dataclass, field
-from typing import Any, NamedTuple, Optional, Protocol
+from typing import Any, Callable, Generator, NamedTuple, Optional, Protocol
 
 import chess
 import cozy_chess as cc
@@ -44,6 +44,33 @@ class PositionEvaluator(Protocol):
     def evaluate(
         self, batch: list[tuple[Any, chess.Board]]
     ) -> list[PositionEval]: ...
+
+
+class EvalRequest(NamedTuple):
+    """A batch of (handle, board) pairs a stepwise generator wants scored.
+
+    Yielded by the `*_stepwise` generators in place of a synchronous
+    `evaluator.evaluate(batch)` call; the driver sends back the matching
+    `list[PositionEval]` via `gen.send(...)`.
+    """
+
+    batch: list[tuple[Any, chess.Board]]
+
+
+def _drive(gen: Generator[EvalRequest, list[PositionEval], Any], evaluator: PositionEvaluator) -> Any:
+    """Run a stepwise search generator to completion synchronously.
+
+    This is the sync API's entire implementation: pump the generator,
+    answering each EvalRequest with evaluator.evaluate(batch), until it
+    returns. A future G-game scheduler drives the same generators by
+    interleaving evaluate() calls across games instead.
+    """
+    try:
+        request = next(gen)
+        while True:
+            request = gen.send(evaluator.evaluate(request.batch))
+    except StopIteration as stop:
+        return stop.value
 
 
 @dataclass(frozen=True)
@@ -174,21 +201,23 @@ class _RootCandidate:
     reply_candidates: list[dict[str, Any]] = field(default_factory=list)
 
 
-def _expand_root_candidates(
+def _expand_root_candidates_stepwise(
     *,
-    evaluator: PositionEvaluator,
+    extend: Callable[[Any, chess.Board, chess.Move], Any],
     root_handle: Any,
     board: chess.Board,
-    root_cozy: "cc.Board",
+    cozy_root: "cc.Board",
     legal_moves: list[chess.Move],
     legal_log_priors: list[float],
     top_k: int,
-) -> tuple[list[_RootCandidate], Optional[int]]:
+) -> Generator[EvalRequest, list[PositionEval], tuple[list[_RootCandidate], Optional[int]]]:
     """Build the top-k prior root candidates and batch-evaluate their boards.
 
-    Returns (candidates, mate_index). When a candidate move delivers
-    checkmate no other move can score higher: mate_index is set, no
-    evaluator call is made, and the partially built candidates list must be
+    Stepwise generator core shared by select_value_rerank and
+    select_value_search_d2 (via `yield from`). Returns (candidates,
+    mate_index) as its StopIteration.value. When a candidate move delivers
+    checkmate no other move can score higher: mate_index is set, no eval
+    request is made, and the partially built candidates list must be
     ignored. Terminal boards never appear as training tokens, so they carry
     the exact game result instead of going through the value head.
     """
@@ -198,7 +227,7 @@ def _expand_root_candidates(
     batch_to_candidate: list[int] = []
     for local_idx in _prior_order(legal_log_priors)[: min(top_k, len(legal_moves))]:
         move = legal_moves[local_idx]
-        board1, cozy1 = _dual_push(board, root_cozy, move)
+        board1, cozy1 = _dual_push(board, cozy_root, move)
         terminal_value = terminal_value_for_color(board1, color=root_color, cozy_board=cozy1)
         if terminal_value is not None and terminal_value >= 1.0:
             return candidates, local_idx
@@ -213,32 +242,33 @@ def _expand_root_candidates(
         candidates.append(candidate)
         if terminal_value is not None:
             continue
-        candidate.handle1 = evaluator.extend(root_handle, board, move)
+        candidate.handle1 = extend(root_handle, board, move)
         batch.append((candidate.handle1, board1))
         batch_to_candidate.append(len(candidates) - 1)
 
     if batch:
-        for cand_idx, position_eval in zip(batch_to_candidate, evaluator.evaluate(batch)):
+        position_evals = yield EvalRequest(batch=batch)
+        for cand_idx, position_eval in zip(batch_to_candidate, position_evals):
             candidates[cand_idx].board1_eval = position_eval
     return candidates, None
 
 
-def select_value_rerank(
+def _rerank_stepwise(
     *,
-    evaluator: PositionEvaluator,
+    extend: Callable[[Any, chess.Board, chess.Move], Any],
     root_handle: Any,
     board: chess.Board,
     legal_moves: list[chess.Move],
     legal_log_priors: list[float],
     top_k: int,
     lam: float,
-) -> tuple[int, list[dict[str, Any]]]:
+) -> Generator[EvalRequest, list[PositionEval], tuple[int, list[dict[str, Any]]]]:
     root_cozy = cozy_bridge.board_to_cozy(board)
-    candidates, mate_index = _expand_root_candidates(
-        evaluator=evaluator,
+    candidates, mate_index = yield from _expand_root_candidates_stepwise(
+        extend=extend,
         root_handle=root_handle,
         board=board,
-        root_cozy=root_cozy,
+        cozy_root=root_cozy,
         legal_moves=legal_moves,
         legal_log_priors=legal_log_priors,
         top_k=top_k,
@@ -283,7 +313,7 @@ def select_value_rerank(
     return chosen_index, rerank_rows
 
 
-def select_value_search_d2(
+def select_value_rerank(
     *,
     evaluator: PositionEvaluator,
     root_handle: Any,
@@ -293,13 +323,37 @@ def select_value_search_d2(
     top_k: int,
     lam: float,
 ) -> tuple[int, list[dict[str, Any]]]:
+    return _drive(
+        _rerank_stepwise(
+            extend=evaluator.extend,
+            root_handle=root_handle,
+            board=board,
+            legal_moves=legal_moves,
+            legal_log_priors=legal_log_priors,
+            top_k=top_k,
+            lam=lam,
+        ),
+        evaluator,
+    )
+
+
+def _d2_stepwise(
+    *,
+    extend: Callable[[Any, chess.Board, chess.Move], Any],
+    root_handle: Any,
+    board: chess.Board,
+    legal_moves: list[chess.Move],
+    legal_log_priors: list[float],
+    top_k: int,
+    lam: float,
+) -> Generator[EvalRequest, list[PositionEval], tuple[int, list[dict[str, Any]]]]:
     root_color = board.turn
     root_cozy = cozy_bridge.board_to_cozy(board)
-    candidates, mate_index = _expand_root_candidates(
-        evaluator=evaluator,
+    candidates, mate_index = yield from _expand_root_candidates_stepwise(
+        extend=extend,
         root_handle=root_handle,
         board=board,
-        root_cozy=root_cozy,
+        cozy_root=root_cozy,
         legal_moves=legal_moves,
         legal_log_priors=legal_log_priors,
         top_k=top_k,
@@ -359,13 +413,14 @@ def select_value_search_d2(
             if terminal_value is not None:
                 continue
             board2_batch.append(
-                (evaluator.extend(candidate.handle1, board1, opp_move), board2)
+                (extend(candidate.handle1, board1, opp_move), board2)
             )
             board2_meta.append((candidate, len(candidate.reply_candidates) - 1))
 
     if board2_batch:
+        board2_evals = yield EvalRequest(batch=board2_batch)
         for (candidate, reply_idx), position_eval in zip(
-            board2_meta, evaluator.evaluate(board2_batch)
+            board2_meta, board2_evals
         ):
             # Side-to-move at board2 is the root color again: POV matches root.
             candidate.reply_candidates[reply_idx]["value_after_reply"] = float(
@@ -419,6 +474,30 @@ def select_value_search_d2(
             chosen_index = candidate.local_idx
 
     return chosen_index, search_rows
+
+
+def select_value_search_d2(
+    *,
+    evaluator: PositionEvaluator,
+    root_handle: Any,
+    board: chess.Board,
+    legal_moves: list[chess.Move],
+    legal_log_priors: list[float],
+    top_k: int,
+    lam: float,
+) -> tuple[int, list[dict[str, Any]]]:
+    return _drive(
+        _d2_stepwise(
+            extend=evaluator.extend,
+            root_handle=root_handle,
+            board=board,
+            legal_moves=legal_moves,
+            legal_log_priors=legal_log_priors,
+            top_k=top_k,
+            lam=lam,
+        ),
+        evaluator,
+    )
 
 
 @dataclass
@@ -480,7 +559,7 @@ def _push_children(
     arm: _Arm,
     node: _TreeNode,
     position_eval: PositionEval,
-    evaluator: PositionEvaluator,
+    extend: Callable[[Any, chess.Board, chess.Move], Any],
     config: HalvingConfig,
     counter: "itertools.count",
     root_color: chess.Color,
@@ -526,22 +605,22 @@ def _push_children(
             child.terminal_value_stm = terminal_stm
             node.children.append(child)
             continue
-        child.handle = evaluator.extend(node.handle, node.board, move)
+        child.handle = extend(node.handle, node.board, move)
         node.children.append(child)
         heapq.heappush(arm.frontier, (-child.path_log_prior, next(counter), child))
 
 
-def select_value_search_halving(
+def _halving_stepwise(
     *,
-    evaluator: PositionEvaluator,
+    extend: Callable[[Any, chess.Board, chess.Move], Any],
     root_handle: Any,
     board: chess.Board,
     legal_moves: list[chess.Move],
     legal_log_priors: list[float],
     config: HalvingConfig,
     rng: Optional[random.Random] = None,
-) -> tuple[int, list[dict[str, Any]]]:
-    """Pick a root move by sequential halving over value-backed subtrees.
+) -> Generator[EvalRequest, list[PositionEval], tuple[int, list[dict[str, Any]]]]:
+    """Stepwise generator core of select_value_search_halving; see its docstring.
 
     Precondition: legal_moves is non-empty (the caller projects legal moves
     and raises before dispatch when none map to the vocab).
@@ -595,7 +674,7 @@ def select_value_search_halving(
             node = _TreeNode(
                 board=board1,
                 cozy_board=cozy1,
-                handle=evaluator.extend(root_handle, board, move),
+                handle=extend(root_handle, board, move),
                 depth=0,
                 path_log_prior=float(legal_log_priors[idx]),
             )
@@ -630,14 +709,14 @@ def select_value_search_halving(
                     remaining[id(arm)] -= 1
             if not wave:
                 break
-            evals = evaluator.evaluate([(node.handle, node.board) for _, node in wave])
+            evals = yield EvalRequest(batch=[(node.handle, node.board) for _, node in wave])
             spent += len(wave)
             for (arm, node), position_eval in zip(wave, evals):
                 node.value_stm = float(position_eval.value_stm)
                 arm.evals_spent += 1
                 arm.max_depth_reached = max(arm.max_depth_reached, node.depth)
                 _push_children(
-                    arm, node, position_eval, evaluator, config, counter, root_color
+                    arm, node, position_eval, extend, config, counter, root_color
                 )
         for arm in survivors:
             _score_arm(arm, config.lam)
@@ -671,3 +750,32 @@ def select_value_search_halving(
         for arm in arms
     ]
     return best.local_idx, rows
+
+
+def select_value_search_halving(
+    *,
+    evaluator: PositionEvaluator,
+    root_handle: Any,
+    board: chess.Board,
+    legal_moves: list[chess.Move],
+    legal_log_priors: list[float],
+    config: HalvingConfig,
+    rng: Optional[random.Random] = None,
+) -> tuple[int, list[dict[str, Any]]]:
+    """Pick a root move by sequential halving over value-backed subtrees.
+
+    See _halving_stepwise for the algorithm; this is a thin synchronous
+    driver around its generator core.
+    """
+    return _drive(
+        _halving_stepwise(
+            extend=evaluator.extend,
+            root_handle=root_handle,
+            board=board,
+            legal_moves=legal_moves,
+            legal_log_priors=legal_log_priors,
+            config=config,
+            rng=rng,
+        ),
+        evaluator,
+    )
