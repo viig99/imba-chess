@@ -113,8 +113,9 @@ the correctness oracle; cozy is an internal acceleration detail behind
 - **Stage 1 — forcing-move floor on cozy.** At each expanded node, build one
   cozy board (from raw bitboards or maintained incrementally) and evaluate
   `_is_forcing` via cozy for all candidate replies. Attacks the ~15%
-  gives_check share. Behind a flag; fixed-seed rollout-equivalence run + full
-  test suite + `--profile` re-measurement before/after.
+  gives_check share. Behind a flag during validation only; fixed-seed
+  rollout-equivalence run + full test suite + `--profile` re-measurement
+  before/after.
 - **Stage 2 — node expansion + movegen + terminal check on cozy.** Search-tree
   nodes carry cozy boards (converted once per search root); python-chess
   remains at the interface (root board in, `chess.Move` out). Terminal
@@ -126,6 +127,17 @@ the correctness oracle; cozy is an internal acceleration detail behind
   maturity becomes a liability or we want `expand_node`-style coarse calls /
   a cozy-native `BoardStateEncoder`, vendor a small maturin crate in-repo over
   cozy-chess (MIT). Not needed to start.
+
+**No leftover flags or dead code.** Flags exist only inside a stage as its
+validation mechanism. A stage's definition of done is the *cutover*: once its
+equivalence gates pass, the old python-chess code path and the flag are
+deleted in that same stage's final commit — cozy becomes the only
+implementation of that piece, and `main` never carries two implementations
+across stage boundaries. Rollback before cutover is "turn the flag off";
+rollback after cutover is `git revert` of a small, self-contained commit.
+The Stage 0 differential harness is not dead code and stays permanently: it
+is test-only, and python-chess remains a dependency regardless (public
+interface currency, PGN parsing in the data pipeline, oracle in tests).
 
 Risks & mitigations: binding youth (pin exact version; Stage 0 harness is the
 real safety net; Stage 3 is the exit); castling encoding (translate at the
