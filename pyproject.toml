@@ -14,6 +14,7 @@ dependencies = [
   "tensorboard",
   "torch-optimi",
   "tqdm",
+  "cozy-chess-py==0.1.1",
 ]
 
 [project.optional-dependencies]
