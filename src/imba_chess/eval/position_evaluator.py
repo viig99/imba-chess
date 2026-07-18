@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import contextlib
-from dataclasses import replace
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any
 
@@ -179,6 +179,19 @@ def load_hstu_checkpoint(
     return model, compile_enabled
 
 
+def _autocast_context(device: torch.device, dtype: torch.dtype):
+    """Shared inference autocast policy: CUDA + fp16/bf16 only, else a no-op.
+
+    Factored out of _forward_model/CachedPositionEvaluator.evaluate so the
+    rollout script's merged-wave executors (cross-game batching) can wrap
+    their own model calls with the exact same policy.
+    """
+    use_amp = device.type == "cuda" and dtype in (torch.float16, torch.bfloat16)
+    if use_amp:
+        return torch.autocast(device_type="cuda", dtype=dtype)
+    return contextlib.nullcontext()
+
+
 def _forward_model(
     *,
     model: torch.nn.Module,
@@ -195,13 +208,7 @@ def _forward_model(
         total_tokens=int(batch["total_tokens"]),
         device=device,
     )
-    use_amp = device.type == "cuda" and dtype in (torch.float16, torch.bfloat16)
-    autocast_ctx = (
-        torch.autocast(device_type="cuda", dtype=dtype)
-        if use_amp
-        else contextlib.nullcontext()
-    )
-    with torch.inference_mode(), autocast_ctx:
+    with torch.inference_mode(), _autocast_context(device, dtype):
         return model(
             batch, block_mask=block_mask, return_loss=False, return_kv=return_kv
         )
@@ -259,6 +266,31 @@ class _CachedNode:
         self.path_kv: tuple[torch.Tensor, torch.Tensor] | None = None
 
 
+@dataclass
+class _DecodeRequest:
+    """CPU-side pre-work for one wave of forward_decode, plus what consuming
+    the result needs afterward.
+
+    Built by CachedPositionEvaluator.build_decode_request; consumed by
+    consume_decode_result once the model call (forward_decode, single-game,
+    or forward_decode_grouped, cross-game merged) has produced logits and
+    per-layer (k, v). prefix_kv/prefix_len are carried alongside so the
+    rollout script's cross-game executor can read each game's own prefix
+    without reaching into evaluator internals -- needed to build the merged
+    call's prefix_kv_grouped/prefix_lens.
+    """
+
+    nodes: list[_CachedNode]
+    boards: list[chess.Board]
+    new_token_batch: dict[str, Any]
+    positions: torch.Tensor
+    suffix_kv: list[tuple[torch.Tensor, torch.Tensor]] | None
+    suffix_positions: torch.Tensor | None
+    suffix_mask: torch.Tensor | None
+    prefix_kv: Any
+    prefix_len: int
+
+
 class CachedPositionEvaluator:
     """PositionEvaluator over a per-turn prefix K/V cache + one-token decodes.
 
@@ -292,9 +324,15 @@ class CachedPositionEvaluator:
         depth = parent.depth + 1 if parent is not None else 0
         return _CachedNode(parent, int(self._move_vocab.encode(move.uci())), depth)
 
-    def evaluate(self, batch):
-        if not batch:
-            return []
+    def build_decode_request(self, batch) -> _DecodeRequest:
+        """All CPU pre-work for one wave: encode boards, token tensors,
+        suffix gather, positions -- everything before the model call.
+
+        Precondition: batch is non-empty (evaluate() guards the empty case
+        before calling this; the rollout script's decode-wave payloads are
+        also always non-empty, since every EvalRequest-yielding generator
+        only yields a non-empty batch).
+        """
         nodes: list[_CachedNode] = [handle for handle, _ in batch]
         boards = [board for _, board in batch]
         states = [self._board_state_encoder.encode(board) for board in boards]
@@ -327,49 +365,53 @@ class CachedPositionEvaluator:
         )
         max_suffix = max(node.depth for node in nodes)
 
-        use_amp = self._device.type == "cuda" and self._dtype in (
-            torch.float16,
-            torch.bfloat16,
-        )
-        autocast_ctx = (
-            torch.autocast(device_type="cuda", dtype=self._dtype)
-            if use_amp
-            else contextlib.nullcontext()
-        )
-        with torch.inference_mode(), autocast_ctx:
-            suffix_kv = suffix_positions = suffix_mask = None
-            if max_suffix > 0:
-                suffix_kv, suffix_positions, suffix_mask = self._wave_suffixes(
-                    nodes, max_suffix
-                )
-            out = self._model.forward_decode(
-                new_token_batch=new_token_batch,
-                positions=positions,
-                prefix_kv=self._prefix_kv,
-                suffix_kv=suffix_kv,
-                suffix_positions=suffix_positions,
-                suffix_mask=suffix_mask,
+        suffix_kv = suffix_positions = suffix_mask = None
+        if max_suffix > 0:
+            suffix_kv, suffix_positions, suffix_mask = self._wave_suffixes(
+                nodes, max_suffix
             )
-            # Stack the wave's per-layer (k, v) once, then extend each node's
-            # root->self path cache so descendants get their suffix for free.
-            k_all = torch.stack([k for k, _ in out["kv"]], dim=0)  # [L, B, H, 1, d]
-            v_all = torch.stack([v for _, v in out["kv"]], dim=0)
-            for row, node in enumerate(nodes):
-                own_k, own_v = k_all[:, row], v_all[:, row]
-                if node.parent is None:
-                    node.path_kv = (own_k, own_v)
-                else:
-                    parent_k, parent_v = node.parent.path_kv
-                    node.path_kv = (
-                        torch.cat([parent_k, own_k], dim=2),
-                        torch.cat([parent_v, own_v], dim=2),
-                    )
-            # One device->host transfer per wave instead of two syncs per node.
-            logits = out["logits"].float().cpu()
-            value_logits = out["value_logits"].float().cpu()
+
+        return _DecodeRequest(
+            nodes=nodes,
+            boards=boards,
+            new_token_batch=new_token_batch,
+            positions=positions,
+            suffix_kv=suffix_kv,
+            suffix_positions=suffix_positions,
+            suffix_mask=suffix_mask,
+            prefix_kv=self._prefix_kv,
+            prefix_len=self._prefix_len,
+        )
+
+    def consume_decode_result(
+        self, request: _DecodeRequest, out: dict[str, torch.Tensor]
+    ) -> list[PositionEval]:
+        """path_kv extension + logits->PositionEval, given a model output.
+
+        `out` must have the forward_decode/forward_decode_grouped return
+        shape: "kv" a per-layer list of (k, v) each [B, H, 1, d], "logits"
+        and "value_logits" each [B, ...], rows in request.nodes/boards order.
+        """
+        # Stack the wave's per-layer (k, v) once, then extend each node's
+        # root->self path cache so descendants get their suffix for free.
+        k_all = torch.stack([k for k, _ in out["kv"]], dim=0)  # [L, B, H, 1, d]
+        v_all = torch.stack([v for _, v in out["kv"]], dim=0)
+        for row, node in enumerate(request.nodes):
+            own_k, own_v = k_all[:, row], v_all[:, row]
+            if node.parent is None:
+                node.path_kv = (own_k, own_v)
+            else:
+                parent_k, parent_v = node.parent.path_kv
+                node.path_kv = (
+                    torch.cat([parent_k, own_k], dim=2),
+                    torch.cat([parent_v, own_v], dim=2),
+                )
+        # One device->host transfer per wave instead of two syncs per node.
+        logits = out["logits"].float().cpu()
+        value_logits = out["value_logits"].float().cpu()
 
         results = []
-        for row, board in enumerate(boards):
+        for row, board in enumerate(request.boards):
             value_stm = _value_scalar_from_logits(value_logits[row])
             try:
                 legal_logits, legal_moves, _, _ = _project_legal_logits(
@@ -386,6 +428,21 @@ class CachedPositionEvaluator:
                 )
             )
         return results
+
+    def evaluate(self, batch):
+        if not batch:
+            return []
+        request = self.build_decode_request(batch)
+        with torch.inference_mode(), _autocast_context(self._device, self._dtype):
+            out = self._model.forward_decode(
+                new_token_batch=request.new_token_batch,
+                positions=request.positions,
+                prefix_kv=request.prefix_kv,
+                suffix_kv=request.suffix_kv,
+                suffix_positions=request.suffix_positions,
+                suffix_mask=request.suffix_mask,
+            )
+        return self.consume_decode_result(request, out)
 
     def _wave_suffixes(self, nodes, max_suffix: int):
         """Padded per-layer ancestor K/V for one wave.
