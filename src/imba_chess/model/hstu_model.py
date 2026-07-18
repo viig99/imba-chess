@@ -647,3 +647,86 @@ class HSTUChessModel(nn.Module):
         if self.value_head is not None:
             output["value_logits"] = self.value_head(x)
         return output
+
+    def forward_decode_grouped(
+        self,
+        *,
+        new_token_batch: dict[str, Any],
+        positions: torch.Tensor,
+        group_index: torch.Tensor,
+        prefix_kv_grouped: list[tuple[torch.Tensor, torch.Tensor]],
+        prefix_lens: torch.Tensor,
+        suffix_kv: list[tuple[torch.Tensor, torch.Tensor]] | None = None,
+        suffix_positions: torch.Tensor | None = None,
+        suffix_mask: torch.Tensor | None = None,
+    ) -> dict[str, Any]:
+        """Decode one new token per batch row against per-game grouped
+        prefix K/V caches (cross-game merged wave).
+
+        Companion to forward_decode for the multi-game batched search
+        executor: rows from up to G different games share one call, each
+        row reading only its own game's prefix via `group_index` [B] -> g.
+        prefix_kv_grouped is per-layer (k, v) with shape [G, H, maxP, d]
+        (games zero-padded on the token dim to the batch's longest prefix);
+        prefix_lens [G] gives each game's real (unpadded) length. Suffix
+        args are unchanged from forward_decode -- already per-row.
+
+        Single-prefix forward_decode above is untouched and remains the
+        G=1 / eval path; this is purely additive.
+
+        Returns the same dict shape as forward_decode: logits/value_logits
+        at the new tokens plus each layer's (k, v) for growing suffix
+        caches, in original row order.
+        """
+        assert not self.training, "forward_decode_grouped is inference-only"
+        device = self.piece_square_embedding.weight.device
+        positions = positions.to(device=device, dtype=torch.long)
+        group_index = group_index.to(device=device, dtype=torch.long)
+        prefix_lens = prefix_lens.to(device=device, dtype=torch.long)
+        content = self._build_content(new_token_batch)
+        batch_size = int(content.shape[0])
+        num_groups = int(prefix_lens.numel())
+        # Every attn_output row is written by whichever group claims it (see
+        # forward_decode_grouped in hstu_attention.py); a row whose
+        # group_index falls outside [0, num_groups) would never be claimed
+        # and silently carry uninitialized memory into logits/value_logits.
+        # Validated here once, at the model boundary, rather than per-layer.
+        if int(group_index.numel()) != batch_size:
+            raise ValueError(
+                "group_index must have shape [B] matching new_token_batch"
+            )
+        if num_groups > 0 and bool(
+            ((group_index < 0) | (group_index >= num_groups)).any()
+        ):
+            raise ValueError("group_index values must be in [0, num_groups)")
+        x = self.position_embedding.at_positions(content, positions)
+
+        new_kv: list[tuple[torch.Tensor, torch.Tensor]] = []
+        for layer_idx, layer in enumerate(self.layers):
+            prefix_k, prefix_v = prefix_kv_grouped[layer_idx]
+            if suffix_kv is not None:
+                layer_suffix_k, layer_suffix_v = suffix_kv[layer_idx]
+            else:
+                layer_suffix_k = layer_suffix_v = None
+            x, k_new, v_new = layer.forward_decode_grouped(
+                x,
+                prefix_k=prefix_k,
+                prefix_v=prefix_v,
+                prefix_lens=prefix_lens,
+                group_index=group_index,
+                q_positions=positions,
+                suffix_k=layer_suffix_k,
+                suffix_v=layer_suffix_v,
+                suffix_positions=suffix_positions,
+                suffix_mask=suffix_mask,
+            )
+            new_kv.append((k_new, v_new))
+
+        x = self.final_norm(x)
+        output: dict[str, Any] = {
+            "logits": self.prediction_head(x),
+            "kv": new_kv,
+        }
+        if self.value_head is not None:
+            output["value_logits"] = self.value_head(x)
+        return output

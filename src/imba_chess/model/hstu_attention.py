@@ -255,3 +255,162 @@ class SequentialTransductionUnitJagged(torch.nn.Module):
         )
         x_out = (self._o(o_input) + x).squeeze(1)
         return x_out, k_new, v_new
+
+    def forward_decode_grouped(
+        self,
+        x_new: torch.Tensor,
+        *,
+        prefix_k: torch.Tensor,
+        prefix_v: torch.Tensor,
+        prefix_lens: torch.Tensor,
+        group_index: torch.Tensor,
+        q_positions: torch.Tensor,
+        suffix_k: torch.Tensor | None = None,
+        suffix_v: torch.Tensor | None = None,
+        suffix_positions: torch.Tensor | None = None,
+        suffix_mask: torch.Tensor | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Decode one new token per batch row against per-game grouped
+        prefix K/V (cross-game merged wave).
+
+        x_new: [B, D]; prefix_k/v: [G, H, maxP, d] (games padded on the
+        token dim); prefix_lens: [G] real (unpadded) length per game;
+        group_index: [B] row -> game index g. suffix_k/v/positions/mask are
+        unchanged from forward_decode -- already per-row.
+
+        Rows are bucketed by group and each group's prefix attention is
+        computed as ONE einsum over that group's real (unpadded) prefix
+        slice `prefix_k[g, :, :prefix_lens[g], :]` -- this reproduces
+        forward_decode's single-prefix math exactly (same shapes, same
+        score/bias/softmax path) for each group in turn, so it inherits
+        forward_decode's correctness rather than re-deriving the masking
+        convention. Never gather `prefix_k[group_index]`: that would
+        materialize a [B, H, maxP, d] per-row copy of every game's prefix,
+        the exact memory blowup grouping exists to avoid. Only the (small)
+        per-row query/key/value/suffix tensors are ever index_select'd.
+
+        Returns (x_out [B, D], k_new [B, H, 1, d_qk], v_new [B, H, 1, d_v])
+        -- k_new/v_new for the FULL batch, in original row order (they only
+        depend on each row's own token, not on its group's prefix).
+        """
+        assert (suffix_k is None) == (suffix_v is None) == (
+            suffix_positions is None
+        ) == (suffix_mask is None), "suffix tensors must be provided together"
+        batch_size = x_new.size(0)
+        x = x_new.unsqueeze(1)  # [B, 1, D]
+        normed_x = self._norm_input(x)
+        uvqk_x = F.silu(self._uvqk(normed_x))
+        u, v, q, k = torch.split(
+            uvqk_x,
+            [
+                self._linear_dim * self._num_heads,
+                self._linear_dim * self._num_heads,
+                self._attention_dim * self._num_heads,
+                self._attention_dim * self._num_heads,
+            ],
+            dim=-1,
+        )
+        # q/k/v projections are per-row (independent of grouping) -- compute
+        # once for the whole batch, same as forward_decode.
+        q_heads = self._reshape_uvqk_for_mm(q, self._num_heads, self._attention_dim)
+        k_new = self._reshape_uvqk_for_mm(k, self._num_heads, self._attention_dim)
+        v_new = self._reshape_uvqk_for_mm(v, self._num_heads, self._linear_dim)
+
+        scale = self._attention_dim**-0.5
+        device = x_new.device
+        bias_dtype = q_heads.dtype
+        has_suffix = suffix_k is not None and suffix_k.size(2) > 0
+
+        attn_output = torch.empty(
+            batch_size, self._num_heads, 1, self._linear_dim,
+            dtype=q_heads.dtype, device=device,
+        )
+
+        num_groups = prefix_k.size(0)
+        for g in range(num_groups):
+            row_idx = (group_index == g).nonzero(as_tuple=True)[0]
+            if row_idx.numel() == 0:
+                continue
+            actual_len = int(prefix_lens[g].item())
+            max_p = prefix_k.size(2)
+            if not 0 <= actual_len <= max_p:
+                raise ValueError(
+                    f"prefix_lens[{g}]={actual_len} out of range for padded "
+                    f"prefix length {max_p}"
+                )
+
+            q_g = q_heads.index_select(0, row_idx)
+            q_pos_g = q_positions.index_select(0, row_idx)
+            # Real (unpadded) prefix slice for this game only -- a view, not
+            # a per-row copy: identical shape/semantics to forward_decode's
+            # prefix_k [H, T, d].
+            prefix_k_g = prefix_k[g, :, :actual_len, :]
+            prefix_v_g = prefix_v[g, :, :actual_len, :]
+
+            prefix_scores = (
+                torch.einsum("bhqd,htd->bhqt", q_g, prefix_k_g.to(q_g.dtype)) * scale
+            )
+            prefix_positions = torch.arange(actual_len, device=device).view(
+                1, actual_len
+            )
+            prefix_scores = prefix_scores + self._relative_bias(
+                prefix_positions, q_pos_g
+            ).to(bias_dtype)
+
+            score_parts = [prefix_scores]
+            if has_suffix:
+                suffix_k_g = suffix_k.index_select(0, row_idx)
+                suffix_v_g = suffix_v.index_select(0, row_idx)
+                suffix_pos_g = suffix_positions.index_select(0, row_idx)
+                suffix_mask_g = suffix_mask.index_select(0, row_idx)
+                suffix_scores = (
+                    torch.einsum(
+                        "bhqd,bhsd->bhqs", q_g, suffix_k_g.to(q_g.dtype)
+                    )
+                    * scale
+                )
+                suffix_scores = suffix_scores + self._relative_bias(
+                    suffix_pos_g, q_pos_g
+                ).to(bias_dtype)
+                suffix_scores = suffix_scores.masked_fill(
+                    ~suffix_mask_g.view(row_idx.numel(), 1, 1, -1), float("-inf")
+                )
+                score_parts.append(suffix_scores)
+
+            k_new_g = k_new.index_select(0, row_idx)
+            v_new_g = v_new.index_select(0, row_idx)
+            self_scores = (q_g * k_new_g).sum(dim=-1, keepdim=True) * scale
+            self_scores = self_scores + self._ps_w[:, self._max_seq_len - 1].view(
+                1, -1, 1, 1
+            ).to(bias_dtype)
+            score_parts.append(self_scores)
+
+            scores = torch.cat(score_parts, dim=-1)  # [Bg, H, 1, T_g + s + 1]
+            weights = torch.softmax(scores.float(), dim=-1).to(q_g.dtype)
+
+            out_g = torch.einsum(
+                "bhqt,htd->bhqd", weights[..., :actual_len], prefix_v_g.to(weights.dtype)
+            )
+            offset = actual_len
+            if has_suffix:
+                suffix_len = suffix_k_g.size(2)
+                out_g = out_g + torch.einsum(
+                    "bhqs,bhsd->bhqd",
+                    weights[..., offset : offset + suffix_len],
+                    suffix_v_g.to(weights.dtype),
+                )
+                offset += suffix_len
+            out_g = out_g + weights[..., offset:] * v_new_g
+
+            attn_output.index_copy_(0, row_idx, out_g)
+
+        attn_output = self._norm_attn_output(
+            attn_output.permute(0, 2, 1, 3).reshape(
+                batch_size, 1, self._num_heads * self._linear_dim
+            )
+        )
+        o_input = F.dropout(
+            u * attn_output, p=self._dropout_ratio, training=self.training
+        )
+        x_out = (self._o(o_input) + x).squeeze(1)
+        return x_out, k_new, v_new
