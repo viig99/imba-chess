@@ -71,3 +71,30 @@ Result (20 games / 169 positions, local):
 **Also not started**: whether to keep 12 remote shards vs. try pushing higher now that the GPU-memory plateau pattern is understood; `search_budget` reduction as a direct (but quality-costing) throughput lever; the CPU-quota headroom (~11 more core-equivalents available before the 23-core cgroup cap) is real but secondary to the GPU-memory ceiling that's currently binding.
 
 **Follow-up**: the `gives_check`/`search_bookkeeping` finding above was addressed via cozy-chess adoption (Stage 1+2, 2026-07-18) — see `docs/superpowers/specs/2026-07-18-rollout-cpu-hotpath-optimization-design.md` §6 for the measured results and Stage-3 go/no-go decision.
+
+## Addendum (2026-07-18): torch.compile on rollout inference — negative result, do not re-run blind
+
+After the cozy cutover left `search_gpu` (45.1%) + `root_eval` (~20%) as the
+dominant buckets, we tried `torch.compile(model, dynamic=True, fullgraph=False)`
+(the eval_vs_stockfish `--compile` recipe; `attention_dim=64` is a power of
+two, so the recorded Triton-codegen guard doesn't apply) on
+`generate_search_rollouts.py`. Two attempts, two distinct failures:
+
+1. **Default Inductor settings: hard deadlock.** ~33s of CPU progress, then
+   every thread parked in `futex_do_wait` for 60+ minutes, ~1.3GB GPU
+   allocated, no output. Signature matches the known Inductor
+   parallel-compile-worker fork/thread deadlock.
+2. **`TORCHINDUCTOR_COMPILE_THREADS=1`: recompilation storm.** No deadlock,
+   but the run blew a 10-minute budget without producing a single profile
+   block (eager: 20 games in ~2 min), with GPU utilization ~15% — consistent
+   with `dynamic=True` recompiling for the search's highly variable wave
+   shapes (batch 1..hundreds × varying seq lens) instead of inferring.
+
+The `--compile` flag added for the experiment was reverted (uncommitted): a
+flag that reliably hangs is a trap. If ever revisited, fix the shape problem
+first (pad/bucket wave batch sizes to a few fixed shapes, or compile only the
+root forward with `mark_dynamic` on batch), and keep a hard timeout on the
+first run. Note `forward_decode` is plain matmuls by design (2026-07-04
+prefix-cache decision) and was never in compile scope anyway — the ceiling
+here was only ever the ~20% root_eval bucket. The real GPU lever remains
+cross-game batched search.
