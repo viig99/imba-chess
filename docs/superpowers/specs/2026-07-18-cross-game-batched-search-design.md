@@ -155,3 +155,66 @@ is by then ready for it.
   existing merged batches); re-evaluate with profile evidence only.
 - Stage 3 of the CPU-hot-path spec (cozy-native encoder / coarse Rust calls)
   — reopens if/when post-batching profiles show CPU dominant.
+
+## Results (2026-07-18, branch cross-game-batching)
+
+All measurements: 20 games / 169 positions / 346,093 search evals, local
+RTX 3070 Ti (8GB), checkpoint_23, `--sample-seed 42`.
+
+### Gates
+
+- **Layer 0**: `tests/test_search.py` unchanged and passing throughout; suite
+  grew 173 → 198 across the branch.
+- **Layer 1 (byte-identical, G=1)**: PASS — `--concurrent-games 1` parquet is
+  byte-identical to the pre-branch pipeline (`assert_frame_equal`, 169 rows;
+  same 1,371 waves / 346,093 evals).
+- **Determinism**: G=4 repeat run byte-identical run-to-run.
+- **Layer 2, bf16 (as originally specified)**: FAILED thresholds — G=4/G=16
+  vs G=1 move agreement 94.7%/93.5% (bar ≥99%), p99 |Δv| ~0.09 (bar ≤1e-3).
+  Diagnosis: NOT a logic bug. fp32 G=4 vs fp32 G=1 = **100% agreement, p99
+  1e-6**; and bf16's own noise floor (bf16 G=1 vs fp32 G=1) is **90.4%
+  agreement, p99 0.131 — larger than the batching divergence itself**. bf16's
+  near-tie chaos was always present in nightly rollouts; batching adds no new
+  error source.
+- **Layer 2 at the adopted config (fp32, G=8)**: **PASS at the original
+  strict thresholds** — 100% move agreement, p99 |Δv| = 1.07e-6, max 6.9e-6.
+- The gate runs also caught two real bugs CPU tests could not see (fixed +
+  regression-tested, commit 54ea56c): CPU-fabricated suffix tensors meeting
+  CUDA tensors in `_merge_decode_requests` (device-mismatch crash), and
+  crashed runs living on as zombie processes (unhandled main exceptions now
+  hard-exit nonzero — matters for remote shard fleets).
+
+### Throughput (20-game set, wall time)
+
+| Config | total | s/game | waves | search_gpu | root_eval | bookkeeping | peak VRAM |
+|---|---|---|---|---|---|---|---|
+| G=1 bf16 (= old pipeline) | 90.9s | 4.5 | 1,371 | 40.3s (44%) | 19.6s (22%) | 31.0s (34%) | — |
+| G=4 bf16 | 59.4s | 3.0 | 416 | 9.0s (15%) | 17.0s (29%) | 33.3s (56%) | — |
+| G=16 bf16 | 55.6s | 2.8 | 180 | 8.2s (15%) | 10.9s (20%) | 36.5s (65%) | 7.7GB |
+| **G=8 fp32 (adopted)** | **66.0s** | **3.3** | 264 | 11.9s (18%) | 17.7s (27%) | 36.3s (55%) | **6.9GB** |
+
+The per-wave fixed tax amortized exactly as designed: waves 1,371 → 180-416,
+total GPU time 60s → 19-30s. The workload is now CPU-bound (bookkeeping
+55-65%) — the predicted trigger for reopening the CPU-hot-path spec's
+Stage 3.
+
+### Decision (user-approved 2026-07-18)
+
+**Rollout generation runs at `--dtype float32 --concurrent-games 8` locally.**
+At G≥4 the workload is overhead-bound enough that fp32 is nearly free
+(4.3 vs 4.2 s/game at G=4), it passes Layer 2 at the original thresholds
+with no criterion-weakening, and its targets are cleaner than the bf16
+nightly ever was. Combined with the cozy-chess work: ~5.9 → 3.3 s/game,
+~1.8x end-to-end at HIGHER numeric fidelity than the starting point.
+
+### Follow-ups
+
+- **Layer 3 (standing acceptance, nightly)**: before the remote fleet
+  switches to G>1, train a short localcoverage run on batched-fp32 rollouts
+  and confirm eval_vs_stockfish parity vs a sequential-rollout twin.
+- **Remote 5090 (32GB)**: G-sweep (fp32 G≈24-48 plausible), and reduce shard
+  count accordingly (one process with large G replaces many shards; the
+  12-shard GPU-memory plateau no longer binds the same way).
+- **CPU is dominant again (55-65%)**: reopen the CPU-hot-path spec's Stage 3
+  discussion (cozy-native tree/encoder, coarse Rust calls) with a fresh
+  cProfile of the bookkeeping bucket.
