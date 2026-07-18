@@ -64,3 +64,30 @@ def test_legal_move_sets_match_python_chess_everywhere():
         assert sorted(m.uci() for m in board.legal_moves) == sorted(
             cozy_move_to_uci(cozy, m) for m in cozy.generate_moves()
         ), board.fen()
+
+
+def test_terminal_value_fast_matches_terminal_value_for_color():
+    from imba_chess.eval.cozy_bridge import terminal_value_fast
+    from imba_chess.eval.search import terminal_value_for_color
+
+    terminal_seen = 0
+    # Random games REPLAYED so boards carry real move stacks -- repetition and
+    # 50-move claims need history, bare FENs can't exercise them.
+    rng = random.Random(99)
+    for g in range(400):
+        board = chess.Board()
+        # Shuffle-heavy move choice to actually reach repetitions/50-move claims.
+        for _ in range(200):
+            moves = list(board.legal_moves)
+            if not moves:
+                break
+            quiet = [m for m in moves if not board.is_capture(m) and m.promotion is None]
+            move = rng.choice(quiet if (quiet and rng.random() < 0.8) else moves)
+            board.push(move)
+            expected = terminal_value_for_color(board, color=chess.WHITE)
+            got = terminal_value_fast(board_to_cozy(board), board, chess.WHITE)
+            assert got == expected, (board.fen(), expected, got)
+            if expected is not None:
+                terminal_seen += 1
+                break
+    assert terminal_seen >= 30  # sweep must actually hit terminal states

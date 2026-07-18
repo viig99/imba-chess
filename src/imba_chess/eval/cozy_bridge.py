@@ -89,3 +89,39 @@ def cozy_move_to_uci(cozy_board: cc.Board, move: cc.Move) -> str:
         new_file = "g" if uci[2] > uci[0] else "c"
         return uci[0] + uci[1] + new_file + uci[3]
     return uci
+
+
+def _no_heavy_pieces(cozy_board: cc.Board) -> bool:
+    return not (
+        int(cozy_board.pieces(cc.Piece.Pawn))
+        | int(cozy_board.pieces(cc.Piece.Rook))
+        | int(cozy_board.pieces(cc.Piece.Queen))
+    )
+
+
+def terminal_value_fast(
+    cozy_board: cc.Board, board: chess.Board, color: chess.Color
+) -> float | None:
+    """Drop-in for search.terminal_value_for_color, cozy fast path.
+
+    cozy status() decides checkmate/stalemate (~50ns vs ~4.3us). python-chess
+    stays the oracle on the rare paths: insufficient material (only reachable
+    when no pawn/rook/queen exists -- cheap cozy pre-filter) and draw claims
+    (only reachable at halfmove_clock >= 7, the pre-existing guard).
+    """
+    status = cozy_board.status()
+    if status == cc.GameStatus.Won:
+        # cozy 'Won' == side to move is checkmated; winner is the other side.
+        winner = not board.turn
+        return 1.0 if winner == color else -1.0
+    if status == cc.GameStatus.Drawn:
+        return 0.0  # stalemate
+    if _no_heavy_pieces(cozy_board) and board.is_insufficient_material():
+        return 0.0
+    if board.halfmove_clock >= 7:
+        outcome = board.outcome(claim_draw=True)
+        if outcome is not None:
+            if outcome.winner is None:
+                return 0.0
+            return 1.0 if outcome.winner == color else -1.0
+    return None
