@@ -704,7 +704,16 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--sample-every-n-plies", type=int, default=8)
     parser.add_argument("--sample-seed", type=int, default=42)
     parser.add_argument("--device", choices=["auto", "cpu", "cuda"], default=None)
-    parser.add_argument("--dtype", choices=["float32", "bfloat16", "float16"], default=None)
+    parser.add_argument(
+        "--dtype",
+        choices=["float32", "bfloat16", "float16"],
+        # float32 (not the config's eval dtype) is this script's default by
+        # measured decision (spec 2026-07-18 cross-game-batched-search,
+        # Results): at concurrent-games >= 4 the workload is overhead-bound
+        # enough that fp32 is nearly free, and it makes batched rollouts match
+        # sequential ones to ~1e-6 instead of bf16's ~0.13 noise floor.
+        default="float32",
+    )
     # Search knobs default to [eval_vs_stockfish] so a rollout run matches
     # whatever the live eval protocol currently uses; override per-run if needed.
     parser.add_argument("--search-budget", type=int, default=None)
@@ -779,12 +788,15 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--concurrent-games",
         type=int,
-        default=1,
+        # 8 = the adopted local production config (fp32, peak ~6.9GB on the
+        # 8GB 3070 Ti). Pass 1 to reproduce the sequential driver's exact
+        # per-game batches (byte-identical output at a fixed seed).
+        default=8,
         help="Run this many game coroutines concurrently via the batch "
         "scheduler, merging their root-eval and search decode waves into "
         "shared GPU calls each tick. Always routes through the scheduler "
-        "(even the default of 1, which then merges nothing per tick and is "
-        "byte-identical to the pre-scheduler sequential driver).",
+        "(a value of 1 merges nothing per tick and is byte-identical to "
+        "the pre-scheduler sequential driver).",
     )
     return parser.parse_args()
 
