@@ -35,7 +35,7 @@ def board_to_cozy(board: chess.Board) -> cc.Board:
         bitboard = getattr(board, attr)
         for color, mask in (
             (cc.Color.White, bitboard & occ_white),
-            (cc.Color.Black, bitboard & ~occ_white & bitboard),
+            (cc.Color.Black, bitboard & ~occ_white),
         ):
             if mask:
                 for square in cc.BitBoard(mask):

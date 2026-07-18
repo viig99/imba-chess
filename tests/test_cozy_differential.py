@@ -91,3 +91,43 @@ def test_terminal_value_fast_matches_terminal_value_for_color():
                 terminal_seen += 1
                 break
     assert terminal_seen >= 30  # sweep must actually hit terminal states
+
+
+def test_terminal_value_fast_curated_insufficient_material():
+    """K+B vs K, halfmove 0: hits the _no_heavy_pieces insufficient-material
+    branch specifically (not the draw-claim path, which needs halfmove >= 7).
+
+    The random-game sweep above is not guaranteed to reach insufficient
+    material, so this curated case exercises that branch deterministically.
+    """
+    from imba_chess.eval.cozy_bridge import terminal_value_fast
+    from imba_chess.eval.search import terminal_value_for_color
+
+    board = chess.Board("8/8/3k4/8/8/3KB3/8/8 w - - 0 1")
+    expected = terminal_value_for_color(board, color=chess.WHITE)
+    assert expected == 0.0
+    assert terminal_value_fast(board_to_cozy(board), board, chess.WHITE) == expected
+
+
+def test_search_dual_boards_stay_in_sync(monkeypatch):
+    """Enable the opt-in _dual_push verification and run a real search: every
+    tree edge must keep the python-chess/cozy-chess board pair in sync.
+    """
+    from imba_chess.eval import search
+    from tests.test_search import _MaterialEvaluator
+
+    monkeypatch.setattr(search, "_DUAL_PUSH_VERIFY", True)
+    board = chess.Board(
+        "r1bqkbnr/pppp1ppp/2n5/1B2p3/4P3/5N2/PPPP1PPP/RNBQK2R b KQkq - 3 3"
+    )
+    legal_moves = list(board.legal_moves)
+    legal_log_priors = [-1.0] * len(legal_moves)
+    evaluator = _MaterialEvaluator()
+    search.select_value_search_halving(
+        evaluator=evaluator,
+        root_handle=None,
+        board=board,
+        legal_moves=legal_moves,
+        legal_log_priors=legal_log_priors,
+        config=search.HalvingConfig(budget=64, top_m=8, max_depth=3),
+    )

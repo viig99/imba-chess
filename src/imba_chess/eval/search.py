@@ -15,6 +15,7 @@ import copy
 import heapq
 import itertools
 import math
+import os
 import random
 from dataclasses import dataclass, field
 from typing import Any, NamedTuple, Optional, Protocol
@@ -23,6 +24,10 @@ import chess
 import cozy_chess as cc
 
 from imba_chess.eval import cozy_bridge
+
+# Opt-in dual-board sync verification for tests/debugging (costly: full FEN
+# round-trip per tree edge). Enable with IMBA_DUAL_PUSH_VERIFY=1.
+_DUAL_PUSH_VERIFY = os.environ.get("IMBA_DUAL_PUSH_VERIFY") == "1"
 
 
 class PositionEval(NamedTuple):
@@ -128,6 +133,25 @@ def _search_copy(board: chess.Board) -> chess.Board:
     return board.copy(stack=board.halfmove_clock)
 
 
+def _dual_push(
+    board: chess.Board, cozy_board: "cc.Board", move: chess.Move
+) -> tuple[chess.Board, "cc.Board"]:
+    """Copy both boards and make `move` on each; the pair MUST stay in sync.
+
+    Every tree edge goes through here: a push without its cozy twin is the
+    dual-board invariant violation this helper exists to prevent.
+    """
+    child = _search_copy(board)
+    child.push(move)
+    cozy_child = copy.copy(cozy_board)
+    cozy_child.play(cozy_bridge.py_move_to_cozy(board, move))
+    if __debug__ and _DUAL_PUSH_VERIFY:
+        assert cozy_child.fen() == cozy_bridge.board_to_cozy(child).fen(), (
+            board.fen(), move.uci(),
+        )
+    return child, cozy_child
+
+
 @dataclass
 class _RootCandidate:
     """One top-k root move expanded one ply deep.
@@ -174,10 +198,7 @@ def _expand_root_candidates(
     batch_to_candidate: list[int] = []
     for local_idx in _prior_order(legal_log_priors)[: min(top_k, len(legal_moves))]:
         move = legal_moves[local_idx]
-        board1 = _search_copy(board)
-        board1.push(move)
-        cozy1 = copy.copy(root_cozy)
-        cozy1.play(cozy_bridge.py_move_to_cozy(board, move))
+        board1, cozy1 = _dual_push(board, root_cozy, move)
         terminal_value = terminal_value_for_color(board1, color=root_color, cozy_board=cozy1)
         if terminal_value is not None and terminal_value >= 1.0:
             return candidates, local_idx
@@ -323,10 +344,7 @@ def select_value_search_d2(
 
         for opp_local_idx in opp_indices:
             opp_move = board1_eval.legal_moves[opp_local_idx]
-            board2 = _search_copy(board1)
-            board2.push(opp_move)
-            cozy2 = copy.copy(candidate.cozy1)
-            cozy2.play(cozy_bridge.py_move_to_cozy(board1, opp_move))
+            board2, cozy2 = _dual_push(board1, candidate.cozy1, opp_move)
             terminal_value = terminal_value_for_color(board2, color=root_color, cozy_board=cozy2)
             candidate.reply_candidates.append(
                 {
@@ -486,10 +504,7 @@ def _push_children(
 
     for idx in picks:
         move = position_eval.legal_moves[idx]
-        child_board = _search_copy(node.board)
-        child_board.push(move)
-        child_cozy = copy.copy(node.cozy_board)
-        child_cozy.play(cozy_bridge.py_move_to_cozy(node.board, move))
+        child_board, child_cozy = _dual_push(node.board, node.cozy_board, move)
         # Forcing replies inherit the parent's priority (no decay for their
         # own low prior): a refutation must compete at the plausibility of
         # the line it refutes, not of the reply itself.
@@ -554,10 +569,7 @@ def select_value_search_halving(
     arms: list[_Arm] = []
     for idx in picks:
         move = legal_moves[idx]
-        board1 = _search_copy(board)
-        board1.push(move)
-        cozy1 = copy.copy(root_cozy)
-        cozy1.play(cozy_bridge.py_move_to_cozy(board, move))
+        board1, cozy1 = _dual_push(board, root_cozy, move)
         terminal_root = terminal_value_for_color(board1, color=root_color, cozy_board=cozy1)
         if terminal_root is not None and terminal_root >= 1.0:
             # Immediate win (checkmate delivered): no other move can score higher.
