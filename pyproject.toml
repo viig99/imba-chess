@@ -32,6 +32,11 @@ where = ["src"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+# Repo root on sys.path so test modules can cross-import fixtures, e.g.
+# `from tests.test_cozy_bridge import EDGE_FENS` in test_cozy_differential.py.
+# Needed because `.venv/bin/pytest` (unlike `python -m pytest`) does not add
+# cwd to sys.path, and tests/ intentionally has no __init__.py.
+pythonpath = ["."]
 
 [[tool.uv.index]]
 name = "pytorch-cu130"

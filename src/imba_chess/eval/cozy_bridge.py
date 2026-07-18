@@ -71,6 +71,14 @@ def py_move_to_cozy(board: chess.Board, move: chess.Move) -> cc.Move:
     return cc.Move.from_str(uci)
 
 
+def gives_check(cozy_board: cc.Board, cozy_move: cc.Move) -> bool:
+    """Does this legal move give check? Simulate-in-Rust (~240ns vs ~3us
+    for python-chess's Python-level push/check/pop)."""
+    after = copy.copy(cozy_board)
+    after.play(cozy_move)
+    return bool(after.checkers())
+
+
 def cozy_move_to_uci(cozy_board: cc.Board, move: cc.Move) -> str:
     uci = str(move)
     if (
