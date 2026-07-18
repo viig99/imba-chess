@@ -116,13 +116,20 @@ the correctness oracle; cozy is an internal acceleration detail behind
   gives_check share. Behind a flag during validation only; fixed-seed
   rollout-equivalence run + full test suite + `--profile` re-measurement
   before/after.
-- **Stage 2 — node expansion + movegen + terminal check on cozy.** Search-tree
-  nodes carry cozy boards (converted once per search root); python-chess
-  remains at the interface (root board in, `chess.Move` out). Terminal
-  detection = cozy `status()` + existing halfmove guard + Zobrist-history
-  repetition check (cozy `hash()`), differentially tested against
-  `terminal_value_for_color`. Attacks the ~10% outcome share + copy/push +
-  movegen. This is the bulk of the win.
+- **Stage 2 — node expansion + terminal check on cozy (dual-board).**
+  Search-tree nodes carry a cozy board alongside the python-chess board
+  (root converted once per search call; children via cozy copy+play at
+  ~196ns); python-chess remains at the interface and is what the evaluator/
+  encoder consume. Terminal detection = cozy `status()` for checkmate/
+  stalemate + cheap cozy pre-filter for insufficient material, with
+  python-chess's own `outcome(claim_draw=True)` kept as the rare slow path
+  behind the existing `halfmove_clock >= 7` guard — exact oracle semantics
+  by construction, no hand-rolled repetition tracking. Attacks the ~10%
+  outcome share + the gives-check conversion overhead from Stage 1.
+  (Evaluator-side movegen `_project_legal_logits` and a cozy-native
+  `BoardStateEncoder` are deliberately NOT in this stage — they touch
+  `position_evaluator.py`/`board_state.py` and belong to Stage 3's
+  go/no-go.)
 - **Stage 3 (only if profile still says so) — own thin PyO3 crate.** If binding
   maturity becomes a liability or we want `expand_node`-style coarse calls /
   a cozy-native `BoardStateEncoder`, vendor a small maturin crate in-repo over
