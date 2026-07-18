@@ -23,7 +23,9 @@ import argparse
 import json
 import os
 import random
+import sys
 import time
+import traceback
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Generator, Iterator
@@ -559,6 +561,19 @@ def _merge_decode_requests(requests: list[Any]) -> _MergedDecodeRequest:
         for req in requests:
             wave_size = len(req.nodes)
             if req.suffix_kv is None:
+                # Fabricated rows must share the request's own device (the
+                # model's device, e.g. cuda:0 -- read off prefix_kv, which is
+                # always device-resident kv_caches from the model, never a
+                # bare CPU tensor). torch.zeros/torch.full/torch.arange with
+                # no explicit device argument silently land on the *default*
+                # device (cpu unless torch.set_default_device was called),
+                # which crashes torch.cat below whenever another request in
+                # the same tick DOES have real (device-resident) suffix rows
+                # -- exactly the --concurrent-games > 1 GPU crash this guards
+                # against. ref_k.new_zeros(...) already inherits its device
+                # from ref_k correctly; only the two device-less
+                # torch.zeros(...) calls below needed the explicit device=.
+                request_device = req.prefix_kv[0][0].device
                 for layer in range(num_layers):
                     ref_k, ref_v = req.prefix_kv[layer]
                     suffix_k_rows[layer].append(
@@ -568,9 +583,17 @@ def _merge_decode_requests(requests: list[Any]) -> _MergedDecodeRequest:
                         ref_v.new_zeros((wave_size, ref_v.size(0), max_suffix, ref_v.size(-1)))
                     )
                 suffix_positions_rows.append(
-                    torch.zeros((wave_size, max_suffix), dtype=req.positions.dtype)
+                    torch.zeros(
+                        (wave_size, max_suffix),
+                        dtype=req.positions.dtype,
+                        device=request_device,
+                    )
                 )
-                suffix_mask_rows.append(torch.zeros((wave_size, max_suffix), dtype=torch.bool))
+                suffix_mask_rows.append(
+                    torch.zeros(
+                        (wave_size, max_suffix), dtype=torch.bool, device=request_device
+                    )
+                )
             else:
                 s_g = req.suffix_kv[0][0].size(2)
                 pad = max_suffix - s_g
@@ -931,5 +954,48 @@ def main() -> None:
         print(stats.report())
 
 
+def _main_with_hard_exit_on_crash() -> None:
+    """Entry-point wrapper: guarantees the process actually terminates on an
+    unhandled exception (or Ctrl-C), instead of hanging.
+
+    Observed in practice on a real GPU run: a crash inside scheduler.run()
+    printed its traceback but the process then sat futex-parked forever at
+    0% GPU instead of exiting -- a non-daemon background thread was still
+    alive, and CPython's normal interpreter shutdown (Py_FinalizeEx) blocks
+    joining every non-daemon thread before the process can actually
+    terminate. The most likely culprit here is PyTorch Inductor's
+    AsyncCompile background ThreadPoolExecutor, implicitly spun up by
+    create_batch_block_mask's module-level `torch.compile(...)` (see
+    src/imba_chess/model/hstu_model.py): CPython's own
+    concurrent.futures.thread module registers an atexit hook
+    (_python_exit) that explicitly joins every one of that pool's worker
+    threads, and that join can hang forever if a compile job is in flight or
+    a worker is otherwise blocked. Rather than depend on correctly
+    identifying (and safely daemonizing) every such dependency-owned thread,
+    force-terminate unconditionally: print the traceback, flush output, then
+    bypass the normal thread-joining shutdown path entirely via os._exit.
+    This matters for remote multi-shard operation, where a hung-but-not-dead
+    process silently occupies a shard slot forever instead of failing
+    visibly.
+
+    Referencing the module-level `main` by bare name (not capturing it as a
+    default argument) is deliberate: tests monkeypatch `module.main` and
+    call this function directly to drive the crash/hard-exit path in a
+    subprocess without needing a real GPU or checkpoint.
+    """
+    try:
+        main()
+    except SystemExit:
+        # argparse's own --help/usage-error exits (and any explicit
+        # sys.exit() elsewhere) already carry the right code -- pass through
+        # unchanged rather than clobbering it via the hard-exit path below.
+        raise
+    except BaseException:
+        traceback.print_exc()
+        sys.stdout.flush()
+        sys.stderr.flush()
+        os._exit(1)
+
+
 if __name__ == "__main__":
-    main()
+    _main_with_hard_exit_on_crash()

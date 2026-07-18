@@ -274,3 +274,115 @@ def test_concurrent_games_matches_sequential_with_tiny_model():
             assert seq_row.root_wdl_unsearched == pytest.approx(
                 merged_row.root_wdl_unsearched, abs=1e-4
             )
+
+
+def test_merge_decode_requests_fabricated_suffix_rows_match_request_device():
+    """Regression test for a --concurrent-games > 1 GPU crash: when one
+    game's decode-wave request has no suffix at all (suffix_kv=None, e.g.
+    every node in its wave is root-adjacent) and another game's request in
+    the same tick has a real suffix, _merge_decode_requests fabricates
+    zero-filled suffix_positions/suffix_mask rows for the suffix-less game
+    so all rows can be concatenated into one tensor. Those fabricated rows
+    must land on the SAME device as the request's own real tensors (read off
+    prefix_kv, which is always model-device-resident kv_caches) -- not
+    whatever torch's default device happens to be. On a real run this
+    crashed as "RuntimeError: Expected all tensors to be on the same device,
+    but got ... cpu, different from ... cuda:0" inside torch.cat, because
+    the fabricated rows used torch.zeros(...) with no device= argument.
+
+    The actual bug needs a CPU+CUDA mix, which can't run here. This test
+    reproduces the identical *class* of bug without any GPU: it temporarily
+    makes torch's default device "meta" (a real, distinct-from-cpu device
+    that needs no hardware) while every tensor in the fake requests is
+    built with an *explicit* device="cpu" -- so if _merge_decode_requests
+    ever again creates a fabricated tensor without an explicit device=, it
+    silently lands on "meta" instead of "cpu", and the same torch.cat
+    device-mismatch RuntimeError fires here that fired on CUDA.
+    """
+    pytest.importorskip("torch")
+    import torch
+
+    from imba_chess.eval.position_evaluator import _DecodeRequest
+
+    module = _load_script_module()
+
+    device = torch.device("cpu")
+    num_layers, heads, dqk, dv = 1, 2, 4, 4
+
+    def make_prefix(prefix_len: int):
+        return [
+            (
+                torch.zeros(heads, prefix_len, dqk, device=device),
+                torch.zeros(heads, prefix_len, dv, device=device),
+            )
+            for _ in range(num_layers)
+        ]
+
+    def make_new_token_batch(wave_size: int):
+        return {
+            "piece_ids": torch.zeros(wave_size, 64, dtype=torch.long, device=device),
+            "seq_token_id": torch.zeros(wave_size, dtype=torch.long, device=device),
+            "turn_id": torch.zeros(wave_size, dtype=torch.long, device=device),
+            "castle_id": torch.zeros(wave_size, dtype=torch.long, device=device),
+            "ep_file_id": torch.zeros(wave_size, dtype=torch.long, device=device),
+            "halfmove_bucket_id": torch.zeros(wave_size, dtype=torch.long, device=device),
+            "fullmove_bucket_id": torch.zeros(wave_size, dtype=torch.long, device=device),
+            "prev_move_id": torch.zeros(wave_size, dtype=torch.long, device=device),
+        }
+
+    # Game 0: no suffix at all for this wave (e.g. every node is root-adjacent).
+    req_no_suffix = _DecodeRequest(
+        nodes=[object(), object()],
+        boards=[None, None],
+        new_token_batch=make_new_token_batch(2),
+        positions=torch.tensor([1, 1], dtype=torch.long, device=device),
+        suffix_kv=None,
+        suffix_positions=None,
+        suffix_mask=None,
+        prefix_kv=make_prefix(3),
+        prefix_len=3,
+    )
+    # Game 1: has a real suffix of length 2, explicitly on `device`.
+    suffix_len = 2
+    req_with_suffix = _DecodeRequest(
+        nodes=[object()],
+        boards=[None],
+        new_token_batch=make_new_token_batch(1),
+        positions=torch.tensor([5], dtype=torch.long, device=device),
+        suffix_kv=[
+            (
+                torch.ones(1, heads, suffix_len, dqk, device=device),
+                torch.ones(1, heads, suffix_len, dv, device=device),
+            )
+            for _ in range(num_layers)
+        ],
+        suffix_positions=torch.tensor([[3, 4]], dtype=torch.long, device=device),
+        suffix_mask=torch.tensor([[True, True]], dtype=torch.bool, device=device),
+        prefix_kv=make_prefix(4),
+        prefix_len=4,
+    )
+
+    torch.set_default_device("meta")
+    try:
+        merged = module._merge_decode_requests([req_no_suffix, req_with_suffix])
+    finally:
+        torch.set_default_device("cpu")
+
+    assert merged.suffix_positions.device == device
+    assert merged.suffix_mask.device == device
+    for k, v in merged.suffix_kv:
+        assert k.device == device
+        assert v.device == device
+
+    # Rows 0-1 belong to the suffix-less game: zero-filled, all-False mask.
+    assert torch.equal(merged.suffix_mask[:2], torch.zeros(2, suffix_len, dtype=torch.bool))
+    assert torch.equal(
+        merged.suffix_positions[:2], torch.zeros(2, suffix_len, dtype=torch.long)
+    )
+    for k, v in merged.suffix_kv:
+        assert torch.equal(k[:2], torch.zeros_like(k[:2]))
+        assert torch.equal(v[:2], torch.zeros_like(v[:2]))
+
+    # Row 2 belongs to the suffix-bearing game: its real content survives.
+    assert bool(merged.suffix_mask[2].all())
+    assert torch.equal(merged.suffix_positions[2], torch.tensor([3, 4], dtype=torch.long))
