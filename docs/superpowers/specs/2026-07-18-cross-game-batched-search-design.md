@@ -71,10 +71,18 @@ Three pieces:
 
 - **RootEval** — the full-sequence forward at each sampled ply. Variable
   sequence lengths across games; padded to the batch max per tick.
-- **DecodeWave** — search `forward_decode` batches. Waves are already
-  heterogeneous in node prefix depth *within* one game today;
-  `CachedPositionEvaluator`'s existing KV-gathering handles cross-game
-  concatenation identically, just with more rows.
+- **DecodeWave** — search `forward_decode` batches. Within one game, rows
+  share the game's prefix KV (broadcast — this sharing is what keeps decode
+  memory sane) and carry per-row padded ancestor suffixes. Cross-game merge
+  therefore CANNOT simply concatenate rows: per-row prefix duplication at
+  G=16 would materialize ~50GB of KV. Instead the model gains a
+  **grouped-prefix decode**: rows grouped by game, per-game prefixes stacked
+  `[L, G, H, maxP, d]` with prefix-length masks, rows two-level padded
+  `[G, maxB, ...]`, prefix attention computed as one batched matmul over
+  groups (~tens of MB of scores at G=16). The existing single-prefix
+  `forward_decode` remains the G=1 / eval_vs_stockfish path (both paths
+  live, neither dead), and grouped-vs-sequential equivalence is gated by a
+  dedicated fp32-CPU differential test.
 
 Between yields, a game coroutine does its CPU work exactly as today (ply
 replay, encoding, `_SequenceHistory` updates, row assembly).
