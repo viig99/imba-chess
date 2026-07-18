@@ -134,7 +134,8 @@ class _TimingStats:
       search_bookkeeping -- select_value_search_halving's own time MINUS
                            search_gpu -- heapq/tree management, board copies
                            for candidate moves, python-chess calls inside the
-                           search (_is_forcing, terminal_value_for_color, etc).
+                           search (_forcing_index_set, terminal_value_for_color,
+                           etc).
     """
 
     def __init__(self) -> None:

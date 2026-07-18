@@ -20,6 +20,8 @@ from typing import Any, NamedTuple, Optional, Protocol
 
 import chess
 
+from imba_chess.eval import cozy_bridge
+
 
 class PositionEval(NamedTuple):
     value_stm: float
@@ -74,12 +76,24 @@ def select_greedy(legal_log_priors: list[float]) -> int:
     return max(range(len(legal_log_priors)), key=legal_log_priors.__getitem__)
 
 
-def _is_forcing(board: chess.Board, move: chess.Move) -> bool:
-    return (
-        move.promotion is not None
-        or board.is_capture(move)
-        or board.gives_check(move)
-    )
+def _forcing_index_set(board: chess.Board, legal_moves: list[chess.Move]) -> set[int]:
+    """Indices of forcing moves (promotion/capture/check), one cozy board per node.
+
+    Promotion and capture stay on python-chess (cheap bitboard tests); only
+    check detection crosses to cozy (~240ns/move vs ~3us -- the profiled ~15%
+    hot spot, 1M+ calls per 20-game rollout run).
+    """
+    forcing: set[int] = set()
+    cozy_board = None
+    for idx, move in enumerate(legal_moves):
+        if move.promotion is not None or board.is_capture(move):
+            forcing.add(idx)
+            continue
+        if cozy_board is None:
+            cozy_board = cozy_bridge.board_to_cozy(board)
+        if cozy_bridge.gives_check(cozy_board, cozy_bridge.py_move_to_cozy(board, move)):
+            forcing.add(idx)
+    return forcing
 
 
 def _prior_order(legal_log_priors: list[float]) -> list[int]:
@@ -293,10 +307,11 @@ def select_value_search_d2(
         # tactical refutation is often a low-probability move under a
         # human-imitation policy, so policy top-k alone misses it.
         opp_seen = set(opp_indices)
-        for opp_idx, opp_move in enumerate(board1_eval.legal_moves):
+        opp_forcing = _forcing_index_set(board1, board1_eval.legal_moves)
+        for opp_idx in range(len(board1_eval.legal_moves)):
             if opp_idx in opp_seen:
                 continue
-            if _is_forcing(board1, opp_move):
+            if opp_idx in opp_forcing:
                 opp_indices.append(opp_idx)
                 opp_seen.add(opp_idx)
 
@@ -448,14 +463,16 @@ def _push_children(
     opponent_to_move = node.board.turn != root_color
     order = _prior_order(position_eval.legal_log_priors)
     if opponent_to_move:
+        forcing = _forcing_index_set(node.board, position_eval.legal_moves)
         # Refutation floor: top-r replies by prior plus ALL forcing replies.
         picks = list(order[: config.refutation_top_r])
         seen = set(picks)
-        for idx, move in enumerate(position_eval.legal_moves):
-            if idx not in seen and _is_forcing(node.board, move):
+        for idx in range(len(position_eval.legal_moves)):
+            if idx not in seen and idx in forcing:
                 picks.append(idx)
                 seen.add(idx)
     else:
+        forcing = set()
         picks = list(order[: config.expand_top])
 
     for idx in picks:
@@ -465,7 +482,7 @@ def _push_children(
         # Forcing replies inherit the parent's priority (no decay for their
         # own low prior): a refutation must compete at the plausibility of
         # the line it refutes, not of the reply itself.
-        floor_pick = opponent_to_move and _is_forcing(node.board, move)
+        floor_pick = opponent_to_move and idx in forcing
         child_prior = node.path_log_prior + (
             0.0 if floor_pick else position_eval.legal_log_priors[idx]
         )
@@ -512,8 +529,9 @@ def select_value_search_halving(
         order = _prior_order(legal_log_priors)
     picks = list(order[: min(config.top_m, len(order))])
     seen = set(picks)
-    for idx, move in enumerate(legal_moves):
-        if idx not in seen and _is_forcing(board, move):
+    forcing = _forcing_index_set(board, legal_moves)
+    for idx in range(len(legal_moves)):
+        if idx not in seen and idx in forcing:
             picks.append(idx)
             seen.add(idx)
 
