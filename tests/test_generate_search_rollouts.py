@@ -76,11 +76,59 @@ def test_arm_rows_to_dicts_maps_none_backed_value_to_zero():
     assert projected[0]["backed_value"] == 0.0
 
 
+def _run_games_through_scheduler(module, games, *, model, move_vocab, device, dtype, halving_config, concurrent_games):
+    """Drive N game coroutines through the real BatchScheduler + merged
+    executors this script now uses at runtime (--concurrent-games always
+    routes through the scheduler, even at the default of 1) -- the only way
+    to exercise _process_game post-coroutine-refactor, and doubling as a
+    CPU/tiny-model check that the merged executors don't crash or corrupt
+    shapes when concurrent_games > 1."""
+    from imba_chess.data.board_state import BoardStateEncoder
+    from imba_chess.eval.batch_scheduler import BatchScheduler
+
+    board_state_encoder = BoardStateEncoder()
+    done: dict[str, list] = {}
+    errors: list[tuple[str, BaseException]] = []
+
+    def game_factory():
+        for game in games:
+            gen = module._process_game(
+                game,
+                model=model,
+                move_vocab=move_vocab,
+                board_state_encoder=board_state_encoder,
+                device=device,
+                dtype=dtype,
+                halving_config=halving_config,
+                every_n_plies=1,
+                sample_seed=42,
+                checkpoint_path="dummy.pt",
+            )
+            yield game["game_id"], gen
+
+    scheduler = BatchScheduler(
+        game_factory=game_factory(),
+        executors={
+            "root_eval": module._make_root_eval_executor(
+                model=model, device=device, dtype=dtype, stats=None
+            ),
+            "decode_wave": module._make_decode_wave_executor(
+                model=model, device=device, dtype=dtype, stats=None
+            ),
+        },
+        concurrent_games=concurrent_games,
+        on_game_done=lambda game_id, rows: done.__setitem__(game_id, rows or []),
+        on_game_error=lambda game_id, exc: errors.append((game_id, exc)),
+    )
+    scheduler.run()
+    assert errors == []
+    return done
+
+
 def test_process_game_end_to_end_with_tiny_model(tmp_path):
     import torch as torch_module
 
     pytest.importorskip("torch")
-    from imba_chess.data.board_state import BoardStateEncoder
     from imba_chess.data.move_vocab import MoveVocab
     from imba_chess.model import HSTUChessModel, build_hstu_chess_config
     from imba_chess.config import ModelConfig
@@ -114,18 +162,18 @@ def test_process_game_end_to_end_with_tiny_model(tmp_path):
         ],
     }
 
-    rows = module._process_game(
-        game,
+    halving_config = module.HalvingConfig(budget=32, top_m=4, max_depth=2)
+    done = _run_games_through_scheduler(
+        module,
+        [game],
         model=model,
         move_vocab=move_vocab,
-        board_state_encoder=BoardStateEncoder(),
         device=torch_module.device("cpu"),
         dtype=torch_module.float32,
-        halving_config=module.HalvingConfig(budget=32, top_m=4, max_depth=2),
-        every_n_plies=1,
-        sample_seed=42,
-        checkpoint_path="dummy.pt",
+        halving_config=halving_config,
+        concurrent_games=1,
     )
+    rows = done["https://lichess.org/smoketest"]
 
     assert len(rows) >= 1
     for row in rows:
@@ -143,3 +191,86 @@ def test_process_game_end_to_end_with_tiny_model(tmp_path):
         assert row.search_refutation_top_r == module.HalvingConfig().refutation_top_r
         assert row.search_expand_top == module.HalvingConfig().expand_top
         assert row.search_lam == module.HalvingConfig().lam
+
+
+def test_concurrent_games_matches_sequential_with_tiny_model():
+    """--concurrent-games > 1 must produce the same rows as concurrent_games=1
+    (modulo tiny floating-point differences from batched-matmul reduction
+    order): this is the CPU-only sanity check for the merged root_eval /
+    grouped decode_wave executors that Task 4 owns (the GPU byte-identical
+    gate is a later task's job -- this just guards against a gross
+    correctness bug in the merge/split logic using a real tiny model)."""
+    import torch as torch_module
+
+    pytest.importorskip("torch")
+    from imba_chess.data.move_vocab import MoveVocab
+    from imba_chess.model import HSTUChessModel, build_hstu_chess_config
+    from imba_chess.config import ModelConfig
+
+    module = _load_script_module()
+
+    move_vocab = MoveVocab.build_static()
+    model_cfg = build_hstu_chess_config(
+        ModelConfig(
+            model_dim=32,
+            linear_hidden_dim=16,
+            attention_dim=16,
+            num_heads=2,
+            num_layers=1,
+            max_position_embeddings=64,
+            enable_value_head=True,
+        ),
+        move_vocab_size=len(move_vocab),
+    )
+    model = HSTUChessModel(model_cfg)
+    model.eval()
+
+    games = [
+        {
+            "game_id": "https://lichess.org/g1",
+            "result": "1-0",
+            "plays": [
+                {"move_uci": "e2e4"},
+                {"move_uci": "e7e5"},
+                {"move_uci": "g1f3"},
+                {"move_uci": "b8c6"},
+            ],
+        },
+        {
+            "game_id": "https://lichess.org/g2",
+            "result": "0-1",
+            "plays": [
+                {"move_uci": "d2d4"},
+                {"move_uci": "d7d5"},
+                {"move_uci": "c2c4"},
+                {"move_uci": "e7e6"},
+                {"move_uci": "b1c3"},
+            ],
+        },
+    ]
+    halving_config = module.HalvingConfig(budget=24, top_m=4, max_depth=2)
+    kwargs = dict(
+        model=model,
+        move_vocab=move_vocab,
+        device=torch_module.device("cpu"),
+        dtype=torch_module.float32,
+        halving_config=halving_config,
+    )
+
+    sequential = _run_games_through_scheduler(module, games, concurrent_games=1, **kwargs)
+    merged = _run_games_through_scheduler(module, games, concurrent_games=2, **kwargs)
+
+    assert set(sequential) == set(merged) == {"https://lichess.org/g1", "https://lichess.org/g2"}
+    for game_id in sequential:
+        seq_rows, merged_rows = sequential[game_id], merged[game_id]
+        assert len(seq_rows) == len(merged_rows)
+        for seq_row, merged_row in zip(seq_rows, merged_rows):
+            assert seq_row.ply == merged_row.ply
+            assert seq_row.best_arm_move_uci == merged_row.best_arm_move_uci
+            assert seq_row.arm_move_uci == merged_row.arm_move_uci
+            assert seq_row.best_arm_backed_value == pytest.approx(
+                merged_row.best_arm_backed_value, abs=1e-4
+            )
+            assert seq_row.root_wdl_unsearched == pytest.approx(
+                merged_row.root_wdl_unsearched, abs=1e-4
+            )
