@@ -120,7 +120,7 @@ class BatchScheduler:
             slot.pending = request
         except StopIteration as stop:
             self._finish_slot(slot_id, slots, stop.value)
-        except BaseException as exc:  # noqa: BLE001 - isolate per-game failures
+        except Exception as exc:  # noqa: BLE001 - isolate per-game failures
             self._on_game_error(slot.game_id, exc)
             self._finish_slot(slot_id, slots, None)
 
