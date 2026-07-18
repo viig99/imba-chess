@@ -24,6 +24,7 @@ import json
 import os
 import random
 import time
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Generator, Iterator
 
@@ -493,21 +494,16 @@ def _make_root_eval_executor(*, model, device, dtype, stats: "_TimingStats | Non
     return executor
 
 
+@dataclass
 class _MergedDecodeRequest:
-    __slots__ = (
-        "new_token_batch",
-        "positions",
-        "group_index",
-        "prefix_kv_grouped",
-        "prefix_lens",
-        "suffix_kv",
-        "suffix_positions",
-        "suffix_mask",
-    )
-
-    def __init__(self, **kwargs: Any) -> None:
-        for key, value in kwargs.items():
-            setattr(self, key, value)
+    new_token_batch: dict[str, Any]
+    positions: torch.Tensor
+    group_index: torch.Tensor
+    prefix_kv_grouped: list[tuple[torch.Tensor, torch.Tensor]]
+    prefix_lens: torch.Tensor
+    suffix_kv: list[tuple[torch.Tensor, torch.Tensor]] | None
+    suffix_positions: torch.Tensor | None
+    suffix_mask: torch.Tensor | None
 
 
 def _merge_decode_requests(requests: list[Any]) -> _MergedDecodeRequest:
