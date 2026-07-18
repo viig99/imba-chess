@@ -98,3 +98,11 @@ first run. Note `forward_decode` is plain matmuls by design (2026-07-04
 prefix-cache decision) and was never in compile scope anyway — the ceiling
 here was only ever the ~20% root_eval bucket. The real GPU lever remains
 cross-game batched search.
+
+**Follow-up 2 (2026-07-18)**: the overhead-bound GPU-wave finding was addressed
+by cross-game batched search (generator search core + G-game scheduler +
+grouped-prefix decode) — see
+`docs/superpowers/specs/2026-07-18-cross-game-batched-search-design.md`
+Results. Adopted config: fp32, --concurrent-games 8 locally (~3.3s/game,
+~1.8x total vs this note's baseline, at higher numeric fidelity). Waves
+1,371 → 264 per 20 games; workload now CPU-bound again (bookkeeping 55-65%).
