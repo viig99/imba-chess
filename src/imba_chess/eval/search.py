@@ -11,6 +11,7 @@ This module must stay torch-free so strategy unit tests need no model.
 
 from __future__ import annotations
 
+import copy
 import heapq
 import itertools
 import math
@@ -19,6 +20,7 @@ from dataclasses import dataclass, field
 from typing import Any, NamedTuple, Optional, Protocol
 
 import chess
+import cozy_chess as cc
 
 from imba_chess.eval import cozy_bridge
 
@@ -56,27 +58,26 @@ def _auto_rounds(num_arms: int) -> int:
 
 
 def terminal_value_for_color(
-    board: chess.Board, *, color: chess.Color
+    board: chess.Board, *, color: chess.Color, cozy_board: "cc.Board | None" = None
 ) -> Optional[float]:
     # A repetition/50-move claim needs >= 8 reversible plies of history for
     # the third occurrence, and python-chess allows claiming one reversible
     # ply early via a move that reaches it — so below halfmove_clock 7 no
     # claim is possible and the O(stack) repetition scan can be skipped
     # (~20x on this hot path; verified against the unguarded version on 28k
-    # random positions).
-    outcome = board.outcome(claim_draw=board.halfmove_clock >= 7)
-    if outcome is None:
-        return None
-    if outcome.winner is None:
-        return 0.0
-    return 1.0 if outcome.winner == color else -1.0
+    # random positions). The >= 7 guard lives in cozy_bridge.terminal_value_fast.
+    if cozy_board is None:
+        cozy_board = cozy_bridge.board_to_cozy(board)
+    return cozy_bridge.terminal_value_fast(cozy_board, board, color)
 
 
 def select_greedy(legal_log_priors: list[float]) -> int:
     return max(range(len(legal_log_priors)), key=legal_log_priors.__getitem__)
 
 
-def _forcing_index_set(board: chess.Board, legal_moves: list[chess.Move]) -> set[int]:
+def _forcing_index_set(
+    board: chess.Board, legal_moves: list[chess.Move], cozy_board: "cc.Board"
+) -> set[int]:
     """Indices of forcing moves (promotion/capture/check), one cozy board per node.
 
     Promotion and capture stay on python-chess (cheap bitboard tests); only
@@ -84,14 +85,10 @@ def _forcing_index_set(board: chess.Board, legal_moves: list[chess.Move]) -> set
     hot spot, 1M+ calls per 20-game rollout run).
     """
     forcing: set[int] = set()
-    cozy_board = None
     for idx, move in enumerate(legal_moves):
         if move.promotion is not None or board.is_capture(move):
             forcing.add(idx)
-            continue
-        if cozy_board is None:
-            cozy_board = cozy_bridge.board_to_cozy(board)
-        if cozy_bridge.gives_check(cozy_board, cozy_bridge.py_move_to_cozy(board, move)):
+        elif cozy_bridge.gives_check(cozy_board, cozy_bridge.py_move_to_cozy(board, move)):
             forcing.add(idx)
     return forcing
 
@@ -144,6 +141,7 @@ class _RootCandidate:
     local_idx: int
     move: chess.Move
     board1: chess.Board
+    cozy1: "cc.Board"
     log_prior: float
     terminal_value: Optional[float]
     handle1: Any = None
@@ -157,6 +155,7 @@ def _expand_root_candidates(
     evaluator: PositionEvaluator,
     root_handle: Any,
     board: chess.Board,
+    root_cozy: "cc.Board",
     legal_moves: list[chess.Move],
     legal_log_priors: list[float],
     top_k: int,
@@ -177,13 +176,16 @@ def _expand_root_candidates(
         move = legal_moves[local_idx]
         board1 = _search_copy(board)
         board1.push(move)
-        terminal_value = terminal_value_for_color(board1, color=root_color)
+        cozy1 = copy.copy(root_cozy)
+        cozy1.play(cozy_bridge.py_move_to_cozy(board, move))
+        terminal_value = terminal_value_for_color(board1, color=root_color, cozy_board=cozy1)
         if terminal_value is not None and terminal_value >= 1.0:
             return candidates, local_idx
         candidate = _RootCandidate(
             local_idx=local_idx,
             move=move,
             board1=board1,
+            cozy1=cozy1,
             log_prior=float(legal_log_priors[local_idx]),
             terminal_value=terminal_value,
         )
@@ -210,10 +212,12 @@ def select_value_rerank(
     top_k: int,
     lam: float,
 ) -> tuple[int, list[dict[str, Any]]]:
+    root_cozy = cozy_bridge.board_to_cozy(board)
     candidates, mate_index = _expand_root_candidates(
         evaluator=evaluator,
         root_handle=root_handle,
         board=board,
+        root_cozy=root_cozy,
         legal_moves=legal_moves,
         legal_log_priors=legal_log_priors,
         top_k=top_k,
@@ -269,10 +273,12 @@ def select_value_search_d2(
     lam: float,
 ) -> tuple[int, list[dict[str, Any]]]:
     root_color = board.turn
+    root_cozy = cozy_bridge.board_to_cozy(board)
     candidates, mate_index = _expand_root_candidates(
         evaluator=evaluator,
         root_handle=root_handle,
         board=board,
+        root_cozy=root_cozy,
         legal_moves=legal_moves,
         legal_log_priors=legal_log_priors,
         top_k=top_k,
@@ -307,7 +313,7 @@ def select_value_search_d2(
         # tactical refutation is often a low-probability move under a
         # human-imitation policy, so policy top-k alone misses it.
         opp_seen = set(opp_indices)
-        opp_forcing = _forcing_index_set(board1, board1_eval.legal_moves)
+        opp_forcing = _forcing_index_set(board1, board1_eval.legal_moves, candidate.cozy1)
         for opp_idx in range(len(board1_eval.legal_moves)):
             if opp_idx in opp_seen:
                 continue
@@ -319,7 +325,9 @@ def select_value_search_d2(
             opp_move = board1_eval.legal_moves[opp_local_idx]
             board2 = _search_copy(board1)
             board2.push(opp_move)
-            terminal_value = terminal_value_for_color(board2, color=root_color)
+            cozy2 = copy.copy(candidate.cozy1)
+            cozy2.play(cozy_bridge.py_move_to_cozy(board1, opp_move))
+            terminal_value = terminal_value_for_color(board2, color=root_color, cozy_board=cozy2)
             candidate.reply_candidates.append(
                 {
                     "move_uci": opp_move.uci(),
@@ -398,6 +406,7 @@ def select_value_search_d2(
 @dataclass
 class _TreeNode:
     board: chess.Board
+    cozy_board: "cc.Board"
     handle: Any
     depth: int  # plies below the arm root (arm root = 0)
     path_log_prior: float
@@ -463,7 +472,7 @@ def _push_children(
     opponent_to_move = node.board.turn != root_color
     order = _prior_order(position_eval.legal_log_priors)
     if opponent_to_move:
-        forcing = _forcing_index_set(node.board, position_eval.legal_moves)
+        forcing = _forcing_index_set(node.board, position_eval.legal_moves, node.cozy_board)
         # Refutation floor: top-r replies by prior plus ALL forcing replies.
         picks = list(order[: config.refutation_top_r])
         seen = set(picks)
@@ -479,6 +488,8 @@ def _push_children(
         move = position_eval.legal_moves[idx]
         child_board = _search_copy(node.board)
         child_board.push(move)
+        child_cozy = copy.copy(node.cozy_board)
+        child_cozy.play(cozy_bridge.py_move_to_cozy(node.board, move))
         # Forcing replies inherit the parent's priority (no decay for their
         # own low prior): a refutation must compete at the plausibility of
         # the line it refutes, not of the reply itself.
@@ -488,11 +499,14 @@ def _push_children(
         )
         child = _TreeNode(
             board=child_board,
+            cozy_board=child_cozy,
             handle=None,
             depth=node.depth + 1,
             path_log_prior=child_prior,
         )
-        terminal_stm = terminal_value_for_color(child_board, color=child_board.turn)
+        terminal_stm = terminal_value_for_color(
+            child_board, color=child_board.turn, cozy_board=child_cozy
+        )
         if terminal_stm is not None:
             child.terminal_value_stm = terminal_stm
             node.children.append(child)
@@ -523,13 +537,14 @@ def select_value_search_halving(
     future policy distillation should opt in -- see HalvingConfig.
     """
     root_color = board.turn
+    root_cozy = cozy_bridge.board_to_cozy(board)
     if config.gumbel_root_sampling:
         order = _gumbel_top_k_order(legal_log_priors, rng=rng if rng is not None else random.Random())
     else:
         order = _prior_order(legal_log_priors)
     picks = list(order[: min(config.top_m, len(order))])
     seen = set(picks)
-    forcing = _forcing_index_set(board, legal_moves)
+    forcing = _forcing_index_set(board, legal_moves, root_cozy)
     for idx in range(len(legal_moves)):
         if idx not in seen and idx in forcing:
             picks.append(idx)
@@ -541,7 +556,9 @@ def select_value_search_halving(
         move = legal_moves[idx]
         board1 = _search_copy(board)
         board1.push(move)
-        terminal_root = terminal_value_for_color(board1, color=root_color)
+        cozy1 = copy.copy(root_cozy)
+        cozy1.play(cozy_bridge.py_move_to_cozy(board, move))
+        terminal_root = terminal_value_for_color(board1, color=root_color, cozy_board=cozy1)
         if terminal_root is not None and terminal_root >= 1.0:
             # Immediate win (checkmate delivered): no other move can score higher.
             return idx, [
@@ -565,6 +582,7 @@ def select_value_search_halving(
         if terminal_root is None:
             node = _TreeNode(
                 board=board1,
+                cozy_board=cozy1,
                 handle=evaluator.extend(root_handle, board, move),
                 depth=0,
                 path_log_prior=float(legal_log_priors[idx]),
