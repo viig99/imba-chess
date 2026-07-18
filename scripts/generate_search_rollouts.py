@@ -746,7 +746,9 @@ def _parse_args() -> argparse.Namespace:
         help="Skip this many games at the front of the (deterministic, "
         "unshuffled) stream before recording rollouts -- lets a later "
         "invocation continue past games an earlier one already covered, "
-        "e.g. for a multi-session run stopped and resumed across days.",
+        "e.g. for a multi-session run stopped and resumed across days. "
+        "Note: games that errored (logged and dropped) count toward "
+        "games_processed, so a resume skips rather than retries them.",
     )
     parser.add_argument(
         "--flush-every-games",

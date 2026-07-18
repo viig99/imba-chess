@@ -94,7 +94,10 @@ replay, encoding, `_SequenceHistory` updates, row assembly).
   the progress sidecar, and `--skip-games` resume semantics are preserved
   exactly.
 - **Failure isolation**: a game coroutine that raises is logged and dropped,
-  its slot refilled — same observable effect as today's per-game skip.
+  its slot refilled. (This is NEW behavior — the pre-batching driver had no
+  per-game error handling and crashed the whole process. Side effect: errored
+  games count toward `games_processed`, so a `--skip-games` resume skips
+  rather than retries them.)
 - **Sharding**: `--shard-id/--num-shards` composes on top (multi-GPU remote:
   one process per GPU, G games each).
 
