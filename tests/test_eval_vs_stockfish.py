@@ -998,4 +998,13 @@ def test_run_segment_scheduler_engine_exception_aborts_run(monkeypatch):
     # the way out of _run_segment). The engine is still spawned once (pool
     # construction happens before any game runs).
     assert len(spawned) == 1
+    # This exception originates inside the sf_move EXECUTOR call (the fake
+    # engine's play()), not inside _play_game's own code -- so it bypasses
+    # _release_engine_on_finish's per-slot pool.release entirely (see that
+    # function's docstring: executor-phase exceptions abandon the tick's
+    # suspended game generator(s) without resuming/releasing them). The
+    # actual cleanup path is _run_segment's unconditional
+    # `finally: pool.close()`, which must still quit every pool engine even
+    # though this run aborted mid-game -- regression-pin that here.
+    assert spawned[0].quit_calls == 1
 

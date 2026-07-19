@@ -1036,16 +1036,41 @@ def _release_engine_on_finish(
     gen: Generator[WorkRequest, Any, EvalSummary], pool: EnginePool, slot_index: int
 ) -> Generator[WorkRequest, Any, EvalSummary]:
     """Wrap one game's `_play_game` coroutine so its checked-out engine slot
-    is always returned to `pool`, whether the game finishes normally or
-    raises.
+    is returned to `pool` on the paths this wrapper can actually observe:
+    normal completion, and any exception raised by the game coroutine's own
+    code (e.g. `_play_game`'s `raise RuntimeError("Stockfish returned no
+    move.")`, or anything else executing between yields). Those paths
+    surface as `next()`/`send()` raising on `slot.gen` inside
+    `BatchScheduler._advance`'s try block; a generator's `finally` runs
+    during a `yield from`'s exception unwind, so `pool.release` fires
+    *before* that exception reaches `_advance`'s `except` clause (which then
+    calls `_run_segment`'s `on_game_error`, re-raising to kill the run under
+    this script's fail-fast policy).
 
-    A generator's `finally` block runs during a `yield from`'s exception
-    unwind, before the exception re-emerges from `next()`/`send()` on the
-    *outer* (this) generator -- so `pool.release` fires even on the
-    fail-fast path where `BatchScheduler._advance` catches the propagating
-    exception and hands it to `_run_segment`'s `on_game_error`, which
-    re-raises to kill the run: the slot is freed before that exception ever
-    reaches this function's caller.
+    This wrapper does NOT cover exceptions raised by a merged *executor*
+    call (`root_eval`/`decode_wave`/`sf_move` -- e.g. Stockfish crashing
+    inside `make_sf_move_executor`'s `engine.play()`). Those calls
+    (`self._executors[kind](...)` in `BatchScheduler.run()`'s Phase 3) sit
+    OUTSIDE `_advance`'s try block entirely, so such an exception propagates
+    straight out of `run()` without ever resuming the tick's suspended
+    game generator(s) via `.send()` -- this generator's own `finally` above
+    never runs for that game, and the slot is simply abandoned (its
+    `_play_game` generator is neither closed nor released here). Engine
+    cleanup for that case comes from `_run_segment`'s `finally: pool.close()`,
+    which quits every pool engine unconditionally regardless of any
+    individual slot's release state -- not from this function.
+
+    This split is intentional: this script's fail-fast policy treats an
+    infra-level failure (an engine crash, a GPU error) as fatal to the
+    whole run, with no per-game continuation, so there is currently no
+    scenario where a released-vs-abandoned distinction at the single-slot
+    level matters -- `pool.close()` always fires exactly once, at the very
+    end of `_run_segment`, regardless of which path triggered the abort.
+    A future "continue past one bad game" mode must NOT be built on top of
+    this pool's current acquire/release semantics without first adding
+    structured release for the executor-exception path too (e.g. releasing
+    every live slot's engine from `BatchScheduler.run()`'s own exception
+    handling, not just from each game's wrapper).
     """
     try:
         return (yield from gen)
@@ -1089,15 +1114,19 @@ def _run_segment(
     single-engine-reused-and-reconfigured-across-segments lifecycle.
 
     Engine-to-game assignment goes through `EnginePool.acquire`/`release`
-    (checked out exactly when the scheduler admits a game into a live slot,
-    released exactly when that game's coroutine finishes or raises) rather
-    than a static `game_idx % concurrent_games` round robin: games can take
-    wildly different numbers of plies, so a static round robin can hand two
-    *simultaneously live* games the same physical engine the moment their
-    durations diverge -- corrupting that engine's UCI session and racing its
-    `play()` calls across two `ThreadPoolExecutor` workers in the same tick.
-    Checkout/return brackets each game's actual live-slot lifetime instead,
-    which is race-free by construction regardless of game-length variance.
+    (checked out exactly when the scheduler admits a game into a live slot;
+    released via `_release_engine_on_finish` when that game's coroutine
+    finishes normally or raises from its OWN code -- see that function's
+    docstring for the executor-exception case, which it does not cover and
+    which instead relies on this function's own `finally: pool.close()`
+    below) rather than a static `game_idx % concurrent_games` round robin:
+    games can take wildly different numbers of plies, so a static round
+    robin can hand two *simultaneously live* games the same physical engine
+    the moment their durations diverge -- corrupting that engine's UCI
+    session and racing its `play()` calls across two `ThreadPoolExecutor`
+    workers in the same tick. Checkout/return brackets each game's actual
+    live-slot lifetime instead, which is race-free by construction
+    regardless of game-length variance.
 
     At `concurrent_games=1` the scheduler never holds more than one game
     live at a time (`_fill_slots` only admits a new game once the current
@@ -1234,6 +1263,11 @@ def _run_segment(
             )
             scheduler.run()
     finally:
+        # Unconditional: this is the ONLY cleanup path for a game whose
+        # engine slot was abandoned mid-tick by an executor-phase exception
+        # (see _release_engine_on_finish's docstring) -- pool.close() quits
+        # every engine regardless of whether its slot was ever explicitly
+        # released, so no process leaks even on that path.
         pool.close()
 
     return summary
@@ -1647,10 +1681,14 @@ def _main_with_hard_exit_on_crash() -> None:
     lines below are worth) -- see that copy's docstring for the full
     root-cause writeup (PyTorch Inductor's AsyncCompile background
     ThreadPoolExecutor + CPython's non-daemon-thread-joining shutdown path).
-    The same fail-fast policy applies here: BatchScheduler's on_game_error
-    (Task 3, above) re-raises immediately on any per-game exception, and
-    this wrapper is what turns that re-raise into an actual process exit
-    instead of a hang.
+    The same fail-fast policy applies here: any exception that reaches
+    `_run_segment` -- whether via `BatchScheduler`'s `on_game_error`
+    re-raising a game-coroutine exception, or an executor-phase exception
+    (e.g. Stockfish crashing inside `sf_move`) propagating directly out of
+    `BatchScheduler.run()` without ever reaching `on_game_error` (see
+    `_release_engine_on_finish`'s docstring) -- kills the whole run; this
+    wrapper is what turns that into an actual process exit instead of a
+    hang.
     """
     try:
         main()
