@@ -141,3 +141,59 @@ redundant — plan decides, no orphaned flag either way).
   parity) — unchanged standing item before remote fleet production use.
 - Eval-driver batching; kernel-level GPU work (post-batching shapes make it
   possible, but GPU is no longer the bottleneck).
+
+## Results (2026-07-18, branch cozy-native-tree)
+
+### Gates
+- **Step 0** (canonical UCI move order): validated two ways — deterministic-mode
+  A/B showed **100% identical arm sets** (2686/2686; ordering changed
+  scheduling, never consideration) with 98.2% move agreement; Gumbel-mode
+  agreement 91.1% (expected resampling band). Learning recorded: the plan's
+  shared-arm value-delta prediction was wrong — halving budget allocation
+  depends on the full arm set, so agreement + arm-set identity are the
+  meaningful gates, not value deltas. New baselines minted.
+- **Task 4** (cozy evaluator): G=1 rollout **byte-identical** vs Step-0 baseline.
+- **Task 5** (tree cutover): G=1 AND G=8 rollouts **byte-identical** vs Step-0
+  baselines; eval_vs_stockfish functional smoke healthy (games playing and
+  winning; the compile-on Inductor failure predates this work — nightly
+  already runs `--no-compile` and tracks it as separate follow-up).
+- Differential-harness additions along the way: encoder equivalence incl.
+  played lines and all three ep modes; exact insufficient-material
+  transcription; native repetition/fifty-move claims oracle-gated on 800
+  replayed games (25 draw-claims exercised) plus curated phantom-ep and
+  capturable-ep fixtures; mate-attribution tests at all four color_is_stm
+  sites. Suite 198 → 212.
+
+### Key semantic findings (recorded for posterity)
+- cozy `hash()` includes phantom (uncapturable) ep flags; python-chess's
+  transposition key does not → repetition counting uses a canonical
+  `repetition_hash` (native `hash_without_ep()` when ep is phantom).
+- cozy `status()` auto-draws at halfmove 100 with checkmate precedence (the
+  spec's explicit fifty-move branch was dead code); the one-ply-early fifty
+  claim needs `generate_moves()` truthiness, not `status()==Ongoing`.
+- `board_to_cozy` previously dropped raw ep on capturer-less double pushes —
+  fixed (conversion now matches cozy native play semantics).
+
+### Throughput (20-game set, fp32 G=8 production config)
+| Stage | total | s/game |
+|---|---|---|
+| Pre-Stage-3 (clean, post-batching) | 62.4s | 3.1 |
+| **Post-Stage-3** | **37.2s** | **1.86** |
+
+**1.68x from Stage 3 alone.** Bookkeeping bucket 34.9s → 12.1s. Bucket shares
+now: root_eval 39.4%, search_bookkeeping 32.6%, search_gpu 27.8%. cProfile
+(10 games): 100.1s → 68.2s profiled; python-chess movegen (was ~15s), py
+push (~5s), `uci()` strings (~2.6s), per-edge translation (~3.2s) all gone;
+no single remaining CPU item exceeds ~5% — the hot path is genuinely thin.
+
+Cumulative project arc (same 20-game workload, local 3070 Ti): ~5.9 s/game
+(2026-07-15 baseline) → 1.86 s/game ≈ **3.2x**, at fp32 fidelity throughout
+the final pipeline. Single-process local rate now ~1,935 games/hr.
+
+### What's next (unchanged priorities)
+- Remote 5090 session: G-sweep + shards×G retune — with CPU cost now thin,
+  large-G on the 32GB card should finally approach the coverage target.
+- Layer-3 acceptance run before production training on the new pipeline.
+- No Stage-4 CPU work is currently justified: the profile has no dominant
+  single item left; next levers are GPU-side (root_eval 39.4% — batched
+  further by larger G) and operational (remote scale-out).
