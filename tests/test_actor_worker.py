@@ -16,7 +16,6 @@ Two kinds of coverage:
 
 from __future__ import annotations
 
-import math
 import multiprocessing
 import subprocess
 import sys
@@ -39,7 +38,13 @@ from imba_chess.eval.actor_protocol import (
     WaveResponse,
     WorkerFinished,
 )
-from imba_chess.eval.actor_worker import _WorkerSearchNode, _build_engine, run_eval_worker
+from imba_chess.eval.actor_worker import (
+    _WorkerSearchNode,
+    _build_engine,
+    _legal_vocab_projection,
+    _log_softmax_f32,
+    run_eval_worker,
+)
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 STATIC_VOCAB_PATH = REPO_ROOT / "artifacts" / "move_vocab_static_uci.json"
@@ -89,54 +94,18 @@ def test_actor_protocol_and_worker_stay_torch_free() -> None:
 
 
 # --------------------------------------------------------------------------
-# Fake in-process "server": answers RootEvalRequest/WaveRequest with values
-# derived from a board reconstructed from the request's own board-state
-# fields (piece_ids/turn_id/castle_id), so the worker's real game state and
-# the fake server's answers always agree on which moves are actually legal.
-# En-passant is deliberately not reconstructed (harmless: it can only ever
-# make the returned legal-move set a strict subset of the true one, never
-# include an illegal move, and these test games are far too short for ep to
-# be reachable anyway).
+# Fake in-process "server": answers RootEvalRequest/WaveRequest with all-zero
+# raw "legal_logits", one per requested legal_vocab_id -- the worker itself
+# now computes the legal-move projection (movegen + UCI-sort + vocab lookup)
+# BEFORE sending the request (profile-driven thin-down,
+# docs/superpowers/sdd/thin-report.md), so the fake server no longer needs to
+# reconstruct a board or know anything about legality at all; it only needs
+# to know how many ids were requested per row. All-zero logits make the
+# worker's own log-softmax (`actor_worker._log_softmax_f32`) come out
+# uniform (log(1/n) per entry) -- the same scripted distribution the
+# pre-thin-down fake server built explicitly -- without this test needing to
+# duplicate that math.
 # --------------------------------------------------------------------------
-
-_PIECE_TYPES = [
-    chess.PAWN,
-    chess.KNIGHT,
-    chess.BISHOP,
-    chess.ROOK,
-    chess.QUEEN,
-    chess.KING,
-]
-
-
-def _board_from_state(piece_ids: list[int], turn_id: int, castle_id: int) -> chess.Board:
-    board = chess.Board.empty()
-    for square, code in enumerate(piece_ids):
-        if code == 0:
-            continue
-        color = chess.WHITE if code <= 6 else chess.BLACK
-        piece_type = _PIECE_TYPES[(code - 1) % 6]
-        board.set_piece_at(square, chess.Piece(piece_type, color))
-    board.turn = chess.WHITE if turn_id == 0 else chess.BLACK
-    rights = 0
-    if castle_id & 1:
-        rights |= chess.BB_H1
-    if castle_id & 2:
-        rights |= chess.BB_A1
-    if castle_id & 4:
-        rights |= chess.BB_H8
-    if castle_id & 8:
-        rights |= chess.BB_A8
-    board.castling_rights = rights
-    return board
-
-
-def _scripted_projection(board: chess.Board, *, value_stm: float) -> tuple[float, list[str], list[float]]:
-    legal = sorted(board.legal_moves, key=lambda m: m.uci())
-    ucis = [m.uci() for m in legal]
-    n = len(ucis)
-    log_priors = [math.log(1.0 / n)] * n if n else []
-    return value_stm, ucis, log_priors
 
 
 class _FakeEngine:
@@ -169,28 +138,15 @@ def _run_fake_server(conn, received: list) -> None:
             break
         received.append(msg)
         if isinstance(msg, RootEvalRequest):
-            piece_ids = msg.batch_arrays["piece_ids"][-1]
-            turn_id_field = msg.batch_arrays["turn_id"][-1]
-            castle_id = msg.batch_arrays["castle_id"][-1]
-            board = _board_from_state(piece_ids, turn_id_field, castle_id)
-            value_stm, ucis, log_priors = _scripted_projection(board, value_stm=0.1)
             conn.send(
                 RootEvalResponse(
                     turn_id=msg.turn_id,
-                    value_stm=value_stm,
-                    legal_ucis=ucis,
-                    legal_log_priors=log_priors,
+                    value_stm=0.1,
+                    legal_logits=[0.0] * len(msg.legal_vocab_ids),
                 )
             )
         elif isinstance(msg, WaveRequest):
-            rows = []
-            for row in msg.rows:
-                board = _board_from_state(
-                    row.board_state["piece_ids"],
-                    row.board_state["turn_id"],
-                    row.board_state["castle_id"],
-                )
-                rows.append(_scripted_projection(board, value_stm=0.2))
+            rows = [(0.2, [0.0] * len(row.legal_vocab_ids)) for row in msg.rows]
             conn.send(WaveResponse(rows=rows))
         elif isinstance(msg, WorkerFinished):
             break
@@ -499,3 +455,88 @@ def test_sigterm_while_blocked_in_engine_play_still_quits_engine(tmp_path: Path)
         if proc.is_alive():  # pragma: no cover - safety net only
             proc.kill()
             proc.join(timeout=5.0)
+
+
+# ---------------------------------------------------------------------------
+# Profile-driven thin-down (docs/superpowers/sdd/thin-report.md): the
+# legal-move projection (movegen + UCI-sort + vocab lookup) and the
+# log-softmax over the server's raw logits both moved from the server into
+# this module. These two tests pin their correctness independently of the
+# end-to-end worker/fake-server tests above: `_legal_vocab_projection` must
+# match `position_evaluator._project_legal_logits_cozy`'s mapped+sorted
+# output exactly (over many real random-playout positions, not just the
+# opening), and `_log_softmax_f32` must match `torch.log_softmax`'s float32
+# result to the fp32-exactness suite's 1e-6 bar. Both tests import torch/
+# position_evaluator locally (this module itself must stay torch-free at
+# import time -- test_actor_protocol_and_worker_stay_torch_free above is the
+# permanent regression test for that -- but nothing prevents a TEST
+# function, as opposed to the module under test, from importing torch for
+# its own reference computation).
+# ---------------------------------------------------------------------------
+
+
+def test_legal_vocab_projection_matches_project_legal_logits_cozy_over_random_playouts() -> None:
+    import random
+
+    import cozy_chess as cc
+
+    from imba_chess.data.move_vocab import MoveVocab
+    from imba_chess.eval import cozy_bridge
+    from imba_chess.eval.position_evaluator import _project_legal_logits_cozy
+
+    move_vocab = MoveVocab.build_static()
+    rng = random.Random(0)
+    positions_checked = 0
+    for _game in range(8):
+        board = chess.Board()
+        for _ply in range(30):
+            if board.is_game_over():
+                break
+            legal = list(board.legal_moves)
+            if not legal:
+                break
+            board.push(rng.choice(legal))
+            cozy_board = cozy_bridge.board_to_cozy(board)
+
+            vocab_ids, moves, ucis = _legal_vocab_projection(cozy_board, move_vocab)
+
+            # Reference: the pre-thin-down server-side projection, driven off
+            # a dummy logits tensor (only the move-mapping/order matters
+            # here, not the values) -- fp32-exactness of the actual gathered
+            # VALUES is covered separately by tests/test_actor_server.py.
+            import torch
+
+            dummy_logits = torch.arange(len(move_vocab), dtype=torch.float32)
+            _legal_logits, ref_moves, ref_ucis, _total, _mapped = (
+                _project_legal_logits_cozy(
+                    logits=dummy_logits, cozy_board=cozy_board, move_vocab=move_vocab
+                )
+            )
+            assert ucis == ref_ucis
+            assert [str(m) for m in moves] == [str(m) for m in ref_moves]
+            assert vocab_ids == [move_vocab.token_to_id[u] for u in ucis]
+            positions_checked += 1
+    assert positions_checked > 100
+
+
+def test_log_softmax_f32_matches_torch_log_softmax_fp32() -> None:
+    import random
+
+    import torch
+
+    rng = random.Random(0)
+    for n in (0, 1, 2, 5, 30, 128):
+        raw = [rng.uniform(-20.0, 20.0) for _ in range(n)]
+        # Round-trip through float32 first: raw_logits on the wire are
+        # produced by torch.Tensor.tolist() on a float32 tensor, so a
+        # genuine test input must be exactly float32-representable, same as
+        # production.
+        raw_f32 = torch.tensor(raw, dtype=torch.float32).tolist()
+
+        got = _log_softmax_f32(raw_f32)
+        expected = torch.log_softmax(torch.tensor(raw_f32, dtype=torch.float32), dim=0)
+
+        assert len(got) == n
+        torch.testing.assert_close(
+            torch.tensor(got, dtype=torch.float32), expected, atol=1e-6, rtol=1e-6
+        )

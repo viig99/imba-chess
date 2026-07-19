@@ -35,6 +35,7 @@ from dataclasses import asdict, dataclass
 import chess
 import chess.engine
 import cozy_chess as cc
+import numpy as np
 
 from imba_chess.data.board_state import BoardStateEncoder
 from imba_chess.data.event_builder import BOS_TOKEN_ID, EVENT_TOKEN_ID, TARGET_IGNORE_INDEX
@@ -158,25 +159,68 @@ class _WorkerSearchNode:
         self.move_vocab_id = move_vocab_id
 
 
-def _match_cozy_moves(cozy_board: "cc.Board", legal_ucis: list[str]) -> list["cc.Move"]:
-    """Reverse of `position_evaluator._project_legal_logits_cozy`'s UCI
-    derivation: the server sends back standard (castling-normalized) UCI
-    strings, not `cc.Move` objects -- the wire protocol is chess-object-free
-    -- so reconstructing `search.PositionEval.legal_moves` means matching
-    each returned UCI against THIS position's own cozy movegen. One dict per
-    node (cheap; every search-wave position is distinct anyway), exactly as
-    the task brief specifies.
+def _legal_vocab_projection(
+    cozy_board: "cc.Board", move_vocab: MoveVocab
+) -> tuple[list[int], list["cc.Move"], list[str]]:
+    """Torch-free worker-side mirror of
+    `position_evaluator._project_legal_logits_cozy`'s move-mapping + UCI-sort
+    semantics (profile-driven thin-down, see
+    `docs/superpowers/sdd/thin-report.md`): the worker holds the real cozy
+    board for every search-tree node (and can cheaply derive one for the
+    root from its own live `chess.Board`), so it -- not the server -- runs
+    movegen, derives each move's castling-normalized UCI
+    (`cozy_bridge.cozy_move_to_uci`), keeps only vocab-mapped moves, and
+    sorts the (uci, vocab_id, move) triples jointly by UCI. This is the
+    exact same "drop unmapped, then UCI-sort" discipline
+    `_project_legal_logits_cozy` applies, just computed before the request
+    is sent instead of after a round trip, and never touching a tensor.
+
+    Unlike `_project_legal_logits_cozy`, this never raises on an empty
+    mapped set -- it mirrors `CachedPositionEvaluator.consume_decode_result`'s
+    own `except RuntimeError: legal_moves, legal_ucis, log_priors = [], [], []`
+    for decode-wave rows (empty result, no crash); `_select_model_move` below
+    keeps its own explicit fail-fast raise for the root case, exactly as
+    before.
     """
-    uci_to_move = {
-        cozy_bridge.cozy_move_to_uci(cozy_board, move): move
-        for move in cozy_board.generate_moves()
-    }
-    try:
-        return [uci_to_move[uci] for uci in legal_ucis]
-    except KeyError as exc:
-        raise RuntimeError(
-            f"server returned a UCI not legal on this position: {exc}"
-        ) from exc
+    legal_moves_all = list(cozy_board.generate_moves())
+    ucis_all = [cozy_bridge.cozy_move_to_uci(cozy_board, move) for move in legal_moves_all]
+    triples: list[tuple[str, int, "cc.Move"]] = []
+    for move, uci in zip(legal_moves_all, ucis_all):
+        vocab_id = move_vocab.token_to_id.get(uci)
+        if vocab_id is not None:
+            triples.append((uci, int(vocab_id), move))
+    triples.sort(key=lambda t: t[0])
+    legal_ucis = [t[0] for t in triples]
+    legal_vocab_ids = [t[1] for t in triples]
+    legal_moves = [t[2] for t in triples]
+    return legal_vocab_ids, legal_moves, legal_ucis
+
+
+def _log_softmax_f32(raw_logits: list[float]) -> list[float]:
+    """Worker-side pure-Python (numpy) twin of
+    `torch.log_softmax(tensor.float(), dim=0)` over the ~30 raw legal-move
+    logits the server now returns unprojected (profile-driven thin-down --
+    see `docs/superpowers/sdd/thin-report.md` for the fp32-parity evidence).
+
+    Computed in float64 (numerically stable max-subtract + log-sum-exp, the
+    same algebraic form ATen's float32 log_softmax kernel uses internally,
+    just at higher precision throughout) and only rounded to float32 at the
+    very end. `raw_logits` entries are Python floats produced by
+    `torch.Tensor.tolist()` on a float32 tensor -- an exact, lossless
+    float32->float64 widening, so the float64 computation here operates on
+    the identical bit values torch's own kernel would. log-softmax is
+    well-conditioned for a vector this small (~30 legal moves), so the
+    float64-then-round-to-float32 result matches torch's native float32
+    computation to within a few ULPs -- comfortably inside the 1e-6
+    tolerance the fp32-exactness test suite requires (verified directly
+    against `torch.log_softmax` in `tests/test_actor_worker.py`).
+    """
+    if not raw_logits:
+        return []
+    shifted = np.asarray(raw_logits, dtype=np.float64)
+    shifted = shifted - shifted.max()
+    logsumexp = np.log(np.exp(shifted).sum())
+    return (shifted - logsumexp).astype(np.float32).tolist()
 
 
 class _WaveEvaluator:
@@ -192,6 +236,18 @@ class _WaveEvaluator:
     model turn"), so ids restart at 0 every turn -- the server's
     per-(worker_id, turn_id) KV tree can be released wholesale once the turn
     is done (Task 2's `release_turn`).
+
+    Profile-driven thin-down (`docs/superpowers/sdd/thin-report.md`):
+    `evaluate()` now computes each row's legal-move projection ITSELF
+    (`_legal_vocab_projection`, off the real cozy board it already holds)
+    before sending the `WaveRequest`, and stashes the resulting
+    `(legal_moves, legal_ucis)` in `self._pending_legal`, keyed by node_id --
+    the server never sees a board or a move string, only the vocab ids and,
+    on the way back, raw logits. `WaveResponse` rows are matched back to
+    their node via `self._pending_legal.pop(node_id)` rather than positional
+    zip-with-boards, so a future response-reordering bug (there isn't one
+    today -- `WaveResponse.rows` is documented request order) would raise a
+    KeyError instead of silently mismatching a position's legal moves.
     """
 
     def __init__(
@@ -209,6 +265,7 @@ class _WaveEvaluator:
         self._move_vocab = move_vocab
         self._board_state_encoder = board_state_encoder
         self._next_node_id = 0
+        self._pending_legal: dict[int, tuple[list["cc.Move"], list[str]]] = {}
 
     def extend(self, handle, move_uci: str) -> "_WorkerSearchNode":
         """`handle` is opaque to the caller (search.py); `None` (or
@@ -230,8 +287,12 @@ class _WaveEvaluator:
         if not batch:
             return []
         rows: list[WaveRow] = []
-        boards: list["cc.Board"] = []
+        node_ids: list[int] = []
         for handle, cozy_board in batch:
+            legal_vocab_ids, legal_moves, legal_ucis = _legal_vocab_projection(
+                cozy_board, self._move_vocab
+            )
+            self._pending_legal[handle.node_id] = (legal_moves, legal_ucis)
             board_state = self._board_state_encoder.encode_cozy(cozy_board)
             rows.append(
                 WaveRow(
@@ -239,9 +300,10 @@ class _WaveEvaluator:
                     parent_id=handle.parent_id,
                     prev_move_vocab_id=handle.move_vocab_id,
                     board_state=vars(board_state),
+                    legal_vocab_ids=legal_vocab_ids,
                 )
             )
-            boards.append(cozy_board)
+            node_ids.append(handle.node_id)
         self._conn.send(
             WaveRequest(worker_id=self._worker_id, turn_id=self._turn_id, rows=rows)
         )
@@ -256,16 +318,14 @@ class _WaveEvaluator:
                 f"{len(response.rows)} != request row count {len(batch)}"
             )
         results: list[search.PositionEval] = []
-        for (value_stm, legal_ucis, legal_log_priors), cozy_board in zip(
-            response.rows, boards
-        ):
-            legal_moves = _match_cozy_moves(cozy_board, legal_ucis)
+        for node_id, (value_stm, legal_logits) in zip(node_ids, response.rows):
+            legal_moves, legal_ucis = self._pending_legal.pop(node_id)
             results.append(
                 search.PositionEval(
                     value_stm=float(value_stm),
                     legal_moves=legal_moves,
-                    legal_ucis=list(legal_ucis),
-                    legal_log_priors=list(legal_log_priors),
+                    legal_ucis=legal_ucis,
+                    legal_log_priors=_log_softmax_f32(list(legal_logits)),
                 )
             )
         return results
@@ -428,19 +488,43 @@ def _select_model_move(
 ) -> tuple[chess.Move, dict]:
     """Torch-free, protocol-driven twin of `scripts/eval_vs_stockfish.py`'s
     `_select_model_move`: the model forward becomes one `RootEvalRequest`/
-    `RootEvalResponse` round trip (the server does the forward AND the
-    vocab projection -- it owns the logits -- so `legal_ucis`/
-    `legal_log_priors` come back already UCI-sorted), and
-    `CachedPositionEvaluator` becomes `_WaveEvaluator`. Everything
-    downstream -- `search.select_greedy`/`select_value_rerank`/
-    `select_value_search_d2`/`select_value_search_halving` -- is called
-    exactly as `_select_model_move` calls it, since `_WaveEvaluator`
-    satisfies the same `search.PositionEvaluator` protocol
-    `CachedPositionEvaluator` does.
+    `RootEvalResponse` round trip, and `CachedPositionEvaluator` becomes
+    `_WaveEvaluator`. Everything downstream -- `search.select_greedy`/
+    `select_value_rerank`/`select_value_search_d2`/
+    `select_value_search_halving` -- is called exactly as
+    `_select_model_move` calls it, since `_WaveEvaluator` satisfies the same
+    `search.PositionEvaluator` protocol `CachedPositionEvaluator` does.
+
+    Profile-driven thin-down (`docs/superpowers/sdd/thin-report.md`): the
+    vocab projection (movegen + UCI-sort + vocab-id lookup) is now computed
+    HERE, worker-side, off this worker's own live `board` (converted to
+    cozy once), exactly as `_WaveEvaluator.evaluate` does per node -- the
+    server only ever sees the resulting `legal_vocab_ids` and gathers raw
+    logits at them; `legal_log_priors` is then this worker's own
+    `_log_softmax_f32` over those raw logits, not a server-computed field.
     """
+    # NOTE: legal_moves here must stay python-chess chess.Move objects (the
+    # root's `board` is a chess.Board, pushed via board.push(move) by
+    # _play_one_game, and search.select_* at the root level is called with
+    # board=<chess.Board> throughout) -- _legal_vocab_projection's own
+    # `legal_moves` return is cozy cc.Move (used at the WAVE/decode-tree
+    # level below, Stage 3's cozy-only search tree), so it is deliberately
+    # discarded here in favor of rebuilding chess.Move from the (still
+    # UCI-sorted) uci strings, exactly as the pre-thin-down code built them
+    # from the server's response.legal_ucis.
+    cozy_board = cozy_bridge.board_to_cozy(board)
+    legal_vocab_ids, _cozy_legal_moves, legal_ucis = _legal_vocab_projection(
+        cozy_board, move_vocab
+    )
+    legal_moves = [chess.Move.from_uci(uci) for uci in legal_ucis]
     batch_arrays = history.build_batch_for_current_position(board)
     conn.send(
-        RootEvalRequest(worker_id=worker_id, turn_id=turn_id, batch_arrays=batch_arrays)
+        RootEvalRequest(
+            worker_id=worker_id,
+            turn_id=turn_id,
+            batch_arrays=batch_arrays,
+            legal_vocab_ids=legal_vocab_ids,
+        )
     )
     response = conn.recv()
     if not isinstance(response, RootEvalResponse) or response.turn_id != turn_id:
@@ -450,8 +534,7 @@ def _select_model_move(
         )
 
     total_legal_moves = len(list(board.legal_moves))
-    legal_moves = [chess.Move.from_uci(uci) for uci in response.legal_ucis]
-    legal_log_priors = list(response.legal_log_priors)
+    legal_log_priors = _log_softmax_f32(list(response.legal_logits))
     mapped_legal_moves = len(legal_moves)
     if mapped_legal_moves == 0:
         raise RuntimeError(

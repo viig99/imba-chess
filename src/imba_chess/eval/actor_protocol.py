@@ -33,26 +33,41 @@ class RootEvalRequest:
     `_build_single_batch()` dict (`position_evaluator.py`): every tensor
     field there becomes a plain nested list here, scalar ints stay ints. See
     `actor_worker._PlainSequenceHistory.build_batch_for_current_position`.
+
+    `legal_vocab_ids` (profile-driven thin-down, see
+    `docs/superpowers/sdd/thin-report.md`): the worker -- which holds the
+    real python-chess board for the current position -- computes the
+    UCI-sorted, vocab-mapped legal-move projection itself
+    (`actor_worker._legal_vocab_projection`, converting to a cozy board
+    first) and sends only the resulting vocab ids. The server never
+    reconstructs a board or runs movegen at all anymore: it just gathers raw
+    logits at these ids, in this order, and returns them unprojected (see
+    `RootEvalResponse`). The worker keeps its own parallel
+    (`cc.Move`, uci) lists locally so it never needs move/uci strings back
+    on the wire.
     """
 
     worker_id: int
     turn_id: int
     batch_arrays: dict
+    legal_vocab_ids: list[int]
 
 
 @dataclass
 class RootEvalResponse:
-    """server -> worker: root forward result, already vocab-projected.
+    """server -> worker: root forward result, UNPROJECTED.
 
-    `legal_ucis`/`legal_log_priors` are index-aligned and UCI-sorted (the
-    same canonical order `position_evaluator._project_legal_logits_cozy`
-    produces) -- the server owns projection since it owns the logits.
+    `legal_logits` is the raw (pre-softmax) logit gathered at each of the
+    request's own `legal_vocab_ids`, in that same order -- the server does a
+    single batched index op per call (no per-request Python movegen/sort
+    loop), and the worker computes log-softmax itself
+    (`actor_worker._log_softmax_f32`) since it already knows which
+    moves/ucis those ids correspond to.
     """
 
     turn_id: int
     value_stm: float
-    legal_ucis: list[str]
-    legal_log_priors: list[float]
+    legal_logits: list[float]
 
 
 @dataclass
@@ -60,15 +75,23 @@ class WaveRow:
     """One search-tree node's decode request, worker-minted.
 
     `board_state` is `vars(BoardState)` (`data/models.py`): plain
-    ints/lists, chess-free -- the server reconstructs whatever it needs
-    (a cozy board, for legal-move projection) from these fields rather than
-    receiving a board object across the pipe.
+    ints/lists, chess-free -- used ONLY to tensorize this node's one new
+    decode token (piece placement / turn / castle / ep / clock buckets);
+    the server no longer reconstructs a board object from it at all (no
+    movegen happens server-side anymore).
+
+    `legal_vocab_ids` is this node's own UCI-sorted, vocab-mapped legal-move
+    projection, computed worker-side from the REAL cozy board for this node
+    (`actor_worker._legal_vocab_projection`) -- see `RootEvalRequest`'s
+    docstring for the full rationale; identical division of labor, just
+    per-node instead of per-turn.
     """
 
     node_id: int
     parent_id: int | None  # None = child of the turn's root prefix
     prev_move_vocab_id: int
     board_state: dict
+    legal_vocab_ids: list[int]
 
 
 @dataclass
@@ -83,10 +106,14 @@ class WaveRequest:
 
 @dataclass
 class WaveResponse:
-    """server -> worker: one `(value_stm, legal_ucis, legal_log_priors)`
-    tuple per `WaveRow`, in the same order as `WaveRequest.rows`."""
+    """server -> worker: one `(value_stm, legal_logits)` pair per `WaveRow`,
+    in the same order as `WaveRequest.rows`. `legal_logits` is the raw
+    logits gathered at that row's own `legal_vocab_ids` (one padded batched
+    `torch.gather` per wave server-side, not a per-row Python loop) -- the
+    worker computes log-softmax itself, same division of labor as
+    `RootEvalResponse`."""
 
-    rows: list[tuple[float, list[str], list[float]]]
+    rows: list[tuple[float, list[float]]]
 
 
 @dataclass

@@ -1443,8 +1443,6 @@ def _run_segment_actor_mode(
     segment_options: dict[str, Any],
     segment_name: str,
     model: torch.nn.Module,
-    move_vocab: MoveVocab,
-    board_state_encoder: BoardStateEncoder,
     games: int,
     max_plies: int,
     engine_limit: chess.engine.Limit,
@@ -1469,8 +1467,15 @@ def _run_segment_actor_mode(
     `SimpleEngine` and a static round-robin share of `games` (see
     `_assign_games_round_robin`); serve their model-turn requests from an
     in-process `ActorInferenceServer` built on this segment's already-loaded
-    `model`/`move_vocab`/`board_state_encoder`/`device`/`dtype` (see
-    `_serve_actor_workers` for the serve loop itself).
+    `model`/`device`/`dtype` (see `_serve_actor_workers` for the serve loop
+    itself). The WORKER processes load their own vocab/board-state-config
+    copies from `vocab_path`/`board_state_config` (see
+    `_build_worker_config`) -- since the profile-driven thin-down
+    (`docs/superpowers/sdd/thin-report.md`), the server itself needs neither
+    a `MoveVocab` nor a `BoardStateEncoder` at all: it never runs movegen or
+    vocab lookups anymore (that moved to the workers), so this function no
+    longer takes them as parameters and `ActorInferenceServer` no longer
+    takes them as constructor arguments.
 
     `fake_engine_factory` is test-only (see `_worker_engine_config`); every
     other parameter mirrors `_run_segment`'s own, minus the debug-trace/
@@ -1503,8 +1508,6 @@ def _run_segment_actor_mode(
 
     server = ActorInferenceServer(
         model=model,
-        move_vocab=move_vocab,
-        board_state_encoder=board_state_encoder,
         device=device,
         dtype=dtype,
         # Same value-head requirement as the G=1 path's own
@@ -2052,8 +2055,6 @@ def main() -> None:
                 segment_options=segment_options,
                 segment_name=spec.name,
                 model=model,
-                move_vocab=move_vocab,
-                board_state_encoder=board_state_encoder,
                 games=spec.games,
                 max_plies=args.max_plies,
                 engine_limit=engine_limit,
