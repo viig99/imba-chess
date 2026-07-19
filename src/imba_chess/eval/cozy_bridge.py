@@ -247,6 +247,18 @@ def terminal_value_native(
     python-chess board involved). `hash_history` holds repetition_hash()
     values of PRIOR positions since the last irreversible move (most-recent-
     last; excludes the current position at `cozy_board`).
+
+    "Irreversible move" here means "zeroing" (capture or pawn move, i.e.
+    halfmove_clock resets to 0) -- narrower than python-chess's
+    `is_irreversible`, which also resets on castling-rights loss and
+    ep-cession. That's intentional, not an oversight: castling rights and a
+    capturable ep square are both part of what `repetition_hash` hashes, so
+    two positions on opposite sides of one of those *additional* boundaries
+    already hash differently and can never falsely match in the window sum
+    below. Reset-on-zeroing-only is therefore sufficient; callers (e.g. a
+    future search-tree history) must not narrow the reset condition further,
+    but MAY keep this exact contract without also tracking castling/ep
+    transitions separately.
     """
     status = cozy_board.status()
     if status == cc.GameStatus.Won:

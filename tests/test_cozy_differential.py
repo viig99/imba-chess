@@ -176,7 +176,10 @@ def test_terminal_value_native_matches_oracle_on_replayed_games():
     for g in range(800):
         pyb = chess.Board()
         cb = board_to_cozy(pyb)
-        hash_history = []  # repetition_hash() of prior positions since last irreversible move
+        # repetition_hash() of prior positions since the last irreversible
+        # (zeroing: capture/pawn-move) move -- see terminal_value_native's
+        # docstring for why zeroing-only is a sufficient reset condition.
+        hash_history = []
         for _ in range(300):
             moves = list(pyb.legal_moves)
             if not moves:
@@ -263,6 +266,34 @@ def test_terminal_value_native_curated_phantom_ep_repetition():
     # divergence is real and repetition_hash is the thing bridging it.
     raw_hash_at_p1, canonical_hash_at_p1 = hashes_after_occurrence_1
     assert raw_hash_at_p1 != canonical_hash_at_p1
+
+
+def test_repetition_hash_matches_raw_hash_when_ep_is_legally_capturable():
+    """Counterpart to the phantom-ep curated test above: when the ep flag
+    DOES have a legal capturer, python-chess's transposition key includes
+    ep (Board.has_legal_en_passant() is true), so repetition_hash must NOT
+    strip it -- it should be byte-for-byte cozy's own Board.hash(), not
+    hash_without_ep(). Seed verified via REPL: black's d7d5 leaves white's
+    e5 pawn able to capture en passant on d6.
+    """
+    import copy as copymod
+
+    from imba_chess.eval.cozy_bridge import ep_has_legal_capturer, repetition_hash
+
+    pyb = chess.Board("4k3/3p4/8/4P3/8/8/8/4K3 b - - 0 1")
+    cb = board_to_cozy(pyb)
+    mv = chess.Move.from_uci("d7d5")
+    assert mv in pyb.legal_moves, pyb.fen()
+
+    cb2 = copymod.copy(cb)
+    cb2.play(py_move_to_cozy(pyb, mv))
+    pyb.push(mv)
+
+    assert cb2.en_passant() is not None
+    assert ep_has_legal_capturer(cb2), "fixture is broken: expected a legally capturable ep"
+    assert pyb.has_legal_en_passant()
+    assert repetition_hash(cb2) == cb2.hash()
+    assert repetition_hash(cb2) != cb2.hash_without_ep()
 
 
 def test_search_dual_boards_stay_in_sync(monkeypatch):
