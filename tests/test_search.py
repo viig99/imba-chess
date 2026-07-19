@@ -12,6 +12,8 @@ from imba_chess.eval.search import (
     _auto_rounds,
     _gumbel_top_k_order,
     select_greedy,
+    select_value_rerank,
+    select_value_search_d2,
     select_value_search_halving,
     terminal_value_for_color,
 )
@@ -251,6 +253,54 @@ def test_mate_in_one_short_circuits_with_zero_evals():
     assert len(rows) == 1 and rows[0]["search_score"] == 1.0
 
 
+def test_mate_in_one_short_circuits_with_zero_evals_via_rerank():
+    # Pins _expand_root_candidates_stepwise's color_is_stm=False site (the
+    # root-candidate terminal check, shared by select_value_rerank and
+    # select_value_search_d2 via `yield from`): a low-prior mate must still
+    # be recognized and short-circuit before any evaluate() batch is sent.
+    board = chess.Board("6k1/5ppp/8/8/8/8/8/R6K w - - 0 1")
+    legal_moves = [chess.Move.from_uci("a1b1"), chess.Move.from_uci("a1a8")]
+    legal_log_priors = [-0.1, -3.0]  # mate is LOW prior
+    evaluator = _ArmValueEvaluator({"a1b1": 0.0, "a1a8": 0.0})
+
+    chosen, rows = select_value_rerank(
+        evaluator=evaluator,
+        root_handle=(),
+        board=board,
+        legal_moves=legal_moves,
+        legal_log_priors=legal_log_priors,
+        top_k=2,
+        lam=0.05,
+    )
+
+    assert legal_moves[chosen].uci() == "a1a8"
+    assert evaluator.eval_calls == 0
+    assert len(rows) == 1 and rows[0]["rerank_score"] == 1.0
+
+
+def test_mate_in_one_short_circuits_with_zero_evals_via_d2():
+    # Same fixture/site as the rerank version above, through the other
+    # wrapper of _expand_root_candidates_stepwise.
+    board = chess.Board("6k1/5ppp/8/8/8/8/8/R6K w - - 0 1")
+    legal_moves = [chess.Move.from_uci("a1b1"), chess.Move.from_uci("a1a8")]
+    legal_log_priors = [-0.1, -3.0]  # mate is LOW prior
+    evaluator = _ArmValueEvaluator({"a1b1": 0.0, "a1a8": 0.0})
+
+    chosen, rows = select_value_search_d2(
+        evaluator=evaluator,
+        root_handle=(),
+        board=board,
+        legal_moves=legal_moves,
+        legal_log_priors=legal_log_priors,
+        top_k=2,
+        lam=0.05,
+    )
+
+    assert legal_moves[chosen].uci() == "a1a8"
+    assert evaluator.eval_calls == 0
+    assert len(rows) == 1 and rows[0]["search_score"] == 1.0
+
+
 def test_refutation_floor_catches_low_prior_forcing_refutation():
     # White Qd2, black Nb4. Qd3?? hangs the queen to Nxd3 — a capture the
     # priors rank last. Qh6 is safe. Only the forcing-reply floor finds Nxd3.
@@ -275,3 +325,34 @@ def test_refutation_floor_catches_low_prior_forcing_refutation():
     by_move = {row["move_uci"]: row for row in rows}
     assert by_move["d2d3"]["backed_value"] < by_move["d2h6"]["backed_value"]
     assert evaluator.positions_evaluated <= 8
+
+
+def test_fools_mate_loss_attribution_via_d2():
+    # Pins _d2_stepwise's color_is_stm=True site (the d2-reply terminal
+    # check): after 1.f3 e5, 2.g4?? allows 2...Qh4# -- the reply's mate must
+    # be attributed to g2g4 as a root-POV loss (worst_reply_value == -1.0),
+    # not missed or mis-signed. Qh4+ is a forcing (check) reply, so the
+    # low-prior-ranks-checks-last _MaterialEvaluator still finds it via the
+    # forcing-reply floor. g2g3 is the safe alternative (blocks the h4-e1
+    # diagonal, no check at all), so the search must not walk into the trap.
+    board = chess.Board()
+    board.push_uci("f2f3")
+    board.push_uci("e7e5")
+    legal_moves = [chess.Move.from_uci("g2g4"), chess.Move.from_uci("g2g3")]
+    legal_log_priors = [-0.7, -0.7]
+    evaluator = _MaterialEvaluator()
+
+    chosen, rows = select_value_search_d2(
+        evaluator=evaluator,
+        root_handle=None,
+        board=board,
+        legal_moves=legal_moves,
+        legal_log_priors=legal_log_priors,
+        top_k=3,
+        lam=0.05,
+    )
+
+    by_move = {row["move_uci"]: row for row in rows}
+    assert by_move["g2g4"]["worst_reply_value"] == -1.0
+    assert by_move["g2g4"]["best_reply_uci"] == "d8h4"
+    assert legal_moves[chosen].uci() == "g2g3"
