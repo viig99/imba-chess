@@ -1,8 +1,11 @@
 from __future__ import annotations
 
 import importlib.util
+import multiprocessing
+from dataclasses import asdict
 from pathlib import Path
 import sys
+from types import SimpleNamespace
 
 import chess
 import chess.engine
@@ -10,11 +13,14 @@ import pytest
 
 torch = pytest.importorskip("torch")
 
-from imba_chess.config import ModelConfig, RepoConfig
+from imba_chess.config import BoardStateConfig, ModelConfig, RepoConfig
 from imba_chess.data.board_state import BoardStateEncoder
 from imba_chess.data.move_vocab import MoveVocab, MoveVocabConfig
 from imba_chess.eval.position_evaluator import _forward_model
 from imba_chess.model import HSTUChessModel, build_hstu_chess_config
+
+REPO_ROOT = Path(__file__).resolve().parent.parent
+STATIC_VOCAB_PATH = REPO_ROOT / "artifacts" / "move_vocab_static_uci.json"
 
 
 def _load_eval_script_module():
@@ -963,25 +969,19 @@ def test_run_segment_scheduler_g1_aggregates_alternates_colors_and_reuses_engine
     assert summary.model_turns == 3  # one model turn per game
 
 
-def test_run_segment_scheduler_g2_uses_distinct_engines_per_slot(monkeypatch):
+def test_run_segment_rejects_concurrent_games_greater_than_one(monkeypatch):
+    """Task 3 cutover: `_run_segment`'s in-process `EnginePool`/
+    `BatchScheduler`/`make_sf_move_executor` generality used to ALSO serve
+    `concurrent_games > 1` (this was the exact scenario the deleted
+    `test_run_segment_scheduler_g2_uses_distinct_engines_per_slot` covered);
+    that capability is gone, not merely unreachable from `main()` --
+    `_run_segment` itself now fails fast on `concurrent_games > 1` so it can
+    never again be scaled past one live game, from any caller."""
     module = _load_eval_script_module()
     spawned = _patch_fake_stockfish(monkeypatch)
 
-    summary = _run_fake_segment(module, games=2, concurrent_games=2, spawned=spawned)
-
-    # Two concurrently-live games -> two engines spawned, one per slot; with
-    # only 2 games total, both stay live for their whole duration, so no
-    # slot ever hands off to a second game -- each engine sees exactly the
-    # one game's sf_move call(s).
-    assert len(spawned) == 2
-    assert all(e.configure_calls == [{"Threads": 1}] for e in spawned)
-    assert {len(e.play_calls) for e in spawned} == {1}
-    total_play_calls = sum(len(e.play_calls) for e in spawned)
-    assert total_play_calls == 2  # one engine turn per game
-
-    assert summary.games == 2
-    assert summary.games_as_white == 1
-    assert summary.games_as_black == 1
+    with pytest.raises(ValueError, match="only supports concurrent_games=1"):
+        _run_fake_segment(module, games=2, concurrent_games=2, spawned=spawned)
 
 
 def test_run_segment_scheduler_engine_exception_aborts_run(monkeypatch):
@@ -1007,4 +1007,199 @@ def test_run_segment_scheduler_engine_exception_aborts_run(monkeypatch):
     # `finally: pool.close()`, which must still quit every pool engine even
     # though this run aborted mid-game -- regression-pin that here.
     assert spawned[0].quit_calls == 1
+
+
+# ---------------------------------------------------------------------------
+# Task 3: actor-mode orchestration (--concurrent-games > 1).
+#
+# Real `multiprocessing.get_context("spawn")` integration tests: actual
+# worker PROCESSES, not threads and not direct in-process calls (unlike
+# tests/test_actor_worker.py's own worker tests). This means
+# `worker_config["engine"]["fake_engine_factory"]` must be picklable end to
+# end -- a lambda/closure (fine for Task 1's in-process tests) is not; the
+# factories below are module-level functions instead, resolvable by the
+# freshly-spawned child process via a normal `import
+# tests.test_eval_vs_stockfish` (works under `.venv/bin/pytest`, which puts
+# the repo root on sys.path and multiprocessing's spawn bootstrap propagates
+# that to the child -- verified empirically; a bare `python script.py`
+# invocation would NOT have `tests` importable, but these tests only ever
+# run under pytest).
+# ---------------------------------------------------------------------------
+
+
+class _ActorModeFakeEngine:
+    """Always plays the board's first legal move; never raises."""
+
+    def play(self, board, limit):  # type: ignore[no-untyped-def]
+        move = next(iter(board.legal_moves))
+        return SimpleNamespace(move=move)
+
+    def quit(self) -> None:
+        pass
+
+
+def _actor_mode_fake_engine_factory() -> _ActorModeFakeEngine:
+    """Top-level (picklable-under-spawn) fake-engine factory. See this
+    section's module docstring for why a lambda closure -- Task 1's own
+    `tests/test_actor_worker.py` fixture -- does not work for a REAL spawn
+    integration test: `actor_worker._build_engine`'s docstring documents the
+    same worker-side design note."""
+    return _ActorModeFakeEngine()
+
+
+class _ActorModeCrashingEngine:
+    """Every `.play()` call raises -- used to make a worker process crash
+    deterministically for the dead-worker fail-fast test below."""
+
+    def play(self, board, limit):  # type: ignore[no-untyped-def]
+        raise RuntimeError("actor mode test: engine crashed")
+
+    def quit(self) -> None:
+        pass
+
+
+def _actor_mode_crashing_engine_factory() -> _ActorModeCrashingEngine:
+    return _ActorModeCrashingEngine()
+
+
+def _tiny_actor_mode_model(move_vocab: MoveVocab) -> HSTUChessModel:
+    torch.manual_seed(3)
+    config = build_hstu_chess_config(
+        ModelConfig(
+            model_dim=32,
+            linear_hidden_dim=8,
+            attention_dim=8,
+            num_heads=2,
+            num_layers=1,
+            dropout=0.0,
+            max_position_embeddings=64,
+            enable_value_head=True,  # ActorInferenceServer requires this.
+        ),
+        move_vocab_size=len(move_vocab),
+    )
+    return HSTUChessModel(config).eval()
+
+
+def test_actor_mode_two_workers_play_two_short_games_end_to_end():
+    """2 REAL worker processes play 2 short (max_plies=2) games each against
+    a fake Stockfish engine, served by a real (tiny CPU) `ActorInferenceServer`
+    living in this test process -- summaries end up aggregated in game-index
+    order via the hold-back buffer, and shutdown is clean: both workers join
+    with exitcode 0 and no child process is left behind."""
+    module = _load_eval_script_module()
+    move_vocab = MoveVocab.build_static()
+    model = _tiny_actor_mode_model(move_vocab)
+
+    summary = module._run_segment_actor_mode(
+        stockfish_path=Path("unused-fake-engine-path"),
+        segment_options={},
+        segment_name="actor-mode-test",
+        model=model,
+        move_vocab=move_vocab,
+        board_state_encoder=BoardStateEncoder(),
+        games=2,
+        max_plies=2,
+        engine_limit=chess.engine.Limit(time=0.01),
+        device=torch.device("cpu"),
+        dtype=torch.float32,
+        model_move_policy="greedy",
+        value_rerank_top_k=1,
+        value_rerank_lambda=0.0,
+        opening_random_plies=0,
+        seed=0,
+        concurrent_games=2,
+        vocab_path=STATIC_VOCAB_PATH,
+        vocab_include_unk=False,
+        board_state_config=asdict(BoardStateConfig()),
+        halving_config=None,
+        fake_engine_factory=_actor_mode_fake_engine_factory,
+    )
+
+    # max_plies=2 cuts both games off before either can complete; game_idx 0
+    # is model=white (0 % 2 == 0), game_idx 1 is model=black -- one model
+    # turn and one SF turn each, opposite order.
+    assert summary.games == 2
+    assert summary.incomplete_games == 2
+    assert summary.completed_games == 0
+    assert summary.games_as_white == 1
+    assert summary.games_as_black == 1
+    assert summary.total_plies == 4
+    assert summary.model_turns == 2
+
+    # Clean shutdown: no worker process left behind.
+    assert multiprocessing.active_children() == []
+
+
+def test_actor_mode_dead_worker_fails_fast_and_terminates_all_workers():
+    """A crashing engine kills a worker process (an uncaught exception
+    inside `run_eval_worker` exits that process nonzero); the orchestrator
+    must detect this via pipe EOF, raise, and leave NO worker process alive
+    behind it -- --concurrent-games > 1's counterpart to
+    `test_run_segment_scheduler_engine_exception_aborts_run` above."""
+    module = _load_eval_script_module()
+    move_vocab = MoveVocab.build_static()
+    model = _tiny_actor_mode_model(move_vocab)
+
+    with pytest.raises(RuntimeError):
+        module._run_segment_actor_mode(
+            stockfish_path=Path("unused-fake-engine-path"),
+            segment_options={},
+            segment_name="actor-mode-crash-test",
+            model=model,
+            move_vocab=move_vocab,
+            board_state_encoder=BoardStateEncoder(),
+            games=2,
+            max_plies=4,
+            engine_limit=chess.engine.Limit(time=0.01),
+            device=torch.device("cpu"),
+            dtype=torch.float32,
+            model_move_policy="greedy",
+            value_rerank_top_k=1,
+            value_rerank_lambda=0.0,
+            opening_random_plies=0,
+            seed=0,
+            concurrent_games=2,
+            vocab_path=STATIC_VOCAB_PATH,
+            vocab_include_unk=False,
+            board_state_config=asdict(BoardStateConfig()),
+            halving_config=None,
+            fake_engine_factory=_actor_mode_crashing_engine_factory,
+        )
+
+    # Fail-fast supervision: the run dies (nonzero, via the caller's
+    # existing hard-exit wrapper in production) AND every worker process is
+    # gone -- no leaked Stockfish-hosting process left behind.
+    assert multiprocessing.active_children() == []
+
+
+def test_run_segment_actor_mode_rejects_concurrent_games_one():
+    module = _load_eval_script_module()
+    move_vocab = MoveVocab.build_static()
+    model = _tiny_actor_mode_model(move_vocab)
+
+    with pytest.raises(ValueError, match="requires concurrent_games > 1"):
+        module._run_segment_actor_mode(
+            stockfish_path=Path("unused-fake-engine-path"),
+            segment_options={},
+            segment_name="actor-mode-guard-test",
+            model=model,
+            move_vocab=move_vocab,
+            board_state_encoder=BoardStateEncoder(),
+            games=1,
+            max_plies=2,
+            engine_limit=chess.engine.Limit(time=0.01),
+            device=torch.device("cpu"),
+            dtype=torch.float32,
+            model_move_policy="greedy",
+            value_rerank_top_k=1,
+            value_rerank_lambda=0.0,
+            opening_random_plies=0,
+            seed=0,
+            concurrent_games=1,
+            vocab_path=STATIC_VOCAB_PATH,
+            vocab_include_unk=False,
+            board_state_config=asdict(BoardStateConfig()),
+            halving_config=None,
+            fake_engine_factory=_actor_mode_fake_engine_factory,
+        )
 

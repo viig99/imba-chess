@@ -1,6 +1,27 @@
 """Engine pool + concurrent sf_move executor for the fast-clean-evals batched
 driver (`docs/superpowers/plans/2026-07-19-fast-clean-evals.md` Task 2).
 
+CUTOVER NOTE (multiprocess-eval-actors, Task 3,
+`docs/superpowers/specs/2026-07-19-multiprocess-eval-actors-design.md`): this
+module's own docstring below still describes its original `--concurrent-games
+G` generality, but that capability is gone from its sole caller --
+`scripts/eval_vs_stockfish.py`'s `_run_segment` now hard-fails on
+`concurrent_games != 1` (see that function's own cutover-note docstring), so
+in practice `EnginePool` is only ever constructed with `size=1` and
+`make_sf_move_executor` only ever with `pool_threads=1` today. It is KEPT
+(not deleted) because `_run_segment` -- the `concurrent_games=1` in-process,
+byte-deterministic reference/gate path -- still genuinely needs an engine
+handle and an executor shaped for `BatchScheduler`'s merged-call contract;
+`--concurrent-games > 1` now spawns actor-mode worker processes instead
+(`_run_segment_actor_mode`), each owning its Stockfish `SimpleEngine`
+directly (no pool, no thread-pool executor -- see `actor_worker.py`'s
+`_build_engine`). No other module imports this one. This module's own tests
+(`tests/test_engine_pool.py`) still exercise it at pool sizes > 1 as a
+UNIT test of `EnginePool`/`make_sf_move_executor` in isolation (that
+generality is harmless and still correct in isolation -- it is only the
+PRODUCTION call site that was narrowed to size=1), which is why those tests
+were not deleted alongside the in-process G>1 orchestration path.
+
 `EnginePool` owns one engine handle per `BatchScheduler` slot, spawned via a
 caller-supplied `spawn` callable so tests can substitute fakes and production
 code supplies e.g. `lambda: chess.engine.SimpleEngine.popen_uci(sf_path)`.

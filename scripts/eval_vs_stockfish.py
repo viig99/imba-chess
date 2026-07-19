@@ -3,13 +3,15 @@ from __future__ import annotations
 
 import argparse
 import json
+import multiprocessing
 import os
 import random
 import sys
 import traceback
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
+from multiprocessing import connection as mp_connection
 from pathlib import Path
-from typing import Any, Generator, Iterator
+from typing import Any, Callable, Generator, Iterator
 
 import chess
 import chess.engine
@@ -20,6 +22,14 @@ from imba_chess.config import DEFAULT_CONFIG_PATH, load_repo_config
 from imba_chess.data.board_state import BoardStateEncoder
 from imba_chess.data.move_vocab import MoveVocab, load_or_create_static_move_vocab
 from imba_chess.eval import search
+from imba_chess.eval.actor_protocol import (
+    GameDone,
+    RootEvalRequest,
+    WaveRequest,
+    WorkerFinished,
+)
+from imba_chess.eval.actor_server import ActorInferenceServer
+from imba_chess.eval.actor_worker import run_eval_worker
 from imba_chess.eval.batch_scheduler import BatchScheduler, WorkRequest
 from imba_chess.eval.engine_pool import EnginePool, make_sf_move_executor
 from imba_chess.eval.game_animation import render_game_html
@@ -220,12 +230,16 @@ def _parse_args() -> argparse.Namespace:
         "--concurrent-games",
         type=int,
         default=None,
-        help="Run this many game coroutines concurrently per segment via the "
-        "batch scheduler, merging their root-eval/search decode waves and "
-        "sf_move engine calls into shared calls each tick, with one "
-        "Stockfish engine process per concurrent slot. Default 1 (a value "
-        "of 1 merges nothing per tick: byte-identical single-item executor "
-        "calls to the pre-scheduler sequential driver).",
+        help="Run this many games concurrently per segment. Default 1: the "
+        "in-process, byte-deterministic scheduler driver (a single game at "
+        "a time, batch size 1 -- the reference/gate path). Values > 1 route "
+        "to actor mode instead: this many torch-free worker PROCESSES are "
+        "spawned (multiprocessing spawn), each playing its own share of "
+        "games with its own Stockfish engine, served by an in-process GPU "
+        "inference server that merges their model-turn requests -- NOT "
+        "byte-deterministic across runs (accepted; see the multiprocess "
+        "eval actors design spec). --debug-trace-games/--save-games are not "
+        "supported at concurrent_games > 1.",
     )
     return parser.parse_args()
 
@@ -1078,6 +1092,449 @@ def _release_engine_on_finish(
         pool.release(slot_index)
 
 
+def _progress_postfix(summary: EvalSummary) -> dict[str, Any]:
+    """tqdm postfix dict derived purely from a running `EvalSummary` --
+    shared by `_run_segment`'s scheduler-driven `_on_game_done` (G=1) and
+    `_serve_actor_workers`'s in-order game completion (G>1 actor mode), so
+    both progress bars report the same fields the same way. Pure refactor
+    out of what `_run_segment`'s `_on_game_done` always computed inline; no
+    change to the numbers themselves."""
+    white_completed = (
+        summary.wins_as_white + summary.draws_as_white + summary.losses_as_white
+    )
+    black_completed = (
+        summary.wins_as_black + summary.draws_as_black + summary.losses_as_black
+    )
+    white_score = (
+        (summary.wins_as_white + 0.5 * summary.draws_as_white) / white_completed
+        if white_completed > 0
+        else float("nan")
+    )
+    black_score = (
+        (summary.wins_as_black + 0.5 * summary.draws_as_black) / black_completed
+        if black_completed > 0
+        else float("nan")
+    )
+    live_coverage = (
+        summary.legal_moves_mapped_total / summary.legal_moves_total
+        if summary.legal_moves_total > 0
+        else float("nan")
+    )
+    return {
+        "W": summary.wins,
+        "D": summary.draws,
+        "L": summary.losses,
+        "inc": summary.incomplete_games,
+        "avg_plies": f"{summary.avg_plies:.1f}",
+        "avg_moves": f"{summary.avg_full_moves:.1f}",
+        "cov": "--" if summary.legal_moves_total == 0 else f"{live_coverage:.3f}",
+        "no_map": summary.turns_with_no_vocab_legal_move,
+        "srW": "--" if white_completed == 0 else f"{white_score:.2f}",
+        "srB": "--" if black_completed == 0 else f"{black_score:.2f}",
+    }
+
+
+# ---------------------------------------------------------------------------
+# Task 3: actor-mode orchestration (--concurrent-games > 1).
+#
+# Spawns `concurrent_games` torch-free worker processes (`run_eval_worker`,
+# `imba_chess.eval.actor_worker`), each playing a static round-robin share of
+# this segment's games against its OWN Stockfish `SimpleEngine`, and serves
+# their model-turn requests from an in-process `ActorInferenceServer` that
+# owns the model and all KV state. See
+# `docs/superpowers/specs/2026-07-19-multiprocess-eval-actors-design.md` for
+# the architecture and `.superpowers/sdd/task-3-report.md` for the
+# serve-loop design writeup, engine-orphan honesty, and cutover deletions.
+# ---------------------------------------------------------------------------
+
+
+def _limit_to_dict(limit: chess.engine.Limit) -> dict[str, float | int]:
+    """`chess.engine.Limit` -> the plain dict `actor_worker._build_engine_limit`
+    expects in `worker_config["engine"]["stockfish_limit"]` (a live `Limit`
+    object is not picklable-simple across `multiprocessing.get_context(
+    "spawn")`'s pickling of `worker_config`, and the worker never imports
+    `chess.engine`... actually it does (SimpleEngine), but `_build_engine_limit`
+    there is dict-driven by design -- see that function's own docstring --
+    so this mirrors the exact same kwarg set `_run_segment`'s own
+    `_build_engine_limit(args)` builds from argparse fields, just read back
+    off the already-constructed `Limit` instead of off `args` again)."""
+    out: dict[str, float | int] = {}
+    if limit.time is not None:
+        out["time"] = float(limit.time)
+    if limit.nodes is not None:
+        out["nodes"] = int(limit.nodes)
+    if limit.depth is not None:
+        out["depth"] = int(limit.depth)
+    return out
+
+
+def _assign_games_round_robin(games: int, concurrent_games: int) -> list[list[int]]:
+    """Static round-robin game assignment (design spec: "simpler and more
+    deterministic than work-stealing"): worker `w` plays every `game_idx`
+    with `game_idx % concurrent_games == w`, in ascending order -- equal
+    (+/-1) load per worker regardless of `games`."""
+    return [
+        [game_idx for game_idx in range(games) if game_idx % concurrent_games == w]
+        for w in range(concurrent_games)
+    ]
+
+
+def _worker_engine_config(
+    *,
+    stockfish_path: Path,
+    segment_options: dict[str, Any],
+    engine_limit: chess.engine.Limit,
+    fake_engine_factory: Callable[[], Any] | None,
+) -> dict[str, Any]:
+    """Builds `worker_config["engine"]` for one worker -- production supplies
+    `stockfish_path` (a plain string, picklable); `fake_engine_factory` is
+    test-only (must itself be a picklable module-level callable under real
+    spawn -- see `actor_worker._build_engine`'s docstring and this task's
+    report for why an in-test lambda closure, fine for Task 1's in-process
+    tests, does not work here)."""
+    engine_config: dict[str, Any] = {"stockfish_limit": _limit_to_dict(engine_limit)}
+    if fake_engine_factory is not None:
+        engine_config["fake_engine_factory"] = fake_engine_factory
+    else:
+        engine_config["stockfish_path"] = str(stockfish_path)
+        if segment_options:
+            engine_config["stockfish_options"] = dict(segment_options)
+    return engine_config
+
+
+def _build_worker_config(
+    *,
+    worker_id: int,
+    game_indices: list[int],
+    seed: int,
+    max_plies: int,
+    opening_random_plies: int,
+    model_move_policy: str,
+    value_rerank_top_k: int,
+    value_rerank_lambda: float,
+    halving_config: "HalvingConfig | None",
+    vocab_path: Path,
+    vocab_include_unk: bool,
+    board_state_config: dict[str, Any],
+    engine_config: dict[str, Any],
+) -> dict[str, Any]:
+    """Assembles one worker's `worker_config` dict, per the schema documented
+    in `actor_worker.run_eval_worker`'s own docstring -- every value here is
+    plain data (no `Path`/tensor/live objects besides the test-only engine
+    factory), so the whole dict pickles cleanly into a spawned child."""
+    return {
+        "worker_id": int(worker_id),
+        "game_indices": list(game_indices),
+        "seed": int(seed),
+        "max_plies": int(max_plies),
+        "opening_random_plies": int(opening_random_plies),
+        "model_move_policy": str(model_move_policy),
+        "value_rerank_top_k": int(value_rerank_top_k),
+        "value_rerank_lambda": float(value_rerank_lambda),
+        "halving_config": asdict(halving_config) if halving_config is not None else None,
+        "vocab_path": str(vocab_path),
+        "vocab_include_unk": bool(vocab_include_unk),
+        "board_state_config": dict(board_state_config),
+        "engine": engine_config,
+    }
+
+
+def _terminate_worker_processes(processes: list) -> None:
+    """Fail-fast supervision (Task 3): on any dead-worker/pipe-EOF/server
+    exception, terminate EVERY worker process -- SIGTERM first, a grace
+    period to exit on their own, then SIGKILL for stragglers.
+
+    ENGINE-ORPHAN HONESTY (documented, not solved -- see the task report for
+    the full writeup): `actor_worker.py` installs a SIGTERM handler
+    (`_install_sigterm_handler`) that turns SIGTERM into a Python exception,
+    so a worker that exits via the SIGTERM branch below still runs its own
+    `finally: engine.quit()` and its Stockfish child exits cleanly. A
+    straggler that needs the SIGKILL escalation gets NO such chance --
+    SIGKILL is unblockable by design, so that worker's process (and,
+    transitively, its live Stockfish subprocess, now reparented to
+    init/a subreaper) is simply gone with no cleanup hook able to run. This
+    is accepted: the alternative (blocking indefinitely for a worker that
+    refuses to die) is worse for a fail-fast eval run, and a leaked
+    Stockfish process is a bounded, self-terminating cost (it has no more
+    input coming and exits once its own analysis limit is reached or its
+    UCI stdin pipe closes), not a permanently-growing one.
+    """
+    for proc in processes:
+        if proc.is_alive():
+            proc.terminate()
+    for proc in processes:
+        proc.join(timeout=5.0)
+    for proc in processes:
+        if proc.is_alive():
+            proc.kill()
+    for proc in processes:
+        proc.join(timeout=5.0)
+
+
+def _check_workers_alive(processes: list, active_worker_ids: set[int]) -> None:
+    """Defensive liveness sweep: fires only when `mp_connection.wait(...)`
+    times out with nothing ready (see `_serve_actor_workers`) -- the primary
+    dead-worker signal is a pipe EOF/reset on `conn.recv()`, which fires the
+    instant a crashed worker's process (and its fd) is actually gone; this
+    sweep exists only to catch the pathological case where that hasn't
+    happened yet but `proc.is_alive()` already reports the process gone."""
+    for worker_id in sorted(active_worker_ids):
+        proc = processes[worker_id]
+        if not proc.is_alive():
+            raise RuntimeError(
+                f"actor worker {worker_id} (pid={proc.pid}) is no longer "
+                f"alive (exitcode={proc.exitcode}) without ever signaling "
+                "WorkerFinished or a pipe EOF -- treating as a fatal crash."
+            )
+
+
+def _serve_actor_workers(
+    *,
+    server: ActorInferenceServer,
+    parent_conns: list,
+    processes: list,
+    games: int,
+    segment_name: str,
+) -> EvalSummary:
+    """The GPU-server serve loop: poll all worker pipes (worker-id order),
+    batch this round's pending `RootEvalRequest`/`WaveRequest` messages into
+    one `server.service(...)` call, send responses back, and fold `GameDone`
+    fragments into the running `EvalSummary` -- but only in GAME-INDEX
+    ORDER, via a hold-back buffer that exactly mirrors
+    `batch_scheduler.BatchScheduler`'s own `_held_back`/`_emit_ready`
+    stream-order discipline (see that module): games can finish in whatever
+    real order their assigned worker gets to them, but the aggregate summary
+    (and the progress bar) must advance deterministically by game_idx.
+
+    `release_turn` (Task 2's explicit-release design, see
+    `ActorInferenceServer`'s own docstring) fires here, not in the server:
+    once per worker, the moment its NEXT `RootEvalRequest` (a different
+    turn_id) proves the previous turn's search is over, and once more on
+    `WorkerFinished` for whatever turn was still open at that point.
+
+    Fail-fast: a pipe EOF/reset (`conn.recv()` raising `EOFError`/`OSError`)
+    or an unexpected message shape raises immediately, propagating out to
+    `_run_segment_actor_mode`'s `except BaseException` -> terminate-all path
+    -- this function does not itself terminate any process.
+    """
+    summary = EvalSummary()
+    concurrent_games = len(parent_conns)
+    active_worker_ids: set[int] = set(range(concurrent_games))
+    last_turn_by_worker: dict[int, int] = {}
+    held_back: dict[int, dict[str, Any]] = {}
+    next_expected_game_idx = 0
+
+    with tqdm(
+        total=games,
+        desc=f"stockfish-eval-actors[{segment_name}]",
+        unit="game",
+        dynamic_ncols=True,
+    ) as progress:
+        while active_worker_ids:
+            live_conns = [parent_conns[w] for w in sorted(active_worker_ids)]
+            ready = mp_connection.wait(live_conns, timeout=30.0)
+            if not ready:
+                _check_workers_alive(processes, active_worker_ids)
+                continue
+            ready_set = set(ready)
+            ready_worker_ids = [
+                w for w in sorted(active_worker_ids) if parent_conns[w] in ready_set
+            ]
+
+            requests: list[tuple[int, Any]] = []
+            for worker_id in ready_worker_ids:
+                conn = parent_conns[worker_id]
+                try:
+                    message = conn.recv()
+                except (EOFError, OSError) as exc:
+                    raise RuntimeError(
+                        f"actor worker {worker_id}: pipe closed unexpectedly "
+                        "(EOF/reset) -- the worker process likely crashed or "
+                        "was killed mid-run."
+                    ) from exc
+
+                if isinstance(message, RootEvalRequest):
+                    prev_turn = last_turn_by_worker.get(worker_id)
+                    if prev_turn is not None and prev_turn != message.turn_id:
+                        server.release_turn(worker_id, prev_turn)
+                    last_turn_by_worker[worker_id] = message.turn_id
+                    requests.append((worker_id, message))
+                elif isinstance(message, WaveRequest):
+                    requests.append((worker_id, message))
+                elif isinstance(message, GameDone):
+                    held_back[message.game_idx] = message.summary_fragment
+                    while next_expected_game_idx in held_back:
+                        fragment = held_back.pop(next_expected_game_idx)
+                        _accumulate_summary(summary, EvalSummary(**fragment))
+                        progress.update(1)
+                        progress.set_postfix(_progress_postfix(summary))
+                        next_expected_game_idx += 1
+                elif isinstance(message, WorkerFinished):
+                    prev_turn = last_turn_by_worker.pop(worker_id, None)
+                    if prev_turn is not None:
+                        server.release_turn(worker_id, prev_turn)
+                    active_worker_ids.discard(worker_id)
+                else:  # pragma: no cover - fail fast on a protocol violation
+                    raise RuntimeError(
+                        f"actor worker {worker_id}: unexpected message from "
+                        f"worker pipe: {message!r}"
+                    )
+
+            if requests:
+                responses = server.service([msg for _, msg in requests])
+                for (worker_id, _msg), response in zip(requests, responses):
+                    parent_conns[worker_id].send(response)
+
+    if next_expected_game_idx != games:
+        raise RuntimeError(
+            f"actor mode: only {next_expected_game_idx}/{games} games were "
+            "accounted for in game-index order before every worker signaled "
+            "WorkerFinished -- a game_idx is missing (protocol/ordering bug)."
+        )
+    return summary
+
+
+def _run_segment_actor_mode(
+    *,
+    stockfish_path: Path,
+    segment_options: dict[str, Any],
+    segment_name: str,
+    model: torch.nn.Module,
+    move_vocab: MoveVocab,
+    board_state_encoder: BoardStateEncoder,
+    games: int,
+    max_plies: int,
+    engine_limit: chess.engine.Limit,
+    device: torch.device,
+    dtype: torch.dtype,
+    model_move_policy: str,
+    value_rerank_top_k: int,
+    value_rerank_lambda: float,
+    opening_random_plies: int,
+    seed: int,
+    concurrent_games: int,
+    vocab_path: Path,
+    vocab_include_unk: bool,
+    board_state_config: dict[str, Any],
+    halving_config: "HalvingConfig | None" = None,
+    fake_engine_factory: Callable[[], Any] | None = None,
+) -> EvalSummary:
+    """Run one segment's `games` games at `concurrent_games > 1` via actor
+    mode: spawn `concurrent_games` torch-free worker processes
+    (`multiprocessing.get_context("spawn")` -- CUDA-safe, and cheap since
+    workers never import torch), each owning its own Stockfish
+    `SimpleEngine` and a static round-robin share of `games` (see
+    `_assign_games_round_robin`); serve their model-turn requests from an
+    in-process `ActorInferenceServer` built on this segment's already-loaded
+    `model`/`move_vocab`/`board_state_encoder`/`device`/`dtype` (see
+    `_serve_actor_workers` for the serve loop itself).
+
+    `fake_engine_factory` is test-only (see `_worker_engine_config`); every
+    other parameter mirrors `_run_segment`'s own, minus the debug-trace/
+    save-games knobs -- out of scope for actor-mode workers per Task 1's own
+    scoping decision (`actor_worker.py`'s module docstring), and `main()`
+    warns the user if those flags were requested alongside
+    `concurrent_games > 1` rather than silently dropping them.
+
+    Determinism: NOT byte-deterministic across runs or against the G=1
+    reference path (accepted, documented in the design spec's "Collection
+    policy and determinism" section) -- batch composition depends on OS
+    process scheduling. `_run_segment` (`concurrent_games=1`) remains the
+    byte-deterministic reference/gate path.
+
+    Fail-fast supervision: ANY exception here (a worker crash/pipe EOF
+    surfacing inside `_serve_actor_workers`, an `ActorInferenceServer`
+    exception, a worker that does not actually exit after sending
+    `WorkerFinished`, or a worker whose final exit code is nonzero)
+    terminates every worker process (`_terminate_worker_processes`) before
+    propagating -- this function never leaves a worker process running on
+    its way out, success or failure. The exception itself then reaches
+    `main()` -> `_main_with_hard_exit_on_crash`'s existing hard-exit wrapper,
+    which is what turns it into an actual nonzero process exit.
+    """
+    if concurrent_games <= 1:
+        raise ValueError(
+            "_run_segment_actor_mode requires concurrent_games > 1 "
+            f"(got {concurrent_games}); concurrent_games=1 uses _run_segment."
+        )
+
+    server = ActorInferenceServer(
+        model=model,
+        move_vocab=move_vocab,
+        board_state_encoder=board_state_encoder,
+        device=device,
+        dtype=dtype,
+    )
+    game_indices_by_worker = _assign_games_round_robin(games, concurrent_games)
+    engine_config = _worker_engine_config(
+        stockfish_path=stockfish_path,
+        segment_options=segment_options,
+        engine_limit=engine_limit,
+        fake_engine_factory=fake_engine_factory,
+    )
+
+    ctx = multiprocessing.get_context("spawn")
+    processes: list = []
+    parent_conns: list = []
+    try:
+        for worker_id in range(concurrent_games):
+            worker_config = _build_worker_config(
+                worker_id=worker_id,
+                game_indices=game_indices_by_worker[worker_id],
+                seed=seed,
+                max_plies=max_plies,
+                opening_random_plies=opening_random_plies,
+                model_move_policy=model_move_policy,
+                value_rerank_top_k=value_rerank_top_k,
+                value_rerank_lambda=value_rerank_lambda,
+                halving_config=halving_config,
+                vocab_path=vocab_path,
+                vocab_include_unk=vocab_include_unk,
+                board_state_config=board_state_config,
+                engine_config=engine_config,
+            )
+            parent_conn, child_conn = ctx.Pipe()
+            proc = ctx.Process(target=run_eval_worker, args=(child_conn, worker_config))
+            proc.start()
+            # Close OUR copy of the child's end: multiprocessing's spawn
+            # pickling dup()s Connection fds, so if we keep this open, the
+            # underlying socket never reaches full closure when the worker
+            # exits/dies -- parent_conn.recv() would then block forever
+            # instead of raising EOFError, defeating fail-fast detection.
+            child_conn.close()
+            processes.append(proc)
+            parent_conns.append(parent_conn)
+
+        summary = _serve_actor_workers(
+            server=server,
+            parent_conns=parent_conns,
+            processes=processes,
+            games=games,
+            segment_name=segment_name,
+        )
+    except BaseException:
+        _terminate_worker_processes(processes)
+        raise
+    finally:
+        for conn in parent_conns:
+            conn.close()
+
+    for proc in processes:
+        proc.join(timeout=30.0)
+        if proc.is_alive():
+            _terminate_worker_processes(processes)
+            raise RuntimeError(
+                f"actor worker pid={proc.pid} did not exit within the grace "
+                "period after sending WorkerFinished."
+            )
+        if proc.exitcode != 0:
+            raise RuntimeError(
+                f"actor worker pid={proc.pid} exited with nonzero code "
+                f"{proc.exitcode}."
+            )
+    return summary
+
+
 def _run_segment(
     *,
     stockfish_path: Path,
@@ -1133,7 +1590,29 @@ def _run_segment(
     one's slot frees), so every root_eval/decode_wave/sf_move executor call
     carries exactly one payload -- the same single-item call sequence
     `_select_model_move`/`engine.play()` made directly, pre-scheduler.
+
+    CUTOVER NOTE (Task 3, multiprocess-eval-actors): this function's own
+    `concurrent_games` generality -- an `EnginePool`/`BatchScheduler`/
+    `make_sf_move_executor` sized to `concurrent_games` -- used to ALSO be
+    the in-process path for `concurrent_games > 1` (fast-clean-evals). That
+    capability is deleted here (not merely rerouted around): the guard right
+    below makes `concurrent_games > 1` a hard error, so this in-process
+    scheduler machinery can no longer be scaled past one live game no matter
+    how it is called. `--concurrent-games > 1` now spawns actor-mode worker
+    processes instead (`_run_segment_actor_mode`, this module) -- see that
+    function and `docs/superpowers/specs/2026-07-19-multiprocess-eval-actors-design.md`.
+    The body below is otherwise byte-for-byte what it always was, since it
+    is still the sole `concurrent_games=1` reference/gate path and must stay
+    byte-deterministic.
     """
+    if concurrent_games != 1:
+        raise ValueError(
+            "_run_segment only supports concurrent_games=1 (the in-process "
+            "byte-deterministic reference path) -- concurrent_games > 1 was "
+            "superseded by actor-mode workers at cutover; call "
+            "_run_segment_actor_mode instead. Got "
+            f"concurrent_games={concurrent_games}."
+        )
     summary = EvalSummary()
 
     def _spawn_engine() -> chess.engine.SimpleEngine:
@@ -1188,53 +1667,7 @@ def _run_segment(
                 _accumulate_summary(summary, rows)
 
                 progress.update(1)
-                white_completed = (
-                    summary.wins_as_white
-                    + summary.draws_as_white
-                    + summary.losses_as_white
-                )
-                black_completed = (
-                    summary.wins_as_black
-                    + summary.draws_as_black
-                    + summary.losses_as_black
-                )
-                white_score = (
-                    (summary.wins_as_white + 0.5 * summary.draws_as_white)
-                    / white_completed
-                    if white_completed > 0
-                    else float("nan")
-                )
-                black_score = (
-                    (summary.wins_as_black + 0.5 * summary.draws_as_black)
-                    / black_completed
-                    if black_completed > 0
-                    else float("nan")
-                )
-                live_coverage = (
-                    summary.legal_moves_mapped_total / summary.legal_moves_total
-                    if summary.legal_moves_total > 0
-                    else float("nan")
-                )
-                progress.set_postfix(
-                    {
-                        "W": summary.wins,
-                        "D": summary.draws,
-                        "L": summary.losses,
-                        "inc": summary.incomplete_games,
-                        "avg_plies": f"{summary.avg_plies:.1f}",
-                        "avg_moves": f"{summary.avg_full_moves:.1f}",
-                        "cov": "--"
-                        if summary.legal_moves_total == 0
-                        else f"{live_coverage:.3f}",
-                        "no_map": summary.turns_with_no_vocab_legal_move,
-                        "srW": "--"
-                        if white_completed == 0
-                        else f"{white_score:.2f}",
-                        "srB": "--"
-                        if black_completed == 0
-                        else f"{black_score:.2f}",
-                    }
-                )
+                progress.set_postfix(_progress_postfix(summary))
 
             def _on_game_error(game_id: str, exc: BaseException) -> None:
                 # Fail-fast policy (Task 3): unlike generate_search_rollouts.
@@ -1530,6 +1963,23 @@ def main() -> None:
     )
     print(f"  concurrent_games={args.concurrent_games}")
 
+    actor_mode = int(args.concurrent_games) > 1
+    if actor_mode:
+        print("  mode=actor (spawned worker processes; see Task 3 design spec)")
+        if int(args.debug_trace_games) > 0 or bool(args.save_games):
+            # Task 1 scoped debug-trace/game-save plumbing out of the
+            # torch-free worker (actor_worker.py's own module docstring):
+            # neither knob has anywhere to go once concurrent_games > 1
+            # routes through actor mode, so this is a loud no-op rather
+            # than a silently-ignored flag.
+            print(
+                "  WARNING: --debug-trace-games/--save-games are not "
+                "supported in actor mode (concurrent_games > 1) -- ignored "
+                "for this run. Use --concurrent-games 1 for debug traces or "
+                "saved games."
+            )
+    board_state_config_dict = asdict(repo_config.board_state)
+
     segment_results: list[dict[str, Any]] = []
     segment_summaries: list[EvalSummary] = []
 
@@ -1544,41 +1994,67 @@ def main() -> None:
             f"(games={spec.games}, options={segment_options}, "
             f"concurrent_games={args.concurrent_games})"
         )
-        segment_summary = _run_segment(
-            stockfish_path=args.stockfish_path,
-            segment_options=segment_options,
-            segment_name=spec.name,
-            model=model,
-            move_vocab=move_vocab,
-            board_state_encoder=board_state_encoder,
-            games=spec.games,
-            max_plies=args.max_plies,
-            engine_limit=engine_limit,
-            device=device,
-            dtype=dtype,
-            model_move_policy=str(args.model_move_policy),
-            value_rerank_top_k=int(args.value_rerank_top_k),
-            value_rerank_lambda=float(args.value_rerank_lambda),
-            opening_random_plies=int(args.opening_random_plies),
-            debug_trace_games=max(0, int(args.debug_trace_games)),
-            debug_trace_max_plies=max(0, int(args.debug_trace_max_plies)),
-            debug_topk=max(0, int(args.debug_topk)),
-            stockfish_label=_stockfish_label(
-                limit_strength=bool(spec.limit_strength),
-                elo=int(spec.elo) if spec.elo is not None else None,
-            ),
-            save_games_dir=Path(args.save_games_dir) if args.save_games else None,
-            concurrent_games=int(args.concurrent_games),
-            halving_config=HalvingConfig(
-                budget=int(args.search_budget),
-                top_m=int(args.search_top_m),
-                rounds=int(args.halving_rounds),
-                refutation_top_r=int(args.search_refutation_top_r),
-                expand_top=int(args.search_expand_top),
-                max_depth=int(args.search_max_depth),
-                lam=float(args.value_rerank_lambda),
-            ),
+        halving_config = HalvingConfig(
+            budget=int(args.search_budget),
+            top_m=int(args.search_top_m),
+            rounds=int(args.halving_rounds),
+            refutation_top_r=int(args.search_refutation_top_r),
+            expand_top=int(args.search_expand_top),
+            max_depth=int(args.search_max_depth),
+            lam=float(args.value_rerank_lambda),
         )
+        if actor_mode:
+            segment_summary = _run_segment_actor_mode(
+                stockfish_path=args.stockfish_path,
+                segment_options=segment_options,
+                segment_name=spec.name,
+                model=model,
+                move_vocab=move_vocab,
+                board_state_encoder=board_state_encoder,
+                games=spec.games,
+                max_plies=args.max_plies,
+                engine_limit=engine_limit,
+                device=device,
+                dtype=dtype,
+                model_move_policy=str(args.model_move_policy),
+                value_rerank_top_k=int(args.value_rerank_top_k),
+                value_rerank_lambda=float(args.value_rerank_lambda),
+                opening_random_plies=int(args.opening_random_plies),
+                seed=int(args.seed),
+                concurrent_games=int(args.concurrent_games),
+                vocab_path=Path(repo_config.vocab.path),
+                vocab_include_unk=bool(repo_config.vocab.include_unk),
+                board_state_config=board_state_config_dict,
+                halving_config=halving_config,
+            )
+        else:
+            segment_summary = _run_segment(
+                stockfish_path=args.stockfish_path,
+                segment_options=segment_options,
+                segment_name=spec.name,
+                model=model,
+                move_vocab=move_vocab,
+                board_state_encoder=board_state_encoder,
+                games=spec.games,
+                max_plies=args.max_plies,
+                engine_limit=engine_limit,
+                device=device,
+                dtype=dtype,
+                model_move_policy=str(args.model_move_policy),
+                value_rerank_top_k=int(args.value_rerank_top_k),
+                value_rerank_lambda=float(args.value_rerank_lambda),
+                opening_random_plies=int(args.opening_random_plies),
+                debug_trace_games=max(0, int(args.debug_trace_games)),
+                debug_trace_max_plies=max(0, int(args.debug_trace_max_plies)),
+                debug_topk=max(0, int(args.debug_topk)),
+                stockfish_label=_stockfish_label(
+                    limit_strength=bool(spec.limit_strength),
+                    elo=int(spec.elo) if spec.elo is not None else None,
+                ),
+                save_games_dir=Path(args.save_games_dir) if args.save_games else None,
+                concurrent_games=int(args.concurrent_games),
+                halving_config=halving_config,
+            )
         segment_payload = _summary_to_payload(
             summary=segment_summary,
             checkpoint_path=args.checkpoint,

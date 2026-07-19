@@ -17,10 +17,13 @@ Two kinds of coverage:
 from __future__ import annotations
 
 import math
+import multiprocessing
 import subprocess
 import sys
 import textwrap
 import threading
+import time
+from functools import partial
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -417,3 +420,82 @@ def test_build_engine_quits_on_configure_failure(monkeypatch: pytest.MonkeyPatch
         )
 
     assert fake_engine.quit_calls == 1
+
+
+# ---------------------------------------------------------------------------
+# Task 3 addendum: `_install_sigterm_handler` (this module).
+#
+# Task 3's orchestrator (`scripts/eval_vs_stockfish.py`'s
+# `_terminate_worker_processes`) SIGTERMs every worker on any fail-fast
+# supervision trigger. A bare SIGTERM skips this module's own `finally:
+# engine.quit()` -- the test below proves, with a REAL spawned process (not
+# an in-process call: signal delivery/handling is exactly the mechanism
+# under test), that the installed handler turns that into a clean unwind
+# instead: `engine.quit()` still runs even though the worker is blocked
+# inside `engine.play()` when SIGTERM arrives.
+# ---------------------------------------------------------------------------
+
+
+class _SigtermTestFakeEngine:
+    """Sleeps in `play()` long enough for the test to deliver SIGTERM while
+    the worker is blocked inside it; `quit()` writes a marker file so the
+    test (a different process) can observe it ran."""
+
+    def __init__(self, quit_marker_path: str) -> None:
+        self._quit_marker_path = quit_marker_path
+
+    def play(self, board: chess.Board, limit) -> SimpleNamespace:
+        time.sleep(5.0)
+        return SimpleNamespace(move=next(iter(board.legal_moves)))  # pragma: no cover
+
+    def quit(self) -> None:
+        Path(self._quit_marker_path).write_text("quit-called", encoding="utf-8")
+
+
+def _sigterm_test_fake_engine_factory(*, quit_marker_path: str) -> _SigtermTestFakeEngine:
+    """Top-level (picklable-under-spawn) factory; bound to `quit_marker_path`
+    via `functools.partial` (also picklable, unlike a closure) since the
+    protocol's `fake_engine_factory` is a zero-arg callable."""
+    return _SigtermTestFakeEngine(quit_marker_path)
+
+
+def test_sigterm_while_blocked_in_engine_play_still_quits_engine(tmp_path: Path) -> None:
+    quit_marker = tmp_path / "quit.marker"
+    worker_config = {
+        "worker_id": 0,
+        # game_idx=1 -> model plays BLACK (game_idx % 2 == 1) -> ply 0 is an
+        # SF turn, so the worker calls engine.play() immediately -- no pipe
+        # round trip (and so no fake server) is needed before the kill.
+        "game_indices": [1],
+        "seed": 0,
+        "max_plies": 4,
+        "model_move_policy": "greedy",
+        "vocab_path": str(STATIC_VOCAB_PATH),
+        "engine": {
+            "fake_engine_factory": partial(
+                _sigterm_test_fake_engine_factory, quit_marker_path=str(quit_marker)
+            ),
+            "stockfish_limit": {"time": 0.01},
+        },
+    }
+
+    ctx = multiprocessing.get_context("spawn")
+    parent_conn, child_conn = ctx.Pipe()
+    proc = ctx.Process(target=run_eval_worker, args=(child_conn, worker_config))
+    proc.start()
+    child_conn.close()
+    try:
+        time.sleep(1.0)  # let the worker reach engine.play()'s 5s sleep
+        assert proc.is_alive(), "worker exited before SIGTERM could be sent"
+        proc.terminate()  # SIGTERM
+        proc.join(timeout=10.0)
+        assert not proc.is_alive(), "worker did not exit after SIGTERM"
+        assert quit_marker.exists(), (
+            "engine.quit() did not run after SIGTERM -- the installed "
+            "handler should have unwound run_eval_worker's finally block"
+        )
+    finally:
+        parent_conn.close()
+        if proc.is_alive():  # pragma: no cover - safety net only
+            proc.kill()
+            proc.join(timeout=5.0)

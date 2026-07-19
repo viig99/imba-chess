@@ -29,6 +29,7 @@ from __future__ import annotations
 
 import itertools
 import random
+import signal
 from dataclasses import asdict, dataclass
 
 import chess
@@ -595,6 +596,48 @@ def _play_one_game(
     return summary
 
 
+def _handle_sigterm(signum, frame) -> None:  # noqa: ARG001 - signal handler signature
+    raise SystemExit(143)  # 128 + SIGTERM(15), conventional shell exit code
+
+
+def _install_sigterm_handler() -> None:
+    """Task 3's orchestrator supervises workers fail-fast: on any dead-
+    worker/pipe-EOF/server exception it terminates every worker process --
+    SIGTERM first, then SIGKILL for stragglers after a grace period (see
+    `scripts/eval_vs_stockfish.py`'s `_terminate_worker_processes`). A bare
+    SIGTERM's default disposition kills this process immediately, skipping
+    `run_eval_worker`'s own `finally: engine.quit()` below and leaking that
+    worker's live Stockfish subprocess (reparented to init/a subreaper once
+    its parent -- this worker -- is gone).
+
+    Installing a handler that raises `SystemExit` instead means the signal
+    -- delivered between bytecode instructions, or interrupting a blocking
+    syscall like `conn.recv()`/`engine.play()`'s I/O (PEP 475: a Python
+    signal handler that raises skips the automatic EINTR retry) -- unwinds
+    through whatever try/finally is currently on the stack exactly like any
+    other exception, including `run_eval_worker`'s own `finally:
+    engine.quit()`. So a SIGTERM-based termination still quits this
+    worker's engine cleanly; only the orchestrator's final SIGKILL
+    escalation (unblockable by design -- no handler can intercept it) leaks
+    the Stockfish child, and only for a worker that didn't exit within the
+    SIGTERM grace period. Documented, not solved, in
+    `_terminate_worker_processes`'s own docstring.
+
+    Guarded for the (non-spawn) case where `run_eval_worker` is called
+    directly, in-process, off the main thread -- Task 1's own tests do this
+    (`tests/test_actor_worker.py`'s `_run_two_short_games`, worker on the
+    test's main thread with a background-thread fake server, so this
+    actually lands on the main thread there too, but `signal.signal` is a
+    hard `ValueError` off it) -- `signal.signal` only works on the main
+    thread of the main interpreter, and there is no real OS process signal
+    to intercept in that scenario anyway, so skipping silently is correct.
+    """
+    try:
+        signal.signal(signal.SIGTERM, _handle_sigterm)
+    except ValueError:
+        pass
+
+
 def run_eval_worker(conn, worker_config: dict) -> None:
     """Actor worker entry point (Task 1): plays `worker_config["game_indices"]`
     sequentially, one at a time, talking to the GPU inference server over
@@ -637,6 +680,7 @@ def run_eval_worker(conn, worker_config: dict) -> None:
     a bad `stockfish_limit` dict never reaches "subprocess already spawned,
     then raise" territory at all.
     """
+    _install_sigterm_handler()
     worker_id = int(worker_config["worker_id"])
     game_indices = list(worker_config["game_indices"])
     seed = int(worker_config.get("seed", 0))
