@@ -5,6 +5,7 @@ import random
 
 import chess
 
+from imba_chess.eval import cozy_bridge
 from imba_chess.eval.search import (
     HalvingConfig,
     PositionEval,
@@ -14,6 +15,16 @@ from imba_chess.eval.search import (
     select_value_search_halving,
     terminal_value_for_color,
 )
+
+
+def _cozy_legal_moves_sorted(cozy_board):
+    """Cozy legal moves + aligned ucis, UCI-sorted -- the canonical order
+    real evaluators (position_evaluator._project_legal_logits_cozy) return.
+    """
+    moves = list(cozy_board.generate_moves())
+    ucis = [cozy_bridge.cozy_move_to_uci(cozy_board, move) for move in moves]
+    order = sorted(range(len(moves)), key=lambda i: ucis[i])
+    return [moves[i] for i in order], [ucis[i] for i in order]
 
 
 def test_select_greedy_returns_argmax_index_first_on_ties():
@@ -124,20 +135,20 @@ class _ArmValueEvaluator:
         self.eval_calls = 0
         self.positions_evaluated = 0
 
-    def extend(self, handle, board_before, move):
-        return (handle or ()) + (move,)
+    def extend(self, handle, move_uci):
+        return (handle or ()) + (move_uci,)
 
     def evaluate(self, batch):
         self.eval_calls += 1
         self.positions_evaluated += len(batch)
         results = []
-        for handle, board in batch:
-            value_root_pov = self.arm_values[handle[0].uci()]
+        for handle, cozy_board in batch:
+            value_root_pov = self.arm_values[handle[0]]
             stm_is_root_side = len(handle) % 2 == 0
             value_stm = value_root_pov if stm_is_root_side else -value_root_pov
-            moves = list(board.legal_moves)
+            moves, ucis = _cozy_legal_moves_sorted(cozy_board)
             log_prior = math.log(1.0 / len(moves)) if moves else 0.0
-            results.append(PositionEval(value_stm, moves, [log_prior] * len(moves)))
+            results.append(PositionEval(value_stm, moves, ucis, [log_prior] * len(moves)))
         return results
 
 
@@ -148,22 +159,27 @@ class _MaterialEvaluator:
         self.eval_calls = 0
         self.positions_evaluated = 0
 
-    def extend(self, handle, board_before, move):
-        return (handle or ()) + (move,)
+    def extend(self, handle, move_uci):
+        return (handle or ()) + (move_uci,)
 
     def evaluate(self, batch):
         self.eval_calls += 1
         self.positions_evaluated += len(batch)
         results = []
-        for handle, board in batch:
-            moves = list(board.legal_moves)
+        for handle, cozy_board in batch:
+            moves, ucis = _cozy_legal_moves_sorted(cozy_board)
+            board = chess.Board(cozy_board.fen())
             priors = [
                 -5.0
-                if (m.promotion is not None or board.is_capture(m) or board.gives_check(m))
+                if (
+                    m.promotion is not None
+                    or board.is_capture(chess.Move.from_uci(u))
+                    or board.gives_check(chess.Move.from_uci(u))
+                )
                 else -0.1
-                for m in moves
+                for m, u in zip(moves, ucis)
             ]
-            results.append(PositionEval(_material_stm(board), moves, priors))
+            results.append(PositionEval(_material_stm(board), moves, ucis, priors))
         return results
 
 

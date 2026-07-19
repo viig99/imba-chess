@@ -299,6 +299,7 @@ import chess
 
 from imba_chess.data.board_state import BoardStateEncoder
 from imba_chess.data.move_vocab import MoveVocab, MoveVocabConfig
+from imba_chess.eval import cozy_bridge
 from imba_chess.eval.search import PositionEval, select_value_search_d2
 
 
@@ -317,14 +318,25 @@ def _load_eval_script_module():
 
 class _FullForwardReferenceEvaluator:
     """Reference PositionEvaluator: rebuilds every sequence and runs a full
-    forward — the uncached ground truth the cached path must reproduce."""
+    forward — the uncached ground truth the cached path must reproduce.
 
-    def __init__(self, *, module, model, move_vocab, board_state_encoder, played):
+    Unlike CachedPositionEvaluator, this reference needs the board BEFORE
+    every move on the handle's path (not just the final position) to build
+    _SequenceHistory incrementally -- but the PositionEvaluator protocol's
+    extend(handle, move_uci) carries no board. So `handle` here is just the
+    list of ucis played since root_board, and evaluate() replays them on a
+    copy of root_board to reconstruct each intermediate board_before.
+    """
+
+    def __init__(
+        self, *, module, model, move_vocab, board_state_encoder, played, root_board
+    ):
         self._module = module
         self._model = model
         self._move_vocab = move_vocab
         self._encoder = board_state_encoder
         self._played = played  # list[(board_before, move_uci)] real game so far
+        self._root_board = root_board  # py board the extend-chain's handle=None roots at
 
     def _fresh_history(self):
         history = self._module._SequenceHistory(
@@ -335,17 +347,21 @@ class _FullForwardReferenceEvaluator:
             history.record_played_move(move_uci)
         return history
 
-    def extend(self, handle, board_before, move):
-        line = list(handle) if handle is not None else []
-        return line + [(board_before.copy(stack=False), move.uci())]
+    def extend(self, handle, move_uci):
+        path = list(handle) if handle is not None else []
+        return path + [move_uci]
 
     def evaluate(self, batch):
         results = []
-        for handle, board in batch:
+        for handle, cozy_board in batch:
+            board = chess.Board(cozy_board.fen())
             history = self._fresh_history()
-            for board_before, move_uci in handle:
-                history.append_observed_position(board_before)
+            replay_board = self._root_board.copy()
+            for move_uci in handle:
+                history.append_observed_position(replay_board)
                 history.record_played_move(move_uci)
+                replay_board.push_uci(move_uci)
+            assert replay_board.board_fen() == board.board_fen()
             full_batch = history.build_batch_for_current_position(board)
             with torch.no_grad():
                 out = self._model(full_batch, return_loss=False)
@@ -358,9 +374,10 @@ class _FullForwardReferenceEvaluator:
                     logits=logits, board=board, move_vocab=self._move_vocab
                 )
                 log_priors = torch.log_softmax(legal_logits.float(), dim=0).tolist()
+                legal_ucis = [m.uci() for m in legal_moves]
             except RuntimeError:
-                legal_moves, log_priors = [], []
-            results.append(PositionEval(value_stm, legal_moves, log_priors))
+                legal_moves, legal_ucis, log_priors = [], [], []
+            results.append(PositionEval(value_stm, legal_moves, legal_ucis, log_priors))
         return results
 
 
@@ -408,45 +425,46 @@ def test_cached_evaluator_matches_full_forward_reference():
         move_vocab=move_vocab,
         board_state_encoder=encoder,
         played=played,
+        root_board=board,
     )
 
     # Depth 1: two candidate moves. Depth 2: one reply under each.
     candidates = [chess.Move.from_uci("b8c6"), chess.Move.from_uci("d7d6")]
-    cached_handles = [cached.extend(None, board, move) for move in candidates]
-    ref_handles = [reference.extend(None, board, move) for move in candidates]
+    cached_handles = [cached.extend(None, move.uci()) for move in candidates]
+    ref_handles = [reference.extend(None, move.uci()) for move in candidates]
     boards1 = []
     for move in candidates:
         board1 = board.copy()
         board1.push(move)
         boards1.append(board1)
+    cozy_boards1 = [cozy_bridge.board_to_cozy(b1) for b1 in boards1]
 
-    cached_evals = cached.evaluate(list(zip(cached_handles, boards1)))
-    ref_evals = reference.evaluate(list(zip(ref_handles, boards1)))
+    cached_evals = cached.evaluate(list(zip(cached_handles, cozy_boards1)))
+    ref_evals = reference.evaluate(list(zip(ref_handles, cozy_boards1)))
     for got, want in zip(cached_evals, ref_evals):
         assert abs(got.value_stm - want.value_stm) < 1e-5
-        assert [m.uci() for m in got.legal_moves] == [
-            m.uci() for m in want.legal_moves
-        ]
+        assert got.legal_ucis == want.legal_ucis
         for a, b in zip(got.legal_log_priors, want.legal_log_priors):
             assert abs(a - b) < 1e-5
 
     # One depth-2 node under each candidate, evaluated in a single wave.
     replies = [list(b1.legal_moves)[0] for b1 in boards1]
     cached2 = [
-        cached.extend(handle, b1, reply)
-        for handle, b1, reply in zip(cached_handles, boards1, replies)
+        cached.extend(handle, reply.uci())
+        for handle, reply in zip(cached_handles, replies)
     ]
     ref2 = [
-        reference.extend(handle, b1, reply)
-        for handle, b1, reply in zip(ref_handles, boards1, replies)
+        reference.extend(handle, reply.uci())
+        for handle, reply in zip(ref_handles, replies)
     ]
     boards2 = []
     for b1, reply in zip(boards1, replies):
         b2 = b1.copy()
         b2.push(reply)
         boards2.append(b2)
-    cached_evals2 = cached.evaluate(list(zip(cached2, boards2)))
-    ref_evals2 = reference.evaluate(list(zip(ref2, boards2)))
+    cozy_boards2 = [cozy_bridge.board_to_cozy(b2) for b2 in boards2]
+    cached_evals2 = cached.evaluate(list(zip(cached2, cozy_boards2)))
+    ref_evals2 = reference.evaluate(list(zip(ref2, cozy_boards2)))
     for got, want in zip(cached_evals2, ref_evals2):
         assert abs(got.value_stm - want.value_stm) < 1e-5
         for a, b in zip(got.legal_log_priors, want.legal_log_priors):
@@ -487,6 +505,7 @@ def test_strategy_picks_identical_move_cached_vs_reference():
         move_vocab=move_vocab,
         board_state_encoder=encoder,
         played=[],
+        root_board=board,
     )
 
     chosen_cached, _ = select_value_search_d2(
@@ -528,3 +547,68 @@ def test_project_legal_logits_returns_moves_sorted_by_uci():
     # move's uci equals its logit value directly.
     for row, move in zip(legal_logits.tolist(), legal_moves):
         assert row == move_vocab.token_to_id[move.uci()]
+
+
+def test_project_legal_logits_cozy_matches_py_variant_incl_castling():
+    """Direct unit test of _project_legal_logits_cozy (Stage 3 Task 4),
+    mirroring test_project_legal_logits_returns_moves_sorted_by_uci but from
+    a cozy board -- on a castling-rich position where cozy's own internal
+    move encoding (e1h1/e1a1, king-takes-rook) differs from the standard
+    UCI (e1g1/e1c1) cozy_move_to_uci must emit and the projection must sort
+    by.
+    """
+    from imba_chess.eval.position_evaluator import (
+        _project_legal_logits,
+        _project_legal_logits_cozy,
+    )
+
+    move_vocab = _static_vocab()
+    logits = torch.arange(len(move_vocab), dtype=torch.float32)
+    fen = "r3k2r/p1ppqpb1/bn2pnp1/3PN3/1p2P3/2N2Q1p/PPPBBPPP/R3K2R w KQkq - 0 1"
+    board = chess.Board(fen)
+    cozy_board = cozy_bridge.board_to_cozy(board)
+
+    legal_logits_py, legal_moves_py, _, _ = _project_legal_logits(
+        logits=logits, board=board, move_vocab=move_vocab
+    )
+    (
+        legal_logits_cozy,
+        legal_moves_cozy,
+        legal_ucis_cozy,
+        total_cozy,
+        mapped_cozy,
+    ) = _project_legal_logits_cozy(
+        logits=logits, cozy_board=cozy_board, move_vocab=move_vocab
+    )
+
+    py_ucis = [m.uci() for m in legal_moves_py]
+    assert "e1g1" in py_ucis and "e1c1" in py_ucis  # sanity: this fen has both castles
+    # Same canonical UCI order as the python-chess variant (Task 1's
+    # cross-movegen invariant), standard-UCI castling included.
+    assert legal_ucis_cozy == py_ucis
+    assert legal_ucis_cozy == sorted(legal_ucis_cozy)
+    assert len(legal_moves_cozy) == len(legal_ucis_cozy)
+
+    # Alignment: legal_logits row i is the vocab logit of legal_moves[i] /
+    # legal_ucis[i] (index-aligned) for the sorted cozy result, and
+    # legal_ucis really is cozy_move_to_uci(legal_moves[i]) -- not some
+    # independently-derived string that happens to match.
+    for row, uci in zip(legal_logits_cozy.tolist(), legal_ucis_cozy):
+        assert row == move_vocab.token_to_id[uci]
+    for move, uci in zip(legal_moves_cozy, legal_ucis_cozy):
+        assert cozy_bridge.cozy_move_to_uci(cozy_board, move) == uci
+
+    assert total_cozy == len(list(cozy_board.generate_moves()))
+    assert mapped_cozy == len(legal_moves_py)
+    torch.testing.assert_close(legal_logits_cozy, legal_logits_py)
+
+
+def test_project_legal_logits_cozy_raises_when_nothing_maps_to_vocab():
+    from imba_chess.eval.position_evaluator import _project_legal_logits_cozy
+
+    empty_vocab = MoveVocab.build([], config=MoveVocabConfig(include_unk=False))
+    board = chess.Board()
+    cozy_board = cozy_bridge.board_to_cozy(board)
+    logits = torch.zeros(len(empty_vocab))
+    with pytest.raises(RuntimeError):
+        _project_legal_logits_cozy(logits=logits, cozy_board=cozy_board, move_vocab=empty_vocab)

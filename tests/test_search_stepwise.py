@@ -1,9 +1,9 @@
 """The stepwise generator core must be call-for-call identical to the sync API.
 
 _RecordingEvaluator wraps a real evaluator and logs every evaluate() batch
-(handles + board FENs). Driving the generator by hand must produce the same
-chosen move, same rows, and the same sequence of evaluate() batches as the
-sync wrapper — proving the wrapper/generator refactor changed nothing.
+(handles + cozy-board FENs). Driving the generator by hand must produce the
+same chosen move, same rows, and the same sequence of evaluate() batches as
+the sync wrapper — proving the wrapper/generator refactor changed nothing.
 """
 
 import random
@@ -20,11 +20,11 @@ class _RecordingEvaluator:
         self.inner = inner
         self.calls: list[list[str]] = []
 
-    def extend(self, handle, board_before, move):
-        return self.inner.extend(handle, board_before, move)
+    def extend(self, handle, move_uci):
+        return self.inner.extend(handle, move_uci)
 
     def evaluate(self, batch):
-        self.calls.append([board.fen() for _, board in batch])
+        self.calls.append([cozy_board.fen() for _, cozy_board in batch])
         return self.inner.evaluate(batch)
 
 

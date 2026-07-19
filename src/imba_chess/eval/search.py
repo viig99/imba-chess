@@ -31,30 +31,44 @@ _DUAL_PUSH_VERIFY = os.environ.get("IMBA_DUAL_PUSH_VERIFY") == "1"
 
 
 class PositionEval(NamedTuple):
+    """One evaluated position: value head + legal moves under the vocab.
+
+    `legal_moves` are cozy-chess `cc.Move` objects (Stage 3: `evaluate()`
+    receives cozy boards and projects legal moves via cozy movegen);
+    `legal_ucis` is index-aligned with `legal_moves`, computed once during
+    projection (via `cozy_move_to_uci`, castling-aware) so search/rows never
+    re-derive UCI strings from a move object.
+    """
+
     value_stm: float
-    legal_moves: list[chess.Move]
+    legal_moves: list["cc.Move"]
+    legal_ucis: list[str]
     legal_log_priors: list[float]
 
 
 class PositionEvaluator(Protocol):
-    def extend(
-        self, handle: Any, board_before: chess.Board, move: chess.Move
-    ) -> Any: ...
+    """`handle` is opaque (a search-node handle); `evaluate` batch entries
+    are `(handle, cozy_board)` pairs (cozy-chess Board -- the tree still
+    also carries a python-chess twin internally this stage, but the
+    evaluator boundary itself is cozy-native). `extend` only needs the
+    played move's UCI (vocab encoding); it does not need a board."""
+
+    def extend(self, handle: Any, move_uci: str) -> Any: ...
 
     def evaluate(
-        self, batch: list[tuple[Any, chess.Board]]
+        self, batch: list[tuple[Any, "cc.Board"]]
     ) -> list[PositionEval]: ...
 
 
 class EvalRequest(NamedTuple):
-    """A batch of (handle, board) pairs a stepwise generator wants scored.
+    """A batch of (handle, cozy_board) pairs a stepwise generator wants scored.
 
     Yielded by the `*_stepwise` generators in place of a synchronous
     `evaluator.evaluate(batch)` call; the driver sends back the matching
     `list[PositionEval]` via `gen.send(...)`.
     """
 
-    batch: list[tuple[Any, chess.Board]]
+    batch: list[tuple[Any, "cc.Board"]]
 
 
 def _drive(gen: Generator[EvalRequest, list[PositionEval], Any], evaluator: PositionEvaluator) -> Any:
@@ -108,19 +122,36 @@ def select_greedy(legal_log_priors: list[float]) -> int:
 
 
 def _forcing_index_set(
-    board: chess.Board, legal_moves: list[chess.Move], cozy_board: "cc.Board"
+    board: chess.Board,
+    legal_moves: list,
+    cozy_board: "cc.Board",
+    legal_ucis: Optional[list[str]] = None,
 ) -> set[int]:
     """Indices of forcing moves (promotion/capture/check), one cozy board per node.
 
-    Promotion and capture stay on python-chess (cheap bitboard tests); only
-    check detection crosses to cozy (~240ns/move vs ~3us -- the profiled ~15%
-    hot spot, 1M+ calls per 20-game rollout run).
+    `legal_moves` is python-chess Move objects at the root (legal_ucis
+    unused there: the move IS already a python-chess Move) or cozy-chess
+    Move objects at deeper tree nodes (legal_ucis required there, aligned
+    with legal_moves via PositionEval.legal_ucis) -- the transitional shape
+    while search.py's tree still carries python-chess boards alongside cozy
+    ones (Task 5 makes this cozy-only). Promotion and check-detection use
+    whichever representation is already at hand (no translation in the
+    common case); only the python-chess-board capture test needs a
+    python-chess Move, reconstructed from the precomputed uci for cozy
+    moves.
     """
     forcing: set[int] = set()
     for idx, move in enumerate(legal_moves):
-        if move.promotion is not None or board.is_capture(move):
+        if isinstance(move, chess.Move):
+            py_move, cozy_move = move, None
+        else:
+            assert legal_ucis is not None
+            py_move, cozy_move = chess.Move.from_uci(legal_ucis[idx]), move
+        if move.promotion is not None or board.is_capture(py_move):
             forcing.add(idx)
-        elif cozy_bridge.gives_check(cozy_board, cozy_bridge.py_move_to_cozy(board, move)):
+        elif cozy_bridge.gives_check(
+            cozy_board, cozy_move if cozy_move is not None else cozy_bridge.py_move_to_cozy(board, move)
+        ):
             forcing.add(idx)
     return forcing
 
@@ -203,7 +234,7 @@ class _RootCandidate:
 
 def _expand_root_candidates_stepwise(
     *,
-    extend: Callable[[Any, chess.Board, chess.Move], Any],
+    extend: Callable[[Any, str], Any],
     root_handle: Any,
     board: chess.Board,
     cozy_root: "cc.Board",
@@ -242,8 +273,8 @@ def _expand_root_candidates_stepwise(
         candidates.append(candidate)
         if terminal_value is not None:
             continue
-        candidate.handle1 = extend(root_handle, board, move)
-        batch.append((candidate.handle1, board1))
+        candidate.handle1 = extend(root_handle, move.uci())
+        batch.append((candidate.handle1, cozy1))
         batch_to_candidate.append(len(candidates) - 1)
 
     if batch:
@@ -255,7 +286,7 @@ def _expand_root_candidates_stepwise(
 
 def _rerank_stepwise(
     *,
-    extend: Callable[[Any, chess.Board, chess.Move], Any],
+    extend: Callable[[Any, str], Any],
     root_handle: Any,
     board: chess.Board,
     legal_moves: list[chess.Move],
@@ -339,7 +370,7 @@ def select_value_rerank(
 
 def _d2_stepwise(
     *,
-    extend: Callable[[Any, chess.Board, chess.Move], Any],
+    extend: Callable[[Any, str], Any],
     root_handle: Any,
     board: chess.Board,
     legal_moves: list[chess.Move],
@@ -370,7 +401,7 @@ def _d2_stepwise(
             }
         ]
 
-    board2_batch: list[tuple[Any, chess.Board]] = []
+    board2_batch: list[tuple[Any, "cc.Board"]] = []
     board2_meta: list[tuple[_RootCandidate, int]] = []
     for candidate in candidates:
         if candidate.terminal_value is not None or candidate.board1_eval is None:
@@ -388,7 +419,9 @@ def _d2_stepwise(
         # tactical refutation is often a low-probability move under a
         # human-imitation policy, so policy top-k alone misses it.
         opp_seen = set(opp_indices)
-        opp_forcing = _forcing_index_set(board1, board1_eval.legal_moves, candidate.cozy1)
+        opp_forcing = _forcing_index_set(
+            board1, board1_eval.legal_moves, candidate.cozy1, legal_ucis=board1_eval.legal_ucis
+        )
         for opp_idx in range(len(board1_eval.legal_moves)):
             if opp_idx in opp_seen:
                 continue
@@ -397,12 +430,13 @@ def _d2_stepwise(
                 opp_seen.add(opp_idx)
 
         for opp_local_idx in opp_indices:
-            opp_move = board1_eval.legal_moves[opp_local_idx]
-            board2, cozy2 = _dual_push(board1, candidate.cozy1, opp_move)
+            opp_uci = board1_eval.legal_ucis[opp_local_idx]
+            opp_move_py = chess.Move.from_uci(opp_uci)
+            board2, cozy2 = _dual_push(board1, candidate.cozy1, opp_move_py)
             terminal_value = terminal_value_for_color(board2, color=root_color, cozy_board=cozy2)
             candidate.reply_candidates.append(
                 {
-                    "move_uci": opp_move.uci(),
+                    "move_uci": opp_uci,
                     "opp_policy_logit": float(
                         board1_eval.legal_log_priors[opp_local_idx]
                     ),
@@ -413,7 +447,7 @@ def _d2_stepwise(
             if terminal_value is not None:
                 continue
             board2_batch.append(
-                (extend(candidate.handle1, board1, opp_move), board2)
+                (extend(candidate.handle1, opp_uci), cozy2)
             )
             board2_meta.append((candidate, len(candidate.reply_candidates) - 1))
 
@@ -559,7 +593,7 @@ def _push_children(
     arm: _Arm,
     node: _TreeNode,
     position_eval: PositionEval,
-    extend: Callable[[Any, chess.Board, chess.Move], Any],
+    extend: Callable[[Any, str], Any],
     config: HalvingConfig,
     counter: "itertools.count",
     root_color: chess.Color,
@@ -569,7 +603,9 @@ def _push_children(
     opponent_to_move = node.board.turn != root_color
     order = _prior_order(position_eval.legal_log_priors)
     if opponent_to_move:
-        forcing = _forcing_index_set(node.board, position_eval.legal_moves, node.cozy_board)
+        forcing = _forcing_index_set(
+            node.board, position_eval.legal_moves, node.cozy_board, legal_ucis=position_eval.legal_ucis
+        )
         # Refutation floor: top-r replies by prior plus ALL forcing replies.
         picks = list(order[: config.refutation_top_r])
         seen = set(picks)
@@ -582,8 +618,9 @@ def _push_children(
         picks = list(order[: config.expand_top])
 
     for idx in picks:
-        move = position_eval.legal_moves[idx]
-        child_board, child_cozy = _dual_push(node.board, node.cozy_board, move)
+        move_uci = position_eval.legal_ucis[idx]
+        move_py = chess.Move.from_uci(move_uci)
+        child_board, child_cozy = _dual_push(node.board, node.cozy_board, move_py)
         # Forcing replies inherit the parent's priority (no decay for their
         # own low prior): a refutation must compete at the plausibility of
         # the line it refutes, not of the reply itself.
@@ -605,14 +642,14 @@ def _push_children(
             child.terminal_value_stm = terminal_stm
             node.children.append(child)
             continue
-        child.handle = extend(node.handle, node.board, move)
+        child.handle = extend(node.handle, move_uci)
         node.children.append(child)
         heapq.heappush(arm.frontier, (-child.path_log_prior, next(counter), child))
 
 
 def _halving_stepwise(
     *,
-    extend: Callable[[Any, chess.Board, chess.Move], Any],
+    extend: Callable[[Any, str], Any],
     root_handle: Any,
     board: chess.Board,
     legal_moves: list[chess.Move],
@@ -674,7 +711,7 @@ def _halving_stepwise(
             node = _TreeNode(
                 board=board1,
                 cozy_board=cozy1,
-                handle=extend(root_handle, board, move),
+                handle=extend(root_handle, move.uci()),
                 depth=0,
                 path_log_prior=float(legal_log_priors[idx]),
             )
@@ -709,7 +746,7 @@ def _halving_stepwise(
                     remaining[id(arm)] -= 1
             if not wave:
                 break
-            evals = yield EvalRequest(batch=[(node.handle, node.board) for _, node in wave])
+            evals = yield EvalRequest(batch=[(node.handle, node.cozy_board) for _, node in wave])
             spent += len(wave)
             for (arm, node), position_eval in zip(wave, evals):
                 node.value_stm = float(position_eval.value_stm)

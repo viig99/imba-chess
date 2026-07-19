@@ -23,6 +23,7 @@ import torch
 
 from imba_chess.data.board_state import BoardStateEncoder
 from imba_chess.data.move_vocab import MoveVocab
+from imba_chess.eval import cozy_bridge
 from imba_chess.eval.search import PositionEval
 
 
@@ -65,16 +66,21 @@ def _fake_root_output(move_vocab: MoveVocab) -> dict:
     }
 
 
-def _fake_decode_wave(batch: list[tuple[object, chess.Board]]) -> list[PositionEval]:
-    """Scripted PositionEvals: real legal moves off the real board (so
+def _fake_decode_wave(batch: list[tuple[object, "cc.Board"]]) -> list[PositionEval]:
+    """Scripted PositionEvals: real legal moves off the real cozy board (so
     search's forcing-move/refutation logic has something sane to chew on)
     with made-up uniform-ish priors, and a constant value -- no model call
     anywhere in this path."""
     results = []
-    for _, board in batch:
-        moves = list(board.legal_moves)[:2]
+    for _, cozy_board in batch:
+        moves = list(cozy_board.generate_moves())
+        moves.sort(key=lambda m: cozy_bridge.cozy_move_to_uci(cozy_board, m))
+        moves = moves[:2]
+        ucis = [cozy_bridge.cozy_move_to_uci(cozy_board, m) for m in moves]
         priors = [-0.1 * (i + 1) for i in range(len(moves))]
-        results.append(PositionEval(value_stm=0.0, legal_moves=moves, legal_log_priors=priors))
+        results.append(
+            PositionEval(value_stm=0.0, legal_moves=moves, legal_ucis=ucis, legal_log_priors=priors)
+        )
     return results
 
 

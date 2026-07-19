@@ -6,6 +6,7 @@ from pathlib import Path
 from typing import Any
 
 import chess
+import cozy_chess as cc
 import torch
 import torch.nn.functional as F
 
@@ -16,6 +17,7 @@ from imba_chess.data.event_builder import (
     TARGET_IGNORE_INDEX,
 )
 from imba_chess.data.move_vocab import MoveVocab
+from imba_chess.eval import cozy_bridge
 from imba_chess.eval.search import PositionEval
 from imba_chess.model import HSTUChessModel, build_hstu_chess_config, create_batch_block_mask
 
@@ -255,6 +257,51 @@ def _project_legal_logits(
     return legal_logits, legal_moves_with_ids, total_legal, mapped_legal
 
 
+def _project_legal_logits_cozy(
+    *,
+    logits: torch.Tensor,
+    cozy_board: cc.Board,
+    move_vocab: MoveVocab,
+) -> tuple[torch.Tensor, list[cc.Move], list[str], int, int]:
+    """Cozy-native twin of `_project_legal_logits`: same vocab-mapping and
+    UCI-sort discipline, but movegen and UCI derivation both go through
+    cozy-chess (`generate_moves` + `cozy_move_to_uci`, castling-aware)
+    instead of python-chess. `legal_ucis` is index-aligned with the returned
+    `legal_moves` (computed once here so callers never re-derive it).
+    """
+    legal_moves = list(cozy_board.generate_moves())
+    legal_ucis_all = [cozy_bridge.cozy_move_to_uci(cozy_board, move) for move in legal_moves]
+    legal_move_ids: list[int] = []
+    legal_moves_with_ids: list[cc.Move] = []
+    legal_ucis_with_ids: list[str] = []
+    for move, uci in zip(legal_moves, legal_ucis_all):
+        move_id = move_vocab.token_to_id.get(uci)
+        if move_id is not None:
+            legal_move_ids.append(int(move_id))
+            legal_moves_with_ids.append(move)
+            legal_ucis_with_ids.append(uci)
+    total_legal = len(legal_moves)
+    mapped_legal = len(legal_move_ids)
+    if not legal_move_ids:
+        raise RuntimeError(
+            "No legal moves mapped to vocab ids for current board "
+            f"(total legal={total_legal})."
+        )
+    # Canonical order: sort by UCI string so python-chess and cozy movegen
+    # produce identical move lists (Stage 3 Step 0). Sort ids/moves/ucis
+    # jointly (before index_select) so legal_logits stays aligned to both
+    # legal_moves_with_ids and legal_ucis_with_ids.
+    order = sorted(range(len(legal_moves_with_ids)), key=lambda i: legal_ucis_with_ids[i])
+    legal_moves_with_ids = [legal_moves_with_ids[i] for i in order]
+    legal_ucis_with_ids = [legal_ucis_with_ids[i] for i in order]
+    legal_move_ids = [legal_move_ids[i] for i in order]
+    legal_ids_tensor = torch.tensor(
+        legal_move_ids, device=logits.device, dtype=torch.long
+    )
+    legal_logits = logits.index_select(0, legal_ids_tensor)
+    return legal_logits, legal_moves_with_ids, legal_ucis_with_ids, total_legal, mapped_legal
+
+
 class _CachedNode:
     """Search-node handle: parent link + the move that led here.
 
@@ -289,7 +336,7 @@ class _DecodeRequest:
     """
 
     nodes: list[_CachedNode]
-    boards: list[chess.Board]
+    boards: list[cc.Board]
     new_token_batch: dict[str, Any]
     positions: torch.Tensor
     suffix_kv: list[tuple[torch.Tensor, torch.Tensor]] | None
@@ -327,14 +374,20 @@ class CachedPositionEvaluator:
         self._prefix_kv = prefix_kv
         self._prefix_len = int(prefix_len)
 
-    def extend(self, handle, board_before: chess.Board, move: chess.Move):
+    def extend(self, handle, move_uci: str):
+        """handle is opaque to the caller; move_uci only feeds vocab encoding
+        (no board is needed here -- the parent's path_kv already captures
+        everything about the position)."""
         parent = handle if isinstance(handle, _CachedNode) else None
         depth = parent.depth + 1 if parent is not None else 0
-        return _CachedNode(parent, int(self._move_vocab.encode(move.uci())), depth)
+        return _CachedNode(parent, int(self._move_vocab.encode(move_uci)), depth)
 
     def build_decode_request(self, batch) -> _DecodeRequest:
         """All CPU pre-work for one wave: encode boards, token tensors,
         suffix gather, positions -- everything before the model call.
+
+        `batch` is `list[(handle, cozy_board)]` (cozy-chess Board, Stage 3);
+        encoding goes through `encode_cozy`.
 
         Precondition: batch is non-empty (evaluate() guards the empty case
         before calling this; the rollout script's decode-wave payloads are
@@ -342,8 +395,8 @@ class CachedPositionEvaluator:
         only yields a non-empty batch).
         """
         nodes: list[_CachedNode] = [handle for handle, _ in batch]
-        boards = [board for _, board in batch]
-        states = [self._board_state_encoder.encode(board) for board in boards]
+        boards = [cozy_board for _, cozy_board in batch]
+        states = [self._board_state_encoder.encode_cozy(cozy_board) for cozy_board in boards]
         wave_size = len(batch)
 
         new_token_batch = {
@@ -419,19 +472,20 @@ class CachedPositionEvaluator:
         value_logits = out["value_logits"].float().cpu()
 
         results = []
-        for row, board in enumerate(request.boards):
+        for row, cozy_board in enumerate(request.boards):
             value_stm = _value_scalar_from_logits(value_logits[row])
             try:
-                legal_logits, legal_moves, _, _ = _project_legal_logits(
-                    logits=logits[row], board=board, move_vocab=self._move_vocab
+                legal_logits, legal_moves, legal_ucis, _, _ = _project_legal_logits_cozy(
+                    logits=logits[row], cozy_board=cozy_board, move_vocab=self._move_vocab
                 )
                 log_priors = torch.log_softmax(legal_logits.float(), dim=0).tolist()
             except RuntimeError:
-                legal_moves, log_priors = [], []
+                legal_moves, legal_ucis, log_priors = [], [], []
             results.append(
                 PositionEval(
                     value_stm=value_stm,
                     legal_moves=legal_moves,
+                    legal_ucis=legal_ucis,
                     legal_log_priors=log_priors,
                 )
             )

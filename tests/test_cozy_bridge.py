@@ -1,3 +1,4 @@
+import copy
 import random
 
 import chess
@@ -65,6 +66,29 @@ def test_move_translation_roundtrips_all_legal_moves():
         py_ucis = sorted(m.uci() for m in board.legal_moves)
         cc_ucis = sorted(cozy_move_to_uci(cozy, m) for m in cozy.generate_moves())
         assert py_ucis == cc_ucis, board.fen()
+
+
+def test_uci_roundtrip_from_cozy_move_pushes_identically_on_py_board():
+    """Stage 3 Task 4 relies on this reverse direction: search.py now picks
+    moves from cozy movegen (PositionEval.legal_moves/legal_ucis) but still
+    pushes the python-chess twin via `chess.Move.from_uci(uci)` (the tree
+    still carries a python-chess board this stage). This must hold for every
+    legal move, including castling (cozy's e1h1 vs standard e1g1 encoding,
+    already covered one-way by test_castling_translation_both_directions)
+    and promotions -- not just that the move object parses, but that pushing
+    it on python-chess reaches the exact same position cozy's own play()
+    does."""
+    for board in [chess.Board(f) for f in EDGE_FENS] + _random_boards(20, seed=13):
+        cozy = board_to_cozy(board)
+        for move in cozy.generate_moves():
+            uci = cozy_move_to_uci(cozy, move)
+            py_move = chess.Move.from_uci(uci)
+            assert py_move in board.legal_moves, (board.fen(), uci)
+            py_child = board.copy()
+            py_child.push(py_move)
+            cozy_child = copy.copy(cozy)
+            cozy_child.play(move)
+            assert board_to_cozy(py_child).fen() == cozy_child.fen(), (board.fen(), uci)
 
 
 def test_castling_translation_both_directions():
