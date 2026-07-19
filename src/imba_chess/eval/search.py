@@ -15,7 +15,6 @@ import copy
 import heapq
 import itertools
 import math
-import os
 import random
 from dataclasses import dataclass, field
 from typing import Any, Callable, Generator, NamedTuple, Optional, Protocol
@@ -24,10 +23,6 @@ import chess
 import cozy_chess as cc
 
 from imba_chess.eval import cozy_bridge
-
-# Opt-in dual-board sync verification for tests/debugging (costly: full FEN
-# round-trip per tree edge). Enable with IMBA_DUAL_PUSH_VERIFY=1.
-_DUAL_PUSH_VERIFY = os.environ.get("IMBA_DUAL_PUSH_VERIFY") == "1"
 
 
 class PositionEval(NamedTuple):
@@ -48,10 +43,10 @@ class PositionEval(NamedTuple):
 
 class PositionEvaluator(Protocol):
     """`handle` is opaque (a search-node handle); `evaluate` batch entries
-    are `(handle, cozy_board)` pairs (cozy-chess Board -- the tree still
-    also carries a python-chess twin internally this stage, but the
-    evaluator boundary itself is cozy-native). `extend` only needs the
-    played move's UCI (vocab encoding); it does not need a board."""
+    are `(handle, cozy_board)` pairs (cozy-chess Board -- the search tree
+    below the root is cozy-only, Stage 3 Task 5: no python-chess board is
+    built or carried per tree node). `extend` only needs the played move's
+    UCI (vocab encoding); it does not need a board."""
 
     def extend(self, handle: Any, move_uci: str) -> Any: ...
 
@@ -106,15 +101,20 @@ def _auto_rounds(num_arms: int) -> int:
 def terminal_value_for_color(
     board: chess.Board, *, color: chess.Color, cozy_board: "cc.Board | None" = None
 ) -> Optional[float]:
-    # A repetition/50-move claim needs >= 8 reversible plies of history for
-    # the third occurrence, and python-chess allows claiming one reversible
-    # ply early via a move that reaches it — so below halfmove_clock 7 no
-    # claim is possible and the O(stack) repetition scan can be skipped
-    # (~20x on this hot path; verified against the unguarded version on 28k
-    # random positions). The >= 7 guard lives in cozy_bridge.terminal_value_fast.
+    """Public shim for external callers (tests/harness). The search tree
+    itself (below this module's public select_* entry points) is cozy-only:
+    it calls cozy_bridge.terminal_value_native directly with per-node
+    hash_history, never through this function. This shim reconstructs the
+    hash_history a fresh call needs from `board`'s own move stack via
+    _root_hash_seed -- see that function's docstring for the contract.
+    """
     if cozy_board is None:
         cozy_board = cozy_bridge.board_to_cozy(board)
-    return cozy_bridge.terminal_value_fast(cozy_board, board, color)
+    return cozy_bridge.terminal_value_native(
+        cozy_board,
+        color_is_stm=(color == board.turn),
+        hash_history=_root_hash_seed(board),
+    )
 
 
 def select_greedy(legal_log_priors: list[float]) -> int:
@@ -122,32 +122,33 @@ def select_greedy(legal_log_priors: list[float]) -> int:
 
 
 def _forcing_index_set(
-    board: chess.Board,
     legal_moves: list,
     cozy_board: "cc.Board",
+    *,
+    board: Optional[chess.Board] = None,
     legal_ucis: Optional[list[str]] = None,
 ) -> set[int]:
     """Indices of forcing moves (promotion/capture/check), one cozy board per node.
 
-    `legal_moves` is python-chess Move objects at the root (legal_ucis
-    unused there: the move IS already a python-chess Move) or cozy-chess
-    Move objects at deeper tree nodes (legal_ucis required there, aligned
-    with legal_moves via PositionEval.legal_ucis) -- the transitional shape
-    while search.py's tree still carries python-chess boards alongside cozy
-    ones (Task 5 makes this cozy-only). Promotion and check-detection use
-    whichever representation is already at hand (no translation in the
-    common case); only the python-chess-board capture test needs a
-    python-chess Move, reconstructed from the precomputed uci for cozy
-    moves.
+    `legal_moves` is python-chess Move objects at the root (`board` -- the
+    real root python-chess board -- is required there for the capture test)
+    or cozy-chess Move objects at tree nodes (legal_ucis required there,
+    aligned with legal_moves via PositionEval.legal_ucis; the tree carries
+    no python-chess board at all as of Task 5, so capture detection there is
+    cozy-native via cozy_bridge.is_capture_cozy). Check-detection uses
+    whichever cozy move representation is already at hand -- the root path
+    lazily translates via py_move_to_cozy only when the promotion/capture
+    fast checks don't already resolve the move as forcing.
     """
     forcing: set[int] = set()
     for idx, move in enumerate(legal_moves):
         if isinstance(move, chess.Move):
-            py_move, cozy_move = move, None
+            assert board is not None
+            is_capture, cozy_move = board.is_capture(move), None
         else:
             assert legal_ucis is not None
-            py_move, cozy_move = chess.Move.from_uci(legal_ucis[idx]), move
-        if move.promotion is not None or board.is_capture(py_move):
+            is_capture, cozy_move = cozy_bridge.is_capture_cozy(cozy_board, move), move
+        if move.promotion is not None or is_capture:
             forcing.add(idx)
         elif cozy_bridge.gives_check(
             cozy_board, cozy_move if cozy_move is not None else cozy_bridge.py_move_to_cozy(board, move)
@@ -185,29 +186,60 @@ def _gumbel_top_k_order(legal_log_priors: list[float], *, rng: random.Random) ->
 
 
 def _search_copy(board: chess.Board) -> chess.Board:
-    # Search only needs enough move-stack history for draw-claim detection
-    # (bounded by halfmove_clock); copying a late-game full stack is ~150x
-    # slower for no benefit.
+    # Bounded copy: only enough move-stack history for draw-claim detection
+    # (bounded by halfmove_clock) is needed; copying a late-game full stack
+    # is ~150x slower for no benefit. Used only by _root_hash_seed (the
+    # cozy-only tree below the root carries no python-chess board at all).
     return board.copy(stack=board.halfmove_clock)
 
 
-def _dual_push(
-    board: chess.Board, cozy_board: "cc.Board", move: chess.Move
-) -> tuple[chess.Board, "cc.Board"]:
-    """Copy both boards and make `move` on each; the pair MUST stay in sync.
+def _root_hash_seed(board: chess.Board) -> tuple[int, ...]:
+    """repetition_hash() of the (up to) `halfmove_clock` positions PRIOR to
+    each of the last `n = min(board.halfmove_clock, len(board.move_stack))`
+    played moves, oldest first, current position excluded -- the exact
+    hash_history contract cozy_bridge.terminal_value_native expects (see its
+    docstring), reconstructed from a bare python-chess board's move stack.
+    This is what seeds a fresh tree walk (_cozy_push then folds in one more
+    hash per non-zeroing ply as the tree descends). Empty stack -> empty
+    tuple (matches pre-Task-5 stackless behavior: no history, no claim).
 
-    Every tree edge goes through here: a push without its cozy twin is the
-    dual-board invariant violation this helper exists to prevent.
+    Bounded-copy + pop/replay rather than re-walking board.move_stack in
+    place, so the passed-in `board` is never mutated.
     """
-    child = _search_copy(board)
-    child.push(move)
-    cozy_child = copy.copy(cozy_board)
-    cozy_child.play(cozy_bridge.py_move_to_cozy(board, move))
-    if __debug__ and _DUAL_PUSH_VERIFY:
-        assert cozy_child.fen() == cozy_bridge.board_to_cozy(child).fen(), (
-            board.fen(), move.uci(),
-        )
-    return child, cozy_child
+    twin = _search_copy(board)
+    n = len(twin.move_stack)
+    if n == 0:
+        return ()
+    moves = [twin.pop() for _ in range(n)]
+    moves.reverse()  # chronological order, oldest first
+    cozy = cozy_bridge.board_to_cozy(twin)
+    history = [cozy_bridge.repetition_hash(cozy)]
+    for move in moves[:-1]:  # skip the last move: it reaches the CURRENT position, excluded
+        cozy = copy.copy(cozy)
+        cozy.play(cozy_bridge.py_move_to_cozy(twin, move))
+        twin.push(move)
+        history.append(cozy_bridge.repetition_hash(cozy))
+    return tuple(history)
+
+
+def _cozy_push(
+    cozy_board: "cc.Board", cozy_move: "cc.Move", hash_history: tuple[int, ...]
+) -> tuple["cc.Board", tuple[int, ...]]:
+    """Copy-and-play one tree edge, threading the repetition hash_history.
+
+    Every tree edge goes through here. child_history resets to empty on a
+    zeroing move (capture/pawn move -- child.halfmove_clock == 0) and
+    otherwise carries the parent's history forward with the parent's own
+    repetition_hash appended -- see cozy_bridge.terminal_value_native's
+    docstring for why reset-on-zeroing-only is a sufficient contract.
+    """
+    child = copy.copy(cozy_board)
+    child.play(cozy_move)
+    if child.halfmove_clock == 0:
+        child_history: tuple[int, ...] = ()
+    else:
+        child_history = hash_history + (cozy_bridge.repetition_hash(cozy_board),)
+    return child, child_history
 
 
 @dataclass
@@ -217,13 +249,14 @@ class _RootCandidate:
     terminal_value is the exact game result (root POV) when the move ends the
     game, else None; board1_eval is the value/prior evaluation of the position
     after the move. worst_reply_value / reply_candidates are filled by
-    value_search_d2 only.
+    value_search_d2 only. hash_history1 is cozy1's repetition hash_history
+    (per the _cozy_push contract), threaded into any further push from cozy1.
     """
 
     local_idx: int
     move: chess.Move
-    board1: chess.Board
     cozy1: "cc.Board"
+    hash_history1: tuple[int, ...]
     log_prior: float
     terminal_value: Optional[float]
     handle1: Any = None
@@ -238,6 +271,7 @@ def _expand_root_candidates_stepwise(
     root_handle: Any,
     board: chess.Board,
     cozy_root: "cc.Board",
+    root_hash_seed: tuple[int, ...],
     legal_moves: list[chess.Move],
     legal_log_priors: list[float],
     top_k: int,
@@ -252,21 +286,25 @@ def _expand_root_candidates_stepwise(
     ignored. Terminal boards never appear as training tokens, so they carry
     the exact game result instead of going through the value head.
     """
-    root_color = board.turn
     candidates: list[_RootCandidate] = []
-    batch: list[tuple[Any, chess.Board]] = []
+    batch: list[tuple[Any, "cc.Board"]] = []
     batch_to_candidate: list[int] = []
     for local_idx in _prior_order(legal_log_priors)[: min(top_k, len(legal_moves))]:
         move = legal_moves[local_idx]
-        board1, cozy1 = _dual_push(board, cozy_root, move)
-        terminal_value = terminal_value_for_color(board1, color=root_color, cozy_board=cozy1)
+        cozy_move = cozy_bridge.py_move_to_cozy(board, move)
+        cozy1, hash_history1 = _cozy_push(cozy_root, cozy_move, root_hash_seed)
+        # One ply past the root: side to move at cozy1 is the opponent, so
+        # root-POV color is never the side to move here (color_is_stm=False).
+        terminal_value = cozy_bridge.terminal_value_native(
+            cozy1, color_is_stm=False, hash_history=hash_history1
+        )
         if terminal_value is not None and terminal_value >= 1.0:
             return candidates, local_idx
         candidate = _RootCandidate(
             local_idx=local_idx,
             move=move,
-            board1=board1,
             cozy1=cozy1,
+            hash_history1=hash_history1,
             log_prior=float(legal_log_priors[local_idx]),
             terminal_value=terminal_value,
         )
@@ -300,6 +338,7 @@ def _rerank_stepwise(
         root_handle=root_handle,
         board=board,
         cozy_root=root_cozy,
+        root_hash_seed=_root_hash_seed(board),
         legal_moves=legal_moves,
         legal_log_priors=legal_log_priors,
         top_k=top_k,
@@ -378,13 +417,13 @@ def _d2_stepwise(
     top_k: int,
     lam: float,
 ) -> Generator[EvalRequest, list[PositionEval], tuple[int, list[dict[str, Any]]]]:
-    root_color = board.turn
     root_cozy = cozy_bridge.board_to_cozy(board)
     candidates, mate_index = yield from _expand_root_candidates_stepwise(
         extend=extend,
         root_handle=root_handle,
         board=board,
         cozy_root=root_cozy,
+        root_hash_seed=_root_hash_seed(board),
         legal_moves=legal_moves,
         legal_log_priors=legal_log_priors,
         top_k=top_k,
@@ -407,7 +446,6 @@ def _d2_stepwise(
         if candidate.terminal_value is not None or candidate.board1_eval is None:
             continue
         board1_eval = candidate.board1_eval
-        board1 = candidate.board1
         if not board1_eval.legal_moves:
             candidate.worst_reply_value = -float(board1_eval.value_stm)
             continue
@@ -420,7 +458,7 @@ def _d2_stepwise(
         # human-imitation policy, so policy top-k alone misses it.
         opp_seen = set(opp_indices)
         opp_forcing = _forcing_index_set(
-            board1, board1_eval.legal_moves, candidate.cozy1, legal_ucis=board1_eval.legal_ucis
+            board1_eval.legal_moves, candidate.cozy1, legal_ucis=board1_eval.legal_ucis
         )
         for opp_idx in range(len(board1_eval.legal_moves)):
             if opp_idx in opp_seen:
@@ -431,9 +469,15 @@ def _d2_stepwise(
 
         for opp_local_idx in opp_indices:
             opp_uci = board1_eval.legal_ucis[opp_local_idx]
-            opp_move_py = chess.Move.from_uci(opp_uci)
-            board2, cozy2 = _dual_push(board1, candidate.cozy1, opp_move_py)
-            terminal_value = terminal_value_for_color(board2, color=root_color, cozy_board=cozy2)
+            opp_move_cozy = board1_eval.legal_moves[opp_local_idx]
+            cozy2, hash_history2 = _cozy_push(
+                candidate.cozy1, opp_move_cozy, candidate.hash_history1
+            )
+            # Two plies past the root: side to move at cozy2 is root_color
+            # again, so root-POV color IS the side to move (color_is_stm=True).
+            terminal_value = cozy_bridge.terminal_value_native(
+                cozy2, color_is_stm=True, hash_history=hash_history2
+            )
             candidate.reply_candidates.append(
                 {
                     "move_uci": opp_uci,
@@ -536,8 +580,8 @@ def select_value_search_d2(
 
 @dataclass
 class _TreeNode:
-    board: chess.Board
     cozy_board: "cc.Board"
+    hash_history: tuple[int, ...]  # repetition_hash history per the _cozy_push contract
     handle: Any
     depth: int  # plies below the arm root (arm root = 0)
     path_log_prior: float
@@ -600,11 +644,12 @@ def _push_children(
 ) -> None:
     if node.depth >= config.max_depth or not position_eval.legal_moves:
         return
-    opponent_to_move = node.board.turn != root_color
+    node_stm_is_white = node.cozy_board.side_to_move() == cc.Color.White
+    opponent_to_move = node_stm_is_white != root_color
     order = _prior_order(position_eval.legal_log_priors)
     if opponent_to_move:
         forcing = _forcing_index_set(
-            node.board, position_eval.legal_moves, node.cozy_board, legal_ucis=position_eval.legal_ucis
+            position_eval.legal_moves, node.cozy_board, legal_ucis=position_eval.legal_ucis
         )
         # Refutation floor: top-r replies by prior plus ALL forcing replies.
         picks = list(order[: config.refutation_top_r])
@@ -619,8 +664,8 @@ def _push_children(
 
     for idx in picks:
         move_uci = position_eval.legal_ucis[idx]
-        move_py = chess.Move.from_uci(move_uci)
-        child_board, child_cozy = _dual_push(node.board, node.cozy_board, move_py)
+        move_cozy = position_eval.legal_moves[idx]
+        child_cozy, child_history = _cozy_push(node.cozy_board, move_cozy, node.hash_history)
         # Forcing replies inherit the parent's priority (no decay for their
         # own low prior): a refutation must compete at the plausibility of
         # the line it refutes, not of the reply itself.
@@ -629,14 +674,17 @@ def _push_children(
             0.0 if floor_pick else position_eval.legal_log_priors[idx]
         )
         child = _TreeNode(
-            board=child_board,
             cozy_board=child_cozy,
+            hash_history=child_history,
             handle=None,
             depth=node.depth + 1,
             path_log_prior=child_prior,
         )
-        terminal_stm = terminal_value_for_color(
-            child_board, color=child_board.turn, cozy_board=child_cozy
+        # color IS the child's own side to move by construction: color_is_stm
+        # is trivially True (terminal_value_stm is side-to-move POV, per
+        # _TreeNode's docstring).
+        terminal_stm = cozy_bridge.terminal_value_native(
+            child_cozy, color_is_stm=True, hash_history=child_history
         )
         if terminal_stm is not None:
             child.terminal_value_stm = terminal_stm
@@ -669,13 +717,14 @@ def _halving_stepwise(
     """
     root_color = board.turn
     root_cozy = cozy_bridge.board_to_cozy(board)
+    root_hash_seed = _root_hash_seed(board)
     if config.gumbel_root_sampling:
         order = _gumbel_top_k_order(legal_log_priors, rng=rng if rng is not None else random.Random())
     else:
         order = _prior_order(legal_log_priors)
     picks = list(order[: min(config.top_m, len(order))])
     seen = set(picks)
-    forcing = _forcing_index_set(board, legal_moves, root_cozy)
+    forcing = _forcing_index_set(legal_moves, root_cozy, board=board)
     for idx in range(len(legal_moves)):
         if idx not in seen and idx in forcing:
             picks.append(idx)
@@ -685,8 +734,13 @@ def _halving_stepwise(
     arms: list[_Arm] = []
     for idx in picks:
         move = legal_moves[idx]
-        board1, cozy1 = _dual_push(board, root_cozy, move)
-        terminal_root = terminal_value_for_color(board1, color=root_color, cozy_board=cozy1)
+        cozy_move = cozy_bridge.py_move_to_cozy(board, move)
+        cozy1, hash_history1 = _cozy_push(root_cozy, cozy_move, root_hash_seed)
+        # One ply past the root: side to move at cozy1 is the opponent, so
+        # root-POV color is never the side to move here (color_is_stm=False).
+        terminal_root = cozy_bridge.terminal_value_native(
+            cozy1, color_is_stm=False, hash_history=hash_history1
+        )
         if terminal_root is not None and terminal_root >= 1.0:
             # Immediate win (checkmate delivered): no other move can score higher.
             return idx, [
@@ -709,8 +763,8 @@ def _halving_stepwise(
         )
         if terminal_root is None:
             node = _TreeNode(
-                board=board1,
                 cozy_board=cozy1,
+                hash_history=hash_history1,
                 handle=extend(root_handle, move.uci()),
                 depth=0,
                 path_log_prior=float(legal_log_priors[idx]),

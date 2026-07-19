@@ -99,40 +99,37 @@ def cozy_move_to_uci(cozy_board: cc.Board, move: cc.Move) -> str:
     return uci
 
 
+def is_capture_cozy(cozy_board: cc.Board, move: cc.Move) -> bool:
+    """Does this LEGAL cozy move capture a piece? Mirrors python-chess's
+    Board.is_capture() (normal capture + en passant) without needing a
+    python-chess board.
+
+    Castling is excluded despite the destination square being occupied:
+    cozy represents castling as king-takes-own-rook (see module docstring),
+    which must not count as a capture. The en-passant case relies on
+    legality: a pawn can only move diagonally to an empty square via en
+    passant, so no explicit ep-square check is needed for moves drawn from
+    a legal-move generator.
+    """
+    moving_piece = cozy_board.piece_on(move.from_square)
+    if cozy_board.piece_on(move.to_square) is None:
+        return moving_piece == cc.Piece.Pawn and (
+            int(move.from_square) % 8 != int(move.to_square) % 8
+        )
+    if (
+        moving_piece == cc.Piece.King
+        and cozy_board.color_on(move.to_square) == cozy_board.side_to_move()
+    ):
+        return False  # castling: king "captures" its own rook
+    return True
+
+
 def _no_heavy_pieces(cozy_board: cc.Board) -> bool:
     return not (
         int(cozy_board.pieces(cc.Piece.Pawn))
         | int(cozy_board.pieces(cc.Piece.Rook))
         | int(cozy_board.pieces(cc.Piece.Queen))
     )
-
-
-def terminal_value_fast(
-    cozy_board: cc.Board, board: chess.Board, color: chess.Color
-) -> float | None:
-    """Drop-in for search.terminal_value_for_color, cozy fast path.
-
-    cozy status() decides checkmate/stalemate (~50ns vs ~4.3us). python-chess
-    stays the oracle on the rare paths: insufficient material (only reachable
-    when no pawn/rook/queen exists -- cheap cozy pre-filter) and draw claims
-    (only reachable at halfmove_clock >= 7, the pre-existing guard).
-    """
-    status = cozy_board.status()
-    if status == cc.GameStatus.Won:
-        # cozy 'Won' == side to move is checkmated; winner is the other side.
-        winner = not board.turn
-        return 1.0 if winner == color else -1.0
-    if status == cc.GameStatus.Drawn:
-        return 0.0  # stalemate
-    if _no_heavy_pieces(cozy_board) and board.is_insufficient_material():
-        return 0.0
-    if board.halfmove_clock >= 7:
-        outcome = board.outcome(claim_draw=True)
-        if outcome is not None:
-            if outcome.winner is None:
-                return 0.0
-            return 1.0 if outcome.winner == color else -1.0
-    return None
 
 
 def _ep_adjacent_capturers_cozy(cozy_board: cc.Board) -> list[cc.Move]:
@@ -277,8 +274,8 @@ def terminal_value_native(
     halfmove = cozy_board.halfmove_clock
     if halfmove < 7:
         # A repetition/50-move claim needs >= 7 reversible plies of history
-        # for the third occurrence (or the one-ply-early claims below);
-        # matches the pre-existing guard in terminal_value_fast.
+        # for the third occurrence (or the one-ply-early claims below), so
+        # the O(history) scan below can be skipped entirely.
         return None
 
     current = repetition_hash(cozy_board)

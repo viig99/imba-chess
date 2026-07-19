@@ -300,6 +300,7 @@ import chess
 from imba_chess.data.board_state import BoardStateEncoder
 from imba_chess.data.move_vocab import MoveVocab, MoveVocabConfig
 from imba_chess.eval import cozy_bridge
+from imba_chess.eval.position_evaluator import _project_legal_logits_cozy
 from imba_chess.eval.search import PositionEval, select_value_search_d2
 
 
@@ -370,11 +371,14 @@ class _FullForwardReferenceEvaluator:
                 out["value_logits"][-1]
             )
             try:
-                legal_logits, legal_moves, _, _ = self._module._project_legal_logits(
-                    logits=logits, board=board, move_vocab=self._move_vocab
+                # cozy-native projection (Stage 3 Task 4/5 contract:
+                # PositionEval.legal_moves are always cc.Move, tree levels
+                # included -- search.py's tree carries no python-chess board
+                # to fall back on for a legacy-py-Move PositionEval anymore).
+                legal_logits, legal_moves, legal_ucis, _, _ = _project_legal_logits_cozy(
+                    logits=logits, cozy_board=cozy_board, move_vocab=self._move_vocab
                 )
                 log_priors = torch.log_softmax(legal_logits.float(), dim=0).tolist()
-                legal_ucis = [m.uci() for m in legal_moves]
             except RuntimeError:
                 legal_moves, legal_ucis, log_priors = [], [], []
             results.append(PositionEval(value_stm, legal_moves, legal_ucis, log_priors))

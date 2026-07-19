@@ -3,11 +3,14 @@ cozy-backed primitive used by search.py. Covers perft-suite edge positions
 (castling, en-passant pins/discoveries, promotions) plus seeded random games.
 """
 
+import os
 import random
+from typing import Any
 
 import chess
 import pytest
 
+from imba_chess.eval import cozy_bridge
 from imba_chess.eval.cozy_bridge import (
     board_to_cozy,
     gives_check,
@@ -66,47 +69,38 @@ def test_legal_move_sets_match_python_chess_everywhere():
         ), board.fen()
 
 
-def test_terminal_value_fast_matches_terminal_value_for_color():
-    from imba_chess.eval.cozy_bridge import terminal_value_fast
-    from imba_chess.eval.search import terminal_value_for_color
+def test_is_capture_cozy_matches_python_chess_everywhere():
+    """cozy_bridge.is_capture_cozy (Stage 3 Task 5) is the capture test
+    _forcing_index_set uses at cozy-only tree nodes -- python-chess is_capture
+    remains the oracle, castling included (cozy's king-takes-own-rook
+    encoding must NOT read as a capture despite the destination being
+    occupied by the player's own rook)."""
+    from imba_chess.eval.cozy_bridge import is_capture_cozy
 
-    terminal_seen = 0
-    # Random games REPLAYED so boards carry real move stacks -- repetition and
-    # 50-move claims need history, bare FENs can't exercise them.
-    rng = random.Random(99)
-    for g in range(400):
-        board = chess.Board()
-        # Shuffle-heavy move choice to actually reach repetitions/50-move claims.
-        for _ in range(200):
-            moves = list(board.legal_moves)
-            if not moves:
-                break
-            quiet = [m for m in moves if not board.is_capture(m) and m.promotion is None]
-            move = rng.choice(quiet if (quiet and rng.random() < 0.8) else moves)
-            board.push(move)
-            expected = terminal_value_for_color(board, color=chess.WHITE)
-            got = terminal_value_fast(board_to_cozy(board), board, chess.WHITE)
-            assert got == expected, (board.fen(), expected, got)
-            if expected is not None:
-                terminal_seen += 1
-                break
-    assert terminal_seen >= 30  # sweep must actually hit terminal states
+    checked = 0
+    for board in _all_boards():
+        cozy = board_to_cozy(board)
+        for move in board.legal_moves:
+            cozy_move = py_move_to_cozy(board, move)
+            assert is_capture_cozy(cozy, cozy_move) == board.is_capture(move), (
+                board.fen(), move.uci(),
+            )
+            checked += 1
+    assert checked > 50_000
 
 
-def test_terminal_value_fast_curated_insufficient_material():
-    """K+B vs K, halfmove 0: hits the _no_heavy_pieces insufficient-material
-    branch specifically (not the draw-claim path, which needs halfmove >= 7).
+def test_is_capture_cozy_curated_castling_is_not_a_capture():
+    from imba_chess.eval.cozy_bridge import is_capture_cozy
 
-    The random-game sweep above is not guaranteed to reach insufficient
-    material, so this curated case exercises that branch deterministically.
-    """
-    from imba_chess.eval.cozy_bridge import terminal_value_fast
-    from imba_chess.eval.search import terminal_value_for_color
-
-    board = chess.Board("8/8/3k4/8/8/3KB3/8/8 w - - 0 1")
-    expected = terminal_value_for_color(board, color=chess.WHITE)
-    assert expected == 0.0
-    assert terminal_value_fast(board_to_cozy(board), board, chess.WHITE) == expected
+    for fen, uci in [
+        ("5k2/8/8/8/8/8/8/4K2R w K - 0 1", "e1g1"),
+        ("r3k3/8/8/8/8/8/8/4K3 b q - 0 1", "e8c8"),
+    ]:
+        board = chess.Board(fen)
+        move = chess.Move.from_uci(uci)
+        assert move in board.legal_moves, "test fixture is broken: move not legal"
+        assert not board.is_capture(move), "test fixture is broken: oracle disagrees"
+        assert is_capture_cozy(board_to_cozy(board), py_move_to_cozy(board, move)) is False
 
 
 def test_encode_cozy_matches_encode_on_conversions_and_played_lines():
@@ -296,20 +290,136 @@ def test_repetition_hash_matches_raw_hash_when_ep_is_legally_capturable():
     assert repetition_hash(cb2) != cb2.hash_without_ep()
 
 
-def test_search_dual_boards_stay_in_sync(monkeypatch):
-    """Enable the opt-in _dual_push verification and run a real search: every
-    tree edge must keep the python-chess/cozy-chess board pair in sync.
+def test_root_hash_seed_matches_incremental_history_replayed_games():
+    """search._root_hash_seed(board) must reconstruct exactly the
+    hash_history an incrementally-maintained tracker (the Task-3 test
+    pattern: reset to () on a zeroing move, else append the pre-move
+    repetition_hash) would hold at that same position -- the contract
+    _cozy_push/terminal_value_native expect a tree walk to seed itself with.
+    Replays real games and checks the seed at MANY cut points per game (not
+    just the final ply), so both the "mid-window" and "empty after zeroing"
+    cases get exercised, not just whatever halfmove_clock the game happens
+    to end on.
+    """
+    import copy as copymod
+
+    from imba_chess.eval.cozy_bridge import repetition_hash
+    from imba_chess.eval.search import _root_hash_seed
+
+    rng = random.Random(2024)
+    checked = nonempty_seen = 0
+    for g in range(150):
+        pyb = chess.Board()
+        cb = board_to_cozy(pyb)
+        hash_history: list[int] = []
+        n_plies = rng.randrange(1, 120)
+        for ply in range(n_plies):
+            moves = list(pyb.legal_moves)
+            if not moves:
+                break
+            quiet = [m for m in moves if not pyb.is_capture(m) and m.promotion is None]
+            mv = rng.choice(quiet if (quiet and rng.random() < 0.85) else moves)
+            prev_hash = repetition_hash(cb)
+            prev_halfmove = pyb.halfmove_clock
+            cb2 = copymod.copy(cb)
+            cb2.play(py_move_to_cozy(pyb, mv))
+            pyb.push(mv)
+            hash_history = (
+                [] if pyb.halfmove_clock <= prev_halfmove else hash_history + [prev_hash]
+            )
+            cb = cb2
+            if pyb.is_game_over():
+                break
+            # Check at every ply (not just game end): exercises both the
+            # empty-after-zeroing case and growing/mid-window cases.
+            got = _root_hash_seed(pyb)
+            assert got == tuple(hash_history), (pyb.fen(), ply, hash_history, got)
+            checked += 1
+            if hash_history:
+                nonempty_seen += 1
+    assert checked >= 500
+    assert nonempty_seen >= 100  # must actually exercise non-trivial seeds
+
+
+def test_root_hash_seed_empty_stack_is_empty_tuple():
+    from imba_chess.eval.search import _root_hash_seed
+
+    assert _root_hash_seed(chess.Board()) == ()
+    # A board built straight from a FEN with a nonzero halfmove_clock but no
+    # move_stack has no history to reconstruct -- n = min(hmc, len(stack))
+    # caps at the (empty) stack, matching pre-Task-5 stackless behavior.
+    assert _root_hash_seed(chess.Board("8/8/3k4/8/8/3K4/8/8 w - - 42 30")) == ()
+
+
+class _ShadowVerifyingEvaluator:
+    """Test-only PositionEvaluator wrapper for the opt-in cozy-tree-integrity
+    check (IMBA_COZY_TREE_VERIFY): maintains an independent python-chess
+    shadow board per handle (rebuilt via extend()'s move_uci chain from a
+    fixed root board) and, when enabled, asserts every evaluate() batch's
+    cozy board matches board_to_cozy(shadow) by repetition_hash.
+
+    This replaces the pre-Task-5 `_dual_push` verify assert (which compared
+    an incrementally cozy-played board against a python-chess-driven
+    board_to_cozy conversion at every tree edge, INSIDE search.py): now that
+    the cozy-only tree carries no python-chess board at all, that oracle
+    check has nowhere to live in production code and moves here, into a
+    test-side wrapper that reconstructs the missing python-chess twin
+    independently and drives a real search with it.
+    """
+
+    def __init__(self, inner, root_handle, root_board, *, verify=None):
+        self.inner = inner
+        self._shadow: dict[Any, chess.Board] = {root_handle: root_board.copy()}
+        self._verify = (
+            os.environ.get("IMBA_COZY_TREE_VERIFY") == "1" if verify is None else verify
+        )
+        self.verified_count = 0
+
+    def extend(self, handle, move_uci):
+        new_handle = self.inner.extend(handle, move_uci)
+        child_board = self._shadow[handle].copy()
+        child_board.push_uci(move_uci)
+        self._shadow[new_handle] = child_board
+        return new_handle
+
+    def evaluate(self, batch):
+        if self._verify:
+            for handle, cozy_board in batch:
+                shadow_board = self._shadow[handle]
+                shadow_cozy_hash = cozy_bridge.repetition_hash(cozy_bridge.board_to_cozy(shadow_board))
+                assert cozy_bridge.repetition_hash(cozy_board) == shadow_cozy_hash, (
+                    shadow_board.fen(), cozy_board.fen(),
+                )
+                self.verified_count += 1
+        return self.inner.evaluate(batch)
+
+
+def test_search_cozy_tree_hash_history_matches_shadow_py_replay(monkeypatch):
+    """Enable IMBA_COZY_TREE_VERIFY and run a real search: every cozy tree
+    node's board (reached purely through _cozy_push chains, root through
+    several plies of descent) must match an independently-replayed
+    python-chess shadow board's own cozy conversion -- proving the
+    hash_history-threaded cozy-only tree stays in sync with what a
+    from-scratch python-chess replay of the same move sequence would reach.
     """
     from imba_chess.eval import search
     from tests.test_search import _MaterialEvaluator
 
-    monkeypatch.setattr(search, "_DUAL_PUSH_VERIFY", True)
+    monkeypatch.setenv("IMBA_COZY_TREE_VERIFY", "1")
+    # A few reversible half-moves on top of an already-played opening so
+    # halfmove_clock/move_stack are non-trivial (_root_hash_seed exercised,
+    # not just the trivial empty-history case) and the search tree actually
+    # explores several plies of hash_history threading.
     board = chess.Board(
         "r1bqkbnr/pppp1ppp/2n5/1B2p3/4P3/5N2/PPPP1PPP/RNBQK2R b KQkq - 3 3"
     )
+    for uci in ("c6b8", "b1c3", "b8c6", "c3b1"):
+        board.push_uci(uci)
     legal_moves = list(board.legal_moves)
     legal_log_priors = [-1.0] * len(legal_moves)
-    evaluator = _MaterialEvaluator()
+    evaluator = _ShadowVerifyingEvaluator(
+        _MaterialEvaluator(), root_handle=None, root_board=board
+    )
     search.select_value_search_halving(
         evaluator=evaluator,
         root_handle=None,
@@ -318,3 +428,4 @@ def test_search_dual_boards_stay_in_sync(monkeypatch):
         legal_log_priors=legal_log_priors,
         config=search.HalvingConfig(budget=64, top_m=8, max_depth=3),
     )
+    assert evaluator.verified_count > 0  # the check actually ran, not a no-op
