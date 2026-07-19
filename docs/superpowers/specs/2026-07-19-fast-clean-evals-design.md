@@ -106,3 +106,40 @@ Sequence after implementation gates pass, machine otherwise idle:
 machine load, fp32-deterministic model decisions, and a defensible new
 baseline for checkpoint_23 from which Phase-1b deltas can be measured at
 ±0.03 resolution without protocol caveats.
+
+## Follow-up (user-approved 2026-07-19): multiprocess eval actors — the eval-speed endgame
+
+Measured limit of the current single-process design: even perfect batching
+parity with rollouts gives ~40 min / 200 games, because ~72ms/search of
+Python bookkeeping executes serially under the GIL for all G games
+(55 searches/game × 72ms × 200 games ≈ 13 min irreducible floor), and SF
+thinks barrier against GPU ticks.
+
+Design sketch (supersedes the earlier async-SF-overlap idea — it subsumes it):
+
+- **Worker processes (one per concurrent game, G=8 initially)** run the
+  ENTIRE per-game loop: the torch-free stepwise search generators
+  (`search.py` — already torch-free with opaque handles BY DESIGN), cozy
+  ops, board encoding, summary bookkeeping, and each worker's OWN Stockfish
+  engine called synchronously (SF overlap falls out for free).
+- **Main process = GPU inference server**: owns the model and ALL KV state.
+  Handles become integer IDs; the per-node KV store is keyed by ID and lives
+  only in the main process (workers never hold CUDA tensors). Workers send
+  (ids, encoded board arrays) per wave (~tens of KB, ~0.2ms IPC vs ~30ms
+  waves), main process merges across workers into grouped GPU calls and
+  returns (values, priors) per ID.
+- Expected: serial CPU floor divides by worker count (~9ms effective at 8);
+  SF fully overlapped; realistic 200-game runs ~15-20 min at this budget.
+- Costs to design around: KV-store refactor to ID-keyed main-process
+  ownership; deterministic request-collection order (keep runs reproducible
+  and gates meaningful); CUDA+spawn process lifecycle; a G=1 fidelity path
+  for gating. The rollout pipeline is NOT to be migrated (its single-process
+  batching is already near its workload's optimum; this pattern is for the
+  eval workload's search-every-move + external-engine shape).
+- Prior rejection of "multi-process GPU server" in the cross-game-batching
+  spec was for the ROLLOUT workload (GPU-bound, nothing CPU-parallel); the
+  eval workload inverts the trade, so that verdict does not carry over.
+
+Acceptance for the follow-up when built: perf (200 games well under 30 min
+at G=8 local) AND accuracy (move-probe identity at fp32 vs the single-process
+driver; anchor-band score agreement).
