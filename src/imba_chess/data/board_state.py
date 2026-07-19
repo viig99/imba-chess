@@ -146,7 +146,7 @@ class BoardStateEncoder:
             bb = int(board.pieces(piece))
             for square in chess.scan_forward(bb & white):
                 ids[square] = offset + 1
-            for square in chess.scan_forward(bb & ~white & bb):
+            for square in chess.scan_forward(bb & ~white):
                 ids[square] = offset + 7
         rights_white = board.castle_rights(cc.Color.White)
         rights_black = board.castle_rights(cc.Color.Black)

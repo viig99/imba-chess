@@ -1,8 +1,9 @@
 """python-chess <-> cozy-chess interop for search hot paths.
 
-cozy-chess (Rust, via cozy-chess-py) is an internal acceleration detail of
-search.py; python-chess remains the interface currency and the correctness
-oracle (tests/test_cozy_differential.py). Convention differences owned here:
+cozy-chess (Rust, via cozy-chess-py) is an internal acceleration detail
+shared by search.py, position_evaluator.py, and board_state.py; python-chess
+remains the interface currency and the correctness oracle
+(tests/test_cozy_differential.py). Convention differences owned here:
 
 - Castling: python-chess UCI moves the king two files (e1g1); cozy-chess
   represents castling as king-takes-own-rook (e1h1).
