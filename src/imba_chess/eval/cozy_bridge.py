@@ -51,7 +51,12 @@ def board_to_cozy(board: chess.Board) -> cc.Board:
         long = cc.File.A if rights & queenside_bb else None
         if short is not None or long is not None:
             builder.set_castle_rights(color, short=short, long=long)
-    if board.ep_square is not None and board.has_legal_en_passant():
+    if board.ep_square is not None:
+        # Raw/unconditional, matching cozy's own native double-push semantics
+        # (see cozy Board.fen()/en_passant()) -- NOT gated on a legal capturer
+        # existing. Mode-specific ("legal"/"xfen") filtering is the caller's
+        # job (see BoardStateEncoder._ep_file_id_cozy); gating here would
+        # silently discard information those modes need to reconstruct.
         for square in cc.BitBoard(1 << board.ep_square):
             builder.set_en_passant(square)
     builder.set_halfmove_clock(board.halfmove_clock)

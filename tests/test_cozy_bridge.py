@@ -45,7 +45,14 @@ def test_board_to_cozy_matches_fen_roundtrip(fen):
 
 def test_board_to_cozy_matches_fen_roundtrip_on_random_games():
     for board in _random_boards():
-        assert board_to_cozy(board).fen() == cc.Board.from_fen(board.fen()).fen()
+        # en_passant="fen": raw/unconditional ep serialization, matching both
+        # cozy's own native fen() convention and board_to_cozy's conversion
+        # (which preserves ep_square regardless of a legal/pseudo-legal
+        # capturer existing -- see board_to_cozy's docstring comment).
+        assert (
+            board_to_cozy(board).fen()
+            == cc.Board.from_fen(board.fen(en_passant="fen")).fen()
+        )
 
 
 def test_move_translation_roundtrips_all_legal_moves():

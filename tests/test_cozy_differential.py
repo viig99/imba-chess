@@ -109,6 +109,40 @@ def test_terminal_value_fast_curated_insufficient_material():
     assert terminal_value_fast(board_to_cozy(board), board, chess.WHITE) == expected
 
 
+def test_encode_cozy_matches_encode_on_conversions_and_played_lines():
+    import random
+
+    from imba_chess.data.board_state import BoardStateEncoder
+    from imba_chess.data.models import BoardTokenConfig
+
+    for mode in ("legal", "fen", "xfen"):
+        enc = BoardStateEncoder(BoardTokenConfig(en_passant=mode))
+        # Conversion equivalence on edge FENs + random boards
+        for board in [chess.Board(f) for f in EDGE_FENS] + _random_boards(30, seed=21):
+            assert vars(enc.encode(board)) == vars(enc.encode_cozy(board_to_cozy(board))), (
+                mode,
+                board.fen(),
+            )
+        # Played-line equivalence: cozy board reached via play(), NOT conversion —
+        # catches ep-semantics drift (cozy reports the ep file even with no capturer).
+        rng = random.Random(31)
+        for _ in range(40):
+            pyb = chess.Board()
+            cb = board_to_cozy(pyb)
+            for _ in range(rng.randrange(10, 80)):
+                moves = list(pyb.legal_moves)
+                if not moves:
+                    break
+                mv = rng.choice(moves)
+                cb2 = __import__("copy").copy(cb)
+                cb2.play(py_move_to_cozy(pyb, mv))
+                pyb.push(mv)
+                cb = cb2
+                assert vars(enc.encode(pyb)) == vars(enc.encode_cozy(cb)), (mode, pyb.fen())
+                if pyb.is_game_over():
+                    break
+
+
 def test_search_dual_boards_stay_in_sync(monkeypatch):
     """Enable the opt-in _dual_push verification and run a real search: every
     tree edge must keep the python-chess/cozy-chess board pair in sync.
