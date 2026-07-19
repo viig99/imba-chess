@@ -184,6 +184,14 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--games", type=int, default=8)
     parser.add_argument("--stockfish-elo", type=int, default=2200)
     parser.add_argument("--output-json", type=Path, required=True)
+    parser.add_argument(
+        "--compile",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="Override the config's eval compile setting. Pass --no-compile to "
+        "match production eval runs (the nightly always does: the compiled "
+        "eval decode path has a known pre-existing Inductor crash).",
+    )
     return parser.parse_args()
 
 
@@ -343,7 +351,9 @@ def main() -> None:
         repo_config=repo_config,
         move_vocab=move_vocab,
         device=device,
-        compile_model=bool(eval_cfg.compile),
+        compile_model=bool(
+            eval_cfg.compile if args.compile is None else args.compile
+        ),
         require_value_head=model_move_policy
         in {"value_rerank", "value_search_d2", "value_search_halving"},
     )
