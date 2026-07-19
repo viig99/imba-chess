@@ -25,6 +25,11 @@
 # same policy from colliding with (and being skipped in favor of) an earlier run.
 set -euo pipefail
 
+# CONFIG passthrough (2026-07-19): the eval script defaults to config/imba_chess.toml;
+# both tomls now carry the node-limited fp32 actor-mode protocol, but always pass
+# CONFIG explicitly for non-default setups.
+CONFIG="${CONFIG:-config/imba_chess.toml}"
+
 CHECKPOINT_DIR="${CHECKPOINT_DIR:-artifacts/checkpoints}"
 OUT_DIR="${OUT_DIR:-artifacts/eval}"
 ELO="${ELO:-1400}"
@@ -52,6 +57,7 @@ for policy in ${POLICIES}; do
     fi
     echo "== ${policy} =="
     python scripts/eval_vs_stockfish.py \
+        --config "${CONFIG}" \
         --checkpoint "${best}" \
         --no-compile \
         --model-move-policy "${policy}" \
