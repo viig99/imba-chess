@@ -358,6 +358,19 @@ def main() -> None:
         in {"value_rerank", "value_search_d2", "value_search_halving"},
     )
 
+    if eval_cfg.stockfish_nodes is not None:
+        # Calibration measures nodes-per-move under a WALL-CLOCK budget; it is
+        # meaningless against a config that already node-limits Stockfish (the
+        # config's stockfish_time_sec is then only a non-binding safety
+        # ceiling, e.g. 5.0s -- 100x the intended per-move budget). Fail loud
+        # per repo policy: recalibrate against a frozen time-based config.
+        raise ValueError(
+            "Config sets stockfish_nodes="
+            f"{eval_cfg.stockfish_nodes} -- calibration needs a TIME-based "
+            "config (stockfish_nodes unset, stockfish_time_sec = the real "
+            "per-move budget). Point --config at a frozen time-based config "
+            "to recalibrate."
+        )
     engine_limit = chess.engine.Limit(time=float(eval_cfg.stockfish_time_sec))
     stockfish_options = {
         "Threads": int(eval_cfg.stockfish_threads),
