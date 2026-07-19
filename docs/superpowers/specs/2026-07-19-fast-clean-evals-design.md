@@ -143,3 +143,30 @@ Design sketch (supersedes the earlier async-SF-overlap idea — it subsumes it):
 Acceptance for the follow-up when built: perf (200 games well under 30 min
 at G=8 local) AND accuracy (move-probe identity at fp32 vs the single-process
 driver; anchor-band score agreement).
+
+## Results (2026-07-19)
+
+- Calibration: 416 SF2200 moves at 0.05s idle → median 39,700 nodes →
+  adopted `stockfish_nodes = 40000` (time 5.0s kept as a non-binding safety
+  ceiling).
+- Gates: G=1 structural smoke PASS; G=8 node-limited fp32 smoke PASS (8
+  games / 81s at budget 512); move-probe 98/98 identical vs the
+  single-process baseline.
+- **Anchor A** (node-limited, fp32, G=8, plies=1): **0.5325** @ 200 games —
+  within 0.005 of the time-based clean anchor (0.5275): calibration gate
+  decisively passed.
+- **Anchor B** (same, plies=0): **0.5775** @ 200 games (92W/47D/61L; White
+  0.560 / Black 0.518 — the as-White handicap from the random first ply is
+  gone). +0.045 over plies=1 → **opening_random_plies = 0 adopted** for
+  Elo-limited segments (knob retained for full-strength/deterministic
+  segments, documented in config).
+- **Diversity probe** (20 games, plies=0, full traces): **20/20 unique game
+  signatures**, mean pairwise common prefix 0.8 own-moves (max 11) — SF's
+  Elo-randomization diversifies from the first replies; plies=0 samples are
+  statistically independent.
+- **New official baseline for checkpoint_23 @ SF2200, 2048/d8, node-limited
+  fp32 protocol: 0.5775 ± 0.035 (SE).** Historical time-based 0.595 is
+  retired as load-confounded; all Phase-1b deltas measure against this.
+- Throughput: ~66 min / 200 games at G=8 (~1.35x vs sequential; thin merges
+  + kind-barrier + serial-Python floor analyzed in the follow-up sketch —
+  the multiprocess eval actors project is the designated fix).

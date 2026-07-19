@@ -115,7 +115,7 @@ halving_rounds = 0
 search_refutation_top_r = 2
 search_expand_top = 3
 search_max_depth = 8
-opening_random_plies = 1
+opening_random_plies = 0  # adopted 2026-07-19: +0.045 vs plies=1 (random first ply was a handicap); diversity verified 20/20 unique at SF2200 Elo-randomization. Keep >=1 for FULL-STRENGTH (deterministic) SF segments.
 debug_trace_games = 3
 debug_trace_max_plies = 80
 debug_topk = 5
