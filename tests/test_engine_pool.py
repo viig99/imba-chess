@@ -103,6 +103,60 @@ def test_engine_pool_close_quits_all_even_when_one_quit_raises_then_reraises_fir
     assert e2.quit_calls == 1
 
 
+def test_acquire_returns_distinct_slots_and_release_frees_for_reuse():
+    engines = [_FakeEngine() for _ in range(3)]
+    it = iter(engines)
+    pool = EnginePool(spawn=lambda: next(it), size=3)
+
+    slot0, engine0 = pool.acquire()
+    slot1, engine1 = pool.acquire()
+    slot2, engine2 = pool.acquire()
+
+    # Every concurrently-checked-out acquire() gets a distinct slot/engine.
+    assert {slot0, slot1, slot2} == {0, 1, 2}
+    assert {id(engine0), id(engine1), id(engine2)} == {id(e) for e in engines}
+
+    # Once released, a slot's engine is available again -- same physical
+    # engine object, not a new one (EnginePool never respawns).
+    pool.release(slot1)
+    slot_reused, engine_reused = pool.acquire()
+    assert slot_reused == slot1
+    assert engine_reused is engine1
+
+
+def test_acquire_raises_when_pool_exhausted():
+    pool = EnginePool(spawn=lambda: _FakeEngine(), size=2)
+    pool.acquire()
+    pool.acquire()
+
+    with pytest.raises(RuntimeError, match="no free engine slot"):
+        pool.acquire()
+
+
+def test_acquire_release_never_double_checks_out_under_variable_durations():
+    # Regression for the exact bug a static `game_idx % size` round robin
+    # hits: acquire/release must stay correct even when "games" (here,
+    # acquire/release calls interleaved in an order that does NOT match
+    # acquire order) finish in a different order than they started --
+    # e.g. slot 0 stays checked out for a long time while slots 1 and 2
+    # cycle through several short "games" -- no two simultaneously-held
+    # slots may ever collide.
+    pool = EnginePool(spawn=lambda: _FakeEngine(), size=2)
+
+    slot_a, engine_a = pool.acquire()  # long-running "game"
+    slot_b, engine_b = pool.acquire()  # short "game" 1
+    assert {slot_a, slot_b} == {0, 1}
+    pool.release(slot_b)
+
+    slot_c, engine_c = pool.acquire()  # short "game" 2 -- must reuse slot_b's index
+    assert slot_c == slot_b
+    assert engine_c is engine_b
+    # The long-running game's slot/engine must be untouched throughout.
+    assert pool.engine_for_slot(slot_a) is engine_a
+    pool.release(slot_c)
+    pool.release(slot_a)
+
+
 # ---------------------------------------------------------------------------
 # make_sf_move_executor
 # ---------------------------------------------------------------------------

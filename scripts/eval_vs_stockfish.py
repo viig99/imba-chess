@@ -3,10 +3,13 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import random
+import sys
+import traceback
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, Generator, Iterator
 
 import chess
 import chess.engine
@@ -16,7 +19,14 @@ import torch
 from imba_chess.config import DEFAULT_CONFIG_PATH, load_repo_config
 from imba_chess.data.board_state import BoardStateEncoder
 from imba_chess.data.move_vocab import MoveVocab, load_or_create_static_move_vocab
+from imba_chess.eval import search
+from imba_chess.eval.batch_scheduler import BatchScheduler, WorkRequest
+from imba_chess.eval.engine_pool import EnginePool, make_sf_move_executor
 from imba_chess.eval.game_animation import render_game_html
+from imba_chess.eval.merged_executors import (
+    _make_decode_wave_executor,
+    _make_root_eval_executor,
+)
 from imba_chess.eval.position_evaluator import (
     CachedPositionEvaluator,
     _SequenceHistory,
@@ -26,6 +36,7 @@ from imba_chess.eval.position_evaluator import (
     load_hstu_checkpoint,
 )
 from imba_chess.eval.search import (
+    EvalRequest,
     HalvingConfig,
     PositionEval,
     select_greedy,
@@ -205,6 +216,17 @@ def _parse_args() -> argparse.Namespace:
         help="Directory to write saved game PGN/HTML files into.",
     )
     parser.add_argument("--output-json", type=Path, default=None)
+    parser.add_argument(
+        "--concurrent-games",
+        type=int,
+        default=None,
+        help="Run this many game coroutines concurrently per segment via the "
+        "batch scheduler, merging their root-eval/search decode waves and "
+        "sf_move engine calls into shared calls each tick, with one "
+        "Stockfish engine process per concurrent slot. Default 1 (a value "
+        "of 1 merges nothing per tick: byte-identical single-item executor "
+        "calls to the pre-scheduler sequential driver).",
+    )
     return parser.parse_args()
 
 
@@ -337,6 +359,175 @@ def _select_model_move(
             legal_moves=legal_moves_with_ids,
             legal_log_priors=legal_log_priors,
             config=halving_config,
+        )
+    else:
+        raise ValueError(f"Unknown model move policy: {policy}")
+    debug: dict[str, Any] = {
+        "total_legal_moves": total_legal,
+        "mapped_legal_moves": mapped_legal,
+        "coverage": (mapped_legal / total_legal) if total_legal > 0 else float("nan"),
+        "policy": policy,
+    }
+    if policy == "value_rerank":
+        debug["value_rerank_top_k"] = int(min(int(value_rerank_top_k), mapped_legal))
+        debug["value_rerank_lambda"] = float(value_rerank_lambda)
+        debug["value_rerank_candidates"] = rerank_rows
+    if policy == "value_search_d2":
+        debug["value_rerank_top_k"] = int(min(int(value_rerank_top_k), mapped_legal))
+        debug["value_rerank_lambda"] = float(value_rerank_lambda)
+        debug["value_search_d2_candidates"] = search_rows
+    if policy == "value_search_halving":
+        debug["search_budget"] = int(halving_config.budget)
+        debug["value_search_halving_candidates"] = halving_rows
+    if debug_topk > 0:
+        k = min(int(debug_topk), mapped_legal)
+        top_values, top_indices = torch.topk(legal_logits, k=k, largest=True)
+        debug["topk_legal"] = [
+            {
+                "move_uci": legal_moves_with_ids[int(local_idx)].uci(),
+                "logit": float(value.item()),
+            }
+            for value, local_idx in zip(top_values, top_indices)
+        ]
+    return legal_moves_with_ids[chosen_index], debug
+
+
+def _drive_stepwise_as_decode_waves(
+    gen: Generator[EvalRequest, list[PositionEval], Any],
+    evaluator: CachedPositionEvaluator,
+) -> Generator[WorkRequest, Any, Any]:
+    """Pump a `*_stepwise` search generator to completion, forwarding every
+    `EvalRequest` it yields as `WorkRequest("decode_wave", (evaluator,
+    batch))` for the batch scheduler to answer.
+
+    `search._rerank_stepwise` / `search._d2_stepwise` / `search.
+    _halving_stepwise` all share this same `EvalRequest` yield contract (via
+    `search._expand_root_candidates_stepwise`), so one driver here handles
+    all three policies. Mirrors `scripts/generate_search_rollouts.py`'s
+    `_generate_rollout_row` driving pattern for `_halving_stepwise`
+    (duplicated rather than imported from there: that script's version is
+    fused with its own `_TimingStats` bookkeeping via `_timed_advance`,
+    which this eval driver has no equivalent of).
+    """
+    try:
+        request = next(gen)
+        while True:
+            position_evals = yield WorkRequest("decode_wave", (evaluator, request.batch))
+            request = gen.send(position_evals)
+    except StopIteration as stop:
+        return stop.value
+
+
+def _select_model_move_stepwise(
+    *,
+    model: torch.nn.Module,
+    batch: dict[str, Any],
+    board: chess.Board,
+    move_vocab: MoveVocab,
+    board_state_encoder: BoardStateEncoder,
+    device: torch.device,
+    dtype: torch.dtype,
+    policy: str,
+    value_rerank_top_k: int,
+    value_rerank_lambda: float,
+    debug_topk: int = 0,
+    halving_config: HalvingConfig | None = None,
+) -> Generator[WorkRequest, Any, tuple[chess.Move, dict[str, Any]]]:
+    """Scheduler-driven twin of `_select_model_move`: yields
+    `WorkRequest("root_eval", batch)` for the root forward instead of
+    calling `_forward_model` synchronously -- the payload is the bare
+    `batch` dict, the same contract `generate_search_rollouts.py`'s
+    `_generate_rollout_row` uses, answered by the shared
+    `_make_root_eval_executor` (which always requests `return_kv=True`,
+    unlike `_select_model_move`'s policy-conditional `return_kv=policy !=
+    "greedy"` -- a harmless compute-only difference for `greedy`: kv_caches
+    get computed but are never consulted, since `greedy` never builds an
+    evaluator or issues a decode wave).
+
+    For any non-greedy policy this then drives that policy's `*_stepwise`
+    generator core via `_drive_stepwise_as_decode_waves`, forwarding every
+    `EvalRequest` as `WorkRequest("decode_wave", ...)`. All three non-greedy
+    policies route through their `*_stepwise` core exactly as
+    `_select_model_move` routes through their synchronous `select_*`
+    wrapper -- same if/elif dispatch, same requires-value-head guards, same
+    debug-dict shape.
+    """
+    output = yield WorkRequest("root_eval", batch)
+
+    logits = output["logits"][-1]
+    legal_logits, legal_moves_with_ids, total_legal, mapped_legal = _project_legal_logits(
+        logits=logits,
+        board=board,
+        move_vocab=move_vocab,
+    )
+    legal_log_priors = torch.log_softmax(legal_logits.float(), dim=0).tolist()
+    evaluator: CachedPositionEvaluator | None = None
+    if policy != "greedy":
+        evaluator = CachedPositionEvaluator(
+            model=model,
+            move_vocab=move_vocab,
+            board_state_encoder=board_state_encoder,
+            device=device,
+            dtype=dtype,
+            prefix_kv=output["kv_caches"],
+            prefix_len=int(batch["total_tokens"]),
+        )
+    rerank_rows: list[dict[str, Any]] = []
+    search_rows: list[dict[str, Any]] = []
+    halving_rows: list[dict[str, Any]] = []
+    if policy == "greedy":
+        chosen_index = select_greedy(legal_log_priors)
+    elif policy == "value_rerank":
+        if output.get("value_logits") is None:
+            raise RuntimeError(
+                "model_move_policy=value_rerank requires a checkpoint with value head enabled."
+            )
+        chosen_index, rerank_rows = yield from _drive_stepwise_as_decode_waves(
+            search._rerank_stepwise(
+                extend=evaluator.extend,
+                root_handle=None,
+                board=board,
+                legal_moves=legal_moves_with_ids,
+                legal_log_priors=legal_log_priors,
+                top_k=value_rerank_top_k,
+                lam=value_rerank_lambda,
+            ),
+            evaluator,
+        )
+    elif policy == "value_search_d2":
+        if output.get("value_logits") is None:
+            raise RuntimeError(
+                "model_move_policy=value_search_d2 requires a checkpoint with value head enabled."
+            )
+        chosen_index, search_rows = yield from _drive_stepwise_as_decode_waves(
+            search._d2_stepwise(
+                extend=evaluator.extend,
+                root_handle=None,
+                board=board,
+                legal_moves=legal_moves_with_ids,
+                legal_log_priors=legal_log_priors,
+                top_k=value_rerank_top_k,
+                lam=value_rerank_lambda,
+            ),
+            evaluator,
+        )
+    elif policy == "value_search_halving":
+        if output.get("value_logits") is None:
+            raise RuntimeError(
+                "model_move_policy=value_search_halving requires a checkpoint with value head enabled."
+            )
+        if halving_config is None:
+            raise ValueError("policy=value_search_halving requires halving_config")
+        chosen_index, halving_rows = yield from _drive_stepwise_as_decode_waves(
+            search._halving_stepwise(
+                extend=evaluator.extend,
+                root_handle=None,
+                board=board,
+                legal_moves=legal_moves_with_ids,
+                legal_log_priors=legal_log_priors,
+                config=halving_config,
+            ),
+            evaluator,
         )
     else:
         raise ValueError(f"Unknown model move policy: {policy}")
@@ -656,9 +847,216 @@ def _build_segment_specs(args: argparse.Namespace) -> list[SegmentSpec]:
     return specs
 
 
+def _play_game(
+    *,
+    game_idx: int,
+    engine: Any,
+    segment_name: str,
+    model: torch.nn.Module,
+    move_vocab: MoveVocab,
+    board_state_encoder: BoardStateEncoder,
+    max_plies: int,
+    engine_limit: chess.engine.Limit,
+    device: torch.device,
+    dtype: torch.dtype,
+    model_move_policy: str,
+    value_rerank_top_k: int,
+    value_rerank_lambda: float,
+    opening_random_plies: int,
+    debug_trace_games: int,
+    debug_trace_max_plies: int,
+    debug_topk: int,
+    stockfish_label: str,
+    save_games_dir: Path | None,
+    halving_config: "HalvingConfig | None" = None,
+) -> Generator[WorkRequest, Any, EvalSummary]:
+    """One game's coroutine core: the `BatchScheduler` game-factory contract.
+
+    Mirrors today's (pre-scheduler) `_run_segment` inner loop body exactly,
+    except its two model-call sites and its one engine-call site are now
+    `yield WorkRequest(...)` instead of synchronous calls, so
+    `BatchScheduler` can merge them across concurrently-live games:
+      - model turn: `yield from _select_model_move_stepwise(...)`, which
+        itself yields `WorkRequest("root_eval", ...)` then, for non-greedy
+        policies, `WorkRequest("decode_wave", ...)` per search wave.
+      - engine turn: `yield WorkRequest("sf_move", (engine, board.copy(),
+        engine_limit))` -- `board.copy()` so the engine thread (sf_move
+        payloads fan out over a `ThreadPoolExecutor`, see `engine_pool.
+        make_sf_move_executor`) never touches the live game board this
+        coroutine keeps mutating across ticks.
+
+    Opening-random plies, summary-fragment bookkeeping, debug traces, and
+    the `save_games` hook are otherwise untouched from today's inline logic
+    -- they need no yield, so they stay plain synchronous code between
+    yields exactly as before.
+
+    `engine` is this game's checked-out slot engine (see
+    `EnginePool.acquire`/`_release_engine_on_finish`): reused as-is for
+    every engine turn in this one game, matching today's one-engine-for-
+    all-games-in-a-segment behavior generalized to one-engine-per-
+    concurrent-slot.
+
+    Returns (via `StopIteration.value`) a per-game `EvalSummary` fragment
+    (`games == 1` once `_update_summary` runs below) -- `_run_segment`'s
+    `on_game_done` folds it into the running segment total via
+    `_accumulate_summary`, in the scheduler's stream order.
+    """
+    summary = EvalSummary()
+    board = chess.Board()
+    history = _SequenceHistory(
+        move_vocab=move_vocab,
+        board_state_encoder=board_state_encoder,
+    )
+    model_color = chess.WHITE if (game_idx % 2 == 0) else chess.BLACK
+    completed = True
+    plies = 0
+
+    while not board.is_game_over(claim_draw=True):
+        if plies >= max_plies:
+            completed = False
+            break
+        if plies < opening_random_plies:
+            legal = list(board.legal_moves)
+            if not legal:
+                break
+            move = random.choice(legal)
+            if game_idx < debug_trace_games and plies < debug_trace_max_plies:
+                turn = "W" if board.turn == chess.WHITE else "B"
+                tqdm.write(
+                    f"[debug][{segment_name}] game={game_idx + 1} ply={plies + 1} turn={turn} "
+                    f"opening_random selected={move.uci()}"
+                )
+        elif board.turn == model_color:
+            batch = history.build_batch_for_current_position(board)
+            move, debug_info = yield from _select_model_move_stepwise(
+                model=model,
+                batch=batch,
+                board=board,
+                move_vocab=move_vocab,
+                board_state_encoder=board_state_encoder,
+                device=device,
+                dtype=dtype,
+                policy=model_move_policy,
+                value_rerank_top_k=value_rerank_top_k,
+                value_rerank_lambda=value_rerank_lambda,
+                debug_topk=debug_topk,
+                halving_config=halving_config,
+            )
+            summary.model_turns += 1
+            summary.legal_moves_total += int(debug_info["total_legal_moves"])
+            summary.legal_moves_mapped_total += int(
+                debug_info["mapped_legal_moves"]
+            )
+            if int(debug_info["mapped_legal_moves"]) == 0:
+                summary.turns_with_no_vocab_legal_move += 1
+            if (
+                game_idx < debug_trace_games
+                and plies < debug_trace_max_plies
+            ):
+                turn = "W" if board.turn == chess.WHITE else "B"
+                coverage = float(debug_info["coverage"])
+                tqdm.write(
+                    f"[debug][{segment_name}] game={game_idx + 1} ply={plies + 1} turn={turn} "
+                    f"coverage={coverage:.3f} selected={move.uci()}"
+                )
+                topk = debug_info.get("topk_legal")
+                if isinstance(topk, list) and topk:
+                    topk_str = ", ".join(
+                        f"{entry['move_uci']}:{entry['logit']:.3f}"
+                        for entry in topk
+                    )
+                    tqdm.write(f"[debug][{segment_name}]   topk={topk_str}")
+                rerank_rows = debug_info.get("value_rerank_candidates")
+                if isinstance(rerank_rows, list) and rerank_rows:
+                    rerank_str = ", ".join(
+                        f"{entry['move_uci']}:logit={entry['policy_logit']:.3f}|"
+                        f"v_next={entry['value_next']:.3f}|score={entry['rerank_score']:.3f}"
+                        for entry in rerank_rows
+                    )
+                    tqdm.write(
+                        f"[debug][{segment_name}]   value_rerank={rerank_str}"
+                    )
+                search_rows = debug_info.get("value_search_d2_candidates")
+                if isinstance(search_rows, list) and search_rows:
+                    search_str = ", ".join(
+                        f"{entry['move_uci']}:logit={entry['policy_logit']:.3f}|"
+                        f"worst_reply={entry['worst_reply_value']:.3f}|"
+                        f"best_reply={entry['best_reply_uci']}|score={entry['search_score']:.3f}"
+                        for entry in search_rows
+                    )
+                    tqdm.write(
+                        f"[debug][{segment_name}]   value_search_d2={search_str}"
+                    )
+                halving_rows = debug_info.get("value_search_halving_candidates")
+                if isinstance(halving_rows, list) and halving_rows:
+                    halving_str = ", ".join(
+                        f"{entry['move_uci']}:evals={entry['evals_spent']}"
+                        f"|backed={entry['backed_value']}"
+                        f"|score={entry['search_score']}"
+                        f"|out_r={entry['eliminated_round']}"
+                        for entry in halving_rows
+                    )
+                    tqdm.write(
+                        f"[debug][{segment_name}]   value_search_halving={halving_str}"
+                    )
+        else:
+            result = yield WorkRequest("sf_move", (engine, board.copy(), engine_limit))
+            if result.move is None:
+                raise RuntimeError("Stockfish returned no move.")
+            move = result.move
+
+        history.append_observed_position(board)
+        history.record_played_move(move.uci())
+        board.push(move)
+        plies += 1
+
+    result = board.result(claim_draw=True) if completed else "*"
+    if save_games_dir is not None and game_idx < debug_trace_games:
+        _save_traced_game(
+            board=board,
+            model_color=model_color,
+            result=result,
+            completed=completed,
+            segment_name=segment_name,
+            stockfish_label=stockfish_label,
+            game_idx=game_idx,
+            save_games_dir=save_games_dir,
+        )
+    _update_summary(
+        summary,
+        result=result,
+        model_color=model_color,
+        completed=completed,
+        plies=plies,
+    )
+    return summary
+
+
+def _release_engine_on_finish(
+    gen: Generator[WorkRequest, Any, EvalSummary], pool: EnginePool, slot_index: int
+) -> Generator[WorkRequest, Any, EvalSummary]:
+    """Wrap one game's `_play_game` coroutine so its checked-out engine slot
+    is always returned to `pool`, whether the game finishes normally or
+    raises.
+
+    A generator's `finally` block runs during a `yield from`'s exception
+    unwind, before the exception re-emerges from `next()`/`send()` on the
+    *outer* (this) generator -- so `pool.release` fires even on the
+    fail-fast path where `BatchScheduler._advance` catches the propagating
+    exception and hands it to `_run_segment`'s `on_game_error`, which
+    re-raises to kill the run: the slot is freed before that exception ever
+    reaches this function's caller.
+    """
+    try:
+        return (yield from gen)
+    finally:
+        pool.release(slot_index)
+
+
 def _run_segment(
     *,
-    engine: chess.engine.SimpleEngine,
+    stockfish_path: Path,
+    segment_options: dict[str, Any],
     segment_name: str,
     model: torch.nn.Module,
     move_vocab: MoveVocab,
@@ -677,211 +1075,204 @@ def _run_segment(
     debug_topk: int,
     stockfish_label: str,
     save_games_dir: Path | None,
+    concurrent_games: int,
     halving_config: "HalvingConfig | None" = None,
 ) -> EvalSummary:
+    """Run one segment's `games` games through `BatchScheduler`, for any
+    `concurrent_games >= 1`.
+
+    Owns one `EnginePool` of `concurrent_games` Stockfish processes, spawned
+    fresh for this segment (each configured with `segment_options` at spawn
+    time, matching today's per-segment `engine.configure(...)` call
+    generalized to every pool engine) and closed when the segment ends --
+    see the module docstring / task report for why this replaces the old
+    single-engine-reused-and-reconfigured-across-segments lifecycle.
+
+    Engine-to-game assignment goes through `EnginePool.acquire`/`release`
+    (checked out exactly when the scheduler admits a game into a live slot,
+    released exactly when that game's coroutine finishes or raises) rather
+    than a static `game_idx % concurrent_games` round robin: games can take
+    wildly different numbers of plies, so a static round robin can hand two
+    *simultaneously live* games the same physical engine the moment their
+    durations diverge -- corrupting that engine's UCI session and racing its
+    `play()` calls across two `ThreadPoolExecutor` workers in the same tick.
+    Checkout/return brackets each game's actual live-slot lifetime instead,
+    which is race-free by construction regardless of game-length variance.
+
+    At `concurrent_games=1` the scheduler never holds more than one game
+    live at a time (`_fill_slots` only admits a new game once the current
+    one's slot frees), so every root_eval/decode_wave/sf_move executor call
+    carries exactly one payload -- the same single-item call sequence
+    `_select_model_move`/`engine.play()` made directly, pre-scheduler.
+    """
     summary = EvalSummary()
-    with tqdm(
-        total=games,
-        desc=f"stockfish-eval[{segment_name}]",
-        unit="game",
-        dynamic_ncols=True,
-    ) as progress:
-        for game_idx in range(games):
-            board = chess.Board()
-            history = _SequenceHistory(
-                move_vocab=move_vocab,
-                board_state_encoder=board_state_encoder,
-            )
-            model_color = chess.WHITE if (game_idx % 2 == 0) else chess.BLACK
-            completed = True
-            plies = 0
 
-            while not board.is_game_over(claim_draw=True):
-                if plies >= max_plies:
-                    completed = False
-                    break
-                if plies < opening_random_plies:
-                    legal = list(board.legal_moves)
-                    if not legal:
-                        break
-                    move = random.choice(legal)
-                    if game_idx < debug_trace_games and plies < debug_trace_max_plies:
-                        turn = "W" if board.turn == chess.WHITE else "B"
-                        tqdm.write(
-                            f"[debug][{segment_name}] game={game_idx + 1} ply={plies + 1} turn={turn} "
-                            f"opening_random selected={move.uci()}"
-                        )
-                elif board.turn == model_color:
-                    batch = history.build_batch_for_current_position(board)
-                    move, debug_info = _select_model_move(
-                        model=model,
-                        batch=batch,
-                        board=board,
-                        move_vocab=move_vocab,
-                        board_state_encoder=board_state_encoder,
-                        device=device,
-                        dtype=dtype,
-                        policy=model_move_policy,
-                        value_rerank_top_k=value_rerank_top_k,
-                        value_rerank_lambda=value_rerank_lambda,
-                        debug_topk=debug_topk,
-                        halving_config=halving_config,
-                    )
-                    summary.model_turns += 1
-                    summary.legal_moves_total += int(debug_info["total_legal_moves"])
-                    summary.legal_moves_mapped_total += int(
-                        debug_info["mapped_legal_moves"]
-                    )
-                    if int(debug_info["mapped_legal_moves"]) == 0:
-                        summary.turns_with_no_vocab_legal_move += 1
-                    if (
-                        game_idx < debug_trace_games
-                        and plies < debug_trace_max_plies
-                    ):
-                        turn = "W" if board.turn == chess.WHITE else "B"
-                        coverage = float(debug_info["coverage"])
-                        tqdm.write(
-                            f"[debug][{segment_name}] game={game_idx + 1} ply={plies + 1} turn={turn} "
-                            f"coverage={coverage:.3f} selected={move.uci()}"
-                        )
-                        topk = debug_info.get("topk_legal")
-                        if isinstance(topk, list) and topk:
-                            topk_str = ", ".join(
-                                f"{entry['move_uci']}:{entry['logit']:.3f}"
-                                for entry in topk
-                            )
-                            tqdm.write(f"[debug][{segment_name}]   topk={topk_str}")
-                        rerank_rows = debug_info.get("value_rerank_candidates")
-                        if isinstance(rerank_rows, list) and rerank_rows:
-                            rerank_str = ", ".join(
-                                f"{entry['move_uci']}:logit={entry['policy_logit']:.3f}|"
-                                f"v_next={entry['value_next']:.3f}|score={entry['rerank_score']:.3f}"
-                                for entry in rerank_rows
-                            )
-                            tqdm.write(
-                                f"[debug][{segment_name}]   value_rerank={rerank_str}"
-                            )
-                        search_rows = debug_info.get("value_search_d2_candidates")
-                        if isinstance(search_rows, list) and search_rows:
-                            search_str = ", ".join(
-                                f"{entry['move_uci']}:logit={entry['policy_logit']:.3f}|"
-                                f"worst_reply={entry['worst_reply_value']:.3f}|"
-                                f"best_reply={entry['best_reply_uci']}|score={entry['search_score']:.3f}"
-                                for entry in search_rows
-                            )
-                            tqdm.write(
-                                f"[debug][{segment_name}]   value_search_d2={search_str}"
-                            )
-                        halving_rows = debug_info.get("value_search_halving_candidates")
-                        if isinstance(halving_rows, list) and halving_rows:
-                            halving_str = ", ".join(
-                                f"{entry['move_uci']}:evals={entry['evals_spent']}"
-                                f"|backed={entry['backed_value']}"
-                                f"|score={entry['search_score']}"
-                                f"|out_r={entry['eliminated_round']}"
-                                for entry in halving_rows
-                            )
-                            tqdm.write(
-                                f"[debug][{segment_name}]   value_search_halving={halving_str}"
-                            )
-                else:
-                    result = engine.play(board, engine_limit)
-                    if result.move is None:
-                        raise RuntimeError("Stockfish returned no move.")
-                    move = result.move
+    def _spawn_engine() -> chess.engine.SimpleEngine:
+        spawned = chess.engine.SimpleEngine.popen_uci(str(stockfish_path))
+        spawned.configure(segment_options)
+        return spawned
 
-                history.append_observed_position(board)
-                history.record_played_move(move.uci())
-                board.push(move)
-                plies += 1
-
-            result = board.result(claim_draw=True) if completed else "*"
-            if save_games_dir is not None and game_idx < debug_trace_games:
-                _save_traced_game(
-                    board=board,
-                    model_color=model_color,
-                    result=result,
-                    completed=completed,
-                    segment_name=segment_name,
-                    stockfish_label=stockfish_label,
+    pool = EnginePool(spawn=_spawn_engine, size=concurrent_games)
+    try:
+        def _game_factory() -> Iterator[tuple[str, Any]]:
+            for game_idx in range(games):
+                slot_index, slot_engine = pool.acquire()
+                gen = _play_game(
                     game_idx=game_idx,
+                    engine=slot_engine,
+                    segment_name=segment_name,
+                    model=model,
+                    move_vocab=move_vocab,
+                    board_state_encoder=board_state_encoder,
+                    max_plies=max_plies,
+                    engine_limit=engine_limit,
+                    device=device,
+                    dtype=dtype,
+                    model_move_policy=model_move_policy,
+                    value_rerank_top_k=value_rerank_top_k,
+                    value_rerank_lambda=value_rerank_lambda,
+                    opening_random_plies=opening_random_plies,
+                    debug_trace_games=debug_trace_games,
+                    debug_trace_max_plies=debug_trace_max_plies,
+                    debug_topk=debug_topk,
+                    stockfish_label=stockfish_label,
                     save_games_dir=save_games_dir,
+                    halving_config=halving_config,
                 )
-            _update_summary(
-                summary,
-                result=result,
-                model_color=model_color,
-                completed=completed,
-                plies=plies,
-            )
+                yield (
+                    f"{segment_name}-game{game_idx}",
+                    _release_engine_on_finish(gen, pool, slot_index),
+                )
 
-            progress.update(1)
-            white_completed = (
-                summary.wins_as_white + summary.draws_as_white + summary.losses_as_white
+        with tqdm(
+            total=games,
+            desc=f"stockfish-eval[{segment_name}]",
+            unit="game",
+            dynamic_ncols=True,
+        ) as progress:
+
+            def _on_game_done(game_id: str, rows: EvalSummary | None) -> None:
+                # rows is never None here: _on_game_error below always
+                # re-raises rather than letting the scheduler continue on to
+                # report a (game_id, None) completion for a failed game.
+                assert rows is not None
+                _accumulate_summary(summary, rows)
+
+                progress.update(1)
+                white_completed = (
+                    summary.wins_as_white
+                    + summary.draws_as_white
+                    + summary.losses_as_white
+                )
+                black_completed = (
+                    summary.wins_as_black
+                    + summary.draws_as_black
+                    + summary.losses_as_black
+                )
+                white_score = (
+                    (summary.wins_as_white + 0.5 * summary.draws_as_white)
+                    / white_completed
+                    if white_completed > 0
+                    else float("nan")
+                )
+                black_score = (
+                    (summary.wins_as_black + 0.5 * summary.draws_as_black)
+                    / black_completed
+                    if black_completed > 0
+                    else float("nan")
+                )
+                live_coverage = (
+                    summary.legal_moves_mapped_total / summary.legal_moves_total
+                    if summary.legal_moves_total > 0
+                    else float("nan")
+                )
+                progress.set_postfix(
+                    {
+                        "W": summary.wins,
+                        "D": summary.draws,
+                        "L": summary.losses,
+                        "inc": summary.incomplete_games,
+                        "avg_plies": f"{summary.avg_plies:.1f}",
+                        "avg_moves": f"{summary.avg_full_moves:.1f}",
+                        "cov": "--"
+                        if summary.legal_moves_total == 0
+                        else f"{live_coverage:.3f}",
+                        "no_map": summary.turns_with_no_vocab_legal_move,
+                        "srW": "--"
+                        if white_completed == 0
+                        else f"{white_score:.2f}",
+                        "srB": "--"
+                        if black_completed == 0
+                        else f"{black_score:.2f}",
+                    }
+                )
+
+            def _on_game_error(game_id: str, exc: BaseException) -> None:
+                # Fail-fast policy (Task 3): unlike generate_search_rollouts.
+                # py's on_game_error (logs and skips one bad game out of a
+                # large batch-generation run), eval play has no equivalent
+                # "skip this game" semantics -- a mid-game crash means the
+                # segment's results are no longer trustworthy, so this
+                # re-raises to kill the whole run rather than silently
+                # continuing with a hole in the summary.
+                raise exc
+
+            scheduler = BatchScheduler(
+                game_factory=_game_factory(),
+                executors={
+                    "root_eval": _make_root_eval_executor(
+                        model=model, device=device, dtype=dtype, stats=None
+                    ),
+                    "decode_wave": _make_decode_wave_executor(
+                        model=model, device=device, dtype=dtype, stats=None
+                    ),
+                    "sf_move": make_sf_move_executor(pool_threads=concurrent_games),
+                },
+                concurrent_games=concurrent_games,
+                on_game_done=_on_game_done,
+                on_game_error=_on_game_error,
             )
-            black_completed = (
-                summary.wins_as_black + summary.draws_as_black + summary.losses_as_black
-            )
-            white_score = (
-                (summary.wins_as_white + 0.5 * summary.draws_as_white) / white_completed
-                if white_completed > 0
-                else float("nan")
-            )
-            black_score = (
-                (summary.wins_as_black + 0.5 * summary.draws_as_black) / black_completed
-                if black_completed > 0
-                else float("nan")
-            )
-            live_coverage = (
-                summary.legal_moves_mapped_total / summary.legal_moves_total
-                if summary.legal_moves_total > 0
-                else float("nan")
-            )
-            progress.set_postfix(
-                {
-                    "W": summary.wins,
-                    "D": summary.draws,
-                    "L": summary.losses,
-                    "inc": summary.incomplete_games,
-                    "avg_plies": f"{summary.avg_plies:.1f}",
-                    "avg_moves": f"{summary.avg_full_moves:.1f}",
-                    "cov": "--"
-                    if summary.legal_moves_total == 0
-                    else f"{live_coverage:.3f}",
-                    "no_map": summary.turns_with_no_vocab_legal_move,
-                    "srW": "--"
-                    if white_completed == 0
-                    else f"{white_score:.2f}",
-                    "srB": "--"
-                    if black_completed == 0
-                    else f"{black_score:.2f}",
-                }
-            )
+            scheduler.run()
+    finally:
+        pool.close()
+
     return summary
+
+
+def _accumulate_summary(target: EvalSummary, fragment: EvalSummary) -> None:
+    """Add `fragment`'s counters into `target` in place.
+
+    Shared by `_merge_summaries` (combining whole-segment summaries into the
+    aggregate) and `_run_segment`'s `on_game_done` (folding one game's
+    just-finished `EvalSummary` fragment into the running segment total, in
+    the scheduler's stream order) -- same field-by-field addition either
+    way, whether `fragment` covers many games or exactly one.
+    """
+    target.games += fragment.games
+    target.completed_games += fragment.completed_games
+    target.wins += fragment.wins
+    target.losses += fragment.losses
+    target.draws += fragment.draws
+    target.games_as_white += fragment.games_as_white
+    target.games_as_black += fragment.games_as_black
+    target.wins_as_white += fragment.wins_as_white
+    target.losses_as_white += fragment.losses_as_white
+    target.draws_as_white += fragment.draws_as_white
+    target.wins_as_black += fragment.wins_as_black
+    target.losses_as_black += fragment.losses_as_black
+    target.draws_as_black += fragment.draws_as_black
+    target.incomplete_games += fragment.incomplete_games
+    target.total_plies += fragment.total_plies
+    target.model_turns += fragment.model_turns
+    target.legal_moves_total += fragment.legal_moves_total
+    target.legal_moves_mapped_total += fragment.legal_moves_mapped_total
+    target.turns_with_no_vocab_legal_move += fragment.turns_with_no_vocab_legal_move
 
 
 def _merge_summaries(summaries: list[EvalSummary]) -> EvalSummary:
     merged = EvalSummary()
     for summary in summaries:
-        merged.games += summary.games
-        merged.completed_games += summary.completed_games
-        merged.wins += summary.wins
-        merged.losses += summary.losses
-        merged.draws += summary.draws
-        merged.games_as_white += summary.games_as_white
-        merged.games_as_black += summary.games_as_black
-        merged.wins_as_white += summary.wins_as_white
-        merged.losses_as_white += summary.losses_as_white
-        merged.draws_as_white += summary.draws_as_white
-        merged.wins_as_black += summary.wins_as_black
-        merged.losses_as_black += summary.losses_as_black
-        merged.draws_as_black += summary.draws_as_black
-        merged.incomplete_games += summary.incomplete_games
-        merged.total_plies += summary.total_plies
-        merged.model_turns += summary.model_turns
-        merged.legal_moves_total += summary.legal_moves_total
-        merged.legal_moves_mapped_total += summary.legal_moves_mapped_total
-        merged.turns_with_no_vocab_legal_move += summary.turns_with_no_vocab_legal_move
+        _accumulate_summary(merged, summary)
     return merged
 
 
@@ -1012,6 +1403,11 @@ def main() -> None:
         if args.save_games_dir is None
         else args.save_games_dir
     )
+    args.concurrent_games = int(
+        eval_cfg.concurrent_games
+        if args.concurrent_games is None
+        else args.concurrent_games
+    )
 
     if args.games < 1:
         raise ValueError("--games must be >= 1")
@@ -1053,6 +1449,8 @@ def main() -> None:
         raise ValueError("--search-expand-top must be >= 1")
     if args.search_max_depth < 1:
         raise ValueError("--search-max-depth must be >= 1")
+    if args.concurrent_games < 1:
+        raise ValueError("--concurrent-games must be >= 1")
     if not args.stockfish_path.exists():
         raise FileNotFoundError(f"Stockfish binary not found: {args.stockfish_path}")
 
@@ -1096,93 +1494,95 @@ def main() -> None:
         f"value_rerank_lambda={args.value_rerank_lambda}, "
         f"opening_random_plies={args.opening_random_plies}"
     )
+    print(f"  concurrent_games={args.concurrent_games}")
 
     segment_results: list[dict[str, Any]] = []
     segment_summaries: list[EvalSummary] = []
 
-    with chess.engine.SimpleEngine.popen_uci(str(args.stockfish_path)) as engine:
-        for spec in segment_specs:
-            segment_options = _build_segment_options(
-                base_threads=args.stockfish_threads,
-                base_hash_mb=args.stockfish_hash_mb,
-                spec=spec,
-            )
-            engine.configure(segment_options)
-            print(
-                f"\nRunning segment '{spec.name}' "
-                f"(games={spec.games}, options={segment_options})"
-            )
-            segment_summary = _run_segment(
-                engine=engine,
-                segment_name=spec.name,
-                model=model,
-                move_vocab=move_vocab,
-                board_state_encoder=board_state_encoder,
-                games=spec.games,
-                max_plies=args.max_plies,
-                engine_limit=engine_limit,
-                device=device,
-                dtype=dtype,
-                model_move_policy=str(args.model_move_policy),
-                value_rerank_top_k=int(args.value_rerank_top_k),
-                value_rerank_lambda=float(args.value_rerank_lambda),
-                opening_random_plies=int(args.opening_random_plies),
-                debug_trace_games=max(0, int(args.debug_trace_games)),
-                debug_trace_max_plies=max(0, int(args.debug_trace_max_plies)),
-                debug_topk=max(0, int(args.debug_topk)),
-                stockfish_label=_stockfish_label(
-                    limit_strength=bool(spec.limit_strength),
-                    elo=int(spec.elo) if spec.elo is not None else None,
-                ),
-                save_games_dir=Path(args.save_games_dir) if args.save_games else None,
-                halving_config=HalvingConfig(
-                    budget=int(args.search_budget),
-                    top_m=int(args.search_top_m),
-                    rounds=int(args.halving_rounds),
-                    refutation_top_r=int(args.search_refutation_top_r),
-                    expand_top=int(args.search_expand_top),
-                    max_depth=int(args.search_max_depth),
-                    lam=float(args.value_rerank_lambda),
-                ),
-            )
-            segment_payload = _summary_to_payload(
-                summary=segment_summary,
-                checkpoint_path=args.checkpoint,
-                stockfish_path=args.stockfish_path,
-                engine_limit=engine_limit,
-                stockfish_options=segment_options,
-                device=device,
-                dtype=dtype,
-                compile_enabled=compile_enabled,
-                seed=args.seed,
-                max_plies=args.max_plies,
-                model_move_policy=str(args.model_move_policy),
-                value_rerank_top_k=int(args.value_rerank_top_k),
-                value_rerank_lambda=float(args.value_rerank_lambda),
-                opening_random_plies=int(args.opening_random_plies),
-                search_knobs={
-                    "search_budget": int(args.search_budget),
-                    "search_top_m": int(args.search_top_m),
-                    "halving_rounds": int(args.halving_rounds),
-                    "search_refutation_top_r": int(args.search_refutation_top_r),
-                    "search_expand_top": int(args.search_expand_top),
-                    "search_max_depth": int(args.search_max_depth),
+    for spec in segment_specs:
+        segment_options = _build_segment_options(
+            base_threads=args.stockfish_threads,
+            base_hash_mb=args.stockfish_hash_mb,
+            spec=spec,
+        )
+        print(
+            f"\nRunning segment '{spec.name}' "
+            f"(games={spec.games}, options={segment_options}, "
+            f"concurrent_games={args.concurrent_games})"
+        )
+        segment_summary = _run_segment(
+            stockfish_path=args.stockfish_path,
+            segment_options=segment_options,
+            segment_name=spec.name,
+            model=model,
+            move_vocab=move_vocab,
+            board_state_encoder=board_state_encoder,
+            games=spec.games,
+            max_plies=args.max_plies,
+            engine_limit=engine_limit,
+            device=device,
+            dtype=dtype,
+            model_move_policy=str(args.model_move_policy),
+            value_rerank_top_k=int(args.value_rerank_top_k),
+            value_rerank_lambda=float(args.value_rerank_lambda),
+            opening_random_plies=int(args.opening_random_plies),
+            debug_trace_games=max(0, int(args.debug_trace_games)),
+            debug_trace_max_plies=max(0, int(args.debug_trace_max_plies)),
+            debug_topk=max(0, int(args.debug_topk)),
+            stockfish_label=_stockfish_label(
+                limit_strength=bool(spec.limit_strength),
+                elo=int(spec.elo) if spec.elo is not None else None,
+            ),
+            save_games_dir=Path(args.save_games_dir) if args.save_games else None,
+            concurrent_games=int(args.concurrent_games),
+            halving_config=HalvingConfig(
+                budget=int(args.search_budget),
+                top_m=int(args.search_top_m),
+                rounds=int(args.halving_rounds),
+                refutation_top_r=int(args.search_refutation_top_r),
+                expand_top=int(args.search_expand_top),
+                max_depth=int(args.search_max_depth),
+                lam=float(args.value_rerank_lambda),
+            ),
+        )
+        segment_payload = _summary_to_payload(
+            summary=segment_summary,
+            checkpoint_path=args.checkpoint,
+            stockfish_path=args.stockfish_path,
+            engine_limit=engine_limit,
+            stockfish_options=segment_options,
+            device=device,
+            dtype=dtype,
+            compile_enabled=compile_enabled,
+            seed=args.seed,
+            max_plies=args.max_plies,
+            model_move_policy=str(args.model_move_policy),
+            value_rerank_top_k=int(args.value_rerank_top_k),
+            value_rerank_lambda=float(args.value_rerank_lambda),
+            opening_random_plies=int(args.opening_random_plies),
+            search_knobs={
+                "search_budget": int(args.search_budget),
+                "search_top_m": int(args.search_top_m),
+                "halving_rounds": int(args.halving_rounds),
+                "search_refutation_top_r": int(args.search_refutation_top_r),
+                "search_expand_top": int(args.search_expand_top),
+                "search_max_depth": int(args.search_max_depth),
+            },
+        )
+        _print_segment_summary(segment_name=spec.name, payload=segment_payload)
+        segment_summaries.append(segment_summary)
+        segment_results.append(
+            {
+                "name": spec.name,
+                "games_requested": int(spec.games),
+                "stockfish": {
+                    "limit_strength": bool(spec.limit_strength),
+                    "elo": None if spec.elo is None else int(spec.elo),
+                    "options": segment_options,
                 },
-            )
-            _print_segment_summary(segment_name=spec.name, payload=segment_payload)
-            segment_summaries.append(segment_summary)
-            segment_results.append(
-                {
-                    "name": spec.name,
-                    "games_requested": int(spec.games),
-                    "stockfish": {
-                        "limit_strength": bool(spec.limit_strength),
-                        "elo": None if spec.elo is None else int(spec.elo),
-                        "options": segment_options,
-                    },
-                    "results": segment_payload,
-                }
-            )
+                "results": segment_payload,
+            }
+        )
 
     aggregate_summary = _merge_summaries(segment_summaries)
     aggregate_payload = _summary_to_payload(
@@ -1235,5 +1635,33 @@ def main() -> None:
         print(f"  wrote: {args.output_json}")
 
 
+def _main_with_hard_exit_on_crash() -> None:
+    """Entry-point wrapper: guarantees the process actually terminates on an
+    unhandled exception (or Ctrl-C), instead of hanging.
+
+    Duplicated from `scripts/generate_search_rollouts.py`'s wrapper of the
+    same name rather than factored into a shared helper (Task 3's brief:
+    extract only if trivial, otherwise duplicate the ~15 lines with a
+    comment -- a shared helper would need to import a script-independent
+    "hard exit" module, which is more indirection than the ~15 duplicated
+    lines below are worth) -- see that copy's docstring for the full
+    root-cause writeup (PyTorch Inductor's AsyncCompile background
+    ThreadPoolExecutor + CPython's non-daemon-thread-joining shutdown path).
+    The same fail-fast policy applies here: BatchScheduler's on_game_error
+    (Task 3, above) re-raises immediately on any per-game exception, and
+    this wrapper is what turns that re-raise into an actual process exit
+    instead of a hang.
+    """
+    try:
+        main()
+    except SystemExit:
+        raise
+    except BaseException:
+        traceback.print_exc()
+        sys.stdout.flush()
+        sys.stderr.flush()
+        os._exit(1)
+
+
 if __name__ == "__main__":
-    main()
+    _main_with_hard_exit_on_crash()

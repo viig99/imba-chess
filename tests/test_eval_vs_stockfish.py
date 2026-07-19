@@ -5,6 +5,7 @@ from pathlib import Path
 import sys
 
 import chess
+import chess.engine
 import pytest
 
 torch = pytest.importorskip("torch")
@@ -12,6 +13,7 @@ torch = pytest.importorskip("torch")
 from imba_chess.config import ModelConfig, RepoConfig
 from imba_chess.data.board_state import BoardStateEncoder
 from imba_chess.data.move_vocab import MoveVocab, MoveVocabConfig
+from imba_chess.eval.position_evaluator import _forward_model
 from imba_chess.model import HSTUChessModel, build_hstu_chess_config
 
 
@@ -573,4 +575,427 @@ def test_value_search_halving_end_to_end_picks_value_backed_move():
     assert debug["policy"] == "value_search_halving"
     rows = debug["value_search_halving_candidates"]
     assert {row["move_uci"] for row in rows} == {"e2e4", "d2d4"}
+
+
+# ---------------------------------------------------------------------------
+# Task 3: _select_model_move_stepwise / batched scheduler driver
+# ---------------------------------------------------------------------------
+#
+# Two layers of coverage below:
+#   1. Equivalence tests -- _select_model_move_stepwise, driven manually
+#      (answering root_eval via _forward_model(..., return_kv=True) and
+#      decode_wave via evaluator.evaluate(batch) directly: exactly the
+#      single-item codepath the real merged executors fall back to at
+#      len(payloads)==1) -- must select the SAME move, for EVERY policy, as
+#      the existing synchronous _select_model_move. This is the "request
+#      sequence per game must equal today's call sequence" requirement,
+#      proven per policy rather than only for one.
+#   2. A real BatchScheduler + EnginePool + _play_game integration test
+#      (fake Stockfish engine, fake root-eval model, no torch autograd
+#      surprises) covering summary aggregation, color alternation, engine
+#      reuse per slot at --concurrent-games 1 vs distinct engines at
+#      --concurrent-games 2, and fail-fast on an engine exception.
+
+
+def _drive_model_move_stepwise(gen, *, model, device, dtype):
+    """Manual next()/send() driver for _select_model_move_stepwise.
+
+    Answers WorkRequest("root_eval", batch) via _forward_model(...,
+    return_kv=True) -- the merged root_eval executor's own hardcoded
+    contract (imba_chess.eval.merged_executors._make_root_eval_executor) --
+    and WorkRequest("decode_wave", (evaluator, batch)) via evaluator.
+    evaluate(batch) directly -- the merged decode_wave executor's
+    len(payloads)==1 passthrough. This is exactly the single-game codepath
+    BatchScheduler exercises at --concurrent-games 1, without needing a real
+    BatchScheduler in these equivalence tests.
+    """
+    try:
+        request = next(gen)
+        while True:
+            if request.kind == "root_eval":
+                response = _forward_model(
+                    model=model,
+                    batch=request.payload,
+                    device=device,
+                    dtype=dtype,
+                    return_kv=True,
+                )
+            elif request.kind == "decode_wave":
+                evaluator, batch = request.payload
+                response = evaluator.evaluate(batch)
+            else:
+                raise AssertionError(f"unexpected WorkRequest kind: {request.kind!r}")
+            request = gen.send(response)
+    except StopIteration as stop:
+        return stop.value
+
+
+def test_select_model_move_stepwise_matches_sync_for_greedy():
+    module = _load_eval_script_module()
+    move_vocab = _mini_vocab()
+    history = module._SequenceHistory(
+        move_vocab=move_vocab, board_state_encoder=BoardStateEncoder()
+    )
+    board = chess.Board()
+    batch = history.build_batch_for_current_position(board)
+
+    move_sync, debug_sync = module._select_model_move(
+        model=_DummyNoValueModel(move_vocab),
+        batch=batch,
+        board=board,
+        move_vocab=move_vocab,
+        board_state_encoder=BoardStateEncoder(),
+        device=torch.device("cpu"),
+        dtype=torch.float32,
+        policy="greedy",
+        value_rerank_top_k=2,
+        value_rerank_lambda=0.2,
+        debug_topk=0,
+    )
+
+    gen = module._select_model_move_stepwise(
+        model=_DummyNoValueModel(move_vocab),
+        batch=batch,
+        board=board,
+        move_vocab=move_vocab,
+        board_state_encoder=BoardStateEncoder(),
+        device=torch.device("cpu"),
+        dtype=torch.float32,
+        policy="greedy",
+        value_rerank_top_k=2,
+        value_rerank_lambda=0.2,
+        debug_topk=0,
+    )
+    move_stepwise, debug_stepwise = _drive_model_move_stepwise(
+        gen, model=_DummyNoValueModel(move_vocab), device=torch.device("cpu"), dtype=torch.float32
+    )
+
+    assert move_stepwise.uci() == move_sync.uci() == "e2e4"
+    assert debug_stepwise["policy"] == debug_sync["policy"] == "greedy"
+
+
+def test_select_model_move_stepwise_matches_sync_for_value_rerank():
+    module = _load_eval_script_module()
+    move_vocab = _mini_vocab()
+    history = module._SequenceHistory(
+        move_vocab=move_vocab, board_state_encoder=BoardStateEncoder()
+    )
+    board = chess.Board()
+    batch = history.build_batch_for_current_position(board)
+
+    model_sync = _DummyValueRerankModel(move_vocab)
+    move_sync, debug_sync = module._select_model_move(
+        model=model_sync,
+        batch=batch,
+        board=board,
+        move_vocab=move_vocab,
+        board_state_encoder=BoardStateEncoder(),
+        device=torch.device("cpu"),
+        dtype=torch.float32,
+        policy="value_rerank",
+        value_rerank_top_k=2,
+        value_rerank_lambda=0.2,
+        debug_topk=0,
+    )
+
+    model_stepwise = _DummyValueRerankModel(move_vocab)
+    gen = module._select_model_move_stepwise(
+        model=model_stepwise,
+        batch=batch,
+        board=board,
+        move_vocab=move_vocab,
+        board_state_encoder=BoardStateEncoder(),
+        device=torch.device("cpu"),
+        dtype=torch.float32,
+        policy="value_rerank",
+        value_rerank_top_k=2,
+        value_rerank_lambda=0.2,
+        debug_topk=0,
+    )
+    move_stepwise, debug_stepwise = _drive_model_move_stepwise(
+        gen, model=model_stepwise, device=torch.device("cpu"), dtype=torch.float32
+    )
+
+    assert move_stepwise.uci() == move_sync.uci() == "d2d4"
+    assert model_stepwise.forward_calls == model_sync.forward_calls
+    assert len(debug_stepwise["value_rerank_candidates"]) == len(
+        debug_sync["value_rerank_candidates"]
+    )
+
+
+def test_select_model_move_stepwise_matches_sync_for_value_search_d2():
+    module = _load_eval_script_module()
+    move_vocab = _mini_vocab()
+    history = module._SequenceHistory(
+        move_vocab=move_vocab, board_state_encoder=BoardStateEncoder()
+    )
+    board = chess.Board()
+    batch = history.build_batch_for_current_position(board)
+
+    model_sync = _DummyValueSearchD2Model(move_vocab)
+    move_sync, debug_sync = module._select_model_move(
+        model=model_sync,
+        batch=batch,
+        board=board,
+        move_vocab=move_vocab,
+        board_state_encoder=BoardStateEncoder(),
+        device=torch.device("cpu"),
+        dtype=torch.float32,
+        policy="value_search_d2",
+        value_rerank_top_k=2,
+        value_rerank_lambda=0.2,
+        debug_topk=0,
+    )
+
+    model_stepwise = _DummyValueSearchD2Model(move_vocab)
+    gen = module._select_model_move_stepwise(
+        model=model_stepwise,
+        batch=batch,
+        board=board,
+        move_vocab=move_vocab,
+        board_state_encoder=BoardStateEncoder(),
+        device=torch.device("cpu"),
+        dtype=torch.float32,
+        policy="value_search_d2",
+        value_rerank_top_k=2,
+        value_rerank_lambda=0.2,
+        debug_topk=0,
+    )
+    move_stepwise, debug_stepwise = _drive_model_move_stepwise(
+        gen, model=model_stepwise, device=torch.device("cpu"), dtype=torch.float32
+    )
+
+    assert move_stepwise.uci() == move_sync.uci() == "d2d4"
+    assert model_stepwise.forward_calls == model_sync.forward_calls
+    assert len(debug_stepwise["value_search_d2_candidates"]) == len(
+        debug_sync["value_search_d2_candidates"]
+    )
+
+
+def test_select_model_move_stepwise_matches_sync_for_value_search_halving():
+    module = _load_eval_script_module()
+    from imba_chess.eval.search import HalvingConfig
+
+    move_vocab = _mini_vocab()
+    history = module._SequenceHistory(
+        move_vocab=move_vocab, board_state_encoder=BoardStateEncoder()
+    )
+    board = chess.Board()
+    batch = history.build_batch_for_current_position(board)
+    halving_config = HalvingConfig(budget=6, top_m=2, rounds=2, lam=0.05)
+
+    model_sync = _DummyHalvingModel(move_vocab)
+    move_sync, debug_sync = module._select_model_move(
+        model=model_sync,
+        batch=batch,
+        board=board,
+        move_vocab=move_vocab,
+        board_state_encoder=BoardStateEncoder(),
+        device=torch.device("cpu"),
+        dtype=torch.float32,
+        policy="value_search_halving",
+        value_rerank_top_k=2,
+        value_rerank_lambda=0.05,
+        debug_topk=0,
+        halving_config=halving_config,
+    )
+
+    model_stepwise = _DummyHalvingModel(move_vocab)
+    gen = module._select_model_move_stepwise(
+        model=model_stepwise,
+        batch=batch,
+        board=board,
+        move_vocab=move_vocab,
+        board_state_encoder=BoardStateEncoder(),
+        device=torch.device("cpu"),
+        dtype=torch.float32,
+        policy="value_search_halving",
+        value_rerank_top_k=2,
+        value_rerank_lambda=0.05,
+        debug_topk=0,
+        halving_config=halving_config,
+    )
+    move_stepwise, debug_stepwise = _drive_model_move_stepwise(
+        gen, model=model_stepwise, device=torch.device("cpu"), dtype=torch.float32
+    )
+
+    assert move_stepwise.uci() == move_sync.uci() == "d2d4"
+    assert model_stepwise.forward_calls == model_sync.forward_calls
+    assert {row["move_uci"] for row in debug_stepwise["value_search_halving_candidates"]} == {
+        row["move_uci"] for row in debug_sync["value_search_halving_candidates"]
+    }
+
+
+class _GreedyZeroLogitModel(torch.nn.Module):
+    """All-zero logits/value_logits for ANY position -- select_greedy then
+    deterministically picks the first legal-move index python-chess's own
+    move generator yields (Python's max() returns the first max on ties),
+    regardless of which side is to move or what the position looks like.
+    Used only with model_move_policy="greedy", so value_logits is never
+    read -- included anyway because the merged root_eval executor's
+    multi-payload path (_split_root_output, --concurrent-games > 1) always
+    slices "value_logits" unconditionally, independent of the eval policy.
+    """
+
+    def __init__(self, move_vocab: MoveVocab) -> None:
+        super().__init__()
+        self.move_vocab = move_vocab
+
+    def forward(self, batch, *, block_mask=None, return_loss=False, return_kv=False):  # type: ignore[no-untyped-def]
+        total_tokens = int(batch["total_tokens"])
+        out = {
+            "logits": torch.zeros((total_tokens, len(self.move_vocab)), dtype=torch.float32),
+            "value_logits": torch.zeros((total_tokens, 3), dtype=torch.float32),
+        }
+        if return_kv:
+            out["kv_caches"] = [
+                (torch.zeros(1, total_tokens, 1), torch.zeros(1, total_tokens, 1))
+            ]
+        return out
+
+
+class _FakeSFEngine:
+    """Fake `chess.engine.SimpleEngine` double for the scheduler-driver
+    tests below: no subprocess, no real UCI protocol. Records every
+    `configure`/`play`/`quit` call; `play` always returns the board's first
+    legal move (deterministic, works for any position) unless `play_exc` is
+    set, in which case every `play` call raises it instead.
+    """
+
+    def __init__(self, *, play_exc: BaseException | None = None) -> None:
+        self.configure_calls: list[dict] = []
+        self.play_calls: list[tuple[str, object]] = []
+        self.quit_calls = 0
+        self._play_exc = play_exc
+
+    def configure(self, options):  # type: ignore[no-untyped-def]
+        self.configure_calls.append(dict(options))
+
+    def play(self, board, limit):  # type: ignore[no-untyped-def]
+        self.play_calls.append((board.fen(), limit))
+        if self._play_exc is not None:
+            raise self._play_exc
+        move = next(iter(board.legal_moves))
+        return chess.engine.PlayResult(move, None)
+
+    def quit(self):  # type: ignore[no-untyped-def]
+        self.quit_calls += 1
+
+
+def _patch_fake_stockfish(monkeypatch, *, play_exc: BaseException | None = None):
+    """Monkeypatch `chess.engine.SimpleEngine.popen_uci` (called by
+    `_run_segment`'s `_spawn_engine` closure) to hand out `_FakeSFEngine`
+    instances instead of spawning a real Stockfish subprocess. Returns the
+    list of spawned fake engines (append-order == EnginePool spawn order,
+    i.e. slot index) so tests can assert on per-slot call counts.
+    """
+    spawned: list[_FakeSFEngine] = []
+
+    def _fake_popen_uci(command, **kwargs):  # type: ignore[no-untyped-def]
+        engine = _FakeSFEngine(play_exc=play_exc)
+        spawned.append(engine)
+        return engine
+
+    monkeypatch.setattr(
+        chess.engine.SimpleEngine, "popen_uci", staticmethod(_fake_popen_uci)
+    )
+    return spawned
+
+
+def _run_fake_segment(module, *, games: int, concurrent_games: int, spawned, model=None):
+    move_vocab = MoveVocab.build_static()
+    board_state_encoder = BoardStateEncoder()
+    model = model if model is not None else _GreedyZeroLogitModel(move_vocab)
+    return module._run_segment(
+        stockfish_path=Path("fake-stockfish-binary"),
+        segment_options={"Threads": 1},
+        segment_name="fake-segment",
+        model=model,
+        move_vocab=move_vocab,
+        board_state_encoder=board_state_encoder,
+        games=games,
+        max_plies=2,
+        engine_limit=chess.engine.Limit(time=0.01),
+        device=torch.device("cpu"),
+        dtype=torch.float32,
+        model_move_policy="greedy",
+        value_rerank_top_k=1,
+        value_rerank_lambda=0.0,
+        opening_random_plies=0,
+        debug_trace_games=0,
+        debug_trace_max_plies=0,
+        debug_topk=0,
+        stockfish_label="fake",
+        save_games_dir=None,
+        concurrent_games=concurrent_games,
+        halving_config=None,
+    )
+
+
+def test_run_segment_scheduler_g1_aggregates_alternates_colors_and_reuses_engine(
+    monkeypatch,
+):
+    module = _load_eval_script_module()
+    spawned = _patch_fake_stockfish(monkeypatch)
+
+    summary = _run_fake_segment(module, games=3, concurrent_games=1, spawned=spawned)
+
+    # Exactly one engine spawned and configured -- concurrent_games=1 means
+    # every game reuses the single pool slot's engine sequentially, matching
+    # today's one-engine-for-all-games-in-a-segment behavior.
+    assert len(spawned) == 1
+    assert spawned[0].configure_calls == [{"Threads": 1}]
+    assert spawned[0].quit_calls == 1
+
+    # 3 games, max_plies=2 -> every game has exactly one model turn and one
+    # engine turn (order depends on model_color) -> 3 sf_move calls total on
+    # the single reused engine.
+    assert len(spawned[0].play_calls) == 3
+
+    # Summary aggregation: 3 games, all incomplete (max_plies cuts them off
+    # before any decisive/drawn result), color alternates by game_idx % 2.
+    assert summary.games == 3
+    assert summary.incomplete_games == 3
+    assert summary.completed_games == 0
+    assert summary.games_as_white == 2  # game_idx 0, 2
+    assert summary.games_as_black == 1  # game_idx 1
+    assert summary.total_plies == 3 * 2
+    assert summary.model_turns == 3  # one model turn per game
+
+
+def test_run_segment_scheduler_g2_uses_distinct_engines_per_slot(monkeypatch):
+    module = _load_eval_script_module()
+    spawned = _patch_fake_stockfish(monkeypatch)
+
+    summary = _run_fake_segment(module, games=2, concurrent_games=2, spawned=spawned)
+
+    # Two concurrently-live games -> two engines spawned, one per slot; with
+    # only 2 games total, both stay live for their whole duration, so no
+    # slot ever hands off to a second game -- each engine sees exactly the
+    # one game's sf_move call(s).
+    assert len(spawned) == 2
+    assert all(e.configure_calls == [{"Threads": 1}] for e in spawned)
+    assert {len(e.play_calls) for e in spawned} == {1}
+    total_play_calls = sum(len(e.play_calls) for e in spawned)
+    assert total_play_calls == 2  # one engine turn per game
+
+    assert summary.games == 2
+    assert summary.games_as_white == 1
+    assert summary.games_as_black == 1
+
+
+def test_run_segment_scheduler_engine_exception_aborts_run(monkeypatch):
+    module = _load_eval_script_module()
+    spawned = _patch_fake_stockfish(
+        monkeypatch, play_exc=RuntimeError("engine crashed mid-game")
+    )
+
+    with pytest.raises(RuntimeError, match="engine crashed mid-game"):
+        _run_fake_segment(module, games=3, concurrent_games=1, spawned=spawned)
+
+    # Fail-fast: the run must not silently continue past a failed game (no
+    # partial/degraded summary is returned -- the exception propagates all
+    # the way out of _run_segment). The engine is still spawned once (pool
+    # construction happens before any game runs).
+    assert len(spawned) == 1
 

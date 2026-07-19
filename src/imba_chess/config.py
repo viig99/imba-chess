@@ -151,6 +151,11 @@ class EvalVsStockfishConfig:
     debug_topk: int = 5
     save_games: bool = True
     save_games_dir: str = "artifacts/eval/games"
+    # Games run concurrently via BatchScheduler, merging their root-eval/
+    # search decode waves and sf_move engine calls into shared calls per
+    # tick. 1 (default) is byte-identical in call sequence to the
+    # pre-scheduler sequential driver.
+    concurrent_games: int = 1
 
 
 @dataclass(frozen=True)

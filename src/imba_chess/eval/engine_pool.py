@@ -50,12 +50,55 @@ class EnginePool:
 
     def __init__(self, *, spawn: Callable[[], Any], size: int) -> None:
         self._engines: list[Any] = [spawn() for _ in range(size)]
+        # FIFO of free physical slot indices, for acquire()/release() (Task
+        # 3's eval driver). Starts with every slot free, ascending order --
+        # deterministic, easy to reason about in tests -- and shrinks/grows
+        # as games check engines out and back in.
+        self._free_slots: list[int] = list(range(size))
 
     def engine_for_slot(self, slot_index: int) -> Any:
         """Return the engine owned by `slot_index`. Stable across calls: the
         same slot always gets back the identical engine object spawned for
         it at construction."""
         return self._engines[slot_index]
+
+    def acquire(self) -> tuple[int, Any]:
+        """Check out a free engine, returning `(slot_index, engine)`.
+
+        Task 3's eval driver calls this exactly when the `BatchScheduler`
+        admits a new game into a live slot (i.e. inside the game factory,
+        synchronously, before the game's coroutine object is even created)
+        and `release`s the slot exactly when that game's coroutine finishes
+        or raises. Because the scheduler never holds more than
+        `concurrent_games` games live at once (see batch_scheduler.py's
+        `_fill_slots` invariant), and acquire/release bracket a game's exact
+        live-slot lifetime 1:1, this guarantees no two *simultaneously live*
+        games ever share a physical engine -- unlike assigning engines by
+        static `game_index % size` round-robin, which breaks the instant two
+        games have different durations (a fast game N and a still-running
+        earlier game can both compute the same `% size` slot while both are
+        live). Raises if every slot is already checked out: that is a caller
+        bug (more concurrently-live games than pool size), not a condition
+        to silently block or reuse a live engine for.
+        """
+        if not self._free_slots:
+            raise RuntimeError(
+                "EnginePool.acquire: no free engine slot available "
+                f"(pool size={len(self._engines)}, all checked out)"
+            )
+        slot_index = self._free_slots.pop(0)
+        return slot_index, self._engines[slot_index]
+
+    def release(self, slot_index: int) -> None:
+        """Return `slot_index`'s engine to the free pool.
+
+        The engine object itself is untouched (still alive, ready for its
+        next game) -- only free-list bookkeeping changes. Safe to call from
+        a generator's `finally` block on both the normal-completion and
+        exception paths (see `scripts/eval_vs_stockfish.py`'s
+        `_release_engine_on_finish`).
+        """
+        self._free_slots.append(slot_index)
 
     def close(self) -> None:
         """Quit every engine, even if some `quit()` calls raise; then
