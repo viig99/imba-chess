@@ -239,7 +239,11 @@ def _parse_args() -> argparse.Namespace:
         "inference server that merges their model-turn requests -- NOT "
         "byte-deterministic across runs (accepted; see the multiprocess "
         "eval actors design spec). --debug-trace-games/--save-games are not "
-        "supported at concurrent_games > 1.",
+        "supported at concurrent_games > 1. At concurrent_games > 1, "
+        "--model-move-policy value_rerank/value_search_d2/"
+        "value_search_halving require a checkpoint with a value head "
+        "(same as at concurrent_games=1) and fail fast at startup "
+        "otherwise; greedy does not.",
     )
     return parser.parse_args()
 
@@ -1394,6 +1398,45 @@ def _serve_actor_workers(
     return summary
 
 
+def _join_and_verify_workers(processes: list) -> None:
+    """Post-serve-loop join/exitcode check, called only after
+    `_serve_actor_workers` has already returned normally (every worker
+    already sent `WorkerFinished`). Wrapped in its OWN try/except so ANY bad
+    outcome here -- a worker that never actually exits within the grace
+    period, OR one that exited with a nonzero code -- terminates EVERY
+    worker (`_terminate_worker_processes`) before propagating, not just the
+    one whose check failed: `processes` is walked in order, so a
+    LATER-indexed worker may still be perfectly alive at the moment an
+    EARLIER one's check fails, and without this wrapper that later worker
+    would be left running. (Code-review fix: the original inline version of
+    this check only called `_terminate_worker_processes` from the
+    `is_alive()` branch; the `exitcode != 0` branch raised directly,
+    leaving any still-alive worker after it in `processes` running --
+    contradicting `_run_segment_actor_mode`'s own docstring claim that it
+    "never leaves a worker process running on its way out, success or
+    failure." Regression-pinned by
+    `tests/test_eval_vs_stockfish.py::test_join_and_verify_workers_terminates_all_on_late_nonzero_exitcode`
+    with fake process stand-ins, deterministically, rather than relying on
+    a real-subprocess race.)
+    """
+    try:
+        for proc in processes:
+            proc.join(timeout=30.0)
+            if proc.is_alive():
+                raise RuntimeError(
+                    f"actor worker pid={proc.pid} did not exit within the "
+                    "grace period after sending WorkerFinished."
+                )
+            if proc.exitcode != 0:
+                raise RuntimeError(
+                    f"actor worker pid={proc.pid} exited with nonzero code "
+                    f"{proc.exitcode}."
+                )
+    except BaseException:
+        _terminate_worker_processes(processes)
+        raise
+
+
 def _run_segment_actor_mode(
     *,
     stockfish_path: Path,
@@ -1464,6 +1507,15 @@ def _run_segment_actor_mode(
         board_state_encoder=board_state_encoder,
         device=device,
         dtype=dtype,
+        # Same value-head requirement as the G=1 path's own
+        # load_hstu_checkpoint(require_value_head=...) gate: only the three
+        # value-dependent policies need a real value_stm. "greedy" is the
+        # one policy that never reads it, so it's the only one allowed to
+        # run actor mode against a value-head-less checkpoint (every
+        # response's value_stm is then a documented 0.0 placeholder --
+        # see ActorInferenceServer.__init__/_ensure_value_logits_placeholder).
+        require_value_head=model_move_policy
+        in {"value_rerank", "value_search_d2", "value_search_halving"},
     )
     game_indices_by_worker = _assign_games_round_robin(games, concurrent_games)
     engine_config = _worker_engine_config(
@@ -1519,19 +1571,7 @@ def _run_segment_actor_mode(
         for conn in parent_conns:
             conn.close()
 
-    for proc in processes:
-        proc.join(timeout=30.0)
-        if proc.is_alive():
-            _terminate_worker_processes(processes)
-            raise RuntimeError(
-                f"actor worker pid={proc.pid} did not exit within the grace "
-                "period after sending WorkerFinished."
-            )
-        if proc.exitcode != 0:
-            raise RuntimeError(
-                f"actor worker pid={proc.pid} exited with nonzero code "
-                f"{proc.exitcode}."
-            )
+    _join_and_verify_workers(processes)
     return summary
 
 
@@ -1971,12 +2011,15 @@ def main() -> None:
             # torch-free worker (actor_worker.py's own module docstring):
             # neither knob has anywhere to go once concurrent_games > 1
             # routes through actor mode, so this is a loud no-op rather
-            # than a silently-ignored flag.
+            # than a silently-ignored flag. stderr (not stdout), per code
+            # review, so it's visible/greppable independent of stdout
+            # redirection (e.g. --output-json pipelines).
             print(
-                "  WARNING: --debug-trace-games/--save-games are not "
+                "WARNING: --debug-trace-games/--save-games are not "
                 "supported in actor mode (concurrent_games > 1) -- ignored "
                 "for this run. Use --concurrent-games 1 for debug traces or "
-                "saved games."
+                "saved games.",
+                file=sys.stderr,
             )
     board_state_config_dict = asdict(repo_config.board_state)
 

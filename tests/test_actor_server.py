@@ -381,6 +381,10 @@ def test_service_rejects_unsupported_request_type():
 
 
 def test_value_head_guard_raises_at_construction():
+    """Default (`require_value_head=True`, unspecified here on purpose --
+    this is what every value-dependent-policy caller gets): a value-head-less
+    model must still fail fast at construction, same as before this
+    parameter existed."""
     move_vocab = _static_vocab()
     model = _tiny_model(vocab_size=len(move_vocab), enable_value_head=False)
     encoder = BoardStateEncoder()
@@ -392,6 +396,50 @@ def test_value_head_guard_raises_at_construction():
             device=torch.device("cpu"),
             dtype=torch.float32,
         )
+
+
+def test_require_value_head_false_allows_construction_and_serves_zero_placeholder():
+    """`require_value_head=False` (the orchestrator's "greedy" gate --
+    scripts/eval_vs_stockfish.py's `_run_segment_actor_mode`) must both (a)
+    allow constructing the server against a value-head-less model, and (b)
+    serve every response's value_stm as the documented `0.0` placeholder --
+    checked on BOTH the root-eval and decode-wave paths, since each reuses a
+    different tensor-math helper that unconditionally expects a
+    "value_logits" key on its input dict (`_split_root_output` /
+    `CachedPositionEvaluator.consume_decode_result`) -- see
+    `_ensure_value_logits_placeholder`."""
+    move_vocab = _static_vocab()
+    model = _tiny_model(vocab_size=len(move_vocab), enable_value_head=False)
+    encoder = BoardStateEncoder()
+    server = ActorInferenceServer(
+        model=model,
+        move_vocab=move_vocab,
+        board_state_encoder=encoder,
+        device=torch.device("cpu"),
+        dtype=torch.float32,
+        require_value_head=False,
+    )
+
+    batch, board = _history_batch_for(
+        moves=["e2e4", "e7e5"], move_vocab=move_vocab, encoder=encoder
+    )
+    root_response = server.register_root(0, 0, _plain_batch_arrays(batch))
+    assert root_response.value_stm == 0.0
+
+    move = list(board.legal_moves)[0]
+    row, _child = _wave_row_for_child(
+        node_id=0,
+        parent_id=None,
+        board_before=board,
+        move=move,
+        encoder=encoder,
+        move_vocab=move_vocab,
+    )
+    wave_response = server.service(
+        [WaveRequest(worker_id=0, turn_id=0, rows=[row])]
+    )[0]
+    value_stm, _legal_ucis, _legal_log_priors = wave_response.rows[0]
+    assert value_stm == 0.0
 
 
 def test_movegen_board_reconstruction_matches_real_board_over_random_playouts():

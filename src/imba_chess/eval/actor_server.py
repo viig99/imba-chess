@@ -214,6 +214,37 @@ def _cozy_board_from_root_batch(
     )
 
 
+def _ensure_value_logits_placeholder(output: dict[str, Any]) -> dict[str, Any]:
+    """When the server's model has no value head (`ActorInferenceServer(
+    require_value_head=False, ...)` -- see that constructor's own
+    docstring), `output` (from `_forward_model`/`forward_decode_grouped`)
+    never has a `"value_logits"` key at all -- the model only sets it `if
+    self.value_head is not None` (`model/hstu_model.py`). But Task 1's wire
+    protocol makes `RootEvalResponse.value_stm`/every `WaveResponse` row's
+    value_stm UNCONDITIONAL fields, and the REUSED tensor-math helpers this
+    server calls (`_split_root_output`, `CachedPositionEvaluator.
+    consume_decode_result`) both unconditionally index `out["value_logits"]`
+    -- rather than editing those shared, rollout-consumed functions to make
+    that key optional, this injects an explicit all-zero placeholder of the
+    right shape in place. softmax(zeros) is the uniform distribution, so
+    `_value_scalar_from_logits` (`probs[2] - probs[0]`) evaluates to exactly
+    `0.0` for every row: a deliberate, documented "no opinion" placeholder,
+    not a real value estimate. `require_value_head=False` is only valid for
+    the `greedy` policy (the caller's own gate -- see
+    `scripts/eval_vs_stockfish.py`'s `_run_segment_actor_mode`), which never
+    reads `value_stm` at all, so this placeholder is never actually
+    consumed by anything downstream; it exists purely so the reused
+    merge/split machinery always has a tensor of the shape it expects.
+    No-op (returns `output` unchanged) when a real `"value_logits"` key is
+    already present."""
+    if "value_logits" not in output:
+        logits = output["logits"]
+        output["value_logits"] = torch.zeros(
+            (logits.shape[0], 3), device=logits.device, dtype=torch.float32
+        )
+    return output
+
+
 def _cozy_board_from_wave_row(
     board_state: dict, board_state_encoder: BoardStateEncoder
 ) -> cc.Board:
@@ -257,27 +288,41 @@ class ActorInferenceServer:
         board_state_encoder: BoardStateEncoder,
         device: torch.device,
         dtype: torch.dtype,
+        require_value_head: bool = True,
     ) -> None:
-        # Validated ONCE here, not per request: RootEvalResponse.value_stm
+        # Validated ONCE here, not per request. RootEvalResponse.value_stm
         # and every WaveResponse row's value_stm are UNCONDITIONAL fields in
         # Task 1's protocol (populated regardless of the worker's own
-        # model_move_policy, which the server never even sees) -- so a model
-        # with no value head can never serve a single request, not just
-        # "requests under policies that need one". This replaces the
+        # model_move_policy, which the server never even sees), so by
+        # default (`require_value_head=True`, matching the G=1 path's own
+        # `load_hstu_checkpoint(require_value_head=...)` gate for
+        # value-dependent policies) a model with no value head can never
+        # serve a single request. `require_value_head=False` -- the
+        # orchestrator passes this exactly when `model_move_policy ==
+        # "greedy"`, the only policy that never reads value_stm -- instead
+        # allows construction with a value-head-less model; every response's
+        # value_stm is then a documented `0.0` placeholder (see
+        # `_ensure_value_logits_placeholder`, called from `_service_roots`/
+        # `_service_waves`), never a real value estimate. This replaces the
         # per-turn RuntimeError scripts/eval_vs_stockfish.py's
         # `_select_model_move` used to raise (moved out of the worker per
         # Task 1's handoff note; the worker no longer has a model to check).
-        if getattr(model, "value_head", None) is None:
+        if require_value_head and getattr(model, "value_head", None) is None:
             raise ValueError(
-                "ActorInferenceServer requires a model with an enabled value "
-                "head: every RootEvalResponse/WaveResponse row carries a "
-                "value_stm field unconditionally, regardless of which "
-                "worker's model_move_policy asked for it (the server never "
-                "sees that policy). Got a model whose .value_head is None "
-                "-- either enable_value_head=False at construction, or a "
-                "checkpoint with no value_head.* parameters (see "
-                "position_evaluator.load_hstu_checkpoint's require_value_head "
-                "for the load-time analogue of this guard)."
+                "ActorInferenceServer(require_value_head=True) requires a "
+                "model with an enabled value head: every RootEvalResponse/"
+                "WaveResponse row carries a value_stm field unconditionally, "
+                "regardless of which worker's model_move_policy asked for it "
+                "(the server never sees that policy). Got a model whose "
+                ".value_head is None -- either enable_value_head=False at "
+                "construction, or a checkpoint with no value_head.* "
+                "parameters (see position_evaluator.load_hstu_checkpoint's "
+                "require_value_head for the load-time analogue of this "
+                "guard). Pass require_value_head=False instead if this run "
+                "only ever uses model_move_policy='greedy' (the only policy "
+                "that never reads value_stm) -- every response's value_stm "
+                "will then be a documented 0.0 placeholder, not a real "
+                "value estimate."
             )
         self._model = model
         self._move_vocab = move_vocab
@@ -362,6 +407,7 @@ class ActorInferenceServer:
             dtype=self._dtype,
             return_kv=True,
         )
+        output = _ensure_value_logits_placeholder(output)
         splits = _split_root_output(output, payloads)
 
         responses: list[RootEvalResponse] = []
@@ -446,6 +492,7 @@ class ActorInferenceServer:
                 suffix_positions=merged.suffix_positions,
                 suffix_mask=merged.suffix_mask,
             )
+        out = _ensure_value_logits_placeholder(out)
         split_outs = _split_decode_output(
             out, [len(dr.nodes) for dr in decode_requests]
         )

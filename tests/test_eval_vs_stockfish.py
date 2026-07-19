@@ -1203,3 +1203,81 @@ def test_run_segment_actor_mode_rejects_concurrent_games_one():
             fake_engine_factory=_actor_mode_fake_engine_factory,
         )
 
+
+class _FakeWorkerProcess:
+    """Minimal `multiprocessing.Process`-shaped stand-in for
+    `_join_and_verify_workers`/`_terminate_worker_processes` unit tests --
+    deterministic, no real subprocess/scheduling race needed to exercise the
+    "a later-indexed worker is still alive when an earlier one's check
+    fails" scenario those functions must handle."""
+
+    def __init__(self, *, pid: int, exitcode: int = 0, stays_alive: bool = False) -> None:
+        self.pid = pid
+        self.exitcode = exitcode
+        self._stays_alive = stays_alive
+        self._alive = True
+        self.join_calls = 0
+        self.terminate_calls = 0
+        self.kill_calls = 0
+
+    def join(self, timeout=None):  # type: ignore[no-untyped-def]
+        self.join_calls += 1
+        if not self._stays_alive:
+            self._alive = False
+
+    def is_alive(self) -> bool:
+        return self._alive
+
+    def terminate(self) -> None:
+        self.terminate_calls += 1
+        self._alive = False
+
+    def kill(self) -> None:
+        self.kill_calls += 1
+        self._alive = False
+
+
+def test_join_and_verify_workers_terminates_all_on_late_nonzero_exitcode():
+    """Regression test for the code-review fix: `_join_and_verify_workers`
+    walks `processes` in order and must terminate EVERY worker -- not just
+    stop at the one whose check failed -- the moment ANY worker's exitcode
+    is nonzero. `bad` (index 0) fails its check first; `still_running`
+    (index 1) is never reached by the plain join loop, so it must be
+    cleaned up via `_terminate_worker_processes`'s own full sweep, not by
+    ever having its own `.join()`/exitcode check run.
+
+    This is exactly what the ORIGINAL (pre-fix) code got wrong: its
+    `exitcode != 0` branch raised directly without calling
+    `_terminate_worker_processes` at all, so `still_running` would never
+    have `.terminate()` called on it -- this test fails against that
+    version (`still_running.terminate_calls == 0`) and passes against the
+    fix.
+    """
+    module = _load_eval_script_module()
+    bad = _FakeWorkerProcess(pid=101, exitcode=1)
+    still_running = _FakeWorkerProcess(pid=102, exitcode=0, stays_alive=True)
+    processes = [bad, still_running]
+
+    with pytest.raises(RuntimeError, match="nonzero code"):
+        module._join_and_verify_workers(processes)
+
+    assert still_running.terminate_calls == 1
+    assert not still_running.is_alive()
+
+
+def test_join_and_verify_workers_terminates_all_when_worker_never_exits():
+    """Same regression coverage for the sibling is_alive() branch (which
+    already called _terminate_worker_processes before this fix, but is
+    covered here too so both branches of _join_and_verify_workers stay
+    pinned side by side)."""
+    module = _load_eval_script_module()
+    stuck = _FakeWorkerProcess(pid=201, exitcode=0, stays_alive=True)
+    other = _FakeWorkerProcess(pid=202, exitcode=0, stays_alive=True)
+    processes = [stuck, other]
+
+    with pytest.raises(RuntimeError, match="did not exit within the grace period"):
+        module._join_and_verify_workers(processes)
+
+    assert stuck.terminate_calls == 1
+    assert other.terminate_calls == 1
+
