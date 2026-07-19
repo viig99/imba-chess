@@ -29,6 +29,8 @@ set -euo pipefail
 # both tomls now carry the node-limited fp32 actor-mode protocol, but always pass
 # CONFIG explicitly for non-default setups.
 CONFIG="${CONFIG:-config/imba_chess.toml}"
+# Reduce CUDA allocator fragmentation for long actor-mode runs (error-message-recommended).
+export PYTORCH_ALLOC_CONF="${PYTORCH_ALLOC_CONF:-expandable_segments:True}"
 
 CHECKPOINT_DIR="${CHECKPOINT_DIR:-artifacts/checkpoints}"
 OUT_DIR="${OUT_DIR:-artifacts/eval}"
