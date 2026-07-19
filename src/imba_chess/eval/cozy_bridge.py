@@ -13,9 +13,12 @@ oracle (tests/test_cozy_differential.py). Convention differences owned here:
 from __future__ import annotations
 
 import copy
+from typing import Sequence
 
 import chess
 import cozy_chess as cc
+
+_FILE_CHARS = "abcdefgh"
 
 _PIECES = (
     (cc.Piece.Pawn, "pawns"),
@@ -129,4 +132,167 @@ def terminal_value_fast(
             if outcome.winner is None:
                 return 0.0
             return 1.0 if outcome.winner == color else -1.0
+    return None
+
+
+def _ep_adjacent_capturers_cozy(cozy_board: cc.Board) -> list[cc.Move]:
+    """Pseudo-legal ep capture moves (0-2) for the board's ep flag, if any.
+
+    Shared plumbing for ep-legality probes: used here by
+    ep_has_legal_capturer/repetition_hash, and by
+    BoardStateEncoder._ep_file_id_cozy (src/imba_chess/data/board_state.py)
+    for its "legal"/"xfen" en-passant token modes -- both need to know which
+    (<=2) adjacent enemy pawns could pseudo-legally capture the ep square.
+    """
+    ep_file = cozy_board.en_passant()
+    if ep_file is None:
+        return []
+    file_char = str(ep_file)
+    file_idx = _FILE_CHARS.index(file_char)
+    stm = cozy_board.side_to_move()
+    to_rank = "6" if stm == cc.Color.White else "3"
+    from_rank = "5" if stm == cc.Color.White else "4"
+    pawns = int(cozy_board.colors(stm) & cozy_board.pieces(cc.Piece.Pawn))
+    moves = []
+    for adj in (file_idx - 1, file_idx + 1):
+        if not 0 <= adj <= 7:
+            continue
+        from_sq_index = (int(from_rank) - 1) * 8 + adj
+        if not (pawns >> from_sq_index) & 1:
+            continue
+        moves.append(
+            cc.Move.from_str(f"{_FILE_CHARS[adj]}{from_rank}{file_char}{to_rank}")
+        )
+    return moves
+
+
+def ep_has_legal_capturer(cozy_board: cc.Board) -> bool:
+    """True iff the board's ep flag (if any) has an actual LEGAL capturing
+    pawn move -- mirrors python-chess's Board.has_legal_en_passant(), the
+    gate its transposition key (and therefore threefold-repetition counting)
+    uses to decide whether ep is "real". False when there is no ep flag."""
+    return any(cozy_board.is_legal(mv) for mv in _ep_adjacent_capturers_cozy(cozy_board))
+
+
+def repetition_hash(cozy_board: cc.Board) -> int:
+    """Canonical repetition/transposition hash.
+
+    cozy's Board.hash() folds the ep flag into the hash unconditionally, even
+    when no legal capturer exists (a "phantom" ep flag set by any double
+    pawn push, per cozy's native FEN-style semantics). python-chess's
+    transposition key -- what threefold-repetition claims actually key off
+    of -- excludes ep unless Board.has_legal_en_passant() is true. Without
+    this normalization, the same position reached once via a capturer-less
+    double push and once via any other path would hash differently and
+    threefold repetitions would be undercounted (see Task 2 handoff:
+    board_to_cozy preserves raw/unconditional ep, and cozy's own play() sets
+    it the same unconditional way on double pushes).
+    """
+    if cozy_board.en_passant() is not None and not ep_has_legal_capturer(cozy_board):
+        return cozy_board.hash_without_ep()
+    return cozy_board.hash()
+
+
+def _has_insufficient_material_for(cozy_board: cc.Board, color: cc.Color) -> bool:
+    pawns = int(cozy_board.pieces(cc.Piece.Pawn))
+    rooks = int(cozy_board.pieces(cc.Piece.Rook))
+    queens = int(cozy_board.pieces(cc.Piece.Queen))
+    knights = int(cozy_board.pieces(cc.Piece.Knight))
+    bishops = int(cozy_board.pieces(cc.Piece.Bishop))
+    kings = int(cozy_board.pieces(cc.Piece.King))
+    occ = int(cozy_board.colors(color))
+    other = cc.Color.Black if color == cc.Color.White else cc.Color.White
+    occ_other = int(cozy_board.colors(other))
+
+    if occ & (pawns | rooks | queens):
+        return False
+
+    # Knights are only insufficient material if:
+    # (1) We do not have any other pieces, including more than one knight.
+    # (2) The opponent does not have pawns, knights, bishops or rooks.
+    #     These would allow selfmate.
+    if occ & knights:
+        return bin(occ).count("1") <= 2 and not (occ_other & ~kings & ~queens)
+
+    # Bishops are only insufficient material if:
+    # (1) We do not have any other pieces, including bishops of the
+    #     opposite color.
+    # (2) The opponent does not have bishops of the opposite color,
+    #     pawns or knights. These would allow selfmate.
+    if occ & bishops:
+        same_color = not (bishops & chess.BB_DARK_SQUARES) or not (
+            bishops & chess.BB_LIGHT_SQUARES
+        )
+        return same_color and not pawns and not knights
+
+    return True
+
+
+def insufficient_material(cozy_board: cc.Board) -> bool:
+    """Exact python-chess Board.is_insufficient_material() semantics:
+    neither side has a winning-material possibility, transcribed from
+    chess.Board.has_insufficient_material() (chess/__init__.py) onto cozy
+    bitboards -- including the "all bishops on the board share a square
+    color" case, which is evaluated over BOTH colors' bishops, not just the
+    color being tested."""
+    return _has_insufficient_material_for(
+        cozy_board, cc.Color.White
+    ) and _has_insufficient_material_for(cozy_board, cc.Color.Black)
+
+
+def terminal_value_native(
+    cozy_board: cc.Board, *, color_is_stm: bool, hash_history: Sequence[int]
+) -> float | None:
+    """Drop-in for search.terminal_value_for_color, cozy-native (no
+    python-chess board involved). `hash_history` holds repetition_hash()
+    values of PRIOR positions since the last irreversible move (most-recent-
+    last; excludes the current position at `cozy_board`).
+    """
+    status = cozy_board.status()
+    if status == cc.GameStatus.Won:
+        # cozy 'Won' == side to move is checkmated.
+        return -1.0 if color_is_stm else 1.0
+    if status == cc.GameStatus.Drawn:
+        # Covers BOTH stalemate AND cozy's own halfmove_clock>=100 auto-draw
+        # (cozy's status() implements the raw fifty-move cutoff internally,
+        # checkmate/stalemate always taking precedence -- verified against
+        # the oracle; halfmove_clock is clamped at 100 by cozy's play()).
+        # This subsumes the plain (non-early) fifty-move claim.
+        return 0.0
+    if _no_heavy_pieces(cozy_board) and insufficient_material(cozy_board):
+        return 0.0
+
+    halfmove = cozy_board.halfmove_clock
+    if halfmove < 7:
+        # A repetition/50-move claim needs >= 7 reversible plies of history
+        # for the third occurrence (or the one-ply-early claims below);
+        # matches the pre-existing guard in terminal_value_fast.
+        return None
+
+    current = repetition_hash(cozy_board)
+    window = hash_history[-halfmove:] if halfmove < len(hash_history) else hash_history
+    if sum(1 for h in window if h == current) >= 2:
+        return 0.0  # third occurrence reached
+
+    # python-chess also allows claiming one reversible ply early:
+    # - repetition: any legal move that REACHES the third occurrence
+    #   (can_claim_threefold_repetition).
+    # - fifty-move: at halfmove_clock == 99, any legal non-zeroing move
+    #   (which necessarily reaches halfmove 100) whose resulting position
+    #   still has a legal move of its own (can_claim_fifty_moves ->
+    #   is_fifty_moves, which itself requires a legal move to exist -- NOT
+    #   reliably readable off child.status(), since status() reports Drawn
+    #   at halfmove==100 regardless of whether further moves exist).
+    claim_fifty_early = halfmove == 99
+    target = [*window, current]
+    for move in cozy_board.generate_moves():
+        child = copy.copy(cozy_board)
+        child.play(move)
+        if child.halfmove_clock == 0:
+            continue  # irreversible move: cannot repeat, resets the clock
+        if claim_fifty_early and child.generate_moves():
+            return 0.0
+        child_hash = repetition_hash(child)
+        if sum(1 for h in target if h == child_hash) >= 2:
+            return 0.0
     return None

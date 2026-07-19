@@ -107,8 +107,6 @@ class BoardStateEncoder:
         )
 
     def _ep_file_id_cozy(self, board) -> int:
-        import cozy_chess as cc
-
         ep_file = board.en_passant()
         if ep_file is None:
             return 0
@@ -117,32 +115,19 @@ class BoardStateEncoder:
             return file_idx + 1
         # cozy reports the file after ANY double push (FEN-style). "legal" and
         # "xfen" modes require an actual capturer; probe the <=2 candidate
-        # en-passant captures. cozy only generates fully LEGAL moves, and its
-        # is_legal() is exact (ep pins included) — which matches "legal" mode.
-        # For "xfen" (pseudo-legal capturer exists), a legal capture implies a
+        # en-passant captures (shared with cozy_bridge.repetition_hash, which
+        # needs the same "is this ep flag legally capturable?" probe). cozy
+        # only generates fully LEGAL moves, and its is_legal() is exact (ep
+        # pins included) — which matches "legal" mode. For "xfen"
+        # (pseudo-legal capturer exists), a legal capture implies a
         # pseudo-legal one; the reverse gap (pinned capturer) is the ep-pin
-        # case — handle by checking pawn adjacency for xfen.
-        stm = board.side_to_move()
-        to_rank = "6" if stm == cc.Color.White else "3"
-        from_rank = "5" if stm == cc.Color.White else "4"
-        file_char = "abcdefgh"[file_idx]
-        legal_capture = False
-        adjacent_pawn = False
-        pawns = int(board.colors(stm) & board.pieces(cc.Piece.Pawn))
-        for adj in (file_idx - 1, file_idx + 1):
-            if not 0 <= adj <= 7:
-                continue
-            from_sq_index = (int(from_rank) - 1) * 8 + adj
-            if not (pawns >> from_sq_index) & 1:
-                continue
-            adjacent_pawn = True
-            mv = cc.Move.from_str(f"{'abcdefgh'[adj]}{from_rank}{file_char}{to_rank}")
-            if board.is_legal(mv):
-                legal_capture = True
-                break
+        # case — handled by just checking pawn adjacency for xfen.
+        from imba_chess.eval.cozy_bridge import _ep_adjacent_capturers_cozy
+
+        candidates = _ep_adjacent_capturers_cozy(board)
         if self._ep_ok is chess.Board.has_legal_en_passant:
-            return file_idx + 1 if legal_capture else 0
-        return file_idx + 1 if adjacent_pawn else 0  # xfen: pseudo-legal capturer
+            return file_idx + 1 if any(board.is_legal(mv) for mv in candidates) else 0
+        return file_idx + 1 if candidates else 0  # xfen: pseudo-legal capturer exists
 
     def encode_cozy(self, board) -> BoardState:
         import cozy_chess as cc

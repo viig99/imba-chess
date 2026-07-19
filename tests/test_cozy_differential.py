@@ -143,6 +143,128 @@ def test_encode_cozy_matches_encode_on_conversions_and_played_lines():
                     break
 
 
+def test_insufficient_material_matches_python_chess():
+    fens = [
+        "8/8/3k4/8/8/3KB3/8/8 w - - 0 1",  # KB vs K -> True
+        "8/8/3k4/8/8/3KN3/8/8 w - - 0 1",  # KN vs K -> True
+        "8/8/3k4/8/8/3K4/8/8 w - - 0 1",  # K vs K -> True
+        "8/2b5/3k4/8/8/3KB3/8/8 w - - 0 1",  # KB vs KB (same/opposite bishop colors)
+        "8/2n5/3k4/8/8/3KN3/8/8 w - - 0 1",  # KN vs KN -> oracle decides
+        "8/8/3k4/8/8/3KP3/8/8 w - - 0 1",  # pawn -> False
+        "8/8/3k4/8/8/2NKN3/8/8 w - - 0 1",  # two knights same side -> oracle decides
+    ]
+    from imba_chess.eval.cozy_bridge import insufficient_material
+
+    for fen in fens:
+        b = chess.Board(fen)
+        assert insufficient_material(board_to_cozy(b)) == b.is_insufficient_material(), fen
+    for board in _random_boards(60, seed=41):
+        assert insufficient_material(board_to_cozy(board)) == board.is_insufficient_material(), (
+            board.fen()
+        )
+
+
+def test_terminal_value_native_matches_oracle_on_replayed_games():
+    import copy as copymod
+    import random
+
+    from imba_chess.eval.cozy_bridge import repetition_hash, terminal_value_native
+    from imba_chess.eval.search import terminal_value_for_color
+
+    rng = random.Random(77)
+    terminal_seen = draw_claims_seen = 0
+    for g in range(800):
+        pyb = chess.Board()
+        cb = board_to_cozy(pyb)
+        hash_history = []  # repetition_hash() of prior positions since last irreversible move
+        for _ in range(300):
+            moves = list(pyb.legal_moves)
+            if not moves:
+                break
+            quiet = [m for m in moves if not pyb.is_capture(m) and m.promotion is None]
+            mv = rng.choice(quiet if (quiet and rng.random() < 0.92) else moves)
+            prev_hash = repetition_hash(cb)
+            prev_halfmove = pyb.halfmove_clock
+            cb2 = copymod.copy(cb)
+            cb2.play(py_move_to_cozy(pyb, mv))
+            pyb.push(mv)
+            hash_history = [] if pyb.halfmove_clock <= prev_halfmove else hash_history + [prev_hash]
+            cb = cb2
+            expected = terminal_value_for_color(pyb, color=pyb.turn)
+            got = terminal_value_native(cb, color_is_stm=True, hash_history=hash_history)
+            assert got == expected, (pyb.fen(), len(hash_history), expected, got)
+            if expected is not None:
+                terminal_seen += 1
+                if expected == 0.0 and not pyb.is_stalemate() and not pyb.is_insufficient_material():
+                    draw_claims_seen += 1
+                break
+    assert terminal_seen >= 30
+    assert draw_claims_seen >= 5  # repetition/50-move path must actually be exercised
+
+
+def test_terminal_value_native_curated_phantom_ep_repetition():
+    """Deterministic king-shuffle threefold repetition where one leg is a
+    capturer-less double pawn push -- exercises exactly the phantom-ep
+    divergence documented in the Task 2 handoff: cozy's Board.hash() folds
+    in the ep flag unconditionally (even with no legal capturer), while
+    python-chess's transposition key (what real repetition claims key off
+    of) excludes it. A naive `cb.hash()` repetition counter would fail to
+    recognize the position immediately after the double push as "the same"
+    as its later king-shuffle revisits, undercounting the threefold.
+    """
+    import copy as copymod
+
+    from imba_chess.eval.cozy_bridge import repetition_hash, terminal_value_native
+    from imba_chess.eval.search import terminal_value_for_color
+
+    # Kings far apart, single white pawn free to double-push with no black
+    # pawn anywhere near it -- the resulting ep flag is unconditionally
+    # phantom (no legal capturer can possibly exist).
+    pyb = chess.Board("4k3/8/8/8/8/8/3P4/4K3 w - - 0 1")
+    cb = board_to_cozy(pyb)
+
+    moves = [
+        "d2d4",  # White: capturer-less double push -> phantom ep on d3 (P1, halfmove resets to 0)
+        "e8f8",
+        "e1f1",
+        "f8e8",
+        "f1e1",  # occurrence #2 of P1's occupancy (no ep flag; several plies elapsed)
+        "e8f8",
+        "e1f1",
+        "f8e8",
+        "f1e1",  # occurrence #3 -> threefold repetition claim
+    ]
+
+    hash_history: list[int] = []
+    saw_phantom_ep = False
+    hashes_after_occurrence_1 = None
+    for uci in moves:
+        mv = chess.Move.from_uci(uci)
+        assert mv in pyb.legal_moves, (pyb.fen(), uci)
+        prev_hash = repetition_hash(cb)
+        prev_halfmove = pyb.halfmove_clock
+        cb2 = copymod.copy(cb)
+        cb2.play(py_move_to_cozy(pyb, mv))
+        pyb.push(mv)
+        hash_history = [] if pyb.halfmove_clock <= prev_halfmove else hash_history + [prev_hash]
+        cb = cb2
+        if cb.en_passant() is not None:
+            saw_phantom_ep = True
+            hashes_after_occurrence_1 = (cb.hash(), repetition_hash(cb))
+        expected = terminal_value_for_color(pyb, color=pyb.turn)
+        got = terminal_value_native(cb, color_is_stm=True, hash_history=hash_history)
+        assert got == expected, (pyb.fen(), uci, len(hash_history), expected, got)
+
+    assert saw_phantom_ep, "fixture is broken: expected a phantom ep flag after d2d4"
+    assert pyb.is_repetition(3)
+    assert terminal_value_for_color(pyb, color=pyb.turn) == 0.0
+    # The regression this test targets: cozy's raw hash() at P1 (with the
+    # phantom ep flag) differs from its own hash_without_ep(), proving the
+    # divergence is real and repetition_hash is the thing bridging it.
+    raw_hash_at_p1, canonical_hash_at_p1 = hashes_after_occurrence_1
+    assert raw_hash_at_p1 != canonical_hash_at_p1
+
+
 def test_search_dual_boards_stay_in_sync(monkeypatch):
     """Enable the opt-in _dual_push verification and run a real search: every
     tree edge must keep the python-chess/cozy-chess board pair in sync.
