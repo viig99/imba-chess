@@ -65,6 +65,8 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Any
 
+import time
+
 import torch
 
 from imba_chess.data.event_builder import EVENT_TOKEN_ID
@@ -371,7 +373,19 @@ class ActorInferenceServer:
         device: torch.device,
         dtype: torch.dtype,
         require_value_head: bool = True,
+        profile_sync: bool = False,
     ) -> None:
+        # Wall-clock service buckets, always accumulated (perf_counter cost is
+        # negligible); `profile_sync` additionally cuda-synchronizes at bucket
+        # boundaries so GPU vs pre/post CPU attribution is honest -- enable
+        # only for diagnosis (IMBA_ACTOR_PROFILE=1), it serializes the device.
+        self.profile_sync = bool(profile_sync)
+        self.stats: dict[str, float] = {
+            "root_build_s": 0.0, "root_gpu_s": 0.0, "root_post_s": 0.0,
+            "wave_build_s": 0.0, "wave_gpu_s": 0.0, "wave_post_s": 0.0,
+            "root_calls": 0, "root_reqs": 0,
+            "wave_calls": 0, "wave_reqs": 0, "wave_rows": 0,
+        }
         # Validated ONCE here, not per request. RootEvalResponse.value_stm
         # and every WaveResponse row's value_stm are UNCONDITIONAL fields
         # (populated regardless of the worker's own model_move_policy, which
@@ -462,6 +476,12 @@ class ActorInferenceServer:
                 responses[i] = response
         return responses
 
+    def _sync_if_profiling(self) -> None:
+        # Honest GPU-vs-CPU wall attribution needs a device sync at bucket
+        # boundaries; only paid when profiling (IMBA_ACTOR_PROFILE=1 path).
+        if self.profile_sync and self._device.type == "cuda":
+            torch.cuda.synchronize(self._device)
+
     def release_turn(self, worker_id: int, turn_id: int) -> None:
         self._turns.pop((int(worker_id), int(turn_id)), None)
 
@@ -470,8 +490,11 @@ class ActorInferenceServer:
     ) -> list[RootEvalResponse]:
         if not requests:
             return []
+        _t0 = time.perf_counter()
         payloads = [_tensorize_root_batch(r.batch_arrays) for r in requests]
         merged = _merge_root_batches(payloads)
+        self._sync_if_profiling()
+        _t1 = time.perf_counter()
         output = _forward_model(
             model=self._model,
             batch=merged,
@@ -479,6 +502,12 @@ class ActorInferenceServer:
             dtype=self._dtype,
             return_kv=True,
         )
+        self._sync_if_profiling()
+        _t2 = time.perf_counter()
+        self.stats["root_build_s"] += _t1 - _t0
+        self.stats["root_gpu_s"] += _t2 - _t1
+        self.stats["root_calls"] += 1
+        self.stats["root_reqs"] += len(requests)
         output = _ensure_value_logits_placeholder(output)
         splits = _split_root_output(output, payloads)
 
@@ -510,11 +539,14 @@ class ActorInferenceServer:
                     legal_logits=legal_logits,
                 )
             )
+        self._sync_if_profiling()
+        self.stats["root_post_s"] += time.perf_counter() - _t2
         return responses
 
     def _service_waves(self, requests: list[WaveRequest]) -> list[WaveResponse]:
         if not requests:
             return []
+        _t0 = time.perf_counter()
         decode_requests: list[_ArenaDecodeRequest] = []
         turns: list[_TurnState] = []
         per_request_chains: list[list[list[int]]] = []
@@ -578,6 +610,8 @@ class ActorInferenceServer:
             per_request_chains.append(parent_chains)
 
         merged = _merge_decode_requests(decode_requests)
+        self._sync_if_profiling()
+        _t1 = time.perf_counter()
         with torch.inference_mode(), _autocast_context(self._device, self._dtype):
             out = self._model.forward_decode_grouped(
                 new_token_batch=merged.new_token_batch,
@@ -590,6 +624,13 @@ class ActorInferenceServer:
                 suffix_positions=merged.suffix_positions,
                 suffix_mask=merged.suffix_mask,
             )
+        self._sync_if_profiling()
+        _t2 = time.perf_counter()
+        self.stats["wave_build_s"] += _t1 - _t0
+        self.stats["wave_gpu_s"] += _t2 - _t1
+        self.stats["wave_calls"] += 1
+        self.stats["wave_reqs"] += len(requests)
+        self.stats["wave_rows"] += sum(len(r.rows) for r in requests)
         out = _ensure_value_logits_placeholder(out)
         split_outs = _split_decode_output(
             out, [len(dr.nodes) for dr in decode_requests]
@@ -619,4 +660,6 @@ class ActorInferenceServer:
             responses.append(
                 WaveResponse(rows=list(zip(value_stm_list, legal_logits_per_row)))
             )
+        self._sync_if_profiling()
+        self.stats["wave_post_s"] += time.perf_counter() - _t2
         return responses

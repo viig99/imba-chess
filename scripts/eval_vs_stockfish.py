@@ -8,6 +8,7 @@ import os
 import random
 import sys
 import traceback
+import time
 from dataclasses import asdict, dataclass
 from multiprocessing import connection as mp_connection
 from pathlib import Path
@@ -103,6 +104,8 @@ class SegmentSpec:
     limit_strength: bool
     elo: int | None
 
+
+_ACTOR_PROFILE = os.environ.get("IMBA_ACTOR_PROFILE") == "1"
 
 def _parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
@@ -1328,6 +1331,11 @@ def _serve_actor_workers(
     held_back: dict[int, dict[str, Any]] = {}
     next_expected_game_idx = 0
 
+    serve_stats: dict[str, float] = {
+        "start": time.perf_counter(),
+        "wait_s": 0.0, "recv_s": 0.0, "service_s": 0.0, "send_s": 0.0,
+        "rounds": 0, "round_reqs": 0,
+    }
     with tqdm(
         total=games,
         desc=f"stockfish-eval-actors[{segment_name}]",
@@ -1335,8 +1343,10 @@ def _serve_actor_workers(
         dynamic_ncols=True,
     ) as progress:
         while active_worker_ids:
+            _t_loop = time.perf_counter()
             live_conns = [parent_conns[w] for w in sorted(active_worker_ids)]
             ready = mp_connection.wait(live_conns, timeout=30.0)
+            serve_stats["wait_s"] += time.perf_counter() - _t_loop
             if not ready:
                 _check_workers_alive(processes, active_worker_ids)
                 continue
@@ -1345,6 +1355,7 @@ def _serve_actor_workers(
                 w for w in sorted(active_worker_ids) if parent_conns[w] in ready_set
             ]
 
+            _t_recv = time.perf_counter()
             requests: list[tuple[int, Any]] = []
             for worker_id in ready_worker_ids:
                 conn = parent_conns[worker_id]
@@ -1384,10 +1395,33 @@ def _serve_actor_workers(
                         f"worker pipe: {message!r}"
                     )
 
+            serve_stats["recv_s"] += time.perf_counter() - _t_recv
+
             if requests:
+                _t_svc = time.perf_counter()
                 responses = server.service([msg for _, msg in requests])
+                _t_send = time.perf_counter()
                 for (worker_id, _msg), response in zip(requests, responses):
                     parent_conns[worker_id].send(response)
+                serve_stats["service_s"] += _t_send - _t_svc
+                serve_stats["send_s"] += time.perf_counter() - _t_send
+                serve_stats["rounds"] += 1
+                serve_stats["round_reqs"] += len(requests)
+
+    if _ACTOR_PROFILE:
+        total = time.perf_counter() - serve_stats["start"]
+        lines = [f"[actor-profile] segment wall {total:.1f}s; serve-loop buckets:"]
+        for key in ("wait_s", "recv_s", "service_s", "send_s"):
+            lines.append(f"  {key}: {serve_stats[key]:.1f}s ({100 * serve_stats[key] / total:.1f}%)")
+        if serve_stats["rounds"]:
+            lines.append(
+                f"  rounds: {serve_stats['rounds']}  mean reqs/round: "
+                f"{serve_stats['round_reqs'] / serve_stats['rounds']:.2f}"
+            )
+        lines.append("  server buckets (cuda-synced):")
+        for key, value in server.stats.items():
+            lines.append(f"    {key}: {value:.1f}" if isinstance(value, float) else f"    {key}: {value}")
+        print("\n".join(lines), file=sys.stderr)
 
     if next_expected_game_idx != games:
         raise RuntimeError(
@@ -1510,6 +1544,7 @@ def _run_segment_actor_mode(
         model=model,
         device=device,
         dtype=dtype,
+        profile_sync=_ACTOR_PROFILE,
         # Same value-head requirement as the G=1 path's own
         # load_hstu_checkpoint(require_value_head=...) gate: only the three
         # value-dependent policies need a real value_stm. "greedy" is the
