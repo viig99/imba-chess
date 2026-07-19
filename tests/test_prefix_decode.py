@@ -508,3 +508,23 @@ def test_strategy_picks_identical_move_cached_vs_reference():
         lam=0.05,
     )
     assert legal_moves[chosen_cached].uci() == legal_moves[chosen_ref].uci()
+
+
+def test_project_legal_logits_returns_moves_sorted_by_uci():
+    from imba_chess.eval.position_evaluator import _project_legal_logits
+
+    move_vocab = _static_vocab()
+    logits = torch.arange(len(move_vocab), dtype=torch.float32)
+    board = chess.Board(
+        "r3k2r/p1ppqpb1/bn2pnp1/3PN3/1p2P3/2N2Q1p/PPPBBPPP/R3K2R w KQkq - 0 1"
+    )
+    legal_logits, legal_moves, _, _ = _project_legal_logits(
+        logits=logits, board=board, move_vocab=move_vocab
+    )
+    ucis = [m.uci() for m in legal_moves]
+    assert ucis == sorted(ucis)
+    # Alignment: each row of legal_logits must be the vocab logit of the
+    # SAME-index move. Since logits == arange(vocab_size), the vocab id of a
+    # move's uci equals its logit value directly.
+    for row, move in zip(legal_logits.tolist(), legal_moves):
+        assert row == move_vocab.token_to_id[move.uci()]

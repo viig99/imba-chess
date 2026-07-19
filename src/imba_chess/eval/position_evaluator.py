@@ -240,6 +240,14 @@ def _project_legal_logits(
             "No legal moves mapped to vocab ids for current board "
             f"(total legal={total_legal})."
         )
+    # Canonical order: sort by UCI string so python-chess and cozy movegen
+    # (Stage 3) produce identical move lists. Gumbel draws and prior-tie
+    # breaks in search are index-based, so this order is behavior, not just
+    # cosmetics. Sort ids and moves jointly (before index_select) so
+    # legal_logits stays aligned to legal_moves_with_ids.
+    order = sorted(range(len(legal_moves_with_ids)), key=lambda i: legal_moves_with_ids[i].uci())
+    legal_moves_with_ids = [legal_moves_with_ids[i] for i in order]
+    legal_move_ids = [legal_move_ids[i] for i in order]
     legal_ids_tensor = torch.tensor(
         legal_move_ids, device=logits.device, dtype=torch.long
     )
