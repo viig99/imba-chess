@@ -205,6 +205,7 @@ def test_forward_decode_grouped_matches_per_game_forward_decode():
             group_index=group_index,
             prefix_kv_grouped=prefix_kv_grouped,
             prefix_lens=prefix_lens,
+            prefix_lens_list=prefix_lens.tolist(),
             suffix_kv=suffix_kv,
             suffix_positions=suffix_positions,
             suffix_mask=suffix_mask,
@@ -257,6 +258,7 @@ def test_forward_decode_grouped_g1_matches_plain_forward_decode():
             group_index=torch.tensor([0], dtype=torch.long),
             prefix_kv_grouped=prefix_kv_grouped,
             prefix_lens=torch.tensor([T], dtype=torch.long),
+            prefix_lens_list=[T],
             suffix_kv=suffix_kv,
             suffix_positions=suffix_positions,
             suffix_mask=suffix_mask,
@@ -325,6 +327,7 @@ def test_forward_decode_grouped_multiple_rows_per_group():
             group_index=group_index,
             prefix_kv_grouped=prefix_kv_grouped,
             prefix_lens=prefix_lens,
+            prefix_lens_list=prefix_lens.tolist(),
         )
 
     for i, ref in enumerate(references):
@@ -425,6 +428,7 @@ def test_forward_decode_grouped_interleaved_group_index():
             group_index=group_index,
             prefix_kv_grouped=prefix_kv_grouped,
             prefix_lens=prefix_lens,
+            prefix_lens_list=prefix_lens.tolist(),
             suffix_kv=suffix_kv,
             suffix_positions=suffix_positions,
             suffix_mask=suffix_mask,
@@ -473,4 +477,5 @@ def test_forward_decode_grouped_empty_prefix_lens_raises():
             group_index=torch.tensor([0], dtype=torch.long),
             prefix_kv_grouped=prefix_kv_grouped,
             prefix_lens=torch.zeros(0, dtype=torch.long),
+            prefix_lens_list=[],
         )

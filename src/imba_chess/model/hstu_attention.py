@@ -262,7 +262,7 @@ class SequentialTransductionUnitJagged(torch.nn.Module):
         *,
         prefix_k: torch.Tensor,
         prefix_v: torch.Tensor,
-        prefix_lens: torch.Tensor,
+        prefix_lens_list: list[int],
         group_index: torch.Tensor,
         q_positions: torch.Tensor,
         suffix_k: torch.Tensor | None = None,
@@ -274,9 +274,17 @@ class SequentialTransductionUnitJagged(torch.nn.Module):
         prefix K/V (cross-game merged wave).
 
         x_new: [B, D]; prefix_k/v: [G, H, maxP, d] (games padded on the
-        token dim); prefix_lens: [G] real (unpadded) length per game;
-        group_index: [B] row -> game index g. suffix_k/v/positions/mask are
-        unchanged from forward_decode -- already per-row.
+        token dim); prefix_lens_list: length-G plain Python list, real
+        (unpadded) length per game -- deliberately a host-side list[int],
+        not a tensor: the per-group loop below reads one entry per group per
+        layer, and indexing a device tensor there (`.item()`) would force a
+        device->host sync G*num_layers times per decode step. The caller
+        already has these lengths as Python ints before any tensor is built
+        (see _DecodeRequest.prefix_len / _merge_decode_requests in
+        scripts/generate_search_rollouts.py), so no tensor round-trip -- and
+        no sync -- is needed to get them here. group_index: [B] row -> game
+        index g. suffix_k/v/positions/mask are unchanged from
+        forward_decode -- already per-row.
 
         Rows are bucketed by group and each group's prefix attention is
         computed as ONE einsum over that group's real (unpadded) prefix
@@ -331,7 +339,7 @@ class SequentialTransductionUnitJagged(torch.nn.Module):
             row_idx = (group_index == g).nonzero(as_tuple=True)[0]
             if row_idx.numel() == 0:
                 continue
-            actual_len = int(prefix_lens[g].item())
+            actual_len = prefix_lens_list[g]
             max_p = prefix_k.size(2)
             if not 0 <= actual_len <= max_p:
                 raise ValueError(

@@ -656,6 +656,7 @@ class HSTUChessModel(nn.Module):
         group_index: torch.Tensor,
         prefix_kv_grouped: list[tuple[torch.Tensor, torch.Tensor]],
         prefix_lens: torch.Tensor,
+        prefix_lens_list: list[int],
         suffix_kv: list[tuple[torch.Tensor, torch.Tensor]] | None = None,
         suffix_positions: torch.Tensor | None = None,
         suffix_mask: torch.Tensor | None = None,
@@ -668,8 +669,16 @@ class HSTUChessModel(nn.Module):
         row reading only its own game's prefix via `group_index` [B] -> g.
         prefix_kv_grouped is per-layer (k, v) with shape [G, H, maxP, d]
         (games zero-padded on the token dim to the batch's longest prefix);
-        prefix_lens [G] gives each game's real (unpadded) length. Suffix
-        args are unchanged from forward_decode -- already per-row.
+        prefix_lens [G] gives each game's real (unpadded) length, used only
+        for this function's own boundary validation below (num_groups,
+        group_index range). prefix_lens_list is the same G values as a
+        plain host-side list[int] -- passed straight through to each
+        layer's grouped decode, which indexes it once per group per layer;
+        threading the already-known Python ints instead of the device
+        tensor avoids a device->host sync there (see
+        SequentialTransductionUnitJagged.forward_decode_grouped's
+        docstring). Suffix args are unchanged from forward_decode --
+        already per-row.
 
         Single-prefix forward_decode above is untouched and remains the
         G=1 / eval path; this is purely additive.
@@ -686,6 +695,12 @@ class HSTUChessModel(nn.Module):
         content = self._build_content(new_token_batch)
         batch_size = int(content.shape[0])
         num_groups = int(prefix_lens.numel())
+        if len(prefix_lens_list) != num_groups:
+            raise ValueError(
+                "prefix_lens_list must have length num_groups "
+                f"(== prefix_lens.numel() == {num_groups}), got "
+                f"{len(prefix_lens_list)}"
+            )
         # Every attn_output row is written by whichever group claims it (see
         # forward_decode_grouped in hstu_attention.py); a row whose
         # group_index falls outside [0, num_groups) would never be claimed
@@ -717,7 +732,7 @@ class HSTUChessModel(nn.Module):
                 x,
                 prefix_k=prefix_k,
                 prefix_v=prefix_v,
-                prefix_lens=prefix_lens,
+                prefix_lens_list=prefix_lens_list,
                 group_index=group_index,
                 q_positions=positions,
                 suffix_k=layer_suffix_k,
