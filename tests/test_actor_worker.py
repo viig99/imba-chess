@@ -25,6 +25,7 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import chess
+import chess.engine
 import pytest
 
 from imba_chess.eval.actor_protocol import (
@@ -35,7 +36,7 @@ from imba_chess.eval.actor_protocol import (
     WaveResponse,
     WorkerFinished,
 )
-from imba_chess.eval.actor_worker import _WorkerSearchNode, run_eval_worker
+from imba_chess.eval.actor_worker import _WorkerSearchNode, _build_engine, run_eval_worker
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 STATIC_VOCAB_PATH = REPO_ROOT / "artifacts" / "move_vocab_static_uci.json"
@@ -380,3 +381,39 @@ def test_worker_search_node_extend_mirrors_cached_node_parent_semantics() -> Non
     # treated the same as None, mirroring _CachedNode.extend's isinstance guard.
     other_root_child = evaluator.extend(object(), "e2e4")
     assert other_root_child.parent_id is None
+
+
+def test_build_engine_quits_on_configure_failure(monkeypatch: pytest.MonkeyPatch) -> None:
+    """`_build_engine`'s production path (`stockfish_path`, not
+    `fake_engine_factory`): if `engine.configure(...)` raises right after a
+    successful `popen_uci`, the already-spawned engine must be quit()
+    before the exception propagates -- otherwise that Stockfish subprocess
+    leaks (run_eval_worker's own try/finally can't help here: it starts
+    only after `_build_engine` returns, so this guard has to live inside
+    `_build_engine` itself). `popen_uci` itself is monkeypatched out (no
+    real Stockfish binary needed for this unit test) to return a fake
+    engine whose `.configure()` always raises."""
+
+    class _ConfigureFailsEngine:
+        def __init__(self) -> None:
+            self.quit_calls = 0
+
+        def configure(self, options: dict) -> None:
+            raise RuntimeError("bad UCI option")
+
+        def quit(self) -> None:
+            self.quit_calls += 1
+
+    fake_engine = _ConfigureFailsEngine()
+    monkeypatch.setattr(
+        chess.engine.SimpleEngine,
+        "popen_uci",
+        staticmethod(lambda path: fake_engine),
+    )
+
+    with pytest.raises(RuntimeError, match="bad UCI option"):
+        _build_engine(
+            {"stockfish_path": "/fake/stockfish", "stockfish_options": {"Threads": 2}}
+        )
+
+    assert fake_engine.quit_calls == 1

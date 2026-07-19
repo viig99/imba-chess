@@ -398,7 +398,16 @@ def _build_engine(engine_config: dict):
     engine = chess.engine.SimpleEngine.popen_uci(str(stockfish_path))
     options = engine_config.get("stockfish_options")
     if options:
-        engine.configure(options)
+        # popen_uci already succeeded (the subprocess is live) by the time
+        # configure() runs; if configure() itself raises (a bad UCI option
+        # value, engine protocol error, ...) that subprocess must still be
+        # reaped here rather than left running -- quit-on-failure, then
+        # re-raise unchanged (fail-fast preserved, nothing swallowed).
+        try:
+            engine.configure(options)
+        except Exception:
+            engine.quit()
+            raise
     return engine
 
 
@@ -617,8 +626,16 @@ def run_eval_worker(conn, worker_config: dict) -> None:
     Fail-fast (repo policy): no exception here is caught and swallowed. A
     dead pipe, a malformed response, an engine crash -- all propagate to the
     caller (Task 3's orchestrator kills the whole run on any worker
-    exception/EOF). The only `finally` is `engine.quit()`, so a real
-    Stockfish subprocess is never leaked even when a game raises.
+    exception/EOF). `engine.quit()` runs in a `finally` covering the whole
+    game loop, so a real Stockfish subprocess is never leaked by anything
+    raised while playing; `_build_engine` additionally quits-then-re-raises
+    if `engine.configure(...)` itself fails right after a successful
+    `popen_uci` (a window this `finally` can't reach, since it starts only
+    once `engine` already exists). `_build_engine_limit` runs BEFORE
+    `_build_engine` for the same reason: it can't leak anything since it
+    never spawns a subprocess, so validating/building the limit first means
+    a bad `stockfish_limit` dict never reaches "subprocess already spawned,
+    then raise" territory at all.
     """
     worker_id = int(worker_config["worker_id"])
     game_indices = list(worker_config["game_indices"])
@@ -644,12 +661,19 @@ def run_eval_worker(conn, worker_config: dict) -> None:
         else BoardTokenConfig()
     )
 
-    engine_config = worker_config["engine"]
-    engine = _build_engine(engine_config)
-    engine_limit = _build_engine_limit(engine_config.get("stockfish_limit"))
     rng = random.Random(seed + worker_id)
     turn_counter = itertools.count()
 
+    engine_config = worker_config["engine"]
+    # Limit first, engine second: _build_engine_limit is pure (no
+    # subprocess), so if it raises (a malformed "stockfish_limit" dict)
+    # there is nothing live yet to leak. Building the engine only after the
+    # limit is known-good, immediately before the try/finally below, means
+    # the ONLY thing the finally's engine.quit() ever needs to cover is
+    # "the engine object already exists" -- no window between engine
+    # construction and try-entry where an unrelated raise could skip quit().
+    engine_limit = _build_engine_limit(engine_config.get("stockfish_limit"))
+    engine = _build_engine(engine_config)
     try:
         for game_idx in game_indices:
             summary = _play_one_game(
