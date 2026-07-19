@@ -121,38 +121,47 @@ def select_greedy(legal_log_priors: list[float]) -> int:
     return max(range(len(legal_log_priors)), key=legal_log_priors.__getitem__)
 
 
-def _forcing_index_set(
-    legal_moves: list,
+def _forcing_index_set_root(
+    legal_moves: list[chess.Move],
     cozy_board: "cc.Board",
     *,
-    board: Optional[chess.Board] = None,
-    legal_ucis: Optional[list[str]] = None,
+    board: chess.Board,
 ) -> set[int]:
-    """Indices of forcing moves (promotion/capture/check), one cozy board per node.
+    """Indices of forcing moves (promotion/capture/check) at the root.
 
-    `legal_moves` is python-chess Move objects at the root (`board` -- the
-    real root python-chess board -- is required there for the capture test)
-    or cozy-chess Move objects at tree nodes (legal_ucis required there,
-    aligned with legal_moves via PositionEval.legal_ucis; the tree carries
-    no python-chess board at all as of Task 5, so capture detection there is
-    cozy-native via cozy_bridge.is_capture_cozy). Check-detection uses
-    whichever cozy move representation is already at hand -- the root path
-    lazily translates via py_move_to_cozy only when the promotion/capture
-    fast checks don't already resolve the move as forcing.
+    `legal_moves` is python-chess Move objects; `board` -- the real root
+    python-chess board -- is required for the capture test. Check-detection
+    lazily translates each move via py_move_to_cozy only when the
+    promotion/capture fast checks don't already resolve it as forcing.
     """
     forcing: set[int] = set()
     for idx, move in enumerate(legal_moves):
-        if isinstance(move, chess.Move):
-            assert board is not None
-            is_capture, cozy_move = board.is_capture(move), None
-        else:
-            assert legal_ucis is not None
-            is_capture, cozy_move = cozy_bridge.is_capture_cozy(cozy_board, move), move
+        is_capture = board.is_capture(move)
         if move.promotion is not None or is_capture:
             forcing.add(idx)
-        elif cozy_bridge.gives_check(
-            cozy_board, cozy_move if cozy_move is not None else cozy_bridge.py_move_to_cozy(board, move)
-        ):
+        elif cozy_bridge.gives_check(cozy_board, cozy_bridge.py_move_to_cozy(board, move)):
+            forcing.add(idx)
+    return forcing
+
+
+def _forcing_index_set_tree(
+    legal_moves: list,
+    cozy_board: "cc.Board",
+) -> set[int]:
+    """Indices of forcing moves (promotion/capture/check) at a tree node,
+    one cozy board per node.
+
+    `legal_moves` is cozy-chess Move objects (the tree carries no
+    python-chess board at all as of Task 5, so both the capture and
+    check-detection tests are cozy-native, via cozy_bridge.is_capture_cozy /
+    cozy_bridge.gives_check directly on the move already at hand).
+    """
+    forcing: set[int] = set()
+    for idx, move in enumerate(legal_moves):
+        is_capture = cozy_bridge.is_capture_cozy(cozy_board, move)
+        if move.promotion is not None or is_capture:
+            forcing.add(idx)
+        elif cozy_bridge.gives_check(cozy_board, move):
             forcing.add(idx)
     return forcing
 
@@ -457,9 +466,7 @@ def _d2_stepwise(
         # tactical refutation is often a low-probability move under a
         # human-imitation policy, so policy top-k alone misses it.
         opp_seen = set(opp_indices)
-        opp_forcing = _forcing_index_set(
-            board1_eval.legal_moves, candidate.cozy1, legal_ucis=board1_eval.legal_ucis
-        )
+        opp_forcing = _forcing_index_set_tree(board1_eval.legal_moves, candidate.cozy1)
         for opp_idx in range(len(board1_eval.legal_moves)):
             if opp_idx in opp_seen:
                 continue
@@ -648,9 +655,7 @@ def _push_children(
     opponent_to_move = node_stm_is_white != root_color
     order = _prior_order(position_eval.legal_log_priors)
     if opponent_to_move:
-        forcing = _forcing_index_set(
-            position_eval.legal_moves, node.cozy_board, legal_ucis=position_eval.legal_ucis
-        )
+        forcing = _forcing_index_set_tree(position_eval.legal_moves, node.cozy_board)
         # Refutation floor: top-r replies by prior plus ALL forcing replies.
         picks = list(order[: config.refutation_top_r])
         seen = set(picks)
@@ -724,7 +729,7 @@ def _halving_stepwise(
         order = _prior_order(legal_log_priors)
     picks = list(order[: min(config.top_m, len(order))])
     seen = set(picks)
-    forcing = _forcing_index_set(legal_moves, root_cozy, board=board)
+    forcing = _forcing_index_set_root(legal_moves, root_cozy, board=board)
     for idx in range(len(legal_moves)):
         if idx not in seen and idx in forcing:
             picks.append(idx)

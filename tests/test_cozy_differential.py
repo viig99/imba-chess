@@ -71,7 +71,7 @@ def test_legal_move_sets_match_python_chess_everywhere():
 
 def test_is_capture_cozy_matches_python_chess_everywhere():
     """cozy_bridge.is_capture_cozy (Stage 3 Task 5) is the capture test
-    _forcing_index_set uses at cozy-only tree nodes -- python-chess is_capture
+    _forcing_index_set_tree uses at cozy-only tree nodes -- python-chess is_capture
     remains the oracle, castling included (cozy's king-takes-own-rook
     encoding must NOT read as a capture despite the destination being
     occupied by the player's own rook)."""
