@@ -47,11 +47,17 @@ output_path="${STATE_DIR}/session_${session_ts}.parquet"
 
 echo "$(date): starting session, skip_games=${skip_games}, output=${output_path}" >> "${STATE_DIR}/nightly.log"
 
+# Unattended-night margin (2026-07-20): script default G=8 fp32 peaks 6.9GB on
+# 20-game runs, but the CUDA allocator's high-water-mark creeps over long
+# sessions (2026-07-15 notes) -- G=6 + expandable_segments buys OOM headroom
+# for ~5% throughput, the right trade for month-long unattended operation.
+export PYTORCH_ALLOC_CONF="${PYTORCH_ALLOC_CONF:-expandable_segments:True}"
 nohup python scripts/generate_search_rollouts.py \
     --config "${CONFIG}" \
     --checkpoint "${CHECKPOINT}" \
     --output-path "${output_path}" \
     --skip-games "${skip_games}" \
+    --concurrent-games 6 \
     --flush-every-games 200 \
     >> "${STATE_DIR}/nightly.log" 2>&1 &
 
