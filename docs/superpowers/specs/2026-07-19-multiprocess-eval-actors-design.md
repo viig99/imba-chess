@@ -99,11 +99,12 @@ revisit only if tail-latency measurements demand it).
 - **Score**: 200 games @ SF2200 2048/d8 new protocol: **0.5850** (0.15 SE
   above the 0.5775 baseline; the mid-run 0.49@54 dip was sampling noise that
   resolved exactly as the SE math predicted).
-- **Perf**: **38 min / 200 games = 11s/game** at G=6 — vs 60 min (17-19
-  s/game) for the in-process batched driver and ~2x the per-game cost of
-  the pre-project era measured at ~2x fewer games. Gate target ("well under
-  30, aim 15-20") NOT fully met; accepted with the remaining lever
-  documented below.
+- **Perf**: **38 min / 200 games = 11s/game** at G=6. Comparison chain,
+  correctly attributed: in-process batched driver (fast-clean-evals) ~66
+  min/200; actor mode PRE-optimization 60 min (17-19 s/game); post
+  thin-down+incremental-root 38 min (11 s/game). Pre-project sequential era:
+  ~21-25 s/game. Gate target ("well under 30, aim 15-20") NOT fully met;
+  accepted with the remaining lever documented below.
 
 ### Optimization journal (wall-clock instrumented; IMBA_ACTOR_PROFILE=1)
 1. cProfile-driven thin-down (projection→workers, no board reconstruction,

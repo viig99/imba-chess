@@ -822,3 +822,25 @@ def test_kv_arena_append_and_gather_suffix_round_trip_across_capacity_growth():
                 torch.testing.assert_close(
                     gathered_v[row, :, pos, :], all_v_rows[arena_row][layer]
                 )
+
+
+def test_release_game_frees_prefix_and_incremental_after_release_raises():
+    """Merge-review gap (2026-07-19): `release_game`'s leak-freedom was
+    asserted by design but untested, unlike `release_turn`/`_turns`. This
+    pins both halves: (1) release_game empties the per-worker `_games`
+    persisted-prefix store; (2) an incremental request against the released
+    worker fails fast with the missing-game-state KeyError instead of
+    silently re-registering or reusing stale KV."""
+    fixture = _Fixture()
+
+    incremental_req, _ref = _registered_incremental_request(
+        fixture, worker_id=0, first_moves=["e2e4", "e7e5"], extra_move="g1f3"
+    )
+    assert 0 in fixture.server._games  # registered by the FULL root above
+
+    fixture.server.release_game(0)
+    fixture.server.release_game(0)  # idempotent
+    assert 0 not in fixture.server._games
+
+    with pytest.raises(KeyError, match="no persisted game prefix"):
+        fixture.server.service([incremental_req])
