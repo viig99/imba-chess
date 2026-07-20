@@ -86,3 +86,49 @@ revisit only if tail-latency measurements demand it).
   is near-optimal for its workload).
 - Work-stealing/dynamic assignment; multi-GPU; remote execution.
 - Budget 4096 A/B (queued behind this, on the new protocol).
+
+## Results (2026-07-19/20, branch eval-actors)
+
+### Acceptance
+- **Accuracy**: fixed-composition move-probe 100/100 byte-identical vs the
+  in-process path at fp32, re-verified after EVERY optimization round (thin-
+  down, incremental root). Incremental-turn equivalence pinned in-repo at the
+  canonical decode-vs-forward 1e-5 bound (multi-turn CPU test) and validated
+  to 60-turn depth by a deep-chain drift probe: 2.9e-6 @ turn 5 plateauing
+  ~1.0-1.6e-5 @ turns 30-60 — NO compounding.
+- **Score**: 200 games @ SF2200 2048/d8 new protocol: **0.5850** (0.15 SE
+  above the 0.5775 baseline; the mid-run 0.49@54 dip was sampling noise that
+  resolved exactly as the SE math predicted).
+- **Perf**: **38 min / 200 games = 11s/game** at G=6 — vs 60 min (17-19
+  s/game) for the in-process batched driver and ~2x the per-game cost of
+  the pre-project era measured at ~2x fewer games. Gate target ("well under
+  30, aim 15-20") NOT fully met; accepted with the remaining lever
+  documented below.
+
+### Optimization journal (wall-clock instrumented; IMBA_ACTOR_PROFILE=1)
+1. cProfile-driven thin-down (projection→workers, no board reconstruction,
+   KV arena, batched value softmax): correctness-clean, **throughput-neutral**
+   — cProfile's per-call overhead had inflated Python-call-heavy costs ~5x;
+   lesson recorded: wall-clock buckets for latency-bound serving loops,
+   cProfile only for CPU-bound single-process code.
+2. Batching grace window (3ms and 12ms threshold variants): fattened rounds
+   2.37→3.00 reqs but per-REQUEST service time flat (~30ms) — costs are
+   per-request (per-group kernels, per-row build), not per-call. Reverted.
+3. **Incremental root KV** (full forward once per game, then forward_decode
+   extension per new ply; per-game prefix lifetime): root GPU 48-73s →
+   ~7s per 12-game segment; wall 17-19 → **11s/game**. The decisive fix.
+
+### Remaining lever (documented, not built)
+wave_build (5.9ms/req) + wave_post (6.6ms/req) per-row Python in the server
+(~50% of remaining service time): vectorizing idx/mask construction and
+response marshaling projects to ~9s/game (~30 min/200). Diminishing returns
+vs the 5090 scale-out and Phase-1b; revisit only if eval cadence becomes
+the binding constraint again.
+
+### Ops notes
+- G=6 local (G=8 OOMs at fp32/2048 on the 7.66GiB usable card); retune on
+  larger GPUs.
+- Server profiling: IMBA_ACTOR_PROFILE=1 (serve-loop + cuda-synced server
+  buckets to stderr).
+- The wrapper passes --config explicitly since the anchor-provenance
+  incident (both tomls carry the protocol; CONFIG env overridable).
