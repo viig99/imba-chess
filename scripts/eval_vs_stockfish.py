@@ -1318,6 +1318,12 @@ def _serve_actor_workers(
     once per worker, the moment its NEXT `RootEvalRequest` (a different
     turn_id) proves the previous turn's search is over, and once more on
     `WorkerFinished` for whatever turn was still open at that point.
+    `release_game` (incremental-root-KV optimization, `docs/superpowers/
+    sdd/increm-report.md`) fires on a DIFFERENT lifetime -- once per
+    `GameDone` (that game's persisted root prefix is done growing) and
+    defensively again on `WorkerFinished` -- since the persisted prefix
+    now spans a whole game across turns, not just one turn's decode-wave
+    search tree.
 
     Fail-fast: a pipe EOF/reset (`conn.recv()` raising `EOFError`/`OSError`)
     or an unexpected message shape raises immediately, propagating out to
@@ -1377,6 +1383,20 @@ def _serve_actor_workers(
                 elif isinstance(message, WaveRequest):
                     requests.append((worker_id, message))
                 elif isinstance(message, GameDone):
+                    # Incremental-root-KV optimization (docs/superpowers/sdd/
+                    # increm-report.md): the worker's persisted per-game
+                    # prefix KV lives for exactly this long -- this game just
+                    # finished, so free it here (NOT on the worker's next
+                    # RootEvalRequest, unlike release_turn's per-turn arena/
+                    # node-chain state above, which is unrelated and still
+                    # released that way): the worker's NEXT game (if any)
+                    # always starts with a FULL RootEvalRequest anyway (a
+                    # fresh _PlainSequenceHistory has server_prefix_len=None),
+                    # which would overwrite this entry regardless -- but
+                    # releasing it here promptly frees that memory instead of
+                    # leaving it live for however long this worker takes to
+                    # reach its next game.
+                    server.release_game(worker_id)
                     held_back[message.game_idx] = message.summary_fragment
                     while next_expected_game_idx in held_back:
                         fragment = held_back.pop(next_expected_game_idx)
@@ -1388,6 +1408,11 @@ def _serve_actor_workers(
                     prev_turn = last_turn_by_worker.pop(worker_id, None)
                     if prev_turn is not None:
                         server.release_turn(worker_id, prev_turn)
+                    # Defensive backstop (release_game is idempotent): every
+                    # game already released its own prefix via GameDone
+                    # above, so this is normally a no-op -- mirrors
+                    # release_turn's own defensive WorkerFinished call.
+                    server.release_game(worker_id)
                     active_worker_ids.discard(worker_id)
                 else:  # pragma: no cover - fail fast on a protocol violation
                     raise RuntimeError(

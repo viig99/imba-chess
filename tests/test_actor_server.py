@@ -428,9 +428,9 @@ def test_require_value_head_false_allows_construction_and_serves_zero_placeholde
     scripts/eval_vs_stockfish.py's `_run_segment_actor_mode`) must both (a)
     allow constructing the server against a value-head-less model, and (b)
     serve every response's value_stm as the documented `0.0` placeholder --
-    checked on BOTH the root-eval and decode-wave paths, since each reuses a
-    different tensor-math helper that unconditionally expects a
-    "value_logits" key on its input dict -- see
+    checked on the root-eval, decode-wave, AND incremental-root-eval paths,
+    since each reuses a different tensor-math helper that unconditionally
+    expects a "value_logits" key on its input dict -- see
     `_ensure_value_logits_placeholder`."""
     move_vocab = _static_vocab()
     model = _tiny_model(vocab_size=len(move_vocab), enable_value_head=False)
@@ -464,6 +464,299 @@ def test_require_value_head_false_allows_construction_and_serves_zero_placeholde
     )[0]
     value_stm, _legal_logits = wave_response.rows[0]
     assert value_stm == 0.0
+
+    # Incremental root path: replay the SAME two committed moves into a
+    # torch-free _PlainSequenceHistory (mirroring what a real worker would
+    # have built before this register_root call), then commit one more ply
+    # and send an INCREMENTAL RootEvalRequest for the resulting position.
+    from imba_chess.eval.actor_worker import _PlainSequenceHistory
+
+    worker_history = _PlainSequenceHistory(
+        worker_id=0, move_vocab=move_vocab, board_state_encoder=encoder
+    )
+    replay_board = chess.Board()
+    for uci in ("e2e4", "e7e5"):
+        worker_history.append_observed_position(replay_board)
+        worker_history.record_played_move(uci)
+        replay_board.push_uci(uci)
+    assert replay_board.board_fen() == board.board_fen()
+    worker_history.server_prefix_len = int(batch["total_tokens"])
+
+    worker_history.append_observed_position(replay_board)
+    worker_history.record_played_move("g1f3")
+    replay_board.push_uci("g1f3")
+    incremental_tokens, new_total_len = (
+        worker_history.build_incremental_tokens_for_current_position(replay_board)
+    )
+    legal_vocab_ids2, _moves2, _ucis2 = _legal_vocab_projection(
+        cozy_bridge.board_to_cozy(replay_board), move_vocab
+    )
+    incremental_response = server.service(
+        [
+            RootEvalRequest(
+                worker_id=0,
+                turn_id=1,
+                legal_vocab_ids=legal_vocab_ids2,
+                incremental_tokens=incremental_tokens,
+                prefix_len_before=worker_history.server_prefix_len,
+            )
+        ]
+    )[0]
+    assert incremental_response.value_stm == 0.0
+
+
+# ---------------------------------------------------------------------------
+# Incremental-root-KV optimization (docs/superpowers/sdd/increm-report.md):
+# the decisive equivalence test -- an incremental RootEvalRequest's response
+# must match a from-scratch full-forward reference at every turn.
+# ---------------------------------------------------------------------------
+
+
+def test_incremental_root_matches_full_forward_reference_across_turns_and_game_boundary():
+    """Multi-turn, multi-game equivalence: every INCREMENTAL root response
+    (server-side sequential `forward_decode` extension of the persisted
+    per-worker prefix, `_service_incremental_root`) must match a
+    from-scratch FULL forward's root response at the SAME position --
+    across >=6 model turns, including a k=1 "re-root with no committed ply
+    in between" step, an opening-ply skip (forced non-model plies before
+    the first model turn), and a game-boundary reset (a second game on the
+    SAME worker_id, proving `release_game` + the next game's first request
+    starts FULL with no incremental state leaking across games).
+
+    Tolerance: incremental turns are checked at 1e-5 atol/rtol -- matching,
+    not loosening beyond, `tests/test_prefix_decode.py`'s own decode-vs-
+    forward bound (decode is a numerically DIFFERENT path than a full
+    forward: a different einsum/softmax shape, so bit-identical output to
+    this module's stricter 1e-6 default -- used elsewhere here only for
+    full-forward-vs-full-forward comparisons -- isn't the achievable bar).
+    The FIRST turn of each game is still a full forward on both sides, so
+    it stays at the module's normal 1e-6.
+
+    Move sequences are generated deterministically (`next(iter(board.
+    legal_moves))` for every ply, both games) rather than hand-picked UCI
+    strings, so every ply is legal by construction -- verified separately
+    to not trigger game-over within either game's ply budget."""
+    fixture = _Fixture()
+    from imba_chess.eval.actor_worker import _PlainSequenceHistory
+
+    DECODE_ATOL, DECODE_RTOL = 1e-5, 1e-5
+    turn_counter = [0]  # global-monotonic turn_id across both games, like the real worker
+
+    def play_game(
+        *, worker_id: int, num_opening_plies: int, num_turns: int, k1_reroot_on_first_turn: bool
+    ) -> None:
+        board = chess.Board()
+        worker_history = _PlainSequenceHistory(
+            worker_id=worker_id,
+            move_vocab=fixture.move_vocab,
+            board_state_encoder=fixture.encoder,
+        )
+        moves_so_far: list[str] = []
+
+        def commit_next_legal_move() -> None:
+            move = next(iter(board.legal_moves))
+            uci = move.uci()
+            worker_history.append_observed_position(board)
+            worker_history.record_played_move(uci)
+            board.push(move)
+            moves_so_far.append(uci)
+
+        for _ in range(num_opening_plies):
+            commit_next_legal_move()
+
+        def root_round_trip() -> None:
+            ref = _reference_root_response(fixture, moves_so_far)
+            assert ref["board"].fen() == board.fen()
+            turn_id = turn_counter[0]
+            turn_counter[0] += 1
+            if worker_history.server_prefix_len is None:
+                batch_arrays = worker_history.build_batch_for_current_position(board)
+                request = RootEvalRequest(
+                    worker_id=worker_id,
+                    turn_id=turn_id,
+                    legal_vocab_ids=ref["legal_vocab_ids"],
+                    batch_arrays=batch_arrays,
+                )
+                new_total_len = int(batch_arrays["total_tokens"])
+                atol, rtol = ATOL, RTOL
+            else:
+                incremental_tokens, new_total_len = (
+                    worker_history.build_incremental_tokens_for_current_position(board)
+                )
+                request = RootEvalRequest(
+                    worker_id=worker_id,
+                    turn_id=turn_id,
+                    legal_vocab_ids=ref["legal_vocab_ids"],
+                    incremental_tokens=incremental_tokens,
+                    prefix_len_before=worker_history.server_prefix_len,
+                )
+                atol, rtol = DECODE_ATOL, DECODE_RTOL
+            response = fixture.server.service([request])[0]
+            worker_history.server_prefix_len = new_total_len
+            _assert_root_matches(response, ref, turn_id=turn_id, atol=atol, rtol=rtol)
+
+        for turn in range(num_turns):
+            root_round_trip()
+            if turn == 0 and k1_reroot_on_first_turn:
+                # k=1: commit ONLY this turn's "model" move first (not yet
+                # the opponent's reply), then re-root -- a genuine
+                # single-new-token extension. (Re-rooting the SAME position
+                # with NOTHING committed in between would be the
+                # degenerate zero-new-token case -- build_incremental_
+                # tokens_for_current_position rejects that by design, since
+                # the server's persisted prefix already ends exactly there;
+                # this is the smallest legitimate k>=1 case instead.)
+                commit_next_legal_move()
+                root_round_trip()
+                commit_next_legal_move()  # this turn's "opponent" reply
+            else:
+                commit_next_legal_move()  # this turn's "model" move
+                commit_next_legal_move()  # this turn's "opponent" reply
+
+        fixture.server.release_game(worker_id)
+
+    # Game A: an opening-ply skip (2 forced plies before the first model
+    # turn) plus a k=1 re-root, then 3 model turns (1 full + 3 incremental
+    # counting the re-root) -- 8 plies total, well inside a verified-legal
+    # deterministic "first legal move" run.
+    play_game(
+        worker_id=0, num_opening_plies=2, num_turns=3, k1_reroot_on_first_turn=True
+    )
+    # Game B: SAME worker_id, fresh game (game-boundary reset) -- this
+    # game's first request must be FULL (worker_history.server_prefix_len
+    # starts None again for the fresh _PlainSequenceHistory), proving no
+    # incremental state leaked from game A's released prefix.
+    play_game(
+        worker_id=0, num_opening_plies=0, num_turns=3, k1_reroot_on_first_turn=False
+    )
+
+    # >=6 turns total, per the correctness gate.
+    assert turn_counter[0] >= 6
+
+
+def _registered_incremental_request(
+    fixture: _Fixture, *, worker_id: int, first_moves: list[str], extra_move: str
+) -> tuple[RootEvalRequest, dict]:
+    """Registers `worker_id`'s FIRST turn (over `first_moves`) via
+    `register_root`, then builds a real INCREMENTAL `RootEvalRequest` for
+    the position one more move later (`extra_move`) -- shared setup for the
+    cross-worker mixed-batch tests below."""
+    from imba_chess.eval.actor_worker import _PlainSequenceHistory
+
+    ref0 = _reference_root_response(fixture, first_moves)
+    fixture.server.register_root(
+        worker_id, 0, ref0["wire_batch_arrays"], ref0["legal_vocab_ids"]
+    )
+
+    worker_history = _PlainSequenceHistory(
+        worker_id=worker_id,
+        move_vocab=fixture.move_vocab,
+        board_state_encoder=fixture.encoder,
+    )
+    replay_board = chess.Board()
+    for uci in first_moves:
+        worker_history.append_observed_position(replay_board)
+        worker_history.record_played_move(uci)
+        replay_board.push_uci(uci)
+    assert replay_board.board_fen() == ref0["board"].board_fen()
+    worker_history.server_prefix_len = int(ref0["wire_batch_arrays"]["total_tokens"])
+
+    worker_history.append_observed_position(replay_board)
+    worker_history.record_played_move(extra_move)
+    replay_board.push_uci(extra_move)
+    incremental_tokens, _new_len = (
+        worker_history.build_incremental_tokens_for_current_position(replay_board)
+    )
+    ref1 = _reference_root_response(fixture, [*first_moves, extra_move])
+    request = RootEvalRequest(
+        worker_id=worker_id,
+        turn_id=1,
+        legal_vocab_ids=ref1["legal_vocab_ids"],
+        incremental_tokens=incremental_tokens,
+        prefix_len_before=worker_history.server_prefix_len,
+    )
+    return request, ref1
+
+
+def test_mixed_full_and_incremental_roots_batched_in_one_service_call():
+    """Cross-worker root batching (`_service_roots`' dispatcher) must
+    handle a MIXED batch -- some requests FULL, some INCREMENTAL, from
+    DIFFERENT workers -- in one `service()` call, the realistic common
+    case once some workers are past their first turn while others (e.g. a
+    worker that just started its next game) are on their very first.
+    Response order must match request order regardless of which internal
+    path (`_service_full_roots`'s merged batch vs. per-request
+    `_service_incremental_root`) served each one; also covers TWO
+    different workers' INCREMENTAL requests landing in the SAME call
+    (worker 0 and worker 2 here)."""
+    fixture = _Fixture()
+
+    incremental_req0, ref0 = _registered_incremental_request(
+        fixture, worker_id=0, first_moves=["e2e4", "e7e5"], extra_move="g1f3"
+    )
+    full_ref1 = _reference_root_response(fixture, ["d2d4", "d7d5"])
+    full_req1 = RootEvalRequest(
+        worker_id=1,
+        turn_id=0,
+        legal_vocab_ids=full_ref1["legal_vocab_ids"],
+        batch_arrays=full_ref1["wire_batch_arrays"],
+    )
+    incremental_req2, ref2 = _registered_incremental_request(
+        fixture, worker_id=2, first_moves=["c2c4"], extra_move="e7e5"
+    )
+
+    responses = fixture.server.service([incremental_req0, full_req1, incremental_req2])
+    assert len(responses) == 3
+    _assert_root_matches(responses[0], ref0, turn_id=1, atol=1e-5, rtol=1e-5)
+    _assert_root_matches(responses[1], full_ref1, turn_id=0)
+    _assert_root_matches(responses[2], ref2, turn_id=1, atol=1e-5, rtol=1e-5)
+
+
+def test_incremental_root_raises_on_missing_game_state():
+    """No prior FULL RootEvalRequest was ever registered for this
+    worker_id (or its game was already release_game()'d) -- the fail-fast
+    KeyError guard in `_service_incremental_root`."""
+    fixture = _Fixture()
+    with pytest.raises(KeyError, match="no persisted game prefix"):
+        fixture.server.service(
+            [
+                RootEvalRequest(
+                    worker_id=0,
+                    turn_id=0,
+                    legal_vocab_ids=[],
+                    incremental_tokens={
+                        "piece_ids": [[0] * 64],
+                        "seq_token_id": [1],
+                        "turn_id": [0],
+                        "castle_id": [0],
+                        "ep_file_id": [0],
+                        "halfmove_bucket_id": [0],
+                        "fullmove_bucket_id": [0],
+                        "prev_move_id": [0],
+                    },
+                    prefix_len_before=2,
+                )
+            ]
+        )
+
+
+def test_incremental_root_raises_on_prefix_len_desync():
+    """A worker's own recorded `prefix_len_before` disagreeing with the
+    server's actual persisted `_GameState.prefix_len` (protocol/ordering
+    bug) must raise, not silently extend from the wrong offset."""
+    fixture = _Fixture()
+    request, _ref = _registered_incremental_request(
+        fixture, worker_id=0, first_moves=["e2e4", "e7e5"], extra_move="g1f3"
+    )
+    desynced = RootEvalRequest(
+        worker_id=request.worker_id,
+        turn_id=request.turn_id,
+        legal_vocab_ids=request.legal_vocab_ids,
+        incremental_tokens=request.incremental_tokens,
+        prefix_len_before=request.prefix_len_before + 1,
+    )
+    with pytest.raises(RuntimeError, match="prefix desync"):
+        fixture.server.service([desynced])
 
 
 # ---------------------------------------------------------------------------

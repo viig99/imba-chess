@@ -58,7 +58,18 @@ class _PlainSequenceHistory:
     incremental BOS+event token bookkeeping, but every tensor field of
     `_build_single_batch()` stays a plain Python list/int here -- this dict
     IS `RootEvalRequest.batch_arrays`, sent across the pipe as-is (the
-    server tensorizes it on receipt; Task 2)."""
+    server tensorizes it on receipt; Task 2).
+
+    `server_prefix_len` (incremental-root-KV optimization; see
+    `docs/superpowers/sdd/increm-report.md`) tracks how many tokens the
+    SERVER's persisted per-worker prefix KV covers, as of this game's last
+    root request -- `None` means "no root request sent yet for this game",
+    the signal `_select_model_move` uses to send a FULL
+    `RootEvalRequest.batch_arrays` instead of an incremental one. A fresh
+    instance is constructed per game (`actor_worker._play_one_game`), so
+    this starts `None` for every game with no explicit reset needed --
+    "new game = fresh full root" falls out of that structurally.
+    """
 
     def __init__(
         self, *, worker_id: int, move_vocab: MoveVocab, board_state_encoder: BoardStateEncoder
@@ -66,6 +77,7 @@ class _PlainSequenceHistory:
         self._move_vocab = move_vocab
         self._board_state_encoder = board_state_encoder
         self._game_id = f"actor_worker_{worker_id}"
+        self.server_prefix_len: int | None = None
 
         self.seq_token_id: list[int] = [BOS_TOKEN_ID]
         self.piece_ids: list[list[int]] = [[0] * 64]
@@ -138,6 +150,62 @@ class _PlainSequenceHistory:
         self._append_from_state(state)
         try:
             return self._build_single_batch()
+        finally:
+            self._pop_last()
+
+    def build_incremental_tokens_for_current_position(
+        self, board: chess.Board
+    ) -> tuple[dict, int]:
+        """Incremental-root-KV twin of `build_batch_for_current_position`:
+        appends the same transient current-position token, but returns only
+        the TAIL rows added since `self.server_prefix_len` (the server's
+        persisted prefix length as of this game's PREVIOUS root request)
+        instead of the whole sequence -- exactly the fields one
+        `RootEvalRequest.incremental_tokens` step needs
+        (`actor_server._service_incremental_root` feeds them straight into
+        `hstu_model.HSTUChessModel.forward_decode`'s `new_token_batch`, one
+        row at a time). The row count (k) is WHATEVER the actual length
+        delta turns out to be -- normally 2 (this worker's own prior move
+        settling into history + the opponent's reply) but never assumed;
+        see `RootEvalRequest`'s own docstring.
+
+        Returns `(incremental_arrays, new_total_len)` -- `new_total_len` is
+        what the caller should record via `self.server_prefix_len =
+        new_total_len` once the server has confirmed the extension (i.e.
+        after a matching `RootEvalResponse` comes back), mirroring
+        `build_batch_for_current_position`'s own append-then-pop discipline
+        so `history`'s committed bookkeeping is never mutated by evaluating
+        a position that hasn't actually been played yet.
+        """
+        if self.server_prefix_len is None:
+            raise RuntimeError(
+                "build_incremental_tokens_for_current_position called "
+                "before any full root request was registered for this "
+                "game -- use build_batch_for_current_position for the "
+                "game's first root request instead."
+            )
+        state = self._board_state_encoder.encode(board)
+        self._append_from_state(state)
+        try:
+            since = self.server_prefix_len
+            new_total_len = len(self.seq_token_id)
+            if new_total_len <= since:
+                raise RuntimeError(
+                    f"incremental root request has no new tokens: history "
+                    f"length {new_total_len} <= server_prefix_len {since} "
+                    "(protocol/bookkeeping bug)."
+                )
+            tokens = {
+                "piece_ids": [list(row) for row in self.piece_ids[since:]],
+                "seq_token_id": list(self.seq_token_id[since:]),
+                "turn_id": list(self.turn_id[since:]),
+                "castle_id": list(self.castle_id[since:]),
+                "ep_file_id": list(self.ep_file_id[since:]),
+                "halfmove_bucket_id": list(self.halfmove_bucket_id[since:]),
+                "fullmove_bucket_id": list(self.fullmove_bucket_id[since:]),
+                "prev_move_id": list(self.prev_move_id[since:]),
+            }
+            return tokens, new_total_len
         finally:
             self._pop_last()
 
@@ -495,6 +563,14 @@ def _select_model_move(
     `_select_model_move` calls it, since `_WaveEvaluator` satisfies the same
     `search.PositionEvaluator` protocol `CachedPositionEvaluator` does.
 
+    Incremental-root-KV optimization (`docs/superpowers/sdd/increm-report.md`):
+    the `RootEvalRequest` this sends is FULL (`batch_arrays`) only for this
+    game's first model turn (`history.server_prefix_len is None`); every
+    later turn sends an INCREMENTAL request (`incremental_tokens`) carrying
+    only the tokens committed since the previous one, and the server
+    extends its own persisted prefix KV for this worker's game instead of
+    re-forwarding the whole game so far.
+
     Profile-driven thin-down (`docs/superpowers/sdd/thin-report.md`): the
     vocab projection (movegen + UCI-sort + vocab-id lookup) is now computed
     HERE, worker-side, off this worker's own live `board` (converted to
@@ -517,21 +593,37 @@ def _select_model_move(
         cozy_board, move_vocab
     )
     legal_moves = [chess.Move.from_uci(uci) for uci in legal_ucis]
-    batch_arrays = history.build_batch_for_current_position(board)
-    conn.send(
-        RootEvalRequest(
-            worker_id=worker_id,
-            turn_id=turn_id,
-            batch_arrays=batch_arrays,
-            legal_vocab_ids=legal_vocab_ids,
-        )
+
+    # Incremental-root-KV optimization (docs/superpowers/sdd/increm-report.md):
+    # this game's FIRST root request sends the full sequence
+    # (history.server_prefix_len is None); every subsequent one sends only
+    # the new tokens committed since the last root request, and the server
+    # extends its own persisted per-worker prefix KV instead of re-forwarding
+    # the whole game so far.
+    common_request_fields = dict(
+        worker_id=worker_id, turn_id=turn_id, legal_vocab_ids=legal_vocab_ids
     )
+    if history.server_prefix_len is None:
+        batch_arrays = history.build_batch_for_current_position(board)
+        new_server_prefix_len = int(batch_arrays["total_tokens"])
+        request = RootEvalRequest(**common_request_fields, batch_arrays=batch_arrays)
+    else:
+        incremental_tokens, new_server_prefix_len = (
+            history.build_incremental_tokens_for_current_position(board)
+        )
+        request = RootEvalRequest(
+            **common_request_fields,
+            incremental_tokens=incremental_tokens,
+            prefix_len_before=history.server_prefix_len,
+        )
+    conn.send(request)
     response = conn.recv()
     if not isinstance(response, RootEvalResponse) or response.turn_id != turn_id:
         raise RuntimeError(
             f"actor worker {worker_id}: expected RootEvalResponse(turn_id={turn_id}), "
             f"got {response!r}"
         )
+    history.server_prefix_len = new_server_prefix_len
 
     total_legal_moves = len(list(board.legal_moves))
     legal_log_priors = _log_softmax_f32(list(response.legal_logits))

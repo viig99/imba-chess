@@ -58,6 +58,19 @@ read `.nodes` (for its length), `.new_token_batch`, `.positions`,
 off whatever object they're given (no `isinstance` check), so this module's
 own arena-backed request object satisfies that interface without either
 module needing to know about the other's node representation.
+
+Incremental-root-KV optimization (`docs/superpowers/sdd/increm-report.md`):
+wall-clock server profiling showed root evals -- a FULL-sequence forward
+over the whole game so far, EVERY model turn -- as the #1 GPU cost.
+`RootEvalRequest` now has two forms (see its own docstring): FULL (this
+game's first turn; unchanged full-forward path, `_service_full_roots`,
+still cross-worker batched via `_merge_root_batches`) and INCREMENTAL
+(every later turn; `_service_incremental_root`, one sequential single-
+prefix `forward_decode` call per new token, folded directly into a NEW
+per-worker persisted prefix, `_GameState`, keyed by `worker_id` alone and
+released per-GAME by the orchestrator on `GameDone`/`WorkerFinished` --
+distinct from `_TurnState`, still released per-TURN as before for the
+decode-wave search tree).
 """
 
 from __future__ import annotations
@@ -276,12 +289,59 @@ class _TurnState:
     `_KVArena`, and each already-evaluated node's own ancestor-index chain
     (`node_chains[node_id]` = arena rows from the shallowest wave-decode
     node through this node itself, root->self order -- exactly the token
-    span a CHILD of this node needs as its decode suffix)."""
+    span a CHILD of this node needs as its decode suffix).
+
+    `prefix_kv`/`prefix_len` here are a SNAPSHOT of the worker's `_GameState`
+    at this turn's root-request time (same tensor objects, not a copy --
+    see `_GameState`'s own docstring for why sharing is safe): a later
+    turn's incremental extension rebinds `_GameState.prefix_kv` to a NEW
+    concatenated list rather than mutating the old one in place, so an
+    already-created `_TurnState`'s snapshot is never retroactively changed
+    by a later turn's growth."""
 
     prefix_kv: Any
     prefix_len: int
     arena: _KVArena | None = None
     node_chains: dict[int, list[int]] = field(default_factory=dict)
+
+
+@dataclass
+class _GameState:
+    """Persistent per-worker prefix KV, spanning a whole game ACROSS model
+    turns (incremental-root-KV optimization; see
+    `docs/superpowers/sdd/increm-report.md`) -- distinct from `_TurnState`,
+    which is scoped to one turn's decode-wave search tree and still
+    released every turn as before.
+
+    Keyed by `worker_id` ALONE (not `(worker_id, turn_id)`): a worker plays
+    exactly one game at a time (`actor_worker._play_one_game` runs games
+    sequentially in a loop), so `worker_id` unambiguously identifies "this
+    worker's current game" -- `turn_id` keeps incrementing across a
+    worker's whole lifetime (many games), so it plays no role in this key.
+
+    `prefix_kv`/`prefix_len` grow monotonically via `_service_incremental_
+    root`'s sequential `forward_decode` extension, which REBINDS this
+    attribute to a freshly `torch.cat`-built list each time rather than
+    mutating the old tensors in place -- so any `_TurnState` that captured
+    an earlier snapshot stays valid. A FULL `RootEvalRequest` (this
+    worker's next game) unconditionally overwrites the whole entry via
+    dict assignment (`ActorInferenceServer._service_full_roots`), the same
+    "same key re-registration overwrites" discipline `_TurnState`'s own
+    docstring documents for `(worker_id, turn_id)`."""
+
+    prefix_kv: Any
+    prefix_len: int
+
+
+def _snapshot_turn_state(game: _GameState) -> _TurnState:
+    """Builds a turn's `_TurnState` from its worker's CURRENT `_GameState`
+    -- shared by `_service_full_roots` (this game's first turn) and
+    `_service_incremental_root` (every later one), so the "snapshot the
+    game's prefix at root-request time" logic lives in exactly one place.
+    Shares the tensor objects (no copy) -- see `_TurnState`'s own docstring
+    for why that's safe (extension rebinds `_GameState.prefix_kv` rather
+    than mutating it in place)."""
+    return _TurnState(prefix_kv=game.prefix_kv, prefix_len=game.prefix_len)
 
 
 @dataclass
@@ -385,6 +445,13 @@ class ActorInferenceServer:
             "wave_build_s": 0.0, "wave_gpu_s": 0.0, "wave_post_s": 0.0,
             "root_calls": 0, "root_reqs": 0,
             "wave_calls": 0, "wave_reqs": 0, "wave_rows": 0,
+            # Incremental-root-KV optimization: a DISTINCT bucket from
+            # "root_*" above (which stays scoped to the FULL-forward,
+            # merged-batch path only) -- see _service_incremental_root's own
+            # comment on why mixing the two units would corrupt profiling.
+            "incremental_root_gpu_s": 0.0,
+            "incremental_root_calls": 0, "incremental_root_reqs": 0,
+            "incremental_root_tokens": 0,
         }
         # Validated ONCE here, not per request. RootEvalResponse.value_stm
         # and every WaveResponse row's value_stm are UNCONDITIONAL fields
@@ -425,6 +492,13 @@ class ActorInferenceServer:
         # CachedPositionEvaluator + {node_id: _CachedNode} pairing -- see
         # this module's own docstring for the profiling motivation.
         self._turns: dict[tuple[int, int], _TurnState] = {}
+
+        # worker_id -> that worker's CURRENT game's persisted prefix KV
+        # (incremental-root-KV optimization; see _GameState's own
+        # docstring). Released on GameDone/WorkerFinished by the
+        # orchestrator (scripts/eval_vs_stockfish.py's _serve_actor_workers),
+        # same explicit-release discipline as self._turns/release_turn.
+        self._games: dict[int, _GameState] = {}
 
     def register_root(
         self, worker_id: int, turn_id: int, batch_arrays: dict, legal_vocab_ids: list[int]
@@ -485,7 +559,46 @@ class ActorInferenceServer:
     def release_turn(self, worker_id: int, turn_id: int) -> None:
         self._turns.pop((int(worker_id), int(turn_id)), None)
 
+    def release_game(self, worker_id: int) -> None:
+        """Frees `worker_id`'s persisted per-game prefix KV
+        (`_GameState`) -- the orchestrator calls this on `GameDone` (the
+        worker's game just finished) and defensively again on
+        `WorkerFinished`, mirroring `release_turn`'s own idempotent
+        "no-op if already released or never registered" contract. Distinct
+        from `release_turn`: that frees one TURN's decode-wave arena/node
+        chains (still per-turn, unaffected by this optimization); this
+        frees the whole GAME's growing root prefix."""
+        self._games.pop(int(worker_id), None)
+
     def _service_roots(
+        self, requests: list[RootEvalRequest]
+    ) -> list[RootEvalResponse]:
+        """Dispatches each request to the FULL (`_service_full_roots`,
+        cross-worker batched) or INCREMENTAL (`_service_incremental_root`,
+        per-request sequential single-prefix decode) path per its own
+        `batch_arrays`/`incremental_tokens` field, preserving `requests`'
+        own order in the returned list regardless of which path each one
+        took -- mirrors `service()`'s own root/wave dispatch discipline."""
+        if not requests:
+            return []
+        full_positions = [
+            i for i, r in enumerate(requests) if r.batch_arrays is not None
+        ]
+        incremental_positions = [
+            i for i, r in enumerate(requests) if r.incremental_tokens is not None
+        ]
+        responses: list[RootEvalResponse | None] = [None] * len(requests)
+        if full_positions:
+            full_responses = self._service_full_roots(
+                [requests[i] for i in full_positions]
+            )
+            for i, response in zip(full_positions, full_responses):
+                responses[i] = response
+        for i in incremental_positions:
+            responses[i] = self._service_incremental_root(requests[i])
+        return responses  # type: ignore[return-value]
+
+    def _service_full_roots(
         self, requests: list[RootEvalRequest]
     ) -> list[RootEvalResponse]:
         if not requests:
@@ -528,9 +641,17 @@ class ActorInferenceServer:
                 logits_last.unsqueeze(0), [list(request.legal_vocab_ids)]
             )
 
-            self._turns[key] = _TurnState(
+            # This game's first root request: (re-)establish the persisted
+            # per-worker game prefix (incremental-root-KV optimization),
+            # unconditionally overwriting any prior entry -- a fresh FULL
+            # request always means "start fresh", whether or not the
+            # previous game's entry was already explicitly released (see
+            # _GameState's own docstring).
+            game = _GameState(
                 prefix_kv=split["kv_caches"], prefix_len=int(payload["total_tokens"])
             )
+            self._games[int(request.worker_id)] = game
+            self._turns[key] = _snapshot_turn_state(game)
 
             responses.append(
                 RootEvalResponse(
@@ -542,6 +663,145 @@ class ActorInferenceServer:
         self._sync_if_profiling()
         self.stats["root_post_s"] += time.perf_counter() - _t2
         return responses
+
+    def _service_incremental_root(self, request: RootEvalRequest) -> RootEvalResponse:
+        """Extends `worker_id`'s persisted `_GameState` prefix KV by the
+        request's `incremental_tokens`, one new token per sequential
+        `HSTUChessModel.forward_decode` (single-prefix decode) call --
+        folding each step's own returned (k, v) directly into the persisted
+        prefix (concatenated along its token dim) rather than accumulating
+        a separate suffix, since (unlike a decode-WAVE's many divergent
+        search-tree children) there is exactly one path here and the
+        prefix must persist and grow for the NEXT turn too. The LAST
+        token's logits/value_logits are the root eval output -- the same
+        contract a full forward's last-token output satisfies.
+
+        No cross-request batching here (unlike `_service_full_roots`'s
+        ragged merge / `_service_waves`'s grouped decode): each incremental
+        request has its OWN, differently-shaped, persisted prefix, so
+        batching multiple workers' incremental extensions together would
+        need the same per-game grouped-decode machinery `_service_waves`
+        already uses for wave nodes -- out of this optimization's scope
+        (see `docs/superpowers/sdd/increm-report.md`); k is normally 2 so
+        each incremental request is already a small, cheap GPU call
+        relative to the full-sequence forward it replaces.
+        """
+        worker_id = int(request.worker_id)
+        game = self._games.get(worker_id)
+        if game is None:
+            raise KeyError(
+                f"RootEvalRequest(incremental) for worker={worker_id} has no "
+                "persisted game prefix -- missing/out-of-order full "
+                "RootEvalRequest, or release_game() already freed this "
+                "worker's game."
+            )
+        # request.prefix_len_before is guaranteed not None here --
+        # RootEvalRequest.__post_init__ already enforces that whenever
+        # incremental_tokens is set (the only way a request reaches this
+        # method, via _service_roots' dispatch) -- so this check is
+        # unconditional, not defensive against a None that can't occur.
+        if int(request.prefix_len_before) != game.prefix_len:
+            raise RuntimeError(
+                f"worker={worker_id}: incremental RootEvalRequest expected "
+                f"prefix_len_before={request.prefix_len_before}, server has "
+                f"{game.prefix_len} -- worker/server prefix desync "
+                "(protocol/ordering bug, e.g. a missed release_game or "
+                "out-of-order request)."
+            )
+        tokens = request.incremental_tokens
+        n_new = len(tokens["piece_ids"])
+        if n_new < 1:
+            raise ValueError(
+                f"worker={worker_id}: incremental RootEvalRequest carries "
+                "zero new tokens."
+            )
+        max_positions = int(self._model.position_embedding.max_seq_len)
+        if game.prefix_len + n_new > max_positions:
+            # Fail fast at the same conceptual boundary a full forward would
+            # silently clamp position ids at (PositionEmbedding.at_positions
+            # torch.clamps rather than raising) -- this persisted prefix
+            # grows indefinitely across a whole game, unlike a one-shot full
+            # forward, so silently clamping here would silently corrupt
+            # every later turn's attention, not just this one's.
+            raise RuntimeError(
+                f"worker={worker_id}: incremental root extension would grow "
+                f"the persisted prefix to {game.prefix_len + n_new} tokens, "
+                f"past this model's max_position_embeddings={max_positions}."
+            )
+
+        # Batch-tensorize the WHOLE request's fields once (same discipline
+        # as _tensorize_wave_rows/_tensorize_root_batch), instead of
+        # rebuilding n_new tiny single-row tensors per field inside the
+        # decode loop below -- k is small (normally 2) so this is a minor
+        # win, but it's free and matches the pattern used everywhere else
+        # in this module.
+        batched_fields = {
+            key: torch.tensor(tokens[key], dtype=torch.long)
+            for key in (
+                "piece_ids", "seq_token_id", "turn_id", "castle_id",
+                "ep_file_id", "halfmove_bucket_id", "fullmove_bucket_id",
+                "prev_move_id",
+            )
+        }
+
+        _t0 = time.perf_counter()
+        out: dict[str, Any] | None = None
+        with torch.inference_mode(), _autocast_context(self._device, self._dtype):
+            for i in range(n_new):
+                row_batch = {
+                    key: values[i : i + 1] for key, values in batched_fields.items()
+                }
+                position = torch.tensor([game.prefix_len], dtype=torch.long)
+                out = self._model.forward_decode(
+                    new_token_batch=row_batch,
+                    positions=position,
+                    prefix_kv=game.prefix_kv,
+                )
+                # out["kv"][layer] is (k_new, v_new), each [1, H, 1, d] (the
+                # decode call's own batch dim of 1) -- squeeze it and fold
+                # directly into the persisted [H, T, d] prefix (concatenated
+                # along the token dim) so the NEXT iteration/turn already
+                # sees this token as part of the prefix, exactly matching
+                # what a full forward's own kv_caches would contain at this
+                # length (tests/test_prefix_decode.py's decode-vs-forward
+                # equivalence, generalized from "reusable fixed prefix +
+                # growing suffix" to "prefix that grows in place" -- same
+                # attention math either way, see
+                # SequentialTransductionUnitJagged.forward_decode's own
+                # position-based relative bias, not prefix/suffix identity).
+                game.prefix_kv = [
+                    (
+                        torch.cat([prefix_k, k_new.squeeze(0)], dim=1),
+                        torch.cat([prefix_v, v_new.squeeze(0)], dim=1),
+                    )
+                    for (prefix_k, prefix_v), (k_new, v_new) in zip(
+                        game.prefix_kv, out["kv"]
+                    )
+                ]
+                game.prefix_len += 1
+        self._sync_if_profiling()
+        # Distinct bucket from the full-forward path's "root_*" stats, NOT
+        # folded in: those count one merged multi-request batched call, this
+        # counts one request's own k-step SEQUENTIAL decode loop (with
+        # per-token CPU build time included in the elapsed span) -- sharing
+        # one counter across two different units would silently corrupt any
+        # "avg time per root call" analysis built on top of it.
+        self.stats["incremental_root_gpu_s"] += time.perf_counter() - _t0
+        self.stats["incremental_root_calls"] += 1
+        self.stats["incremental_root_reqs"] += 1
+        self.stats["incremental_root_tokens"] += n_new
+
+        assert out is not None  # n_new >= 1 guaranteed above
+        out = _ensure_value_logits_placeholder(out)
+        self._turns[(worker_id, int(request.turn_id))] = _snapshot_turn_state(game)
+        logits_last = out["logits"][0]  # [V] (this call's batch dim is 1)
+        [legal_logits] = _gather_legal_logits(
+            logits_last.unsqueeze(0), [list(request.legal_vocab_ids)]
+        )
+        value_stm = _batched_value_stm(out["value_logits"])[0]
+        return RootEvalResponse(
+            turn_id=request.turn_id, value_stm=value_stm, legal_logits=legal_logits
+        )
 
     def _service_waves(self, requests: list[WaveRequest]) -> list[WaveResponse]:
         if not requests:

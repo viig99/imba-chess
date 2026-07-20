@@ -25,14 +25,50 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 
-@dataclass
+@dataclass(kw_only=True)
 class RootEvalRequest:
-    """worker -> server: one game-turn's root forward.
+    """worker -> server: one game-turn's root forward, in one of two forms
+    (incremental-root-KV optimization; see
+    `docs/superpowers/sdd/increm-report.md`):
 
-    `batch_arrays` is the torch-free twin of `_SequenceHistory`'s
-    `_build_single_batch()` dict (`position_evaluator.py`): every tensor
-    field there becomes a plain nested list here, scalar ints stay ints. See
-    `actor_worker._PlainSequenceHistory.build_batch_for_current_position`.
+    FULL form (`batch_arrays` set, `incremental_tokens` None) -- the
+    game's FIRST root request: `batch_arrays` is the torch-free twin of
+    `_SequenceHistory`'s `_build_single_batch()` dict
+    (`position_evaluator.py`): every tensor field there becomes a plain
+    nested list here, scalar ints stay ints. See `actor_worker.
+    _PlainSequenceHistory.build_batch_for_current_position`. The server
+    runs a full-sequence forward and PERSISTS the resulting prefix KV,
+    keyed by `worker_id` alone (a worker plays exactly one game at a time,
+    so `worker_id` unambiguously identifies "this worker's current game")
+    -- overwriting any prefix already persisted for that worker (a fresh
+    game always starts fresh, whether or not the previous game's prefix
+    was explicitly released first).
+
+    INCREMENTAL form (`incremental_tokens` set, `batch_arrays` None) --
+    every SUBSEQUENT root request of the same game: `incremental_tokens`
+    carries only the NEW board-state tokens committed to the worker's
+    history since its previous root request (normally 2 -- this worker's
+    own prior move settling into history, then the opponent's reply -- but
+    ALWAYS derived from the actual history-length delta, never assumed,
+    since opening plies / this worker's model playing black / etc. can
+    change the count; see `actor_worker._PlainSequenceHistory.
+    build_incremental_tokens_for_current_position`). Same field set as one
+    wave's `new_token_batch` (`WaveRow.board_state`'s encoded fields, here
+    as parallel lists instead of one dict per row): `piece_ids`,
+    `seq_token_id`, `turn_id`, `castle_id`, `ep_file_id`,
+    `halfmove_bucket_id`, `fullmove_bucket_id`, `prev_move_id`, each a
+    list of length k (k = number of new tokens), in sequence order -- the
+    server extends its persisted per-worker prefix KV by running
+    `hstu_model.HSTUChessModel.forward_decode` (single-prefix decode) once
+    per new token, sequentially, folding each token's own returned KV
+    directly into the persisted prefix (see `actor_server.
+    _service_incremental_root`); the LAST token's logits/value_logits are
+    the root eval output, exactly as the full forward's last-token output
+    would be. `prefix_len_before` is this worker's own record of what the
+    server's persisted prefix length should be BEFORE this extension (from
+    `_PlainSequenceHistory.server_prefix_len`) -- a fail-fast desync check,
+    not itself load-bearing for the extension math (the server tracks its
+    own authoritative prefix length).
 
     `legal_vocab_ids` (profile-driven thin-down, see
     `docs/superpowers/sdd/thin-report.md`): the worker -- which holds the
@@ -45,12 +81,44 @@ class RootEvalRequest:
     `RootEvalResponse`). The worker keeps its own parallel
     (`cc.Move`, uci) lists locally so it never needs move/uci strings back
     on the wire.
+
+    Construction is KEYWORD-ONLY (`@dataclass(kw_only=True)`): `batch_arrays`
+    used to be the 3rd required positional field, before `incremental_tokens`/
+    `prefix_len_before` existed; every real caller already constructs this
+    with keywords (worker/server/tests), but a positional call written from
+    muscle memory of the old signature would otherwise silently bind the
+    wrong argument to the wrong field instead of raising -- `__post_init__`
+    below only checks `is not None`, which a swapped dict/list argument can
+    still satisfy. Keyword-only construction turns that into an immediate
+    `TypeError` instead.
     """
 
     worker_id: int
     turn_id: int
-    batch_arrays: dict
     legal_vocab_ids: list[int]
+    batch_arrays: dict | None = None
+    incremental_tokens: dict | None = None
+    prefix_len_before: int | None = None
+
+    def __post_init__(self) -> None:
+        has_full = self.batch_arrays is not None
+        has_incremental = self.incremental_tokens is not None
+        if has_full == has_incremental:  # both set, or neither
+            raise ValueError(
+                "RootEvalRequest must set exactly ONE of batch_arrays (full "
+                "forward -- this game's first root request) or "
+                "incremental_tokens (incremental root extension -- every "
+                f"subsequent request), got batch_arrays="
+                f"{'<set>' if has_full else None}, incremental_tokens="
+                f"{'<set>' if has_incremental else None}."
+            )
+        if has_incremental and self.prefix_len_before is None:
+            raise ValueError(
+                "RootEvalRequest.incremental_tokens requires "
+                "prefix_len_before (the worker's own record of the "
+                "server's persisted prefix length before this extension) "
+                "-- needed for the server's fail-fast desync check."
+            )
 
 
 @dataclass

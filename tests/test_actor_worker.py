@@ -519,6 +519,161 @@ def test_legal_vocab_projection_matches_project_legal_logits_cozy_over_random_pl
     assert positions_checked > 100
 
 
+# ---------------------------------------------------------------------------
+# Incremental-root-KV optimization (docs/superpowers/sdd/increm-report.md):
+# _PlainSequenceHistory's incremental-token slicing and RootEvalRequest's
+# two-form validation, torch-free and independent of the server/model side
+# (that equivalence is covered by tests/test_actor_server.py's decisive
+# test).
+# ---------------------------------------------------------------------------
+
+
+def test_plain_sequence_history_incremental_tokens_match_full_batch_tail() -> None:
+    """`build_incremental_tokens_for_current_position` must return exactly
+    the TAIL rows a from-scratch `build_batch_for_current_position` call
+    would produce at the SAME point (bit-for-bit, not just matching
+    length), for a k=1 case (re-querying the current position with no ply
+    committed in between) and a k=3 case (several plies committed since
+    the last root request) -- proving the slicing is driven by the actual
+    history-length delta, not a hardcoded k=2 (see `RootEvalRequest`'s own
+    docstring for why this must generalize: opening plies, this worker's
+    model playing black, etc. can all change the count). Also checks the
+    "no root request sent yet" guard and that neither incremental nor full
+    builds leak a permanent mutation into `history`'s own bookkeeping."""
+    from imba_chess.data.board_state import BoardStateEncoder
+    from imba_chess.data.move_vocab import MoveVocab
+    from imba_chess.eval.actor_worker import _PlainSequenceHistory
+
+    move_vocab = MoveVocab.build_static()
+    encoder = BoardStateEncoder()
+    history = _PlainSequenceHistory(
+        worker_id=0, move_vocab=move_vocab, board_state_encoder=encoder
+    )
+    board = chess.Board()
+
+    assert history.server_prefix_len is None
+    with pytest.raises(RuntimeError, match="before any full root request"):
+        history.build_incremental_tokens_for_current_position(board)
+
+    full_batch = history.build_batch_for_current_position(board)
+    history.server_prefix_len = int(full_batch["total_tokens"])
+    assert history.server_prefix_len == 2  # BOS + this turn's transient token
+    committed_len_before = len(history.seq_token_id)  # 1 (BOS only, nothing committed yet)
+
+    # k=1: commit exactly ONE new ply -- its content is bit-identical to
+    # the just-evaluated transient token (same position, same prev_move
+    # state), so committed_len catches up to server_prefix_len exactly;
+    # the NEXT root request (for the position after this one ply) is then
+    # a genuine single-new-token (k=1) extension, not the degenerate
+    # zero-new-token case (re-querying the SAME position with nothing
+    # committed has no new tokens at all -- build_incremental_tokens_for_
+    # current_position raises on that, by design; this is the smallest
+    # legitimate k>=1 case, not that one).
+    history.append_observed_position(board)
+    history.record_played_move("e2e4")
+    board.push_uci("e2e4")
+    assert len(history.seq_token_id) == committed_len_before + 1 == history.server_prefix_len
+
+    tokens_k1, new_len_k1 = history.build_incremental_tokens_for_current_position(board)
+    assert new_len_k1 == history.server_prefix_len + 1
+    assert len(tokens_k1["piece_ids"]) == 1
+    assert len(history.seq_token_id) == committed_len_before + 1  # no leaked mutation
+    history.server_prefix_len = new_len_k1
+
+    # Commit 3 real plies before the next root request (k=3 case).
+    for uci in ("e7e5", "g1f3", "b8c6"):
+        history.append_observed_position(board)
+        history.record_played_move(uci)
+        board.push_uci(uci)
+    tokens_k3, new_len_k3 = history.build_incremental_tokens_for_current_position(board)
+    # 3 new committed plies since the k=1 call -- the length delta already
+    # nets out the transient token (it was already included in the
+    # PREVIOUS server_prefix_len, and this call's own transient replaces
+    # it in the same slot), so k == number of NEW plies committed, not
+    # plies+1.
+    assert new_len_k3 - history.server_prefix_len == 3
+    assert len(tokens_k3["piece_ids"]) == 3
+
+    # Bit-for-bit: the incremental payload equals the TAIL of a
+    # from-scratch full batch built at the exact same point.
+    full_at_same_point = history.build_batch_for_current_position(board)
+    for key, values in tokens_k3.items():
+        assert values == full_at_same_point[key][-len(values):]
+
+
+def test_root_eval_request_requires_exactly_one_form() -> None:
+    with pytest.raises(ValueError, match="exactly ONE"):
+        RootEvalRequest(worker_id=0, turn_id=0, legal_vocab_ids=[])
+    with pytest.raises(ValueError, match="exactly ONE"):
+        RootEvalRequest(
+            worker_id=0,
+            turn_id=0,
+            legal_vocab_ids=[],
+            batch_arrays={"total_tokens": 1},
+            incremental_tokens={"piece_ids": []},
+        )
+
+
+def test_root_eval_request_incremental_requires_prefix_len_before() -> None:
+    with pytest.raises(ValueError, match="prefix_len_before"):
+        RootEvalRequest(
+            worker_id=0,
+            turn_id=0,
+            legal_vocab_ids=[],
+            incremental_tokens={"piece_ids": []},
+        )
+
+
+def test_second_root_request_is_incremental_with_correct_delta() -> None:
+    """End-to-end (real worker over a real `Pipe`, fake server): the
+    SECOND (and every later) `RootEvalRequest` of a game must carry
+    `incremental_tokens` (not `batch_arrays`), with `prefix_len_before`
+    matching the previous root request's own resulting total length --
+    the general k-derivation still lands on the ordinary k=2 (this
+    worker's own prior move settling into history + the fake engine's
+    reply) once past the game's first turn, matching
+    `_play_one_game`'s strict model/opponent alternation."""
+    parent_conn, child_conn = multiprocessing.Pipe()
+    received: list = []
+    fake_engine = _FakeEngine()
+
+    worker_config = {
+        "worker_id": 3,
+        "game_indices": [0],  # model plays WHITE (game_idx % 2 == 0)
+        "seed": 0,
+        "max_plies": 8,
+        "opening_random_plies": 0,
+        "model_move_policy": "greedy",
+        "vocab_path": str(STATIC_VOCAB_PATH),
+        "vocab_include_unk": False,
+        "engine": {
+            "fake_engine_factory": lambda: fake_engine,
+            "stockfish_limit": {"time": 0.01},
+        },
+    }
+    server_thread = threading.Thread(target=_run_fake_server, args=(parent_conn, received))
+    server_thread.start()
+    try:
+        run_eval_worker(child_conn, worker_config)
+    finally:
+        server_thread.join(timeout=30)
+        assert not server_thread.is_alive(), "fake server thread did not finish"
+
+    root_requests = [m for m in received if isinstance(m, RootEvalRequest)]
+    assert len(root_requests) >= 3, root_requests
+
+    assert root_requests[0].batch_arrays is not None
+    assert root_requests[0].incremental_tokens is None
+    prev_total = int(root_requests[0].batch_arrays["total_tokens"])
+    for request in root_requests[1:]:
+        assert request.batch_arrays is None
+        assert request.incremental_tokens is not None
+        assert request.prefix_len_before == prev_total
+        k = len(request.incremental_tokens["piece_ids"])
+        assert k == 2
+        prev_total = request.prefix_len_before + k
+
+
 def test_log_softmax_f32_matches_torch_log_softmax_fp32() -> None:
     import random
 
