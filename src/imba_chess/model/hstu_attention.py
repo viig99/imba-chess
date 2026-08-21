@@ -151,6 +151,13 @@ class SequentialTransductionUnitJagged(torch.nn.Module):
         # (training). Both admit the same positions and compute the same
         # scores -- see tests/test_dense_attn_mask.py.
         # output shape: [1, num_heads, S, linear_dim]
+        if block_mask is None and q_heads.device.type == "cpu":
+            # torch 2.13: flex_attention has no CPU backward, and a layer's own
+            # parameters require grad, so it raises during FORWARD on CPU even
+            # under .eval(). block_mask=None means "attend everywhere", whose
+            # dense equivalent is an all-true mask -- same scores, and SDPA does
+            # support CPU backward. _additive_mask still folds in _ps_w.
+            block_mask = torch.ones(S, S, dtype=torch.bool, device=q_heads.device)
         attn_output: torch.Tensor
         if isinstance(block_mask, torch.Tensor):
             attn_output = F.scaled_dot_product_attention(

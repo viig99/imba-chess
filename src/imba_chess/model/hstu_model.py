@@ -392,11 +392,26 @@ class HSTUChessModel(nn.Module):
         x = self.position_embedding(content, seq_offsets)
 
         if self.layers and block_mask is None:
-            block_mask = create_batch_block_mask(
-                seq_offsets=seq_offsets,
-                total_tokens=int(batch["total_tokens"]),
-                device=x.device,
-            )
+            if x.device.type == "cpu":
+                # torch 2.13 raises NotImplementedError("FlexAttention does not
+                # support backward on CPU"), so CPU cannot go through
+                # create_batch_block_mask at all once anything requires grad.
+                # The dense mask admits exactly the same positions and runs as
+                # one SDPA call, which does support CPU backward. CPU runs are
+                # tests and small-batch debugging; the [1, H, S, S] budget in
+                # _additive_mask still raises loudly rather than allocating if a
+                # dataset-sized batch ever lands here.
+                block_mask = create_batch_dense_mask(
+                    seq_offsets=seq_offsets,
+                    total_tokens=int(batch["total_tokens"]),
+                    device=x.device,
+                )
+            else:
+                block_mask = create_batch_block_mask(
+                    seq_offsets=seq_offsets,
+                    total_tokens=int(batch["total_tokens"]),
+                    device=x.device,
+                )
 
         kv_caches: list[tuple[torch.Tensor, torch.Tensor]] = []
         for layer in self.layers:

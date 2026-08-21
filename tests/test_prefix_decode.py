@@ -4,7 +4,7 @@ import pytest
 
 torch = pytest.importorskip("torch")
 
-from imba_chess.model import create_batch_block_mask
+from imba_chess.model import create_batch_dense_mask
 from imba_chess.model.hstu_attention import SequentialTransductionUnitJagged
 from imba_chess.model.position_embedding import PositionEmbedding
 
@@ -25,7 +25,7 @@ def _layer() -> SequentialTransductionUnitJagged:
 
 
 def _full_forward(layer, x):
-    block_mask = create_batch_block_mask(
+    block_mask = create_batch_dense_mask(
         seq_offsets=torch.tensor([0, x.size(0)]),
         total_tokens=x.size(0),
         device=x.device,
@@ -37,7 +37,7 @@ def test_forward_return_kv_output_unchanged():
     layer = _layer()
     x = torch.randn(10, 32)
     full = _full_forward(layer, x)
-    block_mask = create_batch_block_mask(
+    block_mask = create_batch_dense_mask(
         seq_offsets=torch.tensor([0, 10]), total_tokens=10, device=x.device
     )
     out, (k, v) = layer(x=x, block_mask=block_mask, return_kv=True)
@@ -52,7 +52,7 @@ def test_layer_decode_matches_full_forward_token_by_token():
     x = torch.randn(S, 32)
     full = _full_forward(layer, x)
 
-    block_mask = create_batch_block_mask(
+    block_mask = create_batch_dense_mask(
         seq_offsets=torch.tensor([0, T]), total_tokens=T, device=x.device
     )
     out_prefix, (prefix_k, prefix_v) = layer(
@@ -90,7 +90,7 @@ def test_layer_decode_batched_wave_with_mixed_suffix_lengths():
     layer = _layer()
     T = 7
     prefix = torch.randn(T, 32)
-    block_mask = create_batch_block_mask(
+    block_mask = create_batch_dense_mask(
         seq_offsets=torch.tensor([0, T]), total_tokens=T, device=prefix.device
     )
     _, (prefix_k, prefix_v) = layer(x=prefix, block_mask=block_mask, return_kv=True)
