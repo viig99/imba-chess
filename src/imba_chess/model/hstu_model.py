@@ -108,6 +108,48 @@ def create_batch_block_mask(
     )
 
 
+def create_batch_dense_mask(
+    seq_offsets: torch.Tensor,
+    *,
+    total_tokens: int | None = None,
+    device: str | torch.device | None = None,
+) -> torch.Tensor:
+    """[S, S] bool: token q attends to k iff same document and k <= q.
+
+    Admits exactly the positions create_batch_block_mask admits, materialized
+    instead of block-sparse, so attention can run as one fused SDPA call.
+    Eager flex_attention costs ~95 ms per model forward regardless of length
+    (pure dispatch overhead); this is 5-38x faster. See
+    docs/superpowers/notes/2026-08-20-rl-throughput-bottleneck.md.
+
+    Choose by BATCH SHAPE, not by train-vs-eval -- the per-layer additive mask
+    the attention layer derives from this is [1, H, S, S], quadratic in S:
+
+      * dense (this): play/search batches -- a few sequences, a few hundred
+        tokens. ~12 MiB at S=512, H=12.
+      * BlockMask: dataset-sized batches -- ~4,000 tokens over ~50 games
+        (~805 MiB dense, and BlockMask skips the ~98% of the block grid that
+        the block-diagonal document structure masks out anyway). This is
+        training AND dataset evaluation: ignite_evaluator, eval_value_loss,
+        eval_value_by_progress all correctly stay on BlockMask.
+
+    Exceeding the dense budget raises rather than allocating -- see
+    SequentialTransductionUnitJagged._additive_mask.
+    """
+    if total_tokens is None:
+        total_tokens = int(seq_offsets[-1].item())
+    dev = device if device is not None else seq_offsets.device
+    pos = torch.arange(total_tokens, device=dev)
+    # Document id per token = how many document starts lie at or before it.
+    starts = seq_offsets[1:-1].to(dev)
+    if starts.numel():
+        doc = (pos.unsqueeze(1) >= starts.unsqueeze(0)).sum(dim=1)
+    else:
+        doc = torch.zeros(total_tokens, dtype=torch.long, device=dev)
+    causal = pos.unsqueeze(1) >= pos.unsqueeze(0)
+    return causal & (doc.unsqueeze(1) == doc.unsqueeze(0))
+
+
 # 64-dim keeps the encoder at ~2/3 of the trunk's per-token FLOPs; 128-dim
 # quadruples it and roughly triples the training step.
 _BOARD_ENCODER_DIM = 64
@@ -338,7 +380,7 @@ class HSTUChessModel(nn.Module):
         self,
         batch: dict[str, Any],
         *,
-        block_mask: BlockMask | None = None,
+        block_mask: BlockMask | torch.Tensor | None = None,
         return_loss: bool = True,
         return_kv: bool = False,
     ) -> dict[str, torch.Tensor]:

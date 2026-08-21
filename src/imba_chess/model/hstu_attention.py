@@ -4,6 +4,13 @@ from typing import Literal
 from torch.nn.attention.flex_attention import BlockMask, flex_attention
 
 
+# A dense additive mask is [1, H, S, S], so it grows quadratically in S: fine
+# for play/search batches (a few hundred tokens), ruinous for dataset-sized
+# ones (~805 MiB at S=4096, H=12, fp32). Cross this and something picked the
+# wrong mask -- fail loudly rather than allocate it.
+_MAX_ADDITIVE_MASK_BYTES = 256 * 1024 * 1024
+
+
 class SequentialTransductionUnitJagged(torch.nn.Module):
     def __init__(
         self,
@@ -78,10 +85,42 @@ class SequentialTransductionUnitJagged(torch.nn.Module):
     def _generate_rab_score_mod(self):
         return self._position_score_mod
 
+    def _additive_mask(
+        self, allowed: torch.Tensor, *, dtype: torch.dtype
+    ) -> torch.Tensor:
+        """[1, H, S, S] additive mask equivalent to block_mask + score_mod.
+
+        Folds this layer's relative-position bias into an explicit bias tensor
+        so SDPA computes the same scores flex_attention would, then blocks
+        disallowed positions with -inf.
+
+        `_ps_w` is a PER-LAYER parameter, so this is built per layer. Sharing
+        one layer's bias across the stack runs fine and is fast, but silently
+        changes move selection -- pinned by
+        tests/test_dense_attn_mask.py::test_dense_path_uses_each_layer_own_relative_position_bias.
+        """
+        S = allowed.size(-1)
+        want = self._num_heads * S * S * torch.empty((), dtype=dtype).element_size()
+        if want > _MAX_ADDITIVE_MASK_BYTES:
+            raise ValueError(
+                f"dense attention mask would need {want / 2**20:.0f} MiB "
+                f"(S={S}, heads={self._num_heads}, {dtype}). The dense path is "
+                "for small play/search batches; pass a BlockMask from "
+                "create_batch_block_mask for dataset-sized batches."
+            )
+        pos = torch.arange(S, device=allowed.device)
+        idx = torch.clamp(
+            (pos.unsqueeze(0) - pos.unsqueeze(1)) + (self._max_seq_len - 1),
+            0,
+            2 * self._max_seq_len - 2,
+        )
+        bias = self._ps_w[:, idx].unsqueeze(0).to(dtype)
+        return bias.masked_fill(~allowed, float("-inf"))
+
     def forward(
         self,
         x: torch.Tensor,
-        block_mask: BlockMask | None = None,
+        block_mask: BlockMask | torch.Tensor | None = None,
         return_kv: bool = False,
     ):
         # x: [S, D] — total tokens across all sessions
@@ -107,15 +146,28 @@ class SequentialTransductionUnitJagged(torch.nn.Module):
         k_heads = self._reshape_uvqk_for_mm(k, self._num_heads, self._attention_dim)
         v_heads = self._reshape_uvqk_for_mm(v, self._num_heads, self._linear_dim)
 
+        # A plain Tensor is a dense [S, S] bool mask from
+        # create_batch_dense_mask (inference); a BlockMask goes to flex
+        # (training). Both admit the same positions and compute the same
+        # scores -- see tests/test_dense_attn_mask.py.
         # output shape: [1, num_heads, S, linear_dim]
-        attn_output: torch.Tensor = flex_attention(
-            query=q_heads,
-            key=k_heads,
-            value=v_heads,
-            block_mask=block_mask,
-            score_mod=self._generate_rab_score_mod(),
-            kernel_options={"BLOCK_M": 64, "BLOCK_N": 64, "num_stages": 1},
-        )  # type: ignore
+        attn_output: torch.Tensor
+        if isinstance(block_mask, torch.Tensor):
+            attn_output = F.scaled_dot_product_attention(
+                q_heads,
+                k_heads,
+                v_heads,
+                attn_mask=self._additive_mask(block_mask, dtype=q_heads.dtype),
+            )
+        else:
+            attn_output = flex_attention(
+                query=q_heads,
+                key=k_heads,
+                value=v_heads,
+                block_mask=block_mask,
+                score_mod=self._generate_rab_score_mod(),
+                kernel_options={"BLOCK_M": 64, "BLOCK_N": 64, "num_stages": 1},
+            )  # type: ignore
 
         attn_output = self._norm_attn_output(
             attn_output.permute(0, 2, 1, 3).reshape(

@@ -4,6 +4,7 @@ from .hstu_model import (
     HSTUChessModel,
     build_hstu_chess_config,
     create_batch_block_mask,
+    create_batch_dense_mask,
 )
 from .position_embedding import PositionEmbedding
 
@@ -13,5 +14,6 @@ __all__ = [
     "HSTUChessModel",
     "build_hstu_chess_config",
     "create_batch_block_mask",
+    "create_batch_dense_mask",
     "PositionEmbedding",
 ]

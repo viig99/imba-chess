@@ -4,6 +4,7 @@ import contextlib
 from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any
+from weakref import WeakKeyDictionary
 
 import chess
 import cozy_chess as cc
@@ -19,7 +20,11 @@ from imba_chess.data.event_builder import (
 from imba_chess.data.move_vocab import MoveVocab
 from imba_chess.eval import cozy_bridge
 from imba_chess.eval.search import PositionEval
-from imba_chess.model import HSTUChessModel, build_hstu_chess_config, create_batch_block_mask
+from imba_chess.model import (
+    HSTUChessModel,
+    build_hstu_chess_config,
+    create_batch_dense_mask,
+)
 
 
 class _SequenceHistory:
@@ -205,8 +210,15 @@ def _forward_model(
     seq_offsets = batch["seq_offsets"].to(
         device=device, dtype=torch.long, non_blocking=True
     )
-    block_mask = create_batch_block_mask(
-        seq_offsets=seq_offsets,
+    # Dense mask, not BlockMask: same admitted positions, but attention runs as
+    # one fused SDPA call instead of eager flex_attention's ~95 ms/forward of
+    # pure dispatch overhead (docs/superpowers/notes/
+    # 2026-08-20-rl-throughput-bottleneck.md). Safe here because this path only
+    # ever sees play/search batches -- a few sequences of a few hundred tokens.
+    # Dataset-sized evaluation (ignite_evaluator, eval_value_loss) must keep
+    # BlockMask; create_batch_dense_mask's docstring has the size criterion.
+    block_mask = create_batch_dense_mask(
+        seq_offsets,
         total_tokens=int(batch["total_tokens"]),
         device=device,
     )
@@ -257,6 +269,60 @@ def _project_legal_logits(
     return legal_logits, legal_moves_with_ids, total_legal, mapped_legal
 
 
+# cozy encodes castling as king-takes-own-rook, so these four raw move strings
+# are ambiguous: `e1h1` is O-O when a king stands on e1, but an ordinary rook
+# slide otherwise -- the SAME (from, to, promotion) Move with two different
+# correct UCIs. They are therefore the only moves whose mapping depends on the
+# board, and the only ones _cozy_move_id_and_uci must refuse to memoize.
+_CASTLE_RAW_TO_UCI = {
+    "e1h1": "e1g1",
+    "e1a1": "e1c1",
+    "e8h8": "e8g8",
+    "e8a8": "e8c8",
+}
+
+# Per-vocab memo of cozy Move -> (vocab id | None, standard UCI). Keyed weakly
+# on the vocab so two vocabs never share entries and the memo dies with its
+# owner. cozy Move is hashable with value semantics (verified in
+# tests/test_cozy_move_id_cache.py), which is what makes this sound.
+_MOVE_ID_MEMO: "WeakKeyDictionary[MoveVocab, dict[Any, tuple[int | None, str]]]" = (
+    WeakKeyDictionary()
+)
+
+
+def _cozy_move_id_and_uci(
+    cozy_board: "cc.Board", move: "cc.Move", move_vocab: MoveVocab
+) -> tuple[int | None, str]:
+    """(vocab id or None, standard UCI) for a cozy move, memoized per vocab.
+
+    Replaces `cozy_move_to_uci(...)` + `token_to_id.get(...)` on the hot path.
+    That pair built a fresh Python string for every legal move of every
+    evaluated node (10.5M allocations per 20-game run) plus up to two FFI board
+    queries, then hashed the string; here a hit is one dict lookup on the Move
+    itself. Measured 317 -> 76 ns/move (4.2x) on real positions.
+
+    Castling is never memoized -- see _CASTLE_RAW_TO_UCI.
+    """
+    memo = _MOVE_ID_MEMO.get(move_vocab)
+    if memo is None:
+        memo = {}
+        _MOVE_ID_MEMO[move_vocab] = memo
+    hit = memo.get(move)
+    if hit is not None:
+        return hit
+
+    raw = str(move)
+    if raw in _CASTLE_RAW_TO_UCI:
+        if cozy_board.piece_on(move.from_square) == cc.Piece.King:
+            raw = _CASTLE_RAW_TO_UCI[raw]
+        # Board-dependent: deliberately not cached.
+        return (move_vocab.token_to_id.get(raw), raw)
+
+    result = (move_vocab.token_to_id.get(raw), raw)
+    memo[move] = result
+    return result
+
+
 def _project_legal_logits_cozy(
     *,
     logits: torch.Tensor,
@@ -264,18 +330,21 @@ def _project_legal_logits_cozy(
     move_vocab: MoveVocab,
 ) -> tuple[torch.Tensor, list[cc.Move], list[str], int, int]:
     """Cozy-native twin of `_project_legal_logits`: same vocab-mapping and
-    UCI-sort discipline, but movegen and UCI derivation both go through
-    cozy-chess (`generate_moves` + `cozy_move_to_uci`, castling-aware)
-    instead of python-chess. `legal_ucis` is index-aligned with the returned
+    UCI-sort discipline, but movegen goes through cozy-chess `generate_moves`
+    and the per-move UCI/id pair comes from `_cozy_move_id_and_uci` (memoized;
+    castling-aware). `legal_ucis` is index-aligned with the returned
     `legal_moves` (computed once here so callers never re-derive it).
+
+    Single pass on purpose: this runs once per evaluated search node, so the
+    old build-all-UCIs-then-filter shape allocated a throwaway list per node
+    on top of a string per move.
     """
     legal_moves = list(cozy_board.generate_moves())
-    legal_ucis_all = [cozy_bridge.cozy_move_to_uci(cozy_board, move) for move in legal_moves]
     legal_move_ids: list[int] = []
     legal_moves_with_ids: list[cc.Move] = []
     legal_ucis_with_ids: list[str] = []
-    for move, uci in zip(legal_moves, legal_ucis_all):
-        move_id = move_vocab.token_to_id.get(uci)
+    for move in legal_moves:
+        move_id, uci = _cozy_move_id_and_uci(cozy_board, move, move_vocab)
         if move_id is not None:
             legal_move_ids.append(int(move_id))
             legal_moves_with_ids.append(move)
