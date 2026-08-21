@@ -339,3 +339,93 @@ Stage 1 is complete when:
 6. The full suite passes.
 7. The 20-game rollout table and search trajectory are bit-identical.
 8. Performance evidence and the new ownership/build constraints are recorded in the generation handoff.
+
+## Stage 1 Results
+
+Measured 2026-08-21 on the feature worktree (`feat/imba-chess-native`), CPython
+3.12.12, machine verified idle (GPU 0% util, no browser) per the generation
+handoff's measurement rules.
+
+### Projection differential (exact)
+
+`tests/test_native_projection.py`: **415 passed**, no divergence.
+
+- 206 positions per vocabulary — 6 `EDGE_FENS` plus 200 positions strided
+  across 200 random reachable games (`_random_boards(200, seed=911)`) — run
+  against the full static vocabulary (1,970 tokens) and against a restricted
+  1-in-7 slice whose ids deliberately do not match the static vocab's.
+- Compared on ids, UCI strings, total legal count, and move fields, not object
+  equality: the two bindings wrap incompatible Rust `Move` types.
+- Guard cases: the restricted vocabulary is shown to actually drop moves (never
+  vacuously equal); two projectors interleaved on the same boards each keep
+  matching their own oracle; and the full vocabulary drops nothing
+  (`len(ids) == total` everywhere), since a silent drop would starve the search
+  of a candidate move.
+
+Native package suite (`native/imba_chess_native/tests/`): **105 passed**,
+including 9 `MoveProjector` cases. `cargo fmt --check`, `cargo check`, and
+`cargo test` clean.
+
+### Speed gate (PASS)
+
+`scripts/bench_native_move_projector.py`, 80 opening positions imported from
+`bench_project_decompose.py` (mean 31.3 legal moves/node), 60 repetitions per
+side with alternating order, exact-output check before timing:
+
+| path   | median us/node | min  | max   |
+|--------|----------------|------|-------|
+| python | 11.63          | 11.27| 16.56 |
+| native | 2.90           | 2.74 | 3.90  |
+
+**speedup 4.02x**; gate `native <= 5.56 us/node` -> **PASS**. Two independent
+re-runs gave native 2.99 and 3.06 us/node (4.15x, 4.06x), so the result is
+reproducible and not a single-sample artifact. The Python side's 11.63 us/node
+is consistent with the 11.12 us/node baseline of record; this harness times the
+real `_legal_moves_ids_ucis` call rather than the decomposed phases.
+
+Expected end-to-end effect, stated honestly: at 346,091 search evaluations per
+20-game run, removing 8.2 us/node saves ~2.8s of a 41.5s run, i.e. **~6.9%**.
+That is well below this machine's ~+/-20% wall-time noise floor and must not be
+claimed as an end-to-end win from a wall-clock comparison. The isolated,
+interleaved number above is the evidence.
+
+### Pre-cutover label baseline
+
+20 games, `--search-budget 2048 --concurrent-games 8 --dtype float32
+--sample-seed 42`, checkpoint `best_hr10_checkpoint_23_hr10=0.9564.pt`,
+config `config/imba_chess_exit_seeded_rollout.toml`. Output at
+`/tmp/pre_native_projection.parquet`, preserved at
+`artifacts/rollouts/pre_native_projection.parquet` since Task 5 compares
+against it after cutover.
+
+- 169 rollout rows from 20 games; 268 search waves; 346,091 search evaluations
+- generation wall time 44s (2.23 s/game); instrumented total 41.5s
+
+| bucket             | time  | share |
+|--------------------|-------|-------|
+| search_gpu         | 13.1s | 31.6% |
+| search_bookkeeping | 12.9s | 31.2% |
+| decode_project     | 10.1s | 24.3% |
+| decode_prep        |  4.3s | 10.5% |
+| root_eval          |  1.0s |  2.3% |
+| batch_build        |  0.0s |  0.1% |
+| ply_bookkeeping    |  0.0s |  0.1% |
+
+`decode_project` is 29.2 us/eval, of which movegen + mapping + sort is the
+~11.1 us the projector replaces; the remainder is tensor construction and
+log_softmax, which the projector does not touch.
+
+Unrelated defect observed during this run and left unfixed (out of Task 3's
+scope): the generator completed all 20 games, wrote its parquet and progress
+sidecar, and printed its final report, then never exited -- it sat for 11
+minutes holding 4 GB of GPU memory until interrupted.
+`_main_with_hard_exit_on_crash` installs its `os._exit` escape only on the
+exception path, so a *successful* run still goes through CPython's normal
+shutdown and can block forever joining a non-daemon thread -- precisely the
+failure that wrapper's own docstring describes.
+
+### Gate decision
+
+Stage 1 projection is accepted: exact on every differential fixture and 4.02x
+on the isolated benchmark against a 2x requirement. Tasks 4-5 (production
+cutover) are unblocked.
