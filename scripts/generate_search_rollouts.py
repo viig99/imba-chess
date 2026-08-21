@@ -61,7 +61,12 @@ def _progress_sidecar_path(output_path: Path) -> Path:
 
 
 def _write_progress_sidecar(
-    output_path: Path, *, games_skipped: int, games_processed: int, rows: int
+    output_path: Path,
+    *,
+    games_skipped: int,
+    games_processed: int,
+    total_streamed: int,
+    rows: int,
 ) -> None:
     """Atomically records exactly how far this run got.
 
@@ -69,11 +74,18 @@ def _write_progress_sidecar(
     print or return its final summary -- external tooling that needs to know
     the correct --skip-games value for the next session reads this file
     instead of parsing logs or the process's exit state.
+
+    total_games_covered = total_streamed (every game the stream produced,
+    including ones dropped by --skip-games and by --sample-every-n-games),
+    NOT games_skipped + games_processed -- with sparse sampling active most
+    streamed games are neither "skipped for resume" nor "dispatched and
+    processed," so that sum would undercount and a resumed session would
+    misalign the sparse-sampling phase (see _game_records' modulo comment).
     """
     payload = {
         "games_skipped": games_skipped,
         "games_processed": games_processed,
-        "total_games_covered": games_skipped + games_processed,
+        "total_games_covered": total_streamed,
         "rows": rows,
     }
     sidecar_path = _progress_sidecar_path(output_path)
@@ -483,6 +495,23 @@ def _parse_args() -> argparse.Namespace:
         "games_processed, so a resume skips rather than retries them.",
     )
     parser.add_argument(
+        "--sample-every-n-games",
+        type=int,
+        default=1,
+        help="Only dispatch every Nth game encountered in the stream for "
+        "rollout generation (default 1 = every game, current behavior). "
+        "Use >1 with [dataset] shuffling enabled to SPREAD coverage across "
+        "a long stretch of the stream instead of a dense narrow prefix -- "
+        "e.g. --sample-every-n-games 10 rolls out ~10%% of encountered "
+        "games, spaced out, so a later training run using the SAME "
+        "[dataset] shuffle settings/seed naturally encounters rollout-"
+        "covered positions at roughly that density spread across its "
+        "whole run, instead of a solid block at the start. This is a "
+        "*count* of games streamed past (deterministic, seed-independent), "
+        "distinct from --sample-seed which only affects WHICH PLIES within "
+        "a dispatched game get sampled.",
+    )
+    parser.add_argument(
         "--flush-every-games",
         type=int,
         default=200,
@@ -582,15 +611,26 @@ def main() -> None:
         cache_dir=dataset_cfg.cache_dir,
         parquet_batch_size=dataset_cfg.parquet_batch_size,
         max_seq_len=dataset_cfg.max_seq_len,
+        # Threaded through from [dataset] (previously hardcoded to the
+        # LichessDataset defaults, i.e. always unshuffled) so a generation
+        # run can replay the EXACT same seeded stream order a training run
+        # using the same [dataset] config/seed will later see -- see
+        # --sample-every-n-games below for why that alone isn't enough.
+        shuffle_train_month_files_on_start=dataset_cfg.shuffle_train_month_files_on_start,
+        train_month_shuffle_seed=dataset_cfg.train_month_shuffle_seed,
+        train_shuffle_buffer_size=dataset_cfg.train_shuffle_buffer_size,
         board_state_config=repo_config.board_state,
     )
 
     if (args.shard_id is None) != (args.num_shards is None):
         raise ValueError("--shard-id and --num-shards must both be set or both be None")
+    if args.sample_every_n_games < 1:
+        raise ValueError("--sample-every-n-games must be >= 1")
 
     all_rows: list[RolloutRow] = []
     games_processed = 0
     games_skipped = 0
+    total_streamed = 0
     stats = _TimingStats() if args.profile else None
     game_stream = lichess_dataset.stream(shard_id=args.shard_id, num_shards=args.num_shards)
 
@@ -600,11 +640,22 @@ def main() -> None:
         # search that discards its result), and stops offering new games
         # once --max-games worth have been dispatched -- concurrent slots
         # may still be mid-flight past that point, but no *new* game starts.
-        nonlocal games_skipped
+        #
+        # Sparse sampling (--sample-every-n-games): the modulo check uses
+        # the ABSOLUTE stream position (total_streamed, counted from before
+        # --skip-games is applied), not a post-skip relative counter -- so a
+        # resumed session with a nonzero --skip-games stays in the SAME
+        # sampling phase a single continuous run would have used, rather
+        # than realigning.
+        nonlocal games_skipped, total_streamed
         dispatched = 0
         for game in tqdm(game_stream, desc="rollout-generation", unit="game"):
+            position = total_streamed
+            total_streamed += 1
             if games_skipped < args.skip_games:
                 games_skipped += 1
+                continue
+            if position % args.sample_every_n_games != 0:
                 continue
             if args.max_games is not None and dispatched >= args.max_games:
                 return
@@ -647,6 +698,7 @@ def main() -> None:
                 args.output_path,
                 games_skipped=games_skipped,
                 games_processed=games_processed,
+                total_streamed=total_streamed,
                 rows=len(all_rows),
             )
             tqdm.write(
@@ -681,6 +733,7 @@ def main() -> None:
         args.output_path,
         games_skipped=games_skipped,
         games_processed=games_processed,
+        total_streamed=total_streamed,
         rows=len(all_rows),
     )
     print(
@@ -714,6 +767,12 @@ def _main_with_hard_exit_on_crash() -> None:
     This matters for remote multi-shard operation, where a hung-but-not-dead
     process silently occupies a shard slot forever instead of failing
     visibly.
+
+    (Since 2026-08-20 this script's root evals go through
+    create_batch_dense_mask, so create_batch_block_mask -- and the
+    AsyncCompile pool it spins up on first call -- is no longer reached from
+    here. That removes the specific culprit named above, not the class of
+    problem, so the unconditional hard exit stays.)
 
     Referencing the module-level `main` by bare name (not capturing it as a
     default argument) is deliberate: tests monkeypatch `module.main` and
