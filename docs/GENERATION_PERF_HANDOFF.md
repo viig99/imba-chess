@@ -382,3 +382,106 @@ below ~60 Elo currently cannot be measured at all. Fixing throughput without
 fixing the ruler produces *faster nulls*. The minimal fix is more games
 (800/arm -> SE ~0.015, ~2.5 h/arm), which is itself a generation-throughput
 problem — so the two goals are coupled.
+
+---
+
+## 12. Resume checkpoint: owned native binding (2026-08-21)
+
+Work is intentionally paused after the first independently testable task.
+No `MoveProjector`, application import migration, forcing port, or search port
+has started.
+
+### Repository state
+
+- Feature branch: `feat/imba-chess-native`
+- Worktree:
+  `/home/vigi99/CodeDir/imba-chess/.worktrees/imba-chess-native`
+- Task-1 checkpoint commit: `40ecabc` (`feat: add owned native chess binding`)
+- Design:
+  `docs/superpowers/specs/2026-08-21-imba-chess-native-design.md`
+- Executable plan:
+  `docs/superpowers/plans/2026-08-21-imba-chess-native.md`
+- Main baseline commit `eb8df12` contains the user-approved Phase-1b training
+  probes needed to restore the committed test suite to green.
+- The main checkout still has unrelated, deliberately uncommitted generation
+  work in `scripts/generate_search_rollouts.py`,
+  `scripts/rollout_nightly_start.sh`, and `scripts/bench_decode_wave.py`.
+  Do not stage or overwrite it from the feature worktree.
+
+### Completed
+
+1. Vendored the MIT-licensed `cosy-chess-py` 0.1.1 thin wrapper from exact
+   commit `60f663ed4f4f8f95276453245bbc121314ad533f`.
+2. Renamed the owned distribution/import module to `imba_chess_native`.
+3. Added it as a side-by-side maturin path dependency; production still imports
+   `cozy_chess` and therefore remains unchanged.
+4. Ported the complete wrapper API/stub/tests rather than creating a partial
+   second Board convention.
+5. Added an old/new differential over six edge FENs plus 200 positions spread
+   across 200 random reachable games.
+
+Verification at the checkpoint:
+
+- Clean rebased project baseline: **336 passed**
+- Native wrapper + cross-binding parity: **302 passed**
+- `cargo fmt --check`: pass
+- `cargo check`: pass when `PYO3_PYTHON` points at the worktree Python
+
+### Environment commands
+
+Do not let `uv` choose the workstation's default Python 3.14 during the
+side-by-side stage. `cozy-chess-py` and PyO3 0.23 support through Python 3.13.
+The tested environment is CPython 3.12.12:
+
+```bash
+cd /home/vigi99/CodeDir/imba-chess/.worktrees/imba-chess-native
+uv sync --extra dev \
+  --python /home/vigi99/.local/share/uv/python/cpython-3.12.12-linux-x86_64-gnu/bin/python3.12
+
+PYO3_PYTHON="$PWD/.venv/bin/python" \
+  cargo check --manifest-path native/imba_chess_native/Cargo.toml
+```
+
+The final owned package must resolve Python 3.14 policy before cutover: either
+enable an appropriate PyO3 stable-ABI feature or declare the real upper Python
+bound. Do not silently build against 3.14 with an unsupported interpreter.
+
+### Important test correction
+
+`tests.test_cozy_bridge._random_boards(n_games, ...)` takes a game count, not a
+position count. A head slice covered only the first few trajectories; passing
+all generated positions to pytest created thousands of redundant cases.
+The checkpoint generates 200 games and strides the resulting position list to
+exactly 200 well-spread test positions:
+
+```python
+boards = _random_boards(200, seed=731)
+positions = boards[:: max(1, len(boards) // 200)][:200]
+```
+
+Keep the same discipline for Task 3's projector differential.
+
+### Next exact step
+
+Resume at **Task 2: Implement `MoveProjector`** in the plan:
+
+1. Add failing native tests for canonical ordering, restricted mappings,
+   independent vocabularies, invalid keys, standard castling, and Chess960
+   castling.
+2. Verify RED (`MoveProjector` absent).
+3. Implement only `native/imba_chess_native/src/move_projector.rs`, register it,
+   and update the stub.
+4. Rebuild and run the native suite.
+5. Continue to the isolated projector differential/benchmark.
+
+The hard gate remains: native move generation + vocab mapping + canonical
+sorting must be at most **5.56 us/node** (2x faster than the **11.12 us/node**
+Python baseline). If it misses, stop before production cutover.
+
+### Latest strength gate
+
+The post-arena 200-game SF2200/budget-2048 run completed 200/200 games at
+**92 W / 54 D / 54 L, score 0.5950**, with 100% legal-move coverage. This is
+consistent with the previous 0.5850 and 0.5975 baselines; no strength
+regression was observed. Output:
+`artifacts/eval/best_hr10_checkpoint_23_hr10-0.9564_sf2200_value_search_halving_post_arena200.json`.
