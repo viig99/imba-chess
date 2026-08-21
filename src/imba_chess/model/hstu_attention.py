@@ -323,6 +323,7 @@ class SequentialTransductionUnitJagged(torch.nn.Module):
         prefix_v: torch.Tensor,
         prefix_lens_list: list[int],
         group_index: torch.Tensor,
+        row_idx_per_group: list[torch.Tensor],
         q_positions: torch.Tensor,
         suffix_k: torch.Tensor | None = None,
         suffix_v: torch.Tensor | None = None,
@@ -394,8 +395,19 @@ class SequentialTransductionUnitJagged(torch.nn.Module):
         )
 
         num_groups = prefix_k.size(0)
+        if len(row_idx_per_group) != num_groups:
+            raise ValueError(
+                "row_idx_per_group must have one entry per group "
+                f"(== prefix_k.size(0) == {num_groups}), got "
+                f"{len(row_idx_per_group)}"
+            )
         for g in range(num_groups):
-            row_idx = (group_index == g).nonzero(as_tuple=True)[0]
+            # Precomputed by the caller once per wave. These depend only on
+            # group_index, which is fixed across layers, so deriving them here
+            # ran `nonzero` num_layers times over for every group -- and
+            # `nonzero` has a data-dependent output shape, so each one was also
+            # a device->host sync.
+            row_idx = row_idx_per_group[g]
             if row_idx.numel() == 0:
                 continue
             actual_len = prefix_lens_list[g]

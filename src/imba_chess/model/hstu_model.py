@@ -779,6 +779,15 @@ class HSTUChessModel(nn.Module):
         x = self.position_embedding.at_positions(content, positions)
 
         new_kv: list[tuple[torch.Tensor, torch.Tensor]] = []
+        # Row indices per group depend only on group_index, which is fixed for
+        # the whole wave. Each layer used to re-derive them, so a G=8 / 8-layer
+        # wave ran 64 `nonzero` calls where 8 suffice -- and since nonzero's
+        # output shape is data-dependent, each was a device->host sync too. It
+        # measured as the largest single torch op in a rollout profile.
+        row_idx_per_group = [
+            (group_index == g).nonzero(as_tuple=True)[0] for g in range(num_groups)
+        ]
+
         for layer_idx, layer in enumerate(self.layers):
             prefix_k, prefix_v = prefix_kv_grouped[layer_idx]
             if suffix_kv is not None:
@@ -791,6 +800,7 @@ class HSTUChessModel(nn.Module):
                 prefix_v=prefix_v,
                 prefix_lens_list=prefix_lens_list,
                 group_index=group_index,
+                row_idx_per_group=row_idx_per_group,
                 q_positions=positions,
                 suffix_k=layer_suffix_k,
                 suffix_v=layer_suffix_v,
