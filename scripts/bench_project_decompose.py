@@ -19,13 +19,70 @@ from __future__ import annotations
 
 import statistics
 import time
+from weakref import WeakKeyDictionary
 
 import chess
+import imba_chess_native as cc
 import torch
 
 from imba_chess.data.move_vocab import MoveVocab
 from imba_chess.eval import cozy_bridge
-from imba_chess.eval.position_evaluator import _cozy_move_id_and_uci
+
+# ── Retired production fast path, reconstructed ────────────────────────────
+# The memoized per-move (vocab id, UCI) lookup this script decomposes was
+# deleted in the native projection cutover. It is rebuilt here rather than
+# dropped so the 11.12 us/node baseline of record stays reproducible, and so
+# scripts/bench_native_move_projector.py has one honest Python arm to time
+# against instead of a second private copy. Keep the memo -- and keep castling
+# out of it, since the same Move means different things on different boards.
+
+_CASTLE_RAW_TO_UCI = {
+    "e1h1": "e1g1",
+    "e1a1": "e1c1",
+    "e8h8": "e8g8",
+    "e8a8": "e8c8",
+}
+
+_MOVE_ID_MEMO: "WeakKeyDictionary[MoveVocab, dict]" = WeakKeyDictionary()
+
+
+def _cozy_move_id_and_uci(cozy_board, move, move_vocab):
+    memo = _MOVE_ID_MEMO.get(move_vocab)
+    if memo is None:
+        memo = {}
+        _MOVE_ID_MEMO[move_vocab] = memo
+    hit = memo.get(move)
+    if hit is not None:
+        return hit
+    raw = str(move)
+    if raw in _CASTLE_RAW_TO_UCI:
+        if cozy_board.piece_on(move.from_square) == cc.Piece.King:
+            raw = _CASTLE_RAW_TO_UCI[raw]
+        return (move_vocab.token_to_id.get(raw), raw)
+    result = (move_vocab.token_to_id.get(raw), raw)
+    memo[move] = result
+    return result
+
+
+def python_project(board, vocab):
+    """Whole retired projection: movegen, mapping, list build, canonical sort."""
+    legal_moves = list(board.generate_moves())
+    ids, moves, ucis = [], [], []
+    for move in legal_moves:
+        move_id, uci = _cozy_move_id_and_uci(board, move, vocab)
+        if move_id is not None:
+            ids.append(int(move_id))
+            moves.append(move)
+            ucis.append(uci)
+    if not ids:
+        return [], [], [], len(legal_moves)
+    order = sorted(range(len(moves)), key=lambda i: ucis[i])
+    return (
+        [ids[i] for i in order],
+        [moves[i] for i in order],
+        [ucis[i] for i in order],
+        len(legal_moves),
+    )
 
 
 def build_boards() -> list:

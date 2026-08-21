@@ -9,6 +9,7 @@ Phases:
   kv_arena    append one K/V row per node and record ancestor chains
   d2h         wave-level logits/value-logits transfer and synchronization
   movegen     legal move generation, vocab mapping, and canonical sort
+              (one native cozy_bridge.project_legal_moves call per node)
   batched     value/prior tensor projection for the complete wave
   assemble    PositionEval construction
 
@@ -24,6 +25,7 @@ from collections import defaultdict
 
 import torch
 
+from imba_chess.eval import cozy_bridge
 from imba_chess.eval import position_evaluator as pe
 
 T: dict[str, float] = defaultdict(float)
@@ -54,19 +56,9 @@ def instrumented_consume(self, request, out):
     t0 = t()
     per_node = []
     for cozy_board in request.boards:
-        legal_moves_all = list(cozy_board.generate_moves())
-        ids, mvs, ucis = [], [], []
-        for move in legal_moves_all:
-            mid, uci = pe._cozy_move_id_and_uci(cozy_board, move, self._move_vocab)
-            if mid is not None:
-                ids.append(int(mid))
-                mvs.append(move)
-                ucis.append(uci)
-        if ids:
-            order = sorted(range(len(mvs)), key=lambda i: ucis[i])
-            mvs = [mvs[i] for i in order]
-            ucis = [ucis[i] for i in order]
-            ids = [ids[i] for i in order]
+        ids, mvs, ucis, _total = cozy_bridge.project_legal_moves(
+            cozy_board, self._move_vocab
+        )
         per_node.append((ids, mvs, ucis))
     T["movegen+map+sort"] += t() - t0
 

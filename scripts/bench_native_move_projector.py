@@ -14,12 +14,13 @@ Same 80 opening positions as bench_project_decompose.py, imported rather than
 restated so the two benchmarks cannot drift apart. Python/native order
 alternates per repetition so neither side systematically owns the warm cache.
 
-The Python arm is a local reimplementation, not the production path: after the
-cutover there is no Python projection left in the tree. It is the same work the
-pre-cutover `_legal_moves_ids_ucis` did -- movegen, a memoized per-move
-(id, UCI) lookup that must skip the board-dependent castles, and the joint
-sort -- so the comparison stays honest against the 11.12 us/node baseline of
-record.
+The Python arm is `bench_project_decompose.python_project`, a reconstruction of
+the retired path kept in that script alongside the decomposition it feeds: the
+cutover left no Python projection in the tree, and one shared reconstruction
+beats two private copies drifting apart. It does the same work the pre-cutover
+`_legal_moves_ids_ucis` did -- movegen, a memoized per-move (id, UCI) lookup
+that skips the board-dependent castles, and the joint sort -- so the comparison
+stays honest against the 11.12 us/node baseline of record.
 
 Run: .venv/bin/python scripts/bench_native_move_projector.py
 """
@@ -31,64 +32,13 @@ import sys
 import time
 from pathlib import Path
 
-import imba_chess_native as native_cc
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-from bench_project_decompose import build_boards  # noqa: E402
+from bench_project_decompose import build_boards, python_project  # noqa: E402
 
 from imba_chess.data.move_vocab import MoveVocab  # noqa: E402
 from imba_chess.eval import cozy_bridge  # noqa: E402
-
-# ── Python arm ─────────────────────────────────────────────────────────────
-
-_CASTLE_RAW_TO_UCI = {
-    "e1h1": "e1g1",
-    "e1a1": "e1c1",
-    "e8h8": "e8g8",
-    "e8a8": "e8c8",
-}
-
-
-def _move_id_and_uci(board, move, vocab, memo):
-    """Reconstruction of the retired production fast path, memo and all.
-
-    Timing the native projector against a naive unmemoized loop would flatter
-    it, so keep the memo -- and keep castling out of it, since the same Move
-    means different things on different boards.
-    """
-    hit = memo.get(move)
-    if hit is not None:
-        return hit
-    raw = str(move)
-    if raw in _CASTLE_RAW_TO_UCI:
-        if board.piece_on(move.from_square) == native_cc.Piece.King:
-            raw = _CASTLE_RAW_TO_UCI[raw]
-        return (vocab.token_to_id.get(raw), raw)
-    result = (vocab.token_to_id.get(raw), raw)
-    memo[move] = result
-    return result
-
-
-def python_project(board, vocab, memo):
-    legal_moves = list(board.generate_moves())
-    ids, moves, ucis = [], [], []
-    for move in legal_moves:
-        move_id, uci = _move_id_and_uci(board, move, vocab, memo)
-        if move_id is not None:
-            ids.append(int(move_id))
-            moves.append(move)
-            ucis.append(uci)
-    if not ids:
-        return [], [], [], len(legal_moves)
-    order = sorted(range(len(moves)), key=lambda i: ucis[i])
-    return (
-        [ids[i] for i in order],
-        [moves[i] for i in order],
-        [ucis[i] for i in order],
-        len(legal_moves),
-    )
-
 
 GATE_US_PER_NODE = 5.56
 PYTHON_BASELINE_US_PER_NODE = 11.12
@@ -113,13 +63,11 @@ def move_fields(move) -> tuple[int, int, str | None, str]:
     return int(move.from_square), int(move.to_square), promotion, str(move)
 
 
-def check_exact(boards, vocab, memo) -> bool:
+def check_exact(boards, vocab) -> bool:
     """Refuse to report a speedup for a projector that computes the wrong
     thing. Runs before timing and is not itself timed."""
     for board in boards:
-        want_ids, want_moves, want_ucis, want_total = python_project(
-            board, vocab, memo
-        )
+        want_ids, want_moves, want_ucis, want_total = python_project(board, vocab)
         ids, moves, ucis, total = cozy_bridge.project_legal_moves(board, vocab)
         if (ids, ucis, total) != (want_ids, want_ucis, want_total):
             return False
@@ -132,7 +80,6 @@ def main() -> int:
     vocab = MoveVocab.build_static()
     boards = build_boards()
     nodes = len(boards)
-    memo: dict = {}
 
     legal_counts = [len(list(board.generate_moves())) for board in boards]
     print(
@@ -141,7 +88,7 @@ def main() -> int:
         f"vocab: {len(vocab.token_to_id)}"
     )
 
-    exact = check_exact(boards, vocab, memo)
+    exact = check_exact(boards, vocab)
     print(f"exact outputs: {'PASS' if exact else 'FAIL'}")
     if not exact:
         print("native projection diverges from the Python oracle; not timing.")
@@ -149,7 +96,7 @@ def main() -> int:
 
     def run_python() -> None:
         for board in boards:
-            python_project(board, vocab, memo)
+            python_project(board, vocab)
 
     def run_native() -> None:
         for board in boards:

@@ -19,8 +19,20 @@ import time
 import chess
 
 from imba_chess.eval import cozy_bridge
-from imba_chess.eval.position_evaluator import _cozy_move_id_and_uci
+from imba_chess.eval import position_evaluator as _pe
 from imba_chess.data.move_vocab import MoveVocab
+
+if not hasattr(_pe, "_cozy_move_id_and_uci"):
+    raise SystemExit(
+        "This benchmark's subject no longer exists: _cozy_move_id_and_uci was "
+        "removed in the native projection cutover, which replaced the whole "
+        "per-move lookup with one Rust call. The result it produced (311 -> "
+        "154 ns/move, 2.02x) stands as history; there is nothing left here to "
+        "measure. Use scripts/bench_native_move_projector.py for the "
+        "projection path as it exists now."
+    )
+
+_cozy_move_id_and_uci = _pe._cozy_move_id_and_uci
 
 
 def old_move_id_and_uci(cozy_board, move, move_vocab):

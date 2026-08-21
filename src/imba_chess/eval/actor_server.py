@@ -15,7 +15,7 @@ per-ROW Python bottlenecks that this rewrite removes:
   1. `_project_legal_logits_cozy` run server-side per row (107s cum) --
      ELIMINATED. The worker now computes the UCI-sorted, vocab-mapped
      legal-move projection itself (it holds the real board; see
-     `actor_worker._legal_vocab_projection`) and sends only
+     `cozy_bridge.project_legal_moves`) and sends only
      `legal_vocab_ids`; the server does one padded batched
      `torch.gather` per wave/root call instead (`_gather_legal_logits`).
   2. Reconstructing a cozy board from the wire `BoardState`, then

@@ -74,7 +74,7 @@ class RootEvalRequest:
     `docs/superpowers/sdd/thin-report.md`): the worker -- which holds the
     real python-chess board for the current position -- computes the
     UCI-sorted, vocab-mapped legal-move projection itself
-    (`actor_worker._legal_vocab_projection`, converting to a cozy board
+    (`cozy_bridge.project_legal_moves`, converting to a cozy board
     first) and sends only the resulting vocab ids. The server never
     reconstructs a board or runs movegen at all anymore: it just gathers raw
     logits at these ids, in this order, and returns them unprojected (see
@@ -150,7 +150,7 @@ class WaveRow:
 
     `legal_vocab_ids` is this node's own UCI-sorted, vocab-mapped legal-move
     projection, computed worker-side from the REAL cozy board for this node
-    (`actor_worker._legal_vocab_projection`) -- see `RootEvalRequest`'s
+    (`cozy_bridge.project_legal_moves`) -- see `RootEvalRequest`'s
     docstring for the full rationale; identical division of labor, just
     per-node instead of per-turn.
     """
