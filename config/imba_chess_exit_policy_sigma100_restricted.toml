@@ -1,0 +1,140 @@
+[dataset]
+min_avg_elo = 2000
+test_min_avg_elo = 2400
+min_time_control_sec = 180
+split = "train"
+dataset_name = "Lichess/standard-chess-games"
+train_start_month = "2021-01"
+train_end_month = "2025-06"
+val_start_month = "2025-07"
+val_end_month = "2025-07"
+test_start_month = "2025-08"
+test_end_month = "2025-09"
+val_max_games = 100000
+test_max_games = 100000
+cache_dir = "artifacts/hf_cache"
+parquet_batch_size = 8192
+max_seq_len = 512
+# Disabled (unlike production configs): the rollout parquet was generated
+# by scripts/generate_search_rollouts.py streaming this same dataset
+# unshuffled from the start with no --skip-games, so its ~4800 covered
+# games are exactly the first ~4800 games of the unshuffled stream
+# (confirmed empirically: 4796/4796 found within the first 4800 games).
+# Shuffling here would scatter those games across the full multi-year
+# corpus, making the odds of ever touching a rollout-covered game
+# vanishingly small (confirmed empirically: zero overlap in 25000
+# shuffled games). Unshuffled keeps training's early games aligned with
+# the rollout's coverage -- NOTE this means the policy-KL term only gets
+# real gradient signal for roughly the first ~100 steps of any run
+# (~4800 games / ~50 games-per-step), after which the stream moves past
+# the rollout-covered window into uncovered games for good. All three
+# sigma probes share this identical exposure window (same data, same
+# unshuffled order), so the sigma comparison between them stays fair;
+# it just means steps beyond ~100 are ordinary human-CE training that
+# tests whether the early KL-induced shift persists or washes out.
+shuffle_train_month_files_on_start = false
+train_shuffle_buffer_size = 0
+
+[board_state]
+en_passant = "legal"
+halfmove_max = 100
+halfmove_bucket_size = 2
+fullmove_max = 200
+fullmove_bucket_size = 2
+
+[vocab]
+path = "artifacts/move_vocab_static_uci.json"
+include_unk = false
+
+[dataloader]
+max_tokens_per_batch = 4096
+num_workers = 1
+pin_memory = false
+prefetch_factor = 1
+persistent_workers = false
+
+[model]
+model_dim = 768
+linear_hidden_dim = 64
+attention_dim = 64
+num_heads = 12
+num_layers = 8
+dropout = 0.0
+max_position_embeddings = 513
+halfmove_vocab_size = 128
+fullmove_vocab_size = 128
+ignore_index = -100
+relative_attention_bias = "position"
+label_smoothing = 0.05
+elo_weight_min_elo = 2000
+elo_weight_max_elo = 2800
+elo_loss_weight_alpha = 1.0
+elo_loss_weight_strength = 1.0
+enable_value_head = true
+value_loss_weight = 1.0
+value_weight_alpha = 0.9
+value_label_smoothing = 0.0
+moves_left_loss_weight = 0.05
+
+[training]
+epochs = 100
+steps_per_epoch = 10000
+eval_every_steps = 200
+log_every_steps = 10
+full_val_every_epochs = 1
+fast_val_max_games = 300
+fast_test_max_games = 300
+max_lr = 7e-4
+lr_start_factor = 1.0
+lr_end_factor = 0.5
+onecycle_warmup_fraction_first_epoch = 0.1
+weight_decay = 0.01
+grad_clip_norm = 1.0
+seed = 42
+deterministic_eval = true
+eval_num_workers = 0
+save_last_every_steps = 25
+last_checkpoint_keep = 10
+optimizer_triton = true
+optimizer_kahan_sum = true
+compile_model = true
+device = "auto"
+dtype = "bfloat16"
+checkpoint_dir = "artifacts/checkpoints_exit_policy_sigma100_restricted"
+checkpoint_keep = 1
+
+[eval_vs_stockfish]
+games = 1000
+max_plies = 512
+seed = 42
+stockfish_path = "/usr/bin/stockfish"
+stockfish_time_sec = 0.05
+stockfish_threads = 1
+stockfish_hash_mb = 64
+stockfish_limit_strength = false
+ladder_elos = "2200"
+ladder_games_per_segment = 100
+device = "auto"
+dtype = "bfloat16"
+compile = true
+model_move_policy = "value_search_halving"
+value_rerank_top_k = 16
+value_rerank_lambda = 0.05
+search_budget = 2048
+search_top_m = 16
+halving_rounds = 0
+search_refutation_top_r = 2
+search_expand_top = 3
+search_max_depth = 8
+opening_random_plies = 1
+debug_trace_games = 0
+debug_trace_max_plies = 80
+debug_topk = 5
+save_games = true
+save_games_dir = "artifacts/eval/games"
+
+[expert_iteration]
+rollout_path = "artifacts/rollouts/nightly/session_combined_n1n2.parquet"
+beta = 0.0
+policy_kl_weight = 0.1
+policy_kl_sigma = 1.0

@@ -93,6 +93,20 @@ def parse_args() -> argparse.Namespace:
             "training.epochs * training.steps_per_epoch."
         ),
     )
+    parser.add_argument(
+        "--lr-override",
+        type=float,
+        default=None,
+        help=(
+            "After resuming, pin the learning rate to this constant value for "
+            "the rest of the run, bypassing the OneCycle schedule entirely. "
+            "Requires --resume. Needed because resuming restores the scheduler "
+            "state from the checkpoint, so training.max_lr in the config has no "
+            "effect on a resumed run. Intended for short fine-tune/distillation "
+            "probes from an already-converged checkpoint, where the resumed "
+            "schedule lr is far too high."
+        ),
+    )
     return parser.parse_args()
 
 
@@ -185,6 +199,22 @@ def _build_optimizer(model: torch.nn.Module, config, *, device: torch.device):
         model, weight_decay=float(config.training.weight_decay)
     )
     return StableAdamW(param_groups, **kwargs)
+
+
+def _build_constant_lr_scheduler(optimizer: torch.optim.Optimizer, lr: float):
+    """Pin `optimizer` to a constant `lr` and return a scheduler that holds it.
+
+    Used by --lr-override. Rewrites both "lr" and "initial_lr" on every param
+    group: LambdaLR derives its base_lrs from "initial_lr", so setting only
+    "lr" would be undone on the scheduler's first step().
+    """
+    override_lr = float(lr)
+    if not override_lr > 0.0:
+        raise ValueError(f"--lr-override must be > 0, got {lr!r}")
+    for group in optimizer.param_groups:
+        group["lr"] = override_lr
+        group["initial_lr"] = override_lr
+    return torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda=lambda _step: 1.0)
 
 
 def _build_scheduler(optimizer: torch.optim.Optimizer, config):
@@ -522,8 +552,10 @@ def main() -> None:
             f"policy_kl_weight={repo_config.expert_iteration.policy_kl_weight})"
         )
 
+    train_dataset: Any = _make_dataset(repo_config, split="train")
+
     train_loader = build_event_dataloader(
-        lichess_dataset=_make_dataset(repo_config, split="train"),
+        lichess_dataset=train_dataset,
         config=repo_config,
         move_vocab=move_vocab,
         rollout_lookup=rollout_lookup,
@@ -565,6 +597,10 @@ def main() -> None:
             has_value_loss = value_loss is not None
             if value_loss is None:
                 value_loss = torch.zeros_like(loss)
+            policy_kl_loss = output.get("policy_kl_loss")
+            has_policy_kl_loss = policy_kl_loss is not None
+            if policy_kl_loss is None:
+                policy_kl_loss = torch.zeros_like(loss)
             moves_left_loss = output.get("moves_left_loss")
             if moves_left_loss is None:
                 moves_left_loss = torch.zeros_like(loss)
@@ -595,6 +631,8 @@ def main() -> None:
             "policy_loss": policy_loss.detach(),
             "value_loss": value_loss.detach(),
             "has_value_loss": 1.0 if has_value_loss else 0.0,
+            "policy_kl_loss": policy_kl_loss.detach(),
+            "has_policy_kl_loss": 1.0 if has_policy_kl_loss else 0.0,
             "moves_left_loss": moves_left_loss.detach(),
             "lr": float(optimizer.param_groups[0]["lr"]),
             "tokens": float(int(batch["total_tokens"])),
@@ -621,6 +659,11 @@ def main() -> None:
                 if float(out["has_value_loss"]) > 0.5
                 else "--"
             ),
+            "policy_kl": (
+                f"{float(out['policy_kl_loss'].item()):.4f}"
+                if float(out["has_policy_kl_loss"]) > 0.5
+                else "--"
+            ),
             "moves_left": f"{float(out['moves_left_loss'].item()):.4f}",
             "lr": f"{out['lr']:.6f}",
             "tokens": int(out["tokens"]),
@@ -641,6 +684,21 @@ def main() -> None:
         Checkpoint.load_objects(to_load=checkpoint_objects, checkpoint=checkpoint)
         print(f"Resumed training from checkpoint: {args.resume}")
 
+    if args.lr_override is not None:
+        # Must run AFTER load_objects: that call restores the OneCycleLR state
+        # (including its max_lrs and step count) from the checkpoint, which would
+        # otherwise clobber anything set here. Replacing `scheduler` works because
+        # the train step closes over the variable, not its value, and the trainer
+        # has not started yet.
+        if args.resume is None:
+            raise ValueError("--lr-override requires --resume")
+        scheduler = _build_constant_lr_scheduler(optimizer, args.lr_override)
+        checkpoint_objects["scheduler"] = scheduler
+        print(
+            f"LR override active: constant lr={float(args.lr_override):.6e} "
+            "(OneCycle schedule bypassed)"
+        )
+
     tb_logger = TensorboardLogger(log_dir=str(checkpoint_dir / "tb"))
     tb_logger.attach_output_handler(
         trainer,
@@ -660,6 +718,11 @@ def main() -> None:
             | (
                 {"value_loss": float(output["value_loss"].item())}
                 if float(output["has_value_loss"]) > 0.5
+                else {}
+            )
+            | (
+                {"policy_kl_loss": float(output["policy_kl_loss"].item())}
+                if float(output["has_policy_kl_loss"]) > 0.5
                 else {}
             )
         ),
