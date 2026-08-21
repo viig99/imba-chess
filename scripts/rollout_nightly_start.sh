@@ -14,10 +14,18 @@ STATE_DIR="${REPO_DIR}/artifacts/rollouts/nightly"
 PID_FILE="${STATE_DIR}/current.pid"
 STATE_FILE="${STATE_DIR}/state.json"
 CHECKPOINT="${REPO_DIR}/artifacts/checkpoints/best_hr10_checkpoint_23_hr10=0.9564.pt"
-CONFIG="${REPO_DIR}/config/imba_chess_exit_full.toml"
-# 5 nights starting 2026-07-13: last allowed start is 2026-07-17 (its
-# session runs until the 07:00 stop on 2026-07-18).
-END_DATE="2026-07-17"
+# MUST be a config with train_month_shuffle_seed pinned. The 2026-07-13..15
+# nights used imba_chess_exit_full.toml, which leaves it unset -- so the month
+# shuffle was OS-entropy-seeded on every launch and --skip-games resumed into a
+# freshly-reshuffled stream. That silently produced rollouts unaligned with any
+# training run: rollout targets are keyed by (game_id, ply), so a covered game
+# only contributes if training happens to stream that same game, and against a
+# 50M+ game corpus the hit rate is ~0. Those nights are archived under
+# artifacts/rollouts/nightly/unaligned_archive_20260713_20260715/.
+CONFIG="${REPO_DIR}/config/imba_chess_exit_seeded_rollout.toml"
+# 3 nights starting 2026-07-24: last allowed start is 2026-07-26 (its
+# session runs until the 07:00 stop on 2026-07-27).
+END_DATE="2026-07-26"
 
 mkdir -p "${STATE_DIR}"
 cd "${REPO_DIR}"
@@ -57,6 +65,7 @@ nohup python scripts/generate_search_rollouts.py \
     --checkpoint "${CHECKPOINT}" \
     --output-path "${output_path}" \
     --skip-games "${skip_games}" \
+    --sample-every-n-games 10 \
     --concurrent-games 6 \
     --flush-every-games 200 \
     >> "${STATE_DIR}/nightly.log" 2>&1 &
