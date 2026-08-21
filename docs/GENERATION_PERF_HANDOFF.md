@@ -391,12 +391,12 @@ problem — so the two goals are coupled.
 
 ---
 
-## 12. Resume checkpoint: owned native binding (2026-08-21)
+## 12. Owned native binding: complete (2026-08-21)
 
-Tasks 1-4 of the native-binding plan are complete and pushed. Task 5 is
-partially complete and **paused waiting on an idle GPU** -- the remaining
-steps are a label-equality gate and a timing benchmark, and neither can run
-while the machine is in use (see section 6's contention rules).
+Stage 1 of the native-binding plan is **done and gated**. Production projects
+legal moves through Rust, the third-party binding is gone, and both the exact
+label gate and the speed gate passed. What remains is optional follow-on work,
+listed at the end.
 
 ### Repository state
 
@@ -408,6 +408,9 @@ Everything below is pushed; nothing is left uncommitted.
   - `d573821` test: validate native move projection
   - `91e1200` Merge main (seeded-stream generation + success-path hard exit)
   - `922b7c0` perf: use owned native chess projection
+  - `83054fa` docs: refresh the native-binding resume checkpoint
+  - `0ee7eac` fix: bound requires-python to PyO3's real ceiling
+  - `6489040` fix: repair the scripts the projection cutover broke
 - `main` (also pushed):
   - `cd32640` feat: spread rollout coverage with sparse game sampling
   - `a0ff7f0` fix: point the nightly rollout at a seed-pinned config
@@ -435,66 +438,71 @@ space and must not happen per node.
 
 ### Evidence in hand
 
-- Projection differential: **exact** on 206 positions (6 `EDGE_FENS` + 200
-  strided across 200 random reachable games) against both the full static
-  vocabulary and a restricted 1-in-7 slice with non-matching ids.
-- Isolated speed gate: native **2.90 us/node** vs Python **11.63**, a
-  **4.02x** speedup against a `<= 5.56` requirement; re-runs gave 2.99 and
-  3.06. Measured pre-cutover; **needs one confirming re-run** in the final
-  dependency environment (Task 5 Step 4).
-- Suites: full **755 passed**, native package **105 passed**, targeted cutover
-  **629 passed**. `cargo fmt`/`clippy -D warnings` clean. Ruff one better than
-  baseline, no new findings.
-- End-to-end expectation is **~6.9%** of a 20-game run (8.2 us/node saved over
-  346,091 evals, of 41.5s). That is below this machine's noise floor. **Do not
-  claim it from a wall-clock A/B** -- the isolated benchmark is the evidence.
+- **Label and work equality: PASS.** Pre- and post-cutover 20-game rollouts on
+  a common stream produce **bit-identical** output across all 19 parquet
+  columns, including every array column (`best_arm_move_uci`,
+  `best_arm_backed_value` at max |delta| exactly 0.0, `arm_evals_spent`,
+  `arm_log_prior`, `arm_move_uci`, `arm_backed_value`). Identical work too:
+  209 rows / 20 games, **324 waves, 428,016 evaluations** on both arms.
+  Artifacts: `artifacts/rollouts/{pre,post}_native_seeded.parquet`.
+- **Speed gate: PASS.** Native **3.17 us/node** via the production entry point
+  vs **12.18** for the reconstructed retired path -- **3.85x** against a
+  `<= 5.56` requirement, reproducible across four runs (3.16-3.34).
+- Projection differential: **exact** on 206 positions against both a full
+  static vocabulary and a restricted 1-in-7 slice with non-matching ids.
+- Suites: full **755 passed**, native package **105 passed**. `cargo fmt`,
+  `clippy -D warnings` clean. Ruff at the 56-error baseline exactly.
+- `decode_project` fell **13.5s -> 9.1s** on identical work = 10.3 us/node,
+  against 9.0 predicted from the isolated benchmark. `search_gpu` was flat
+  (18.7s both arms), which is what makes that delta readable.
 
-### The pre-cutover baseline is INVALID -- regenerate it
+**Do not claim an end-to-end speedup.** Total wall time moved 54.5s -> 50.9s
+(1.07x), below this machine's noise floor. The bucket delta and the isolated
+benchmark are the evidence; wall clock is not.
 
-`artifacts/rollouts/pre_native_projection.parquet` (and its `/tmp` twin) was
-generated *before* `cd32640` threaded `shuffle_train_month_files_on_start` /
-`train_month_shuffle_seed` / `train_shuffle_buffer_size` into the generation
-stream. Those settings were previously hardcoded to the LichessDataset
-defaults, so the merged tree streams a **different set of games**. Comparing
-the old baseline against a post-cutover run would surface label differences
-that have nothing to do with the projector.
+### The label gate, and the baseline that had to be thrown away
 
-The correct comparison generates both arms on the same stream:
+The first pre-cutover baseline was **invalid** and was deleted. It predated the
+change threading `shuffle_train_month_files_on_start` /
+`train_month_shuffle_seed` / `train_shuffle_buffer_size` into generation --
+previously hardcoded to the LichessDataset defaults -- so it streamed a
+different set of games: **169 rows against 209** for the identical command
+afterwards. Comparing it post-cutover would have shown differences that had
+nothing to do with the projector.
 
-1. `git worktree add <tmp> 91e1200` -- the merge commit: seeded stream
-   present, old Python projection still intact, `cozy-chess-py` still a
-   dependency.
-2. `uv sync --extra dev --python <a 3.12 interpreter>` in that worktree, which
-   reinstalls `cozy-chess-py`.
-3. Run the 20-game generation there -> pre-cutover parquet.
-4. Run the identical command on `922b7c0` -> post-cutover parquet.
-5. Compare per Task 5 Step 3: `game_id, ply` sort, then exact equality on
-   labels, `best_arm_move_uci`, `best_arm_backed_value`, `arm_evals_spent`,
-   `arm_log_prior`, plus identical reported waves and evaluations. Do not
-   relax the gate; any difference is a root-cause investigation.
+The gate that actually ran generated both arms on a common stream: the
+pre-cutover arm from merge commit `91e1200` in a temporary worktree with
+`cozy-chess-py` reinstalled, the post-cutover arm from the cutover commit,
+identical flags. **If you ever need to repeat this, that is the shape** -- an
+arm built from a commit, not from a saved parquet, because a saved parquet
+silently ages out the moment the stream changes.
 
-Roughly two minutes of GPU for both arms.
+### Optional follow-on work
 
-### Remaining Task 5 work
+- A read-only review focused on unsafe type assumptions, castling
+  normalization, projector cache isolation, packaging reproducibility, and
+  test-oracle independence. Not yet requested.
+- `scripts/bench_move_id_micro.py` benchmarked only the deleted per-move
+  lookup, in both arms. It now exits non-zero with a pointer instead of
+  appearing to run, and is a reasonable candidate for deletion.
+- **Next perf target: `search_bookkeeping`**, now the largest Python bucket at
+  15.9s / 31.3%. Ceiling is ~1.27x for the tree half alone (section 8). Keep
+  an independent Python oracle for it, exactly as the projection port did.
 
-- Step 2/3: the two rollouts above and the exact comparison. **GPU.**
-- Step 4: re-run `scripts/bench_native_move_projector.py` in the final
-  dependency environment. CPU-only but it is a *timing* measurement, so it
-  needs a quiet machine.
-- Step 6: append final numbers to the design spec's `## Stage 1 Results` and
-  update this handoff.
-- Step 7: read-only review (unsafe type assumptions, castling normalization,
-  projector cache isolation, packaging reproducibility, test-oracle
-  independence), then a docs commit.
+### Resolved: Python version policy
 
-### Open issue: Python version policy
+`requires-python` is now bounded `>=3.10,<3.14` in both the root and native
+manifests, because the crate builds a version-specific extension (no abi3) and
+PyO3 0.23 supports through 3.13. This workstation's default interpreter is
+3.14.7, so an unbounded declaration meant a fresh `uv sync` picked it and hit a
+compiler error instead of a resolution error. uv now refuses up front:
 
-`requires-python` is an unbounded `>=3.10` and there is no `.python-version`,
-but PyO3 0.23 supports through 3.13. Both venvs are 3.12.12 so nothing breaks
-today -- but a fresh `uv sync` on this workstation picks the 3.14 default and
-the build fails. Bound `requires-python` to `<3.14`, commit a
-`.python-version`, or move to a PyO3 stable-ABI feature. Settle this before
-anyone treats the repo as building from a clean checkout.
+```text
+error: The requested interpreter resolved to Python 3.15.0rc1, which is
+incompatible with the project's Python requirement: `>=3.10, <3.14`
+```
+
+Raise the bound only together with a PyO3 upgrade or a stable-ABI feature.
 
 ### Resolved: the generator hung after every successful run
 
@@ -546,6 +554,12 @@ file. Piping it to `tail` hides all progress until exit.
 - **`scripts/bench_python_opts_paired.sh` can no longer reconstruct its A
   arm** and now fails loudly rather than silently reporting the `encode_cozy`
   half as if it covered both changes.
+- **Deleting a production helper silently breaks `scripts/`.** Nothing in the
+  test suite imports those scripts, so a fully green suite said nothing about
+  three of them (`bench_project_decompose.py`, `bench_move_id_micro.py`,
+  `probe_project_phases.py`) being broken by the removal of
+  `_cozy_move_id_and_uci`. After any similar deletion, import-check every
+  script, not just the suite.
 
 ### Environment commands
 

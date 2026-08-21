@@ -415,6 +415,13 @@ against it after cutover.
 ~11.1 us the projector replaces; the remainder is tensor construction and
 log_softmax, which the projector does not touch.
 
+> **Superseded -- do not use this run as the label gate's reference.** It
+> predates the change threading the `[dataset]` shuffle settings into
+> generation, so it streamed a different set of games (169 rows here vs 209 on
+> the identical command afterwards). Both arms were regenerated on a common
+> stream; see "Label and work equality gate" below. The stale parquet has been
+> deleted rather than left to be picked up by mistake.
+
 Unrelated defect observed during this run and left unfixed (out of Task 3's
 scope): the generator completed all 20 games, wrote its parquet and progress
 sidecar, and printed its final report, then never exited -- it sat for 11
@@ -424,8 +431,70 @@ exception path, so a *successful* run still goes through CPython's normal
 shutdown and can block forever joining a non-daemon thread -- precisely the
 failure that wrapper's own docstring describes.
 
-### Gate decision
+### Gate decision (Stage 1 projection)
 
-Stage 1 projection is accepted: exact on every differential fixture and 4.02x
-on the isolated benchmark against a 2x requirement. Tasks 4-5 (production
-cutover) are unblocked.
+Accepted: exact on every differential fixture and 4.02x on the isolated
+benchmark against a 2x requirement. Tasks 4-5 (production cutover) unblocked.
+
+## Stage 1 Results: post-cutover (2026-08-21)
+
+Production now calls `cozy_bridge.project_legal_moves` exclusively;
+`cozy-chess-py` and both Python projection implementations are gone.
+
+### Label and work equality gate (PASS)
+
+The pre-cutover baseline recorded above was **discarded before this gate ran**:
+it predates the change that threads the `[dataset]` shuffle settings into
+generation, so it streamed a different set of games (169 rows vs 209 on the
+same command). Both arms were regenerated on the same stream -- the
+pre-cutover arm from merge commit `91e1200` in a temporary worktree with
+`cozy-chess-py` reinstalled, the post-cutover arm from the cutover commit.
+
+Identical command on both: 20 games, budget 2048, 8 concurrent, float32,
+`--sample-seed 42`.
+
+| | pre-cutover | post-cutover |
+|---|---|---|
+| rows / games | 209 / 20 | 209 / 20 |
+| search waves | 324 | 324 |
+| search evaluations | 428,016 | 428,016 |
+| instrumented total | 54.5s | 50.9s |
+| `decode_project` | 13.5s (24.7%) | 9.1s (17.8%) |
+| `search_gpu` | 18.7s (34.4%) | 18.7s (36.7%) |
+| `search_bookkeeping` | 14.7s (26.9%) | 15.9s (31.3%) |
+| `decode_prep` | 6.5s (11.9%) | 6.2s (12.1%) |
+
+All 19 parquet columns compare **bit-identical** after sorting by
+`(game_id, ply)`, including every array column: `best_arm_move_uci`,
+`best_arm_backed_value` (max |delta| exactly 0.0), `arm_evals_spent`,
+`arm_log_prior`, `arm_move_uci`, `arm_backed_value`, and the rest. Wave and
+evaluation counts match exactly, so the search did the same work, not merely
+similar work.
+
+`search_gpu` is the drift control and did not move (18.7s both arms), which is
+what makes the `decode_project` delta readable.
+
+### Speed gate, final environment (PASS)
+
+| path | median us/node | min | max |
+|---|---|---|---|
+| python (reconstructed retired path) | 12.18 | 11.80 | 13.08 |
+| native (via `project_legal_moves`) | 3.17 | 2.98 | 3.67 |
+
+**3.85x**, gate `<= 5.56 us/node` -> PASS. Re-runs: 3.16, 3.34, 3.18 us/node
+(3.84x, 3.73x, 3.82x). Slightly slower than the 2.90 measured pre-cutover
+because this times the production entry point, including its per-call
+projector-cache lookup, rather than `MoveProjector.project` directly -- the
+more honest number of the two.
+
+### On the end-to-end number
+
+Total wall time moved 54.5s -> 50.9s, **1.07x**. That is below this machine's
+~+/-20% noise floor and is **not** claimed as a result. What is measurable is
+the targeted bucket: `decode_project` fell 13.5s -> 9.1s on identical work,
+i.e. 4.4s over 428,016 evaluations = **10.3 us/node**, against 9.0 us/node
+predicted from the isolated benchmark. Prediction and observation agree.
+
+The remaining `decode_project` cost is tensor construction and log_softmax,
+which the projector does not touch. `search_bookkeeping` (15.9s, 31.3%) is now
+the largest Python bucket and the next target.
