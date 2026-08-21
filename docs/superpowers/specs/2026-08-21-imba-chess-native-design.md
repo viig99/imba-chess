@@ -498,3 +498,18 @@ predicted from the isolated benchmark. Prediction and observation agree.
 The remaining `decode_project` cost is tensor construction and log_softmax,
 which the projector does not touch. `search_bookkeeping` (15.9s, 31.3%) is now
 the largest Python bucket and the next target.
+
+### Review
+
+One finding, fixed in `15dcbc7`. On a Chess960 board whose king does not start
+on the e-file, a plain king step and a castle can normalize onto the same
+vocabulary token -- king on b1 with a rook on a1 makes both `b1a1` (long
+castle) and the step `b1->c1` map to `"b1c1"`. `project()` returned both, with
+an identical id and UCI and no way to distinguish them; a consumer keying a
+dict by UCI silently lost a legal move. It now raises. Unreachable through this
+application (standard chess only), but real in the shipped binding, which
+offers Chess960 as a first-class feature.
+
+The guard costs nothing measurable: a collision is exactly one entry reached
+twice, so pointer equality decides it (3.24-3.46 us/node with the guard vs
+3.16-3.34 without). No other correctness findings.

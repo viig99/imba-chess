@@ -479,9 +479,14 @@ silently ages out the moment the stream changes.
 
 ### Optional follow-on work
 
-- A read-only review focused on unsafe type assumptions, castling
-  normalization, projector cache isolation, packaging reproducibility, and
-  test-oracle independence. Not yet requested.
+- ~~A read-only review~~ **DONE.** One finding, fixed in `15dcbc7`: the
+  geometric castling normalization could collide a plain king step and a
+  castle onto one vocabulary token on Chess960 boards whose king does not
+  start on the e-file, silently returning a duplicate id/UCI pair.
+  `project()` now refuses instead. No other correctness findings; the
+  reviewer independently traced every `project_legal_moves` call site for the
+  3- to 4-tuple signature change and confirmed sort-stability parity with the
+  Python oracle.
 - `scripts/bench_move_id_micro.py` benchmarked only the deleted per-move
   lookup, in both arms. It now exits non-zero with a pointer instead of
   appearing to run, and is a reasonable candidate for deletion.
@@ -541,7 +546,11 @@ file. Piping it to `tail` hides all progress until exit.
   whose raw castle `e1b1` is absent from the old four-entry castle table and
   therefore still exercises the board-derived rule -- without the collision.
   This edge is harmless in standard chess, where a king can never legally step
-  from e1 to c1 or g1.
+  from e1 to c1 or g1 -- but `project()` no longer *tolerates* it either: since
+  `15dcbc7` a token covering two legal moves raises rather than returning a
+  duplicate. The lesson worth keeping: a from-to token space cannot express
+  Chess960 castling unambiguously, so normalizing into one is a standard-chess
+  convention, not a general one.
 - **`tests.test_cozy_bridge._random_boards(n_games, ...)` takes a game count,
   not a position count.** Generate 200 games and stride the resulting position
   list to 200 well-spread positions.
