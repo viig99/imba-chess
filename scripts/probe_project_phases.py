@@ -55,57 +55,57 @@ def instrumented_consume(self, request, out):
             )
     T["kv_path"] += t() - t0
 
+    # NEW ORDER: logits-independent Python work runs before the first sync,
+    # so any GPU time left after the queued cats is hidden under it.
     t0 = t()
-    logits = out["logits"].float().cpu()
-    value_logits = out["value_logits"].float().cpu()
-    T["d2h"] += t() - t0
-
-    results = []
-    for row, cozy_board in enumerate(request.boards):
-        t0 = t()
-        value_stm = pe._value_scalar_from_logits(value_logits[row])
-        T["assemble"] += t() - t0
-
-        row_logits = logits[row]
-        t0 = t()
+    per_node = []
+    for cozy_board in request.boards:
         legal_moves_all = list(cozy_board.generate_moves())
-        T["movegen"] += t() - t0
-
-        t0 = t()
         ids, mvs, ucis = [], [], []
         for move in legal_moves_all:
             mid, uci = pe._cozy_move_id_and_uci(cozy_board, move, self._move_vocab)
             if mid is not None:
-                ids.append(int(mid)); mvs.append(move); ucis.append(uci)
-        T["mapping"] += t() - t0
+                ids.append(int(mid))
+                mvs.append(move)
+                ucis.append(uci)
+        if ids:
+            order = sorted(range(len(mvs)), key=lambda i: ucis[i])
+            mvs = [mvs[i] for i in order]
+            ucis = [ucis[i] for i in order]
+            ids = [ids[i] for i in order]
+        per_node.append((ids, mvs, ucis))
+    T["movegen+map+sort"] += t() - t0
 
-        if not ids:
-            results.append(pe.PositionEval(value_stm=value_stm, legal_moves=[],
-                                           legal_ucis=[], legal_log_priors=[]))
-            continue
+    t0 = t()
+    logits = out["logits"].float().cpu()
+    value_logits = out["value_logits"].float().cpu()
+    T["d2h(sync wait)"] += t() - t0
 
-        t0 = t()
-        order = sorted(range(len(mvs)), key=lambda i: ucis[i])
-        mvs = [mvs[i] for i in order]
-        ucis = [ucis[i] for i in order]
-        ids = [ids[i] for i in order]
-        T["sortlists"] += t() - t0
+    t0 = t()
+    values = pe._batched_value_scalars(value_logits)
+    id_lists = [ids for ids, _, _ in per_node]
+    prior_rows = [[] for _ in id_lists]
+    if all(id_lists):
+        prior_rows = pe._batched_legal_log_priors(logits, id_lists)
+    else:
+        keep = [r for r, ids in enumerate(id_lists) if ids]
+        if keep:
+            sub = pe._batched_legal_log_priors(
+                logits.index_select(0, torch.tensor(keep, dtype=torch.long)),
+                [id_lists[r] for r in keep],
+            )
+            for r, pr in zip(keep, sub):
+                prior_rows[r] = pr
+    T["batched_torch"] += t() - t0
 
-        t0 = t()
-        idt = torch.tensor(ids, device=row_logits.device, dtype=torch.long)
-        legal_logits = row_logits.index_select(0, idt)
-        T["gather"] += t() - t0
-
-        t0 = t()
-        log_priors = torch.log_softmax(legal_logits.float(), dim=0).tolist()
-        T["softmax"] += t() - t0
-
-        t0 = t()
-        results.append(pe.PositionEval(value_stm=value_stm, legal_moves=mvs,
-                                       legal_ucis=ucis, legal_log_priors=log_priors))
-        T["assemble"] += t() - t0
-        N["nodes"] += 1
-
+    t0 = t()
+    results = [
+        pe.PositionEval(value_stm=values[r], legal_moves=mvs,
+                        legal_ucis=ucis, legal_log_priors=prior_rows[r])
+        for r, (_ids, mvs, ucis) in enumerate(per_node)
+    ]
+    T["assemble"] += t() - t0
+    N["nodes"] += len(per_node)
     N["waves"] += 1
     return results
 

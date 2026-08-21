@@ -606,19 +606,28 @@ class CachedPositionEvaluator:
                     torch.cat([parent_k, own_k], dim=2),
                     torch.cat([parent_v, own_v], dim=2),
                 )
-        # One device->host transfer per wave instead of two syncs per node.
-        logits = out["logits"].float().cpu()
-        value_logits = out["value_logits"].float().cpu()
-
-        # Per-node work is pure Python (movegen + vocab mapping + canonical
-        # sort); every tensor op is hoisted to one call for the whole wave. At
-        # budget 2048 a wave carries ~1,321 nodes, and the old shape ran a
-        # softmax, a torch.tensor, an index_select and a log_softmax per node
-        # over ~31-element rows, where dispatch dominated the arithmetic.
+        # Everything above only QUEUES CUDA work; forward_decode_grouped and
+        # these cats are async. The first real sync is the .cpu() below, and it
+        # was measured at 12.49 us/node of pure GPU wait
+        # (scripts/probe_project_phases.py) -- time the CPU spends blocked.
+        #
+        # movegen + vocab mapping + canonical sort reads only request.boards,
+        # never the logits, so running it BEFORE the sync hides ~12 us/node of
+        # that wait under work we owe anyway. Pure reordering of independent
+        # work: no tensor op moves, so results are bit-identical.
         per_node = [
             _legal_moves_ids_ucis(cozy_board, self._move_vocab)
             for cozy_board in request.boards
         ]
+
+        # One device->host transfer per wave instead of two syncs per node.
+        logits = out["logits"].float().cpu()
+        value_logits = out["value_logits"].float().cpu()
+
+        # Every remaining tensor op is one call for the whole wave. At budget
+        # 2048 a wave carries ~1,321 nodes, and the old shape ran a softmax, a
+        # torch.tensor, an index_select and a log_softmax per node over
+        # ~31-element rows, where dispatch dominated the arithmetic.
         values = _batched_value_scalars(value_logits)
 
         id_lists = [ids for ids, _, _, _ in per_node]
