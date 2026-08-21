@@ -11,6 +11,12 @@ import cozy_chess as cc
 import torch
 import torch.nn.functional as F
 
+# Registers the torch.ops.fbgemm namespace; _wave_suffixes pads a whole decode
+# wave's ancestor K/V with fbgemm::jagged_to_padded_dense instead of one F.pad
+# per node. Imported unconditionally on purpose -- a missing/ABI-mismatched
+# fbgemm must fail loudly here rather than silently degrade the hot path.
+import fbgemm_gpu  # noqa: F401
+
 from imba_chess.data.board_state import BoardStateEncoder
 from imba_chess.data.event_builder import (
     BOS_TOKEN_ID,
@@ -444,8 +450,10 @@ def _project_legal_logits_cozy(
 class _CachedNode:
     """Search-node handle: parent link + the move that led here.
 
-    path_kv is filled after this node is evaluated: the stacked per-layer
-    K/V of every token on the root->self line, shapes [L, H, depth+1, d].
+    path_kv is filled after this node is evaluated: the per-layer K/V of every
+    token on the root->self line, stored TOKEN-FIRST as [depth+1, L, H, d] so a
+    whole wave's suffixes pad in one fbgemm jagged kernel -- see
+    CachedPositionEvaluator._wave_suffixes.
     A child's decode suffix is exactly its parent's path_kv. Parents are
     always evaluated before children in every strategy, so the path is
     complete at evaluate() time.
@@ -594,17 +602,25 @@ class CachedPositionEvaluator:
         """
         # Stack the wave's per-layer (k, v) once, then extend each node's
         # root->self path cache so descendants get their suffix for free.
+        #
+        # path_kv is TOKEN-FIRST, [t, L, H, d]: the ragged dim leads, which is
+        # what lets _wave_suffixes pad a whole wave with one fbgemm jagged
+        # kernel instead of an F.pad per node. The permute+unbind here also
+        # replaces the old per-node k_all[:, row] slicing (2 dispatches/node)
+        # with one call for the wave.
         k_all = torch.stack([k for k, _ in out["kv"]], dim=0)  # [L, B, H, 1, d]
         v_all = torch.stack([v for _, v in out["kv"]], dim=0)
+        k_owns = k_all.permute(1, 3, 0, 2, 4).unbind(0)  # B x [1, L, H, d]
+        v_owns = v_all.permute(1, 3, 0, 2, 4).unbind(0)
         for row, node in enumerate(request.nodes):
-            own_k, own_v = k_all[:, row], v_all[:, row]
+            own_k, own_v = k_owns[row], v_owns[row]
             if node.parent is None:
                 node.path_kv = (own_k, own_v)
             else:
                 parent_k, parent_v = node.parent.path_kv
                 node.path_kv = (
-                    torch.cat([parent_k, own_k], dim=2),
-                    torch.cat([parent_v, own_v], dim=2),
+                    torch.cat([parent_k, own_k], dim=0),
+                    torch.cat([parent_v, own_v], dim=0),
                 )
         # Everything above only QUEUES CUDA work; forward_decode_grouped and
         # these cats are async. The first real sync is the .cpu() below, and it
@@ -677,36 +693,67 @@ class CachedPositionEvaluator:
     def _wave_suffixes(self, nodes, max_suffix: int):
         """Padded per-layer ancestor K/V for one wave.
 
-        Each node's suffix is its parent's path_kv ([L, H, depth, d]); rows
-        are padded on the token dim to the wave max and stacked, then split
-        back into the per-layer [B, H, s, d] pairs forward_decode expects.
+        Each node's suffix is its parent's path_kv, stored TOKEN-FIRST as
+        [t, L, H, d]. That layout is what lets the whole wave pad in one
+        fbgemm jagged kernel: concatenate the paths (already contiguous on the
+        ragged dim) and hand fbgemm the cumulative offsets. Depth-0 nodes
+        contribute a zero-length row, which fbgemm pads to all zeros -- the
+        old explicit zero_k/zero_v rows.
+
+        Replaces one F.pad per node per tensor plus a torch.stack. torch.profiler
+        attributed 9,242 `aten::pad` calls and 178.9 ms to 12 waves of that, and
+        `Timer` measured the pad+stack shape at 8.03 us/node against 0.87 us/node
+        for this one (scripts/bench_wave_suffixes.py). Output is bit-identical.
         """
         ref_k, ref_v = self._prefix_kv[0]
         num_layers = len(self._prefix_kv)
         heads = ref_k.size(0)
-        zero_k = ref_k.new_zeros((num_layers, heads, max_suffix, ref_k.size(-1)))
-        zero_v = ref_v.new_zeros((num_layers, heads, max_suffix, ref_v.size(-1)))
-        rows_k: list[torch.Tensor] = []
-        rows_v: list[torch.Tensor] = []
-        for node in nodes:
-            if node.parent is None:
-                rows_k.append(zero_k)
-                rows_v.append(zero_v)
-                continue
-            path_k, path_v = node.parent.path_kv
-            pad = max_suffix - node.depth
-            rows_k.append(F.pad(path_k, (0, 0, 0, pad)) if pad else path_k)
-            rows_v.append(F.pad(path_v, (0, 0, 0, pad)) if pad else path_v)
-        stacked_k = torch.stack(rows_k, dim=0)  # [B, L, H, s, d_qk]
-        stacked_v = torch.stack(rows_v, dim=0)
-        suffix_kv = list(zip(stacked_k.unbind(dim=1), stacked_v.unbind(dim=1)))
+        dk, dv = ref_k.size(-1), ref_v.size(-1)
+        inner_k, inner_v = num_layers * heads * dk, num_layers * heads * dv
+
+        paths_k = [n.parent.path_kv[0] for n in nodes if n.parent is not None]
+        paths_v = [n.parent.path_kv[1] for n in nodes if n.parent is not None]
+        values_k = (
+            torch.cat(paths_k, dim=0).reshape(-1, inner_k)
+            if paths_k
+            else ref_k.new_zeros((0, inner_k))
+        )
+        values_v = (
+            torch.cat(paths_v, dim=0).reshape(-1, inner_v)
+            if paths_v
+            else ref_v.new_zeros((0, inner_v))
+        )
+        offsets = torch.zeros(
+            len(nodes) + 1, dtype=torch.long, device=values_k.device
+        )
+        offsets[1:] = torch.tensor(
+            [node.depth for node in nodes],
+            dtype=torch.long,
+            device=values_k.device,
+        ).cumsum(0)
+
+        padded_k = torch.ops.fbgemm.jagged_to_padded_dense(
+            values_k, [offsets], [max_suffix], 0.0
+        ).view(len(nodes), max_suffix, num_layers, heads, dk)
+        padded_v = torch.ops.fbgemm.jagged_to_padded_dense(
+            values_v, [offsets], [max_suffix], 0.0
+        ).view(len(nodes), max_suffix, num_layers, heads, dv)
+        # -> [B, L, H, s, d], then split into the per-layer pairs
+        # forward_decode expects.
+        suffix_kv = list(
+            zip(
+                padded_k.permute(0, 2, 3, 1, 4).unbind(dim=1),
+                padded_v.permute(0, 2, 3, 1, 4).unbind(dim=1),
+            )
+        )
         suffix_positions = (
             torch.arange(max_suffix, device=self._device).view(1, -1)
             + self._prefix_len
         ).expand(len(nodes), -1)
-        suffix_mask = torch.tensor(
-            [[i < node.depth for i in range(max_suffix)] for node in nodes],
-            dtype=torch.bool,
-            device=self._device,
+        suffix_mask = (
+            torch.arange(max_suffix, device=self._device).unsqueeze(0)
+            < torch.tensor(
+                [node.depth for node in nodes], device=self._device
+            ).unsqueeze(1)
         )
         return suffix_kv, suffix_positions, suffix_mask

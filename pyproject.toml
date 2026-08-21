@@ -15,6 +15,11 @@ dependencies = [
   "torch-optimi",
   "tqdm",
   "cozy-chess-py==0.1.1",
+  # Jagged/padded kernels for the decode-wave suffix build; see
+  # CachedPositionEvaluator._wave_suffixes. Must match torch's CUDA build --
+  # install from the same index, e.g.
+  #   uv pip install fbgemm-gpu --index-url https://download.pytorch.org/whl/cu130
+  "fbgemm-gpu",
 ]
 
 [project.optional-dependencies]
