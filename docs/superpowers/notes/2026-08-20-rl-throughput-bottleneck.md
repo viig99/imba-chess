@@ -428,6 +428,73 @@ Rules adopted:
 
 Strategic consequence: chasing individual ~1.05x Python wins is unfalsifiable
 on this rig. Prefer structural changes large enough to clear the noise floor.
+## 8. decode_project, decomposed — and two rejections (2026-08-21)
+
+With `decode_prep`/`decode_project` finally timed (section 7), `decode_project`
+was the largest bucket: 23.1s of 74.5s (30.9%), 54 us/node. "Largest bucket" is
+not a design, so it was decomposed with wall-clock accumulators inside the real
+consume path (`scripts/probe_project_phases.py`, 137,210 nodes) rather than
+cProfile — **cProfile inflates this workload ~2x** (349 us/node profiled vs 174
+us/node clean) and had mis-sized `torch.cat` by half.
+
+| phase | us/node | share |
+| --- | --- | --- |
+| `kv_path` (2.05 `torch.cat`/node) | 15.02 | 25.6% |
+| `d2h` (per-wave `.float().cpu()`) | 12.49 | 21.3% |
+| `assemble` (value scalar + PositionEval) | 11.90 | 20.3% |
+| `mapping` (memoized id/UCI loop) | 7.47 | 12.8% |
+| `gather` (`torch.tensor` + `index_select`) | 4.57 | 7.8% |
+| `sortlists` (canonical UCI sort + reorder) | 3.01 | 5.1% |
+| `softmax` (`log_softmax` + `.tolist()`) | 2.42 | 4.1% |
+| `movegen` | 1.51 | 2.6% |
+| `kv_stack` | 0.21 | 0.4% |
+
+**Done:** `assemble`'s value scalar plus `gather` and `softmax` are now one
+call per wave instead of ~4 per node (commit `bd8ee83`). Measured 3.042x on
+that phase (11.70 -> 3.85 us/node, +3.36s per 20-game run) and **bit-identical
+on real labels**: 100.0000% best-arm agreement over 209 positions, max |delta|
+exactly 0.0 on backed values and all 3,261 arm log-priors.
+
+**Rejected — FBGEMM jagged ops.** The proposal targeted the jagged->padded
+merge. That is only part of `decode_prep` (15.3%), and the `cat`/`pad` portion
+specifically is ~3.0s wall of 74.5s = **4.0%, ceiling 1.04x**. A
+CUDA-version-coupled dependency for <=4% loses to spending the same effort on
+a 30.9% bucket.
+
+**Rejected — batching the `kv_path` cats.** The obvious fix (group wave rows by
+parent path length, one `stack`+`cat` per depth, hand out views) makes every
+node's `path_kv` a view into a shared group tensor, coupling lifetimes on the
+largest VRAM consumer in the process: at L=8, H=12, d=64, fp32, k+v, a path
+token is 48 KiB, so 2048 evals x 8 games at mean path 2-3 is **1.5-2.25 GiB**
+on a 7.66 GiB card that already peaks at 7.6 GiB. Storing paths pre-padded to
+`max_depth+1` is worse (3.75 GiB). Trading OOM risk at the production
+`concurrent_games` for ~12 us/node (6.9%, itself under the noise floor) is a
+bad deal. Left alone.
+
+**Also dead: the "lambda sort" idea.** `sorted(..., key=lambda i: ucis[i])`
+looked like ~122 Python calls per node; it is **n calls, not n log n** —
+`sorted` decorates once per element. Measured, `key=ucis.__getitem__` and
+`sorted(zip(...))` are both *slower* (4.20/4.18 vs 3.23 us/node) with identical
+output. No headroom.
+
+### What is actually left, ranked
+
+1. **CPU/GPU overlap (pipelining) — the biggest remaining lever.** CPU is 67.6%
+   and GPU 32.4%, strictly alternating: `d2h` at 21.3% of `decode_project` is
+   the first CUDA sync after the forward launch, i.e. 5.3s of GPU wait booked as
+   CPU work, which only happens because nothing else runs during it. Wave N+1
+   depends on wave N inside a game, so the overlap has to come from splitting
+   the G concurrent games into two staggered groups: group A's Python work runs
+   while group B's forward is on the GPU. Ceiling `1/max(0.676, 0.324)` =
+   **~1.48x**, no new dependency and no VRAM increase. Smaller waves cost some
+   GPU efficiency (157 us/row at 512-1023 rows vs 110 at 2048-4095), so budget
+   for GPU share rising toward ~42%; still ~1.48x.
+2. **Rust/PyO3 for `mapping` (7.47 us/node) plus the 21.3% `search_bookkeeping`
+   bucket** — ceiling 1.27x for the tree half alone (not the 1.86x previously
+   assumed, which was an artifact of the untimed-bucket bug).
+3. `movegen`/`sortlists`/`kv_stack` — 7.2 us/node combined. Not worth it.
+
+
 
 ## Provenance
 
