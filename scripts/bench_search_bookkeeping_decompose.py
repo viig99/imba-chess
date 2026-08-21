@@ -9,12 +9,14 @@ Phases timed separately, on real tree-node states threaded through the real
 `_cozy_push` (so hash_history lengths and zeroing resets are realistic, not
 synthetic):
 
-  forcing     _forcing_index_set_tree: is_capture_cozy + gives_check per legal
-              move, on opponent-to-move nodes only
-  push        _cozy_push: board copy + play + repetition_hash threading
-  terminal    terminal_value_native per created child
+  forcing     turning the projector's flags into an index set (the scan
+              itself is gone -- it now rides along with projection)
+  push+term   push_and_classify: native edge push, history threading, and
+              terminal classification in one crossing
   order       _prior_order: the per-expansion sort
   heap        heappush/heappop with the itertools.count tiebreaker
+  backup      _backed_stm: recursive negamax over a realized arm subtree,
+              run per surviving arm per round
 
 Run: .venv/bin/python scripts/bench_search_bookkeeping_decompose.py
 """
@@ -29,12 +31,15 @@ import time
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+
+import imba_chess_native as native_cc  # noqa: E402
 
 from bench_project_decompose import build_boards  # noqa: E402
 
 from imba_chess.data.move_vocab import MoveVocab  # noqa: E402
 from imba_chess.eval import cozy_bridge  # noqa: E402
-from imba_chess.eval.search import _cozy_push, _prior_order  # noqa: E402
+from imba_chess.eval.search import _backed_stm, _prior_order, _TreeNode  # noqa: E402
 
 EXPAND_TOP = 3
 REFUTATION_TOP_R = 2
@@ -43,9 +48,9 @@ REFUTATION_TOP_R = 2
 def build_nodes(vocab):
     """(board, legal_moves, log_priors, hash_history) per node.
 
-    Histories are threaded through _cozy_push along each opening line rather
-    than fabricated, so the window terminal_value_native sums over has the
-    length distribution the real search sees.
+    Histories are threaded through push_and_classify along each opening line
+    rather than fabricated, so the repetition window has the length
+    distribution the real search sees.
     """
     nodes = []
     for board in build_boards():
@@ -56,10 +61,12 @@ def build_nodes(vocab):
             continue
         # A plausible prior shape: decreasing, so _prior_order does real work.
         priors = [-0.1 * i for i in range(len(moves))]
-        history: tuple[int, ...] = ()
+        history: list[int] = []
         nodes.append((board, moves, priors, history, forcing))
         # Descend one edge to get non-empty histories in the corpus too.
-        child, child_history = _cozy_push(board, moves[0], history)
+        child, child_history, _t = native_cc.push_and_classify(
+            board, moves[0], history, True
+        )
         c_ids, c_moves, _c_ucis, c_forcing, _c_total = (
             cozy_bridge.project_legal_moves(child, vocab)
         )
@@ -90,7 +97,10 @@ def main() -> None:
     children = []
     for board, moves, _priors, history, _forcing in nodes:
         for move in moves[:picks_per_node]:
-            children.append(_cozy_push(board, move, history))
+            child, child_history, _terminal = native_cc.push_and_classify(
+                board, move, history, True
+            )
+            children.append((child, child_history))
     print(f"children: {len(children)} ({picks_per_node} per node)")
 
     def phase_forcing():
@@ -100,16 +110,10 @@ def main() -> None:
         for _board, _moves, _priors, _history, forcing in nodes:
             {idx for idx, flag in enumerate(forcing) if flag}
 
-    def phase_push():
+    def phase_push_terminal():
         for board, moves, _priors, history, _forcing in nodes:
             for move in moves[:picks_per_node]:
-                _cozy_push(board, move, history)
-
-    def phase_terminal():
-        for child, child_history in children:
-            cozy_bridge.terminal_value_native(
-                child, color_is_stm=True, hash_history=child_history
-            )
+                native_cc.push_and_classify(board, move, history, True)
 
     def phase_order():
         for _board, _moves, priors, _history, _forcing in nodes:
@@ -123,12 +127,40 @@ def main() -> None:
         while frontier:
             heapq.heappop(frontier)
 
+    # A realized two-ply arm subtree per node, so backup walks something with
+    # the branching the real search produces rather than a chain.
+    roots = []
+    for board, moves, _priors, history, _forcing in nodes:
+        root = _TreeNode(
+            cozy_board=board, hash_history=history, handle=None, depth=0,
+            path_log_prior=0.0,
+        )
+        root.value_stm = 0.1
+        for move in moves[:picks_per_node]:
+            child_board, child_history, terminal = native_cc.push_and_classify(
+                board, move, history, True
+            )
+            child = _TreeNode(
+                cozy_board=child_board, hash_history=child_history, handle=None,
+                depth=1, path_log_prior=-0.5,
+            )
+            if terminal is not None:
+                child.terminal_value_stm = terminal
+            else:
+                child.value_stm = -0.2
+            root.children.append(child)
+        roots.append(root)
+
+    def phase_backup():
+        for root in roots:
+            _backed_stm(root)
+
     phases = [
         ("forcing", phase_forcing),
-        ("push", phase_push),
-        ("terminal", phase_terminal),
+        ("push+term", phase_push_terminal),
         ("order", phase_order),
         ("heap", phase_heap),
+        ("backup", phase_backup),
     ]
     for _name, fn in phases:  # warm
         fn()
@@ -152,12 +184,17 @@ def main() -> None:
     print("-" * 32)
     print(f"{'measured':<12}{total:>10.2f}")
     print(
-        "\nforcing runs on opponent-to-move nodes only, so weight its share by "
-        "that fraction before sizing a fix."
+        "\nforcing runs on opponent-to-move nodes only (44.9% of expansions, "
+        "measured), so weight its share before sizing a fix."
     )
     print(
-        "Note: this covers per-node/per-child work only. Arm scoring, backup, "
-        "and the generator's own control flow are outside it."
+        "backup is amortized: _backed_stm runs per surviving arm per round, "
+        "not per node -- this charges one subtree walk per node as an upper "
+        "bound."
+    )
+    print(
+        "Outside this harness: arm elimination/sorting and the generator's own "
+        "wave loop (frontier pops, EvalRequest construction)."
     )
 
 

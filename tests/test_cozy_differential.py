@@ -295,7 +295,7 @@ def test_root_hash_seed_matches_incremental_history_replayed_games():
     hash_history an incrementally-maintained tracker (the Task-3 test
     pattern: reset to () on a zeroing move, else append the pre-move
     repetition_hash) would hold at that same position -- the contract
-    _cozy_push/terminal_value_native expect a tree walk to seed itself with.
+    push_and_classify expects a tree walk to seed itself with.
     Replays real games and checks the seed at MANY cut points per game (not
     just the final ply), so both the "mid-window" and "empty after zeroing"
     cases get exercised, not just whatever halfmove_clock the game happens
@@ -333,7 +333,7 @@ def test_root_hash_seed_matches_incremental_history_replayed_games():
             # Check at every ply (not just game end): exercises both the
             # empty-after-zeroing case and growing/mid-window cases.
             got = _root_hash_seed(pyb)
-            assert got == tuple(hash_history), (pyb.fen(), ply, hash_history, got)
+            assert list(got) == list(hash_history), (pyb.fen(), ply, hash_history, got)
             checked += 1
             if hash_history:
                 nonempty_seen += 1

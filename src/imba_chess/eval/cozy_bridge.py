@@ -245,8 +245,15 @@ def insufficient_material(cozy_board: cc.Board) -> bool:
 def terminal_value_native(
     cozy_board: cc.Board, *, color_is_stm: bool, hash_history: Sequence[int]
 ) -> float | None:
-    """Drop-in for search.terminal_value_for_color, cozy-native (no
-    python-chess board involved). `hash_history` holds repetition_hash()
+    """Reference implementation of terminal detection, cozy-native (no
+    python-chess board involved).
+
+    NOT the production path any more: search calls the native
+    `imba_chess_native.push_and_classify`, which folds this together with the
+    edge push into one crossing. This stays as the independent Python oracle
+    that tests/test_native_terminal.py checks the Rust against, and that
+    tests/test_cozy_differential.py in turn checks against python-chess. Do
+    not delete it without replacing that chain. `hash_history` holds repetition_hash()
     values of PRIOR positions since the last irreversible move (most-recent-
     last; excludes the current position at `cozy_board`).
 

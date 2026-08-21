@@ -192,7 +192,7 @@ def _search_copy(board: chess.Board) -> chess.Board:
     return board.copy(stack=board.halfmove_clock)
 
 
-def _root_hash_seed(board: chess.Board) -> tuple[int, ...]:
+def _root_hash_seed(board: chess.Board) -> list[int]:
     """repetition_hash() of the (up to) `halfmove_clock` positions PRIOR to
     each of the last `n = min(board.halfmove_clock, len(board.move_stack))`
     played moves, oldest first, current position excluded -- the exact
@@ -218,27 +218,7 @@ def _root_hash_seed(board: chess.Board) -> tuple[int, ...]:
         cozy.play(cozy_bridge.py_move_to_cozy(twin, move))
         twin.push(move)
         history.append(cozy_bridge.repetition_hash(cozy))
-    return tuple(history)
-
-
-def _cozy_push(
-    cozy_board: "cc.Board", cozy_move: "cc.Move", hash_history: tuple[int, ...]
-) -> tuple["cc.Board", tuple[int, ...]]:
-    """Copy-and-play one tree edge, threading the repetition hash_history.
-
-    Every tree edge goes through here. child_history resets to empty on a
-    zeroing move (capture/pawn move -- child.halfmove_clock == 0) and
-    otherwise carries the parent's history forward with the parent's own
-    repetition_hash appended -- see cozy_bridge.terminal_value_native's
-    docstring for why reset-on-zeroing-only is a sufficient contract.
-    """
-    child = copy.copy(cozy_board)
-    child.play(cozy_move)
-    if child.halfmove_clock == 0:
-        child_history: tuple[int, ...] = ()
-    else:
-        child_history = hash_history + (cozy_bridge.repetition_hash(cozy_board),)
-    return child, child_history
+    return history
 
 
 @dataclass
@@ -291,11 +271,10 @@ def _expand_root_candidates_stepwise(
     for local_idx in _prior_order(legal_log_priors)[: min(top_k, len(legal_moves))]:
         move = legal_moves[local_idx]
         cozy_move = cozy_bridge.py_move_to_cozy(board, move)
-        cozy1, hash_history1 = _cozy_push(cozy_root, cozy_move, root_hash_seed)
         # One ply past the root: side to move at cozy1 is the opponent, so
         # root-POV color is never the side to move here (color_is_stm=False).
-        terminal_value = cozy_bridge.terminal_value_native(
-            cozy1, color_is_stm=False, hash_history=hash_history1
+        cozy1, hash_history1, terminal_value = cc.push_and_classify(
+            cozy_root, cozy_move, root_hash_seed, False
         )
         if terminal_value is not None and terminal_value >= 1.0:
             return candidates, local_idx
@@ -469,13 +448,10 @@ def _d2_stepwise(
         for opp_local_idx in opp_indices:
             opp_uci = board1_eval.legal_ucis[opp_local_idx]
             opp_move_cozy = board1_eval.legal_moves[opp_local_idx]
-            cozy2, hash_history2 = _cozy_push(
-                candidate.cozy1, opp_move_cozy, candidate.hash_history1
-            )
             # Two plies past the root: side to move at cozy2 is root_color
             # again, so root-POV color IS the side to move (color_is_stm=True).
-            terminal_value = cozy_bridge.terminal_value_native(
-                cozy2, color_is_stm=True, hash_history=hash_history2
+            cozy2, hash_history2, terminal_value = cc.push_and_classify(
+                candidate.cozy1, opp_move_cozy, candidate.hash_history1, True
             )
             candidate.reply_candidates.append(
                 {
@@ -580,7 +556,7 @@ def select_value_search_d2(
 @dataclass
 class _TreeNode:
     cozy_board: "cc.Board"
-    hash_history: tuple[int, ...]  # repetition_hash history per the _cozy_push contract
+    hash_history: list[int]  # repetition_hash history per the push_and_classify contract
     handle: Any
     depth: int  # plies below the arm root (arm root = 0)
     path_log_prior: float
@@ -664,7 +640,12 @@ def _push_children(
     for idx in picks:
         move_uci = position_eval.legal_ucis[idx]
         move_cozy = position_eval.legal_moves[idx]
-        child_cozy, child_history = _cozy_push(node.cozy_board, move_cozy, node.hash_history)
+        # color IS the child's own side to move by construction, so
+        # color_is_stm is trivially True (terminal_value_stm is side-to-move
+        # POV, per _TreeNode's docstring).
+        child_cozy, child_history, terminal_stm = cc.push_and_classify(
+            node.cozy_board, move_cozy, node.hash_history, True
+        )
         # Forcing replies inherit the parent's priority (no decay for their
         # own low prior): a refutation must compete at the plausibility of
         # the line it refutes, not of the reply itself.
@@ -678,12 +659,6 @@ def _push_children(
             handle=None,
             depth=node.depth + 1,
             path_log_prior=child_prior,
-        )
-        # color IS the child's own side to move by construction: color_is_stm
-        # is trivially True (terminal_value_stm is side-to-move POV, per
-        # _TreeNode's docstring).
-        terminal_stm = cozy_bridge.terminal_value_native(
-            child_cozy, color_is_stm=True, hash_history=child_history
         )
         if terminal_stm is not None:
             child.terminal_value_stm = terminal_stm
@@ -734,11 +709,10 @@ def _halving_stepwise(
     for idx in picks:
         move = legal_moves[idx]
         cozy_move = cozy_bridge.py_move_to_cozy(board, move)
-        cozy1, hash_history1 = _cozy_push(root_cozy, cozy_move, root_hash_seed)
         # One ply past the root: side to move at cozy1 is the opponent, so
         # root-POV color is never the side to move here (color_is_stm=False).
-        terminal_root = cozy_bridge.terminal_value_native(
-            cozy1, color_is_stm=False, hash_history=hash_history1
+        cozy1, hash_history1, terminal_root = cc.push_and_classify(
+            root_cozy, cozy_move, root_hash_seed, False
         )
         if terminal_root is not None and terminal_root >= 1.0:
             # Immediate win (checkmate delivered): no other move can score higher.
