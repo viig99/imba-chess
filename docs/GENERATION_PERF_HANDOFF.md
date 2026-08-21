@@ -391,6 +391,59 @@ problem — so the two goals are coupled.
 
 ---
 
+## 12b. Generation speedup: measured end to end (2026-08-21)
+
+Three changes landed after the native binding cutover, all gated on
+**bit-identical** 20-game rollout labels (324 waves / 428,016 evaluations
+unchanged in every case):
+
+1. `3192671` forcing detection fused into the native projector -- the scan
+   re-walked the (board, moves) pair projection had just walked.
+2. `0f0a02b` `push_and_classify` -- edge push and terminal detection in one
+   native call, replacing ~15.5 `Board.pieces()` FFI crossings per node.
+3. `292277b` wave row indices derived once per wave instead of once per layer
+   -- `nonzero` was the largest single torch op in a rollout profile (1.019s /
+   2,608 calls) and each call was also a device->host sync.
+
+**Paired A/B/B/A, A = `d4d1a3e`, B = `292277b`, same machine, same session:**
+
+| bucket | before | after | ratio |
+| --- | --- | --- | --- |
+| `search_gpu` | 16.1s | 11.1s | **1.46** |
+| `search_bookkeeping` | 15.8s | 10.4s | **1.52** |
+| `decode_project` | 8.3s | 11.8s | 0.70 |
+| `decode_prep` | 5.8s | 6.5s | 0.88 |
+| `root_eval` (control) | 0.9s | 0.9s | 1.00 |
+| **total** | **47.0s** | **40.8s** | **1.152** |
+
+Within-arm spread was 1.4s (A) and 0.2s (B) against a 6.2s difference, and the
+control bucket came in at exactly 1.00, so **this one is resolved** -- unlike
+the single-shot comparisons, which were repeatedly contaminated by drift of
+0.66x-1.18x in `search_gpu`.
+
+**`decode_project` going 0.70 is expected and is partly an artifact.** Forcing
+detection genuinely moved into it (change 1). But change 3 also removed syncs
+from the layer loop, so the stall moved to the next sync point -- the `.cpu()`
+inside `consume_decode_result`, which `decode_project` times. The buckets are
+enqueue-timed (section 6, rule 1), so moving syncs reshuffles attribution
+without changing work. Read the total, not the split.
+
+### Not done: batching the per-group decode loop
+
+Padding every prefix to `maxP` and masking, so the whole per-group loop
+collapses into one call, is **not bit-identical**. It changes the softmax and
+output-einsum reduction lengths; a probe measured weights and outputs differing
+by ~1e-7 at prefix lengths 37, 200 and 511. The search is a chain of argmax
+comparisons over 2,048 nodes and 8 layers, so that can flip a near-tie and
+change the tree.
+
+Only the exact half was taken (change 3). Doing the rest requires an explicit
+decision to retire the exact-label gate for this path and replace it with a
+label-quality gate (agreement against a 2048 oracle plus a strength run). Do
+not do it silently.
+
+---
+
 ## 12. Owned native binding: complete (2026-08-21)
 
 Stage 1 of the native-binding plan is **done and gated**. Production projects
