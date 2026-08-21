@@ -46,6 +46,7 @@ class TimingStatsLike(Protocol):
     root_eval: float
     search_gpu: float
     decode_prep: float
+    decode_project: float
     search_eval_calls: int
     search_eval_items: int
 
@@ -321,7 +322,10 @@ def _make_decode_wave_executor(*, model, device, dtype, stats: "TimingStatsLike 
         # attributes a large share of a real run to exactly this region
         # (encode_cozy, torch.cat, torch._C._nn.pad), so leaving it out of the
         # buckets made the profile understate total work and made changes here
-        # measure as noise. See tests/test_decode_prep_timing.py.
+        # measure as noise. Kept separate from decode_project because the two
+        # have different fixes: this half is the jagged-padding candidate
+        # (fbgemm jagged_to_padded_dense), that half is pure Python movegen and
+        # vocab projection. See tests/test_decode_prep_timing.py.
         prep0 = time.perf_counter()
         requests = [
             evaluator.build_decode_request(batch) for evaluator, batch in payloads
@@ -356,7 +360,8 @@ def _make_decode_wave_executor(*, model, device, dtype, stats: "TimingStatsLike 
 
         if stats is not None:
             stats.search_gpu += gpu_elapsed
-            stats.decode_prep += prep + post
+            stats.decode_prep += prep
+            stats.decode_project += post
             stats.search_eval_calls += 1
             stats.search_eval_items += sum(len(req.nodes) for req in requests)
         return results

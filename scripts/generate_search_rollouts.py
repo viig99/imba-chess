@@ -174,6 +174,7 @@ class _TimingStats:
         self.root_eval = 0.0
         self.search_gpu = 0.0
         self.decode_prep = 0.0
+        self.decode_project = 0.0
         self.search_bookkeeping = 0.0
         self.search_eval_calls = 0
         self.search_eval_items = 0
@@ -185,6 +186,7 @@ class _TimingStats:
             + self.root_eval
             + self.search_gpu
             + self.decode_prep
+            + self.decode_project
             + self.search_bookkeeping
         )
 
@@ -197,7 +199,8 @@ class _TimingStats:
             ("batch_build (tensor construction, sampled plies)", self.batch_build),
             ("root_eval (root forward, GPU)", self.root_eval),
             ("search_gpu (search forward_decode waves, GPU)", self.search_gpu),
-            ("decode_prep (encode+jagged merge+legal projection, CPU)", self.decode_prep),
+            ("decode_prep (board encode + jagged->padded merge, CPU)", self.decode_prep),
+            ("decode_project (movegen + legal-logit projection, CPU)", self.decode_project),
             ("search_bookkeeping (heap/tree mgmt, CPU)", self.search_bookkeeping),
         ]
         lines = [

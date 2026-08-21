@@ -33,6 +33,7 @@ class _Stats:
         self.root_eval = 0.0
         self.search_gpu = 0.0
         self.decode_prep = 0.0
+        self.decode_project = 0.0
         self.search_eval_calls = 0
         self.search_eval_items = 0
 
@@ -114,7 +115,7 @@ def test_multi_game_path_accounts_for_prep_and_consume(monkeypatch):
 
     assert [len(o) for o in out] == [3, 2]
     assert all(ev.built == 1 and ev.consumed == 1 for ev, _ in payloads)
-    assert stats.decode_prep > 0.0, (
+    assert stats.decode_prep > 0.0 and stats.decode_project > 0.0, (
         "build_decode_request/_merge/consume time was not accounted for"
     )
     assert stats.search_eval_items == 5
@@ -135,7 +136,7 @@ def test_single_game_path_still_only_charges_search_gpu(monkeypatch):
 
     assert [len(o) for o in out] == [4]
     assert stats.search_gpu > 0.0
-    assert stats.decode_prep == 0.0
+    assert stats.decode_prep == 0.0 and stats.decode_project == 0.0
     assert stats.search_eval_items == 4
 
 
