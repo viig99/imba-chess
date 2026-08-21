@@ -3,7 +3,7 @@ name = "imba-chess"
 version = "0.1.0"
 description = "Dataset and training utilities for high-elo chess modeling."
 readme = "README.md"
-requires-python = ">=3.10"
+requires-python = ">=3.10,<3.14"
 dependencies = [
   "datasets>=2.20.0",
   "python-chess>=1.999",

@@ -6,7 +6,12 @@ build-backend = "maturin"
 name = "imba-chess-native"
 version = "0.1.0"
 description = "Owned native chess primitives for imba-chess"
-requires-python = ">=3.10"
+# Upper bound is PyO3 0.23's real ceiling, not a preference: it supports
+# CPython through 3.13, and this crate builds a version-specific extension
+# (no abi3 feature). Without the bound, `uv sync` on a workstation whose
+# default interpreter is 3.14 selects it and the build fails. Raise the bound
+# only together with a PyO3 upgrade or a stable-ABI feature.
+requires-python = ">=3.10,<3.14"
 license = { text = "MIT" }
 
 [tool.maturin]
