@@ -129,6 +129,11 @@ Roughly **34% of wall time is the Python interpreter itself**
 (`ProfilerStep` self 403 ms + `decode_wave` self 446-472 ms) — movegen, vocab
 mapping, tree bookkeeping. That is the single largest remaining target.
 
+Current arena cutover profile (same 12-wave harness, idle GPU) reduced self CPU
+from **1.407 s to 1.003 s** and self CUDA from **297.4 ms to 239.0 ms**.
+The 17,056-call `aten::cat` hotspot disappeared. Peak allocated VRAM at G=8
+fell from **6,340.9 MiB to 4,165.7 MiB**; see §5.
+
 Data loading is **not** a bottleneck (288 games/s steady state, ~940x faster
 than generation), but the HF/fsspec streaming machinery does show up as
 `_ssl._SSLSocket.read` and pathlib churn *outside* the timed buckets. Local
@@ -143,7 +148,7 @@ corpus materialization is a separate, known lever.
 | `scripts/generate_search_rollouts.py` | generation entry point, `_TimingStats` buckets, game coroutines |
 | `src/imba_chess/eval/batch_scheduler.py` | lockstep G-game scheduler (torch-free by design) |
 | `src/imba_chess/eval/merged_executors.py` | merges G payloads into one root-eval / decode-wave call; owns the timing buckets |
-| `src/imba_chess/eval/position_evaluator.py` | `CachedPositionEvaluator`: prefix K/V, `build_decode_request`, `consume_decode_result`, `_wave_suffixes` |
+| `src/imba_chess/eval/position_evaluator.py` | `CachedPositionEvaluator`: prefix K/V, shared per-turn `_KVArena`, decode request/result flow |
 | `src/imba_chess/eval/search.py` | `_halving_stepwise` + scoring/elimination; `HalvingConfig` |
 | `src/imba_chess/eval/cozy_bridge.py` | python-chess <-> cozy-chess conversion, native terminal detection |
 | `src/imba_chess/model/hstu_model.py` | model; `create_batch_block_mask` (flex) and `create_batch_dense_mask` (SDPA) |
@@ -160,6 +165,11 @@ Mask type is chosen by **batch shape**, not train-vs-eval:
 - **`BlockMask` -> flex_attention**: dataset-sized batches (~4,000 tokens),
   i.e. training *and* dataset eval (`ignite_evaluator`, `eval_value_loss`,
   `eval_value_by_progress`).
+
+Those bullets describe full-sequence forwards, including root evaluation.
+Cached one-token `forward_decode*` does manual prefix/suffix `einsum`, masking,
+and softmax. The former FBGEMM operation packed ragged ancestor K/V into a
+dense suffix for that manual decode; it did not feed Q/K/V into SDPA.
 
 `flex_attention` is **not dead code**. At S=4,000 the dense additive mask would
 be `12 * 4000^2 * 4` = **768 MB per layer**, over the 256 MiB guard in
@@ -185,6 +195,7 @@ Chronological, with measured effect. `f16b2cf..c210e49`.
 | `509a425` | hoist logits-independent movegen above the first CUDA sync | `d2h` 12.49 -> 5.84 us/node |
 | `3bf08e3` | torch 2.13 compat: CPU attention -> SDPA; `torch.profiler` + `Timer` harnesses | 6 test failures fixed |
 | `c210e49` | **fbgemm** `jagged_to_padded_dense` for the wave's suffix K/V; `path_kv` stored **token-first** `[t,L,H,d]` | 8.03 -> 0.87 us/node (**~9x**), `decode_prep` 14.8 -> 11.0s |
+| current | replace persistent per-node full-path K/V copies with one shared append-only `_KVArena`; batch ancestor indices before one gather | 12-wave self CPU 1.407 -> 1.003 s (**1.40x**), self CUDA 297.4 -> 239.0 ms (**1.24x**), peak allocated VRAM 6,340.9 -> 4,165.7 MiB (**-34.3%**); 20-game G=8 labels and `arm_evals_spent` bit-identical |
 
 Also fixed: `encode_cozy` (cached constants + inlined `scan_forward`) at
 **1.346x** in isolation.
@@ -294,13 +305,12 @@ give. Treat them as upper bounds, not estimates.
    constantly, and Inductor already crashed on the second shape in this
    codebase. **Needs a shape-bucketing scheme first** (pad wave sizes to
    powers of two?).
-3. **The remaining `aten::cat` (17,056 calls / 12 waves, ~22% of GPU time).**
-   This is `consume_decode_result`'s per-node `path_kv` extension, 2 cats per
-   node. Now that `path_kv` is token-first, a jagged/`dense_to_jagged`
-   formulation is plausible. **Constraint**: the obvious grouped-view version
-   hands out views into one wave-sized tensor (~186 MB), so a single surviving
-   node pins the whole block — and `path_kv` is already **1.5-2.25 GiB** at G=8
-   on a 7.66 GiB card. Any design here must not increase peak VRAM.
+3. **Exploit the arena's memory headroom deliberately.** G=12 now completes at
+   budget 2048 with peak allocated/reserved VRAM **6,187/6,696 MiB**, versus
+   the former G=8 peak near the card limit. On the fixed 20-game gate it cut
+   merged waves from **324 to 271**; wall time moved only ~1.1x, below this
+   machine's trustworthy end-to-end threshold. The capacity is real; larger
+   batches are an enabler for shape bucketing, not a claimed standalone win.
 4. **CPU/GPU overlap (pipelining).** Ceiling only **~1.21x** (GPU is 17% busy;
    total device work is ~422 ms against ~2.4 s of host work). Requires two
    staggered game groups and a launch/collect split of the executor protocol.
@@ -310,10 +320,11 @@ give. Treat them as upper bounds, not estimates.
    + pathlib churn) from the loop. Also unblocks raising `num_workers` (see §9).
 
 ### Rejected, with evidence — don't redo these
-- **NestedTensor for the suffix pad**: measured **2.6x slower** than the
-  existing pad+stack (21.08 vs 8.03 us/node), bit-identical output. It is the
-  right tool for attention *over* ragged sequences, not for pad+stack.
-  Project preference is **fbgemm over NestedTensor** regardless.
+- **NestedTensor for suffix packing**: measured **2.6x slower** than the former
+  pad+stack path (21.08 vs 8.03 us/node), with identical output. If a future
+  design again has a true values+offsets jagged representation, prefer FBGEMM
+  over NestedTensor. The current arena instead has indexed ancestor rows and
+  gathers the final dense suffix directly; no jagged conversion remains.
 - **Preallocated `new_zeros` + slice copy**: 1.30x at B=990 but *slower* at
   B=330; wave-size dependent, ~0.4% of wall.
 - **TF32 (`set_float32_matmul_precision('high')`)**: `aten::mm` is only ~61 ms
@@ -332,17 +343,15 @@ give. Treat them as upper bounds, not estimates.
 
 ## 9. Environment and operational constraints
 
-- **GPU**: RTX 3070 Ti Laptop, **sm_86**, **7.66 GiB** — the binding
-  constraint. `concurrent_games = 6` is the safe local default; **G=12 OOMs**
-  at budget 2048, G=8 peaks ~7.6 GiB. Always set
-  `PYTORCH_ALLOC_CONF=expandable_segments:True`.
-- **torch 2.13.0+cu130**, **fbgemm-gpu 1.8.0+cu130**. These must come from the
-  *same* index or fbgemm won't load — a cu12 wheel against cu130 torch fails
-  with `undefined symbol: ...torch::headeronly::Tag...` and missing
-  `libcufft.so.12`. Install:
-  `uv pip install fbgemm-gpu --index-url https://download.pytorch.org/whl/cu130`.
-  fbgemm is imported unconditionally in `position_evaluator.py` so a bad
-  install fails loudly.
+- **GPU**: RTX 3070 Ti Laptop, **sm_86**, **7.66 GiB**. The arena cut peak
+  allocated VRAM at G=8 from **6,340.9 to 4,165.7 MiB**; G=12 is now tested
+  safe at **6,187 MiB allocated / 6,696 MiB reserved** for fp32, budget 2048.
+  Keep `PYTORCH_ALLOC_CONF=expandable_segments:True`. Configuration defaults
+  remain conservative because the same `[eval_vs_stockfish]` setting also
+  controls actor-mode evaluation.
+- **torch 2.13.0+cu130**. FBGEMM-GPU is no longer a runtime dependency:
+  `_KVArena` stores each node's own K/V once and gathers dense ancestor
+  suffixes by index.
 - **`num_workers=0` in training is load-bearing, not an oversight.** It works
   around a sharding-alignment bug (`torch_iterable.py:42-48`:
   `num_shards = world_size * num_workers`, parquet-file-level sharding vs an

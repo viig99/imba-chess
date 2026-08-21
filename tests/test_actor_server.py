@@ -11,7 +11,11 @@ import cozy_chess as cc
 
 from imba_chess.config import ModelConfig
 from imba_chess.data.board_state import BoardStateEncoder
-from imba_chess.data.move_vocab import MoveVocab, MoveVocabConfig, all_possible_uci_moves
+from imba_chess.data.move_vocab import (
+    MoveVocab,
+    MoveVocabConfig,
+    all_possible_uci_moves,
+)
 from imba_chess.eval import cozy_bridge
 from imba_chess.eval.actor_protocol import (
     RootEvalRequest,
@@ -20,11 +24,13 @@ from imba_chess.eval.actor_protocol import (
     WaveResponse,
     WaveRow,
 )
-from imba_chess.eval.actor_server import ActorInferenceServer, _KVArena
+from imba_chess.eval.actor_server import ActorInferenceServer
 from imba_chess.eval.actor_worker import _legal_vocab_projection
 from imba_chess.eval.position_evaluator import (
     CachedPositionEvaluator,
+    _KVArena,
     _SequenceHistory,
+    _get_or_create_arena,
     _value_scalar_from_logits,
 )
 from imba_chess.model import HSTUChessModel, build_hstu_chess_config
@@ -142,9 +148,7 @@ def _reference_decode(cached: CachedPositionEvaluator, batch):
     NOT catch a uniform per-row additive error in the arena's reconstructed
     decode logits -- exactly the kind of bug a suffix-gather-indexing
     mistake could introduce. Returns `(raw_logits [B, V] float32 cpu,
-    position_evals)`; also runs `consume_decode_result` so callers get the
-    normal `PositionEval` list AND each node's `path_kv` gets set (needed
-    for a subsequent depth+1 wave in the same test)."""
+    position_evals)` and records each node's K/V state for subsequent waves."""
     request = cached.build_decode_request(batch)
     with torch.inference_mode():
         out = cached._model.forward_decode(
@@ -160,14 +164,72 @@ def _reference_decode(cached: CachedPositionEvaluator, batch):
     return raw_logits, position_evals
 
 
+def test_cached_evaluator_arena_stores_one_row_and_builds_mixed_suffix():
+    """Arena chains preserve depth order and mask root-adjacent mixed rows."""
+    fixture = _Fixture()
+    ref = _reference_root_response(fixture, ["e2e4", "e7e5"])
+    cached = ref["cached"]
+
+    first_moves = list(ref["board"].legal_moves)[:2]
+    first_children = []
+    first_handles = []
+    for move in first_moves:
+        child = ref["board"].copy()
+        child.push(move)
+        first_children.append(cozy_bridge.board_to_cozy(child))
+        first_handles.append(cached.extend(None, move.uci()))
+    _reference_decode(cached, list(zip(first_handles, first_children)))
+
+    child_board = cc.Board.from_fen(first_children[0].fen())
+    reply = list(child_board.generate_moves())[0]
+    child_board.play(reply)
+    reply_uci = cozy_bridge.cozy_move_to_uci(first_children[0], reply)
+    descendant = cached.extend(first_handles[0], reply_uci)
+
+    sibling_move = list(ref["board"].legal_moves)[2]
+    sibling_board = ref["board"].copy()
+    sibling_board.push(sibling_move)
+    cozy_sibling = cozy_bridge.board_to_cozy(sibling_board)
+    sibling = cached.extend(None, sibling_move.uci())
+    mixed_batch = [(descendant, child_board), (sibling, cozy_sibling)]
+
+    request = cached.build_decode_request(mixed_batch)
+    assert request.suffix_kv is not None
+    torch.testing.assert_close(
+        request.suffix_mask,
+        torch.tensor([[True], [False]]),
+        atol=0,
+        rtol=0,
+    )
+    assert cached._arena is not None
+    for layer, (suffix_k, suffix_v) in enumerate(request.suffix_kv):
+        torch.testing.assert_close(
+            suffix_k[0, :, 0, :], cached._arena.k[layer, :, 0, :], atol=0, rtol=0
+        )
+        torch.testing.assert_close(
+            suffix_v[0, :, 0, :], cached._arena.v[layer, :, 0, :], atol=0, rtol=0
+        )
+
+    _raw, evals = _reference_decode(cached, mixed_batch)
+    assert len(evals) == 2
+    assert cached._arena.size == 4
+
+
 def _assert_root_matches(
-    response: RootEvalResponse, ref: dict, *, turn_id: int, atol: float = ATOL, rtol: float = RTOL
+    response: RootEvalResponse,
+    ref: dict,
+    *,
+    turn_id: int,
+    atol: float = ATOL,
+    rtol: float = RTOL,
 ) -> None:
     assert isinstance(response, RootEvalResponse)
     assert response.turn_id == turn_id
     torch.testing.assert_close(
-        torch.tensor(response.value_stm), torch.tensor(ref["value_stm"]),
-        atol=atol, rtol=rtol,
+        torch.tensor(response.value_stm),
+        torch.tensor(ref["value_stm"]),
+        atol=atol,
+        rtol=rtol,
     )
     torch.testing.assert_close(
         torch.tensor(response.legal_logits),
@@ -201,16 +263,18 @@ def test_two_worker_root_eval_matches_reference_fp32_exact():
     multi-request ragged root merge."""
     fixture = _Fixture()
     ref0 = _reference_root_response(fixture, ["e2e4", "e7e5"])
-    ref1 = _reference_root_response(
-        fixture, ["d2d4", "d7d5", "g1f3", "b8c6", "c1f4"]
-    )
+    ref1 = _reference_root_response(fixture, ["d2d4", "d7d5", "g1f3", "b8c6", "c1f4"])
 
     req0 = RootEvalRequest(
-        worker_id=0, turn_id=0, batch_arrays=ref0["wire_batch_arrays"],
+        worker_id=0,
+        turn_id=0,
+        batch_arrays=ref0["wire_batch_arrays"],
         legal_vocab_ids=ref0["legal_vocab_ids"],
     )
     req1 = RootEvalRequest(
-        worker_id=1, turn_id=0, batch_arrays=ref1["wire_batch_arrays"],
+        worker_id=1,
+        turn_id=0,
+        batch_arrays=ref1["wire_batch_arrays"],
         legal_vocab_ids=ref1["legal_vocab_ids"],
     )
     responses = fixture.server.service([req0, req1])
@@ -233,8 +297,13 @@ def test_register_root_single_worker_matches_reference():
 
 
 def _wave_row_for_child(
-    *, node_id: int, parent_id: int | None, board_before: chess.Board, move: chess.Move,
-    encoder: BoardStateEncoder, move_vocab: MoveVocab,
+    *,
+    node_id: int,
+    parent_id: int | None,
+    board_before: chess.Board,
+    move: chess.Move,
+    encoder: BoardStateEncoder,
+    move_vocab: MoveVocab,
 ) -> tuple[WaveRow, chess.Board, list[int]]:
     child = board_before.copy()
     child.push(move)
@@ -267,8 +336,12 @@ def test_two_worker_wave_eval_matches_cached_position_evaluator_fp32_exact():
     fixture = _Fixture()
     ref0 = _reference_root_response(fixture, ["e2e4", "e7e5"])
     ref1 = _reference_root_response(fixture, ["d2d4", "d7d5", "g1f3"])
-    fixture.server.register_root(0, 0, ref0["wire_batch_arrays"], ref0["legal_vocab_ids"])
-    fixture.server.register_root(1, 0, ref1["wire_batch_arrays"], ref1["legal_vocab_ids"])
+    fixture.server.register_root(
+        0, 0, ref0["wire_batch_arrays"], ref0["legal_vocab_ids"]
+    )
+    fixture.server.register_root(
+        1, 0, ref1["wire_batch_arrays"], ref1["legal_vocab_ids"]
+    )
 
     candidates0 = list(ref0["board"].legal_moves)[:2]
     candidates1 = list(ref1["board"].legal_moves)[:1]
@@ -276,16 +349,24 @@ def test_two_worker_wave_eval_matches_cached_position_evaluator_fp32_exact():
     rows0, children0 = [], []
     for i, move in enumerate(candidates0):
         row, child, _ids = _wave_row_for_child(
-            node_id=i, parent_id=None, board_before=ref0["board"], move=move,
-            encoder=fixture.encoder, move_vocab=fixture.move_vocab,
+            node_id=i,
+            parent_id=None,
+            board_before=ref0["board"],
+            move=move,
+            encoder=fixture.encoder,
+            move_vocab=fixture.move_vocab,
         )
         rows0.append(row)
         children0.append(child)
     rows1, children1 = [], []
     for i, move in enumerate(candidates1):
         row, child, _ids = _wave_row_for_child(
-            node_id=i, parent_id=None, board_before=ref1["board"], move=move,
-            encoder=fixture.encoder, move_vocab=fixture.move_vocab,
+            node_id=i,
+            parent_id=None,
+            board_before=ref1["board"],
+            move=move,
+            encoder=fixture.encoder,
+            move_vocab=fixture.move_vocab,
         )
         rows1.append(row)
         children1.append(child)
@@ -308,14 +389,19 @@ def test_two_worker_wave_eval_matches_cached_position_evaluator_fp32_exact():
         cached = ref["cached"]
         handles = [cached.extend(None, move.uci()) for move in candidates]
         cozy_children = [cozy_bridge.board_to_cozy(c) for c in children]
-        raw_logits, ref_evals = _reference_decode(cached, list(zip(handles, cozy_children)))
+        raw_logits, ref_evals = _reference_decode(
+            cached, list(zip(handles, cozy_children))
+        )
         assert len(response.rows) == len(ref_evals)
 
         for row, ((value_stm, legal_logits), pe, cozy_child) in enumerate(
             zip(response.rows, ref_evals, cozy_children)
         ):
             torch.testing.assert_close(
-                torch.tensor(value_stm), torch.tensor(pe.value_stm), atol=ATOL, rtol=RTOL
+                torch.tensor(value_stm),
+                torch.tensor(pe.value_stm),
+                atol=ATOL,
+                rtol=RTOL,
             )
             ref_vocab_ids, _moves, _ucis = _legal_vocab_projection(
                 cozy_child, fixture.move_vocab
@@ -337,20 +423,32 @@ def test_depth_two_wave_with_parent_link_matches_reference_and_release_frees_kv(
     fixture = _Fixture()
     ref0 = _reference_root_response(fixture, ["e2e4", "e7e5"])
     ref1 = _reference_root_response(fixture, ["d2d4", "d7d5"])
-    fixture.server.register_root(0, 0, ref0["wire_batch_arrays"], ref0["legal_vocab_ids"])
-    fixture.server.register_root(1, 0, ref1["wire_batch_arrays"], ref1["legal_vocab_ids"])
+    fixture.server.register_root(
+        0, 0, ref0["wire_batch_arrays"], ref0["legal_vocab_ids"]
+    )
+    fixture.server.register_root(
+        1, 0, ref1["wire_batch_arrays"], ref1["legal_vocab_ids"]
+    )
 
     candidate = list(ref0["board"].legal_moves)[0]
     row1, child1, _ids1 = _wave_row_for_child(
-        node_id=0, parent_id=None, board_before=ref0["board"], move=candidate,
-        encoder=fixture.encoder, move_vocab=fixture.move_vocab,
+        node_id=0,
+        parent_id=None,
+        board_before=ref0["board"],
+        move=candidate,
+        encoder=fixture.encoder,
+        move_vocab=fixture.move_vocab,
     )
     fixture.server.service([WaveRequest(worker_id=0, turn_id=0, rows=[row1])])
 
     reply = list(child1.legal_moves)[0]
     row2, child2, _ids2 = _wave_row_for_child(
-        node_id=1, parent_id=0, board_before=child1, move=reply,
-        encoder=fixture.encoder, move_vocab=fixture.move_vocab,
+        node_id=1,
+        parent_id=0,
+        board_before=child1,
+        move=reply,
+        encoder=fixture.encoder,
+        move_vocab=fixture.move_vocab,
     )
     response = fixture.server.service(
         [WaveRequest(worker_id=0, turn_id=0, rows=[row2])]
@@ -359,7 +457,9 @@ def test_depth_two_wave_with_parent_link_matches_reference_and_release_frees_kv(
     cached = ref0["cached"]
     handle1 = cached.extend(None, candidate.uci())
     cozy_child1 = cozy_bridge.board_to_cozy(child1)
-    _raw1, _evals1 = _reference_decode(cached, [(handle1, cozy_child1)])  # sets handle1.path_kv
+    _raw1, _evals1 = _reference_decode(
+        cached, [(handle1, cozy_child1)]
+    )  # records handle1's arena chain
     handle2 = cached.extend(handle1, reply.uci())
     cozy_child2 = cozy_bridge.board_to_cozy(child2)
     raw_logits2, ref_evals2 = _reference_decode(cached, [(handle2, cozy_child2)])
@@ -369,7 +469,9 @@ def test_depth_two_wave_with_parent_link_matches_reference_and_release_frees_kv(
     torch.testing.assert_close(
         torch.tensor(value_stm), torch.tensor(ref_eval.value_stm), atol=ATOL, rtol=RTOL
     )
-    ref_vocab_ids, _moves, _ucis = _legal_vocab_projection(cozy_child2, fixture.move_vocab)
+    ref_vocab_ids, _moves, _ucis = _legal_vocab_projection(
+        cozy_child2, fixture.move_vocab
+    )
     ref_legal_logits = raw_logits2[0].index_select(
         0, torch.tensor(ref_vocab_ids, dtype=torch.long)
     )
@@ -395,10 +497,16 @@ def test_depth_two_wave_with_parent_link_matches_reference_and_release_frees_kv(
 def test_wave_request_for_unregistered_turn_raises_fast():
     fixture = _Fixture()
     row = WaveRow(
-        node_id=0, parent_id=None, prev_move_vocab_id=0,
+        node_id=0,
+        parent_id=None,
+        prev_move_vocab_id=0,
         board_state={
-            "piece_ids": [0] * 64, "turn_id": 0, "castle_id": 0, "ep_file_id": 0,
-            "halfmove_bucket_id": 0, "fullmove_bucket_id": 0,
+            "piece_ids": [0] * 64,
+            "turn_id": 0,
+            "castle_id": 0,
+            "ep_file_id": 0,
+            "halfmove_bucket_id": 0,
+            "fullmove_bucket_id": 0,
         },
         legal_vocab_ids=[],
     )
@@ -420,7 +528,9 @@ def test_value_head_guard_raises_at_construction():
     move_vocab = _static_vocab()
     model = _tiny_model(vocab_size=len(move_vocab), enable_value_head=False)
     with pytest.raises(ValueError, match="value head"):
-        ActorInferenceServer(model=model, device=torch.device("cpu"), dtype=torch.float32)
+        ActorInferenceServer(
+            model=model, device=torch.device("cpu"), dtype=torch.float32
+        )
 
 
 def test_require_value_head_false_allows_construction_and_serves_zero_placeholder():
@@ -436,7 +546,9 @@ def test_require_value_head_false_allows_construction_and_serves_zero_placeholde
     model = _tiny_model(vocab_size=len(move_vocab), enable_value_head=False)
     encoder = BoardStateEncoder()
     server = ActorInferenceServer(
-        model=model, device=torch.device("cpu"), dtype=torch.float32,
+        model=model,
+        device=torch.device("cpu"),
+        dtype=torch.float32,
         require_value_head=False,
     )
 
@@ -459,9 +571,7 @@ def test_require_value_head_false_allows_construction_and_serves_zero_placeholde
         encoder=encoder,
         move_vocab=move_vocab,
     )
-    wave_response = server.service(
-        [WaveRequest(worker_id=0, turn_id=0, rows=[row])]
-    )[0]
+    wave_response = server.service([WaveRequest(worker_id=0, turn_id=0, rows=[row])])[0]
     value_stm, _legal_logits = wave_response.rows[0]
     assert value_stm == 0.0
 
@@ -540,10 +650,16 @@ def test_incremental_root_matches_full_forward_reference_across_turns_and_game_b
     from imba_chess.eval.actor_worker import _PlainSequenceHistory
 
     DECODE_ATOL, DECODE_RTOL = 1e-5, 1e-5
-    turn_counter = [0]  # global-monotonic turn_id across both games, like the real worker
+    turn_counter = [
+        0
+    ]  # global-monotonic turn_id across both games, like the real worker
 
     def play_game(
-        *, worker_id: int, num_opening_plies: int, num_turns: int, k1_reroot_on_first_turn: bool
+        *,
+        worker_id: int,
+        num_opening_plies: int,
+        num_turns: int,
+        k1_reroot_on_first_turn: bool,
     ) -> None:
         board = chess.Board()
         worker_history = _PlainSequenceHistory(
@@ -760,8 +876,7 @@ def test_incremental_root_raises_on_prefix_len_desync():
 
 
 # ---------------------------------------------------------------------------
-# _KVArena unit tests (profile-driven thin-down, change B): the server's own
-# KV bookkeeping, independent of the model/protocol plumbing above.
+# Shared _KVArena unit tests, independent of model/protocol plumbing.
 # ---------------------------------------------------------------------------
 
 
@@ -778,18 +893,26 @@ def test_kv_arena_append_and_gather_suffix_round_trip_across_capacity_growth():
     all_k_rows: list[torch.Tensor] = []  # each [L, H, d]
     all_v_rows: list[torch.Tensor] = []
 
-    from imba_chess.eval.actor_server import _get_or_create_arena
-
     total_rows = 0
     for wave_size in (5, 7, 6, 10):  # cumulative 28, initial capacity 16 -> grows
         k_rows = torch.tensor(
-            [[[[rng.uniform(-1, 1) for _ in range(dim)] for _ in range(wave_size)]
-              for _ in range(heads)] for _ in range(num_layers)],
+            [
+                [
+                    [[rng.uniform(-1, 1) for _ in range(dim)] for _ in range(wave_size)]
+                    for _ in range(heads)
+                ]
+                for _ in range(num_layers)
+            ],
             dtype=torch.float32,
         )  # [L, H, B, d]
         v_rows = torch.tensor(
-            [[[[rng.uniform(-1, 1) for _ in range(dim)] for _ in range(wave_size)]
-              for _ in range(heads)] for _ in range(num_layers)],
+            [
+                [
+                    [[rng.uniform(-1, 1) for _ in range(dim)] for _ in range(wave_size)]
+                    for _ in range(heads)
+                ]
+                for _ in range(num_layers)
+            ],
             dtype=torch.float32,
         )
         arena = _get_or_create_arena(arena, k_rows, v_rows)

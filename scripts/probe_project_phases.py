@@ -1,23 +1,18 @@
-"""True wall-clock phase split inside consume_decode_result (no cProfile).
+"""Wall-clock phase split inside the current arena-backed result consumer.
 
-Throwaway diagnostic. cProfile inflates this workload ~2x (349 us/node profiled
-vs 174 us/node clean), so profiler self-times cannot be compared against the
-clean run's bucket shares -- that mis-sized torch.cat by 2x. This wraps the real
-consume path with perf_counter accumulators instead and runs real games, so the
-phase shares are directly comparable to the decode_project bucket.
+Throwaway diagnostic. cProfile inflates this workload, so these accumulators
+run through real rollout waves. The project's timing buckets remain
+asynchronous; use `profile_torch_waves.py` for CPU/CUDA attribution.
 
 Phases:
-  kv_stack   torch.stack of the wave's per-layer (k, v)
-  kv_path    per-node path_kv cat (the 2.05 cat/node)
-  d2h        the single per-wave .float().cpu() of logits + value_logits
-  movegen    list(generate_moves()) per node
-  mapping    memoized (vocab id, UCI) loop per node
-  sortlists  canonical UCI sort + the 3 reorder comprehensions
-  gather     torch.tensor(ids) + index_select per node
-  softmax    log_softmax(...).tolist() per node
-  assemble   value scalar + PositionEval construction
+  kv_stack    stack per-layer K/V returned for the wave
+  kv_arena    append one K/V row per node and record ancestor chains
+  d2h         wave-level logits/value-logits transfer and synchronization
+  movegen     legal move generation, vocab mapping, and canonical sort
+  batched     value/prior tensor projection for the complete wave
+  assemble    PositionEval construction
 
-Run: .venv/bin/python scripts/probe_project_phases.py
+Run: `.venv/bin/python scripts/probe_project_phases.py`
 """
 
 from __future__ import annotations
@@ -38,25 +33,24 @@ N = {"nodes": 0, "waves": 0}
 def instrumented_consume(self, request, out):
     t = time.perf_counter
     t0 = t()
-    k_all = torch.stack([k for k, _ in out["kv"]], dim=0)
-    v_all = torch.stack([v for _, v in out["kv"]], dim=0)
+    k_stack = torch.stack([k for k, _ in out["kv"]], dim=0)
+    v_stack = torch.stack([v for _, v in out["kv"]], dim=0)
     T["kv_stack"] += t() - t0
 
     t0 = t()
-    for row, node in enumerate(request.nodes):
-        own_k, own_v = k_all[:, row], v_all[:, row]
-        if node.parent is None:
-            node.path_kv = (own_k, own_v)
-        else:
-            parent_k, parent_v = node.parent.path_kv
-            node.path_kv = (
-                torch.cat([parent_k, own_k], dim=2),
-                torch.cat([parent_v, own_v], dim=2),
-            )
-    T["kv_path"] += t() - t0
+    k_rows = k_stack.squeeze(3).permute(0, 2, 1, 3)
+    v_rows = v_stack.squeeze(3).permute(0, 2, 1, 3)
+    self._arena = pe._get_or_create_arena(self._arena, k_rows, v_rows)
+    assigned_rows = self._arena.append(k_rows, v_rows)
+    for node, own_row in zip(request.nodes, assigned_rows):
+        parent_chain = [] if node.parent is None else node.parent.arena_chain
+        if parent_chain is None:
+            raise RuntimeError("Cannot store a child before evaluating its parent")
+        node.arena_chain = parent_chain + [own_row]
+    T["kv_arena"] += t() - t0
 
-    # NEW ORDER: logits-independent Python work runs before the first sync,
-    # so any GPU time left after the queued cats is hidden under it.
+    # Logits-independent Python work runs before the first synchronization,
+    # hiding queued arena writes under work the rollout owes either way.
     t0 = t()
     per_node = []
     for cozy_board in request.boards:
@@ -100,8 +94,12 @@ def instrumented_consume(self, request, out):
 
     t0 = t()
     results = [
-        pe.PositionEval(value_stm=values[r], legal_moves=mvs,
-                        legal_ucis=ucis, legal_log_priors=prior_rows[r])
+        pe.PositionEval(
+            value_stm=values[r],
+            legal_moves=mvs,
+            legal_ucis=ucis,
+            legal_log_priors=prior_rows[r],
+        )
         for r, (_ids, mvs, ucis) in enumerate(per_node)
     ]
     T["assemble"] += t() - t0
@@ -114,11 +112,22 @@ pe.CachedPositionEvaluator.consume_decode_result = instrumented_consume
 
 sys.argv = [
     "generate_search_rollouts.py",
-    "--config", "config/imba_chess_exit_seeded_rollout.toml",
-    "--checkpoint", "artifacts/checkpoints/best_hr10_checkpoint_23_hr10=0.9564.pt",
-    "--output-path", "/tmp/probe_phases.parquet",
-    "--max-games", "6", "--search-budget", "2048", "--concurrent-games", "6",
-    "--dtype", "float32", "--sample-seed", "42",
+    "--config",
+    "config/imba_chess_exit_seeded_rollout.toml",
+    "--checkpoint",
+    "artifacts/checkpoints/best_hr10_checkpoint_23_hr10=0.9564.pt",
+    "--output-path",
+    "/tmp/probe_phases.parquet",
+    "--max-games",
+    "6",
+    "--search-budget",
+    "2048",
+    "--concurrent-games",
+    "6",
+    "--dtype",
+    "float32",
+    "--sample-seed",
+    "42",
 ]
 try:
     runpy.run_path("scripts/generate_search_rollouts.py", run_name="__main__")
@@ -127,9 +136,11 @@ except SystemExit:
 
 nodes = max(1, N["nodes"])
 tot = sum(T.values())
-print(f"\n=== consume_decode_result phase split ===")
-print(f"nodes {nodes:,}   waves {N['waves']:,}   instrumented total {tot:.2f}s "
-      f"({tot / nodes * 1e6:.1f} us/node)\n")
+print("\n=== consume_decode_result phase split ===")
+print(
+    f"nodes {nodes:,}   waves {N['waves']:,}   instrumented total {tot:.2f}s "
+    f"({tot / nodes * 1e6:.1f} us/node)\n"
+)
 print(f"{'phase':<12}{'seconds':>9}{'us/node':>10}{'share':>8}")
 print("-" * 39)
 for k, v in sorted(T.items(), key=lambda kv: -kv[1]):

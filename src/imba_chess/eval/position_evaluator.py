@@ -9,13 +9,7 @@ from weakref import WeakKeyDictionary
 import chess
 import cozy_chess as cc
 import torch
-import torch.nn.functional as F
 
-# Registers the torch.ops.fbgemm namespace; _wave_suffixes pads a whole decode
-# wave's ancestor K/V with fbgemm::jagged_to_padded_dense instead of one F.pad
-# per node. Imported unconditionally on purpose -- a missing/ABI-mismatched
-# fbgemm must fail loudly here rather than silently degrade the hot path.
-import fbgemm_gpu  # noqa: F401
 
 from imba_chess.data.board_state import BoardStateEncoder
 from imba_chess.data.event_builder import (
@@ -24,7 +18,6 @@ from imba_chess.data.event_builder import (
     TARGET_IGNORE_INDEX,
 )
 from imba_chess.data.move_vocab import MoveVocab
-from imba_chess.eval import cozy_bridge
 from imba_chess.eval.search import PositionEval
 from imba_chess.model import (
     HSTUChessModel,
@@ -287,6 +280,7 @@ def _batched_legal_log_priors(
     rows = torch.log_softmax(picked.float(), dim=1).tolist()
     return [row[:n] for row, n in zip(rows, lens)]
 
+
 def _project_legal_logits(
     *,
     logits: torch.Tensor,
@@ -313,7 +307,9 @@ def _project_legal_logits(
     # breaks in search are index-based, so this order is behavior, not just
     # cosmetics. Sort ids and moves jointly (before index_select) so
     # legal_logits stays aligned to legal_moves_with_ids.
-    order = sorted(range(len(legal_moves_with_ids)), key=lambda i: legal_moves_with_ids[i].uci())
+    order = sorted(
+        range(len(legal_moves_with_ids)), key=lambda i: legal_moves_with_ids[i].uci()
+    )
     legal_moves_with_ids = [legal_moves_with_ids[i] for i in order]
     legal_move_ids = [legal_move_ids[i] for i in order]
     legal_ids_tensor = torch.tensor(
@@ -447,25 +443,99 @@ def _project_legal_logits_cozy(
     return legal_logits, moves, ucis, total_legal, len(ids)
 
 
-class _CachedNode:
-    """Search-node handle: parent link + the move that led here.
+class _KVArena:
+    """Growable per-turn store for one decode-token K/V row per search node.
 
-    path_kv is filled after this node is evaluated: the per-layer K/V of every
-    token on the root->self line, stored TOKEN-FIRST as [depth+1, L, H, d] so a
-    whole wave's suffixes pad in one fbgemm jagged kernel -- see
-    CachedPositionEvaluator._wave_suffixes.
-    A child's decode suffix is exactly its parent's path_kv. Parents are
-    always evaluated before children in every strategy, so the path is
-    complete at evaluate() time.
+    `k` and `v` are `[L, H, capacity, d]`. Nodes retain only append-only
+    ancestor row indices; one indexed gather reconstructs a wave's parent
+    suffixes without persistent root-to-node tensor copies.
     """
 
-    __slots__ = ("parent", "move_id", "depth", "path_kv")
+    __slots__ = ("k", "v", "size")
+
+    def __init__(self, k: torch.Tensor, v: torch.Tensor) -> None:
+        self.k = k
+        self.v = v
+        self.size = 0
+
+    def _ensure_capacity(self, extra: int) -> None:
+        needed = self.size + extra
+        capacity = self.k.shape[2]
+        if needed <= capacity:
+            return
+        new_capacity = max(capacity, 1)
+        while new_capacity < needed:
+            new_capacity *= 2
+        new_k = self.k.new_zeros(
+            (self.k.shape[0], self.k.shape[1], new_capacity, self.k.shape[3])
+        )
+        new_v = self.v.new_zeros(
+            (self.v.shape[0], self.v.shape[1], new_capacity, self.v.shape[3])
+        )
+        new_k[:, :, : self.size, :] = self.k[:, :, : self.size, :]
+        new_v[:, :, : self.size, :] = self.v[:, :, : self.size, :]
+        self.k = new_k
+        self.v = new_v
+
+    def append(self, k_rows: torch.Tensor, v_rows: torch.Tensor) -> list[int]:
+        """`k_rows`/`v_rows`: `[L, H, n, d]`, one row per new node, IN WAVE
+        ORDER. Returns the n arena row indices assigned, same order."""
+        n = k_rows.shape[2]
+        self._ensure_capacity(n)
+        start = self.size
+        self.k[:, :, start : start + n, :] = k_rows
+        self.v[:, :, start : start + n, :] = v_rows
+        self.size += n
+        return list(range(start, start + n))
+
+    def gather_suffix(
+        self, idx: torch.Tensor
+    ) -> list[tuple[torch.Tensor, torch.Tensor]]:
+        """`idx`: `[B, S]` long tensor of arena rows (padding positions may
+        hold any in-bounds row -- caller's own `suffix_mask` is what makes
+        those positions inert to the model, not the value gathered here).
+        Returns the per-layer `[(k, v), ...]` list `forward_decode_grouped`
+        expects, each `[B, H, S, d]` -- ONE indexed gather plus one permute
+        for the whole wave, not a per-node `torch.cat` chain."""
+        gathered_k = self.k[:, :, idx, :].permute(0, 2, 1, 3, 4)  # [L, B, H, S, d]
+        gathered_v = self.v[:, :, idx, :].permute(0, 2, 1, 3, 4)
+        return list(zip(gathered_k.unbind(0), gathered_v.unbind(0)))
+
+
+def _padded_chain_indices(
+    chains: list[list[int]], *, device: torch.device
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Materialize all arena ancestor indices and their mask in two transfers."""
+    max_suffix = max((len(chain) for chain in chains), default=0)
+    padded = [chain + [0] * (max_suffix - len(chain)) for chain in chains]
+    idx = torch.tensor(padded, dtype=torch.long, device=device)
+    lengths = torch.tensor([len(chain) for chain in chains], device=device)
+    mask = torch.arange(max_suffix, device=device).unsqueeze(0) < lengths.unsqueeze(1)
+    return idx, mask
+
+
+def _get_or_create_arena(
+    arena: _KVArena | None, k_rows: torch.Tensor, v_rows: torch.Tensor
+) -> _KVArena:
+    if arena is not None:
+        return arena
+    capacity = max(int(k_rows.shape[2]), 16)
+    return _KVArena(
+        k_rows.new_zeros((k_rows.shape[0], k_rows.shape[1], capacity, k_rows.shape[3])),
+        v_rows.new_zeros((v_rows.shape[0], v_rows.shape[1], capacity, v_rows.shape[3])),
+    )
+
+
+class _CachedNode:
+    """Search-node handle with its append-only K/V arena ancestor chain."""
+
+    __slots__ = ("parent", "move_id", "depth", "arena_chain")
 
     def __init__(self, parent: "_CachedNode | None", move_id: int, depth: int) -> None:
         self.parent = parent
         self.move_id = move_id
         self.depth = depth
-        self.path_kv: tuple[torch.Tensor, torch.Tensor] | None = None
+        self.arena_chain: list[int] | None = None
 
 
 @dataclass
@@ -520,11 +590,10 @@ class CachedPositionEvaluator:
         self._dtype = dtype
         self._prefix_kv = prefix_kv
         self._prefix_len = int(prefix_len)
+        self._arena: _KVArena | None = None
 
     def extend(self, handle, move_uci: str):
-        """handle is opaque to the caller; move_uci only feeds vocab encoding
-        (no board is needed here -- the parent's path_kv already captures
-        everything about the position)."""
+        """Create an opaque child handle backed by the shared K/V arena."""
         parent = handle if isinstance(handle, _CachedNode) else None
         depth = parent.depth + 1 if parent is not None else 0
         return _CachedNode(parent, int(self._move_vocab.encode(move_uci)), depth)
@@ -543,7 +612,9 @@ class CachedPositionEvaluator:
         """
         nodes: list[_CachedNode] = [handle for handle, _ in batch]
         boards = [cozy_board for _, cozy_board in batch]
-        states = [self._board_state_encoder.encode_cozy(cozy_board) for cozy_board in boards]
+        states = [
+            self._board_state_encoder.encode_cozy(cozy_board) for cozy_board in boards
+        ]
         wave_size = len(batch)
 
         new_token_batch = {
@@ -551,7 +622,9 @@ class CachedPositionEvaluator:
                 [state.piece_ids for state in states], dtype=torch.long
             ),
             "seq_token_id": torch.full((wave_size,), EVENT_TOKEN_ID, dtype=torch.long),
-            "turn_id": torch.tensor([state.turn_id for state in states], dtype=torch.long),
+            "turn_id": torch.tensor(
+                [state.turn_id for state in states], dtype=torch.long
+            ),
             "castle_id": torch.tensor(
                 [state.castle_id for state in states], dtype=torch.long
             ),
@@ -572,11 +645,26 @@ class CachedPositionEvaluator:
             [self._prefix_len + node.depth for node in nodes], dtype=torch.long
         )
         max_suffix = max(node.depth for node in nodes)
-
         suffix_kv = suffix_positions = suffix_mask = None
         if max_suffix > 0:
-            suffix_kv, suffix_positions, suffix_mask = self._wave_suffixes(
-                nodes, max_suffix
+            if self._arena is None:
+                raise RuntimeError("Missing KV arena for non-root decode wave")
+            parent_chains: list[list[int]] = []
+            for node in nodes:
+                if node.parent is None:
+                    parent_chains.append([])
+                    continue
+                if node.parent.arena_chain is None:
+                    raise RuntimeError(
+                        "Cannot decode a child before evaluating its parent"
+                    )
+                parent_chains.append(node.parent.arena_chain)
+            idx, suffix_mask = _padded_chain_indices(parent_chains, device=self._device)
+            suffix_kv = self._arena.gather_suffix(idx)
+            suffix_positions = (
+                (torch.arange(max_suffix, device=self._device) + self._prefix_len)
+                .unsqueeze(0)
+                .expand(wave_size, -1)
             )
 
         return _DecodeRequest(
@@ -594,43 +682,26 @@ class CachedPositionEvaluator:
     def consume_decode_result(
         self, request: _DecodeRequest, out: dict[str, torch.Tensor]
     ) -> list[PositionEval]:
-        """path_kv extension + logits->PositionEval, given a model output.
+        """Append this wave's K/V once, then project model outputs.
 
         `out` must have the forward_decode/forward_decode_grouped return
         shape: "kv" a per-layer list of (k, v) each [B, H, 1, d], "logits"
         and "value_logits" each [B, ...], rows in request.nodes/boards order.
         """
-        # Stack the wave's per-layer (k, v) once, then extend each node's
-        # root->self path cache so descendants get their suffix for free.
-        #
-        # path_kv is TOKEN-FIRST, [t, L, H, d]: the ragged dim leads, which is
-        # what lets _wave_suffixes pad a whole wave with one fbgemm jagged
-        # kernel instead of an F.pad per node. The permute+unbind here also
-        # replaces the old per-node k_all[:, row] slicing (2 dispatches/node)
-        # with one call for the wave.
-        k_all = torch.stack([k for k, _ in out["kv"]], dim=0)  # [L, B, H, 1, d]
-        v_all = torch.stack([v for _, v in out["kv"]], dim=0)
-        k_owns = k_all.permute(1, 3, 0, 2, 4).unbind(0)  # B x [1, L, H, d]
-        v_owns = v_all.permute(1, 3, 0, 2, 4).unbind(0)
-        for row, node in enumerate(request.nodes):
-            own_k, own_v = k_owns[row], v_owns[row]
-            if node.parent is None:
-                node.path_kv = (own_k, own_v)
-            else:
-                parent_k, parent_v = node.parent.path_kv
-                node.path_kv = (
-                    torch.cat([parent_k, own_k], dim=0),
-                    torch.cat([parent_v, own_v], dim=0),
-                )
-        # Everything above only QUEUES CUDA work; forward_decode_grouped and
-        # these cats are async. The first real sync is the .cpu() below, and it
-        # was measured at 12.49 us/node of pure GPU wait
-        # (scripts/probe_project_phases.py) -- time the CPU spends blocked.
-        #
-        # movegen + vocab mapping + canonical sort reads only request.boards,
-        # never the logits, so running it BEFORE the sync hides ~12 us/node of
-        # that wait under work we owe anyway. Pure reordering of independent
-        # work: no tensor op moves, so results are bit-identical.
+        k_stack = torch.stack([k for k, _ in out["kv"]], dim=0)  # [L, B, H, 1, d]
+        v_stack = torch.stack([v for _, v in out["kv"]], dim=0)
+        k_rows = k_stack.squeeze(3).permute(0, 2, 1, 3)  # [L, H, B, d]
+        v_rows = v_stack.squeeze(3).permute(0, 2, 1, 3)
+        self._arena = _get_or_create_arena(self._arena, k_rows, v_rows)
+        assigned_rows = self._arena.append(k_rows, v_rows)
+        for node, own_row in zip(request.nodes, assigned_rows):
+            parent_chain = [] if node.parent is None else node.parent.arena_chain
+            if parent_chain is None:
+                raise RuntimeError("Cannot store a child before evaluating its parent")
+            node.arena_chain = parent_chain + [own_row]
+
+        # Arena operations only queue CUDA work. Move generation and vocab
+        # mapping overlap the first device-to-host synchronization.
         per_node = [
             _legal_moves_ids_ucis(cozy_board, self._move_vocab)
             for cozy_board in request.boards
@@ -689,71 +760,3 @@ class CachedPositionEvaluator:
                 suffix_mask=request.suffix_mask,
             )
         return self.consume_decode_result(request, out)
-
-    def _wave_suffixes(self, nodes, max_suffix: int):
-        """Padded per-layer ancestor K/V for one wave.
-
-        Each node's suffix is its parent's path_kv, stored TOKEN-FIRST as
-        [t, L, H, d]. That layout is what lets the whole wave pad in one
-        fbgemm jagged kernel: concatenate the paths (already contiguous on the
-        ragged dim) and hand fbgemm the cumulative offsets. Depth-0 nodes
-        contribute a zero-length row, which fbgemm pads to all zeros -- the
-        old explicit zero_k/zero_v rows.
-
-        Replaces one F.pad per node per tensor plus a torch.stack. torch.profiler
-        attributed 9,242 `aten::pad` calls and 178.9 ms to 12 waves of that, and
-        `Timer` measured the pad+stack shape at 8.03 us/node against 0.87 us/node
-        for this one (scripts/bench_wave_suffixes.py). Output is bit-identical.
-        """
-        ref_k, ref_v = self._prefix_kv[0]
-        num_layers = len(self._prefix_kv)
-        heads = ref_k.size(0)
-        dk, dv = ref_k.size(-1), ref_v.size(-1)
-        inner_k, inner_v = num_layers * heads * dk, num_layers * heads * dv
-
-        paths_k = [n.parent.path_kv[0] for n in nodes if n.parent is not None]
-        paths_v = [n.parent.path_kv[1] for n in nodes if n.parent is not None]
-        values_k = (
-            torch.cat(paths_k, dim=0).reshape(-1, inner_k)
-            if paths_k
-            else ref_k.new_zeros((0, inner_k))
-        )
-        values_v = (
-            torch.cat(paths_v, dim=0).reshape(-1, inner_v)
-            if paths_v
-            else ref_v.new_zeros((0, inner_v))
-        )
-        offsets = torch.zeros(
-            len(nodes) + 1, dtype=torch.long, device=values_k.device
-        )
-        offsets[1:] = torch.tensor(
-            [node.depth for node in nodes],
-            dtype=torch.long,
-            device=values_k.device,
-        ).cumsum(0)
-
-        padded_k = torch.ops.fbgemm.jagged_to_padded_dense(
-            values_k, [offsets], [max_suffix], 0.0
-        ).view(len(nodes), max_suffix, num_layers, heads, dk)
-        padded_v = torch.ops.fbgemm.jagged_to_padded_dense(
-            values_v, [offsets], [max_suffix], 0.0
-        ).view(len(nodes), max_suffix, num_layers, heads, dv)
-        # -> [B, L, H, s, d], then split into the per-layer pairs
-        # forward_decode expects.
-        suffix_kv = list(
-            zip(
-                padded_k.permute(0, 2, 3, 1, 4).unbind(dim=1),
-                padded_v.permute(0, 2, 3, 1, 4).unbind(dim=1),
-            )
-        )
-        suffix_positions = (
-            torch.arange(max_suffix, device=self._device).view(1, -1)
-            + self._prefix_len
-        ).expand(len(nodes), -1)
-        suffix_mask = (
-            torch.arange(max_suffix, device=self._device).unsqueeze(0)
-            < torch.tensor(
-                [node.depth for node in nodes], device=self._device
-            ).unsqueeze(1)
-        )
-        return suffix_kv, suffix_positions, suffix_mask

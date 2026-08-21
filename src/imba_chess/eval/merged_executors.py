@@ -167,9 +167,8 @@ def _merge_decode_requests(requests: list[Any]) -> _MergedDecodeRequest:
     num_groups / group_index boundary validation.
     Suffix tensors are per-row [B_g, H, s_g, d]; games with no suffix at all
     (root-adjacent nodes) or a shorter suffix than the tick's max get
-    zero-padded rows with an all-False mask, mirroring how
-    CachedPositionEvaluator._wave_suffixes already pads within one game's
-    wave -- here applied across games instead of across nodes.
+    zero-padded rows with an all-False mask. Each evaluator has already
+    gathered its own arena ancestor rows; this merge only aligns games.
     """
     num_layers = len(requests[0].prefix_kv)
     group_index = torch.cat(
@@ -228,10 +227,14 @@ def _merge_decode_requests(requests: list[Any]) -> _MergedDecodeRequest:
                 for layer in range(num_layers):
                     ref_k, ref_v = req.prefix_kv[layer]
                     suffix_k_rows[layer].append(
-                        ref_k.new_zeros((wave_size, ref_k.size(0), max_suffix, ref_k.size(-1)))
+                        ref_k.new_zeros(
+                            (wave_size, ref_k.size(0), max_suffix, ref_k.size(-1))
+                        )
                     )
                     suffix_v_rows[layer].append(
-                        ref_v.new_zeros((wave_size, ref_v.size(0), max_suffix, ref_v.size(-1)))
+                        ref_v.new_zeros(
+                            (wave_size, ref_v.size(0), max_suffix, ref_v.size(-1))
+                        )
                     )
                 suffix_positions_rows.append(
                     torch.zeros(
@@ -253,13 +256,20 @@ def _merge_decode_requests(requests: list[Any]) -> _MergedDecodeRequest:
                     suffix_k_rows[layer].append(F.pad(k, (0, 0, 0, pad)) if pad else k)
                     suffix_v_rows[layer].append(F.pad(v, (0, 0, 0, pad)) if pad else v)
                 suffix_positions_rows.append(
-                    F.pad(req.suffix_positions, (0, pad)) if pad else req.suffix_positions
+                    F.pad(req.suffix_positions, (0, pad))
+                    if pad
+                    else req.suffix_positions
                 )
                 suffix_mask_rows.append(
-                    F.pad(req.suffix_mask, (0, pad), value=False) if pad else req.suffix_mask
+                    F.pad(req.suffix_mask, (0, pad), value=False)
+                    if pad
+                    else req.suffix_mask
                 )
         suffix_kv = [
-            (torch.cat(suffix_k_rows[layer], dim=0), torch.cat(suffix_v_rows[layer], dim=0))
+            (
+                torch.cat(suffix_k_rows[layer], dim=0),
+                torch.cat(suffix_v_rows[layer], dim=0),
+            )
             for layer in range(num_layers)
         ]
         suffix_positions = torch.cat(suffix_positions_rows, dim=0)
@@ -278,7 +288,9 @@ def _merge_decode_requests(requests: list[Any]) -> _MergedDecodeRequest:
     )
 
 
-def _split_decode_output(out: dict[str, Any], lengths: list[int]) -> list[dict[str, Any]]:
+def _split_decode_output(
+    out: dict[str, Any], lengths: list[int]
+) -> list[dict[str, Any]]:
     """Slice forward_decode_grouped's full-batch output back into G
     per-game-shaped dicts, in original per-game row order (forward_decode_
     grouped guarantees output rows are in original row order, and rows were
@@ -299,9 +311,11 @@ def _split_decode_output(out: dict[str, Any], lengths: list[int]) -> list[dict[s
     return results
 
 
-def _make_decode_wave_executor(*, model, device, dtype, stats: "TimingStatsLike | None"):
+def _make_decode_wave_executor(
+    *, model, device, dtype, stats: "TimingStatsLike | None"
+):
     def executor(
-        payloads: list[tuple[CachedPositionEvaluator, list]]
+        payloads: list[tuple[CachedPositionEvaluator, list]],
     ) -> list[list[search.PositionEval]]:
         if len(payloads) == 1:
             # Single game in this tick's decode_wave batch: the existing
@@ -318,14 +332,9 @@ def _make_decode_wave_executor(*, model, device, dtype, stats: "TimingStatsLike 
                 stats.search_eval_items += len(batch)
             return [result]
 
-        # Board encoding + jagged->padded merge. Previously untimed: cProfile
-        # attributes a large share of a real run to exactly this region
-        # (encode_cozy, torch.cat, torch._C._nn.pad), so leaving it out of the
-        # buckets made the profile understate total work and made changes here
-        # measure as noise. Kept separate from decode_project because the two
-        # have different fixes: this half is the jagged-padding candidate
-        # (fbgemm jagged_to_padded_dense), that half is pure Python movegen and
-        # vocab projection. See tests/test_decode_prep_timing.py.
+        # Board encoding, per-game arena suffix gathers, and the cross-game
+        # merge live in decode_prep. Keep them separate from decode_project,
+        # which is pure Python move generation and vocab projection.
         prep0 = time.perf_counter()
         requests = [
             evaluator.build_decode_request(batch) for evaluator, batch in payloads

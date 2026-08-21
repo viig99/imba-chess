@@ -38,26 +38,16 @@ per-ROW Python bottlenecks that this rewrite removes:
      self) -- ELIMINATED. `_batched_value_stm` runs one softmax over the
      whole wave's/root batch's value_logits and `.tolist()`s once.
 
-Composition vs. reuse: the ragged root-batch merge/split
-(`merged_executors._merge_root_batches`/`_split_root_output`) and the
-model-forward helpers (`position_evaluator._forward_model`/
-`_autocast_context`) are imported and used UNMODIFIED -- zero edits to
-either `merged_executors.py` or `position_evaluator.py`; both stay
-byte-identical for their existing rollout-shared callers.
-`CachedPositionEvaluator`/`_CachedNode`/`_project_legal_logits_cozy` are no
-longer used by this module at all (the composition they used to provide --
-per-node KV chains, board reconstruction + projection -- is exactly what
-`_KVArena`/the worker-side projection replace), so this module no longer
-imports them, `cozy_chess`, or `BoardStateEncoder` either.
+Shared primitives: the ragged merge/split functions come from
+`merged_executors`; model-forward helpers and `_KVArena` come from
+`position_evaluator`. The in-process rollout evaluator and actor server
+therefore use one arena implementation. The actor path still owns its
+wire-specific optimization: workers send encoded board fields and legal
+vocab ids, so the server never reconstructs boards or runs move generation.
 
-`merged_executors._merge_decode_requests`/`_split_decode_output` (the
-cross-worker decode-wave merge/pad math) ARE reused unmodified too, via a
-small duck-typed `_ArenaDecodeRequest` -- those two functions only ever
-read `.nodes` (for its length), `.new_token_batch`, `.positions`,
-`.suffix_kv`/`.suffix_positions`/`.suffix_mask`, `.prefix_kv`, `.prefix_len`
-off whatever object they're given (no `isinstance` check), so this module's
-own arena-backed request object satisfies that interface without either
-module needing to know about the other's node representation.
+`_ArenaDecodeRequest` is a small duck-typed request for the shared merge
+functions. They read only `.nodes`, token tensors, suffix tensors, and prefix
+metadata, so actor wire ids never need to become `_CachedNode` objects.
 
 Incremental-root-KV optimization (`docs/superpowers/sdd/increm-report.md`):
 wall-clock server profiling showed root evals -- a FULL-sequence forward
@@ -95,7 +85,13 @@ from imba_chess.eval.merged_executors import (
     _split_decode_output,
     _split_root_output,
 )
-from imba_chess.eval.position_evaluator import _autocast_context, _forward_model
+from imba_chess.eval.position_evaluator import (
+    _KVArena,
+    _autocast_context,
+    _forward_model,
+    _get_or_create_arena,
+    _padded_chain_indices,
+)
 
 # The plain tensor-batch fields RootEvalRequest.batch_arrays carries -- same
 # field set _SequenceHistory._build_single_batch() (position_evaluator.py)
@@ -116,6 +112,7 @@ _ROOT_BATCH_INT_LIST_FIELDS = (
     "target_move_id",
     "played_by_elo",
 )
+
 
 def _tensorize_root_batch(batch_arrays: dict) -> dict[str, Any]:
     """`RootEvalRequest.batch_arrays` (plain lists/ints, torch-free on the
@@ -203,83 +200,6 @@ def _gather_legal_logits(
     ]
 
 
-class _KVArena:
-    """Growable per-(worker_id, turn_id) decode-token KV store:
-    `k`/`v` each `[L, H, capacity, d]`. Each search-tree node's own
-    one-token decode KV is written ONCE, at an arena row minted by
-    `append`; a node's descendants retrieve their suffix (the full
-    root->parent ancestor chain) via `gather_suffix`, one indexed gather for
-    a whole wave instead of a `torch.cat` per node per depth
-    (`_TurnState.node_chains` holds the cheap append-only Python
-    `list[int]` chains `gather_suffix`'s caller builds the index matrix
-    from).
-
-    Capacity grows by doubling (`_ensure_capacity`), amortizing the
-    reallocation cost across a whole turn's worth of decode waves; lazily
-    created on the turn's FIRST decode wave (`_get_or_create_arena`) from
-    that wave's own KV output shape, since the server never knows a turn's
-    eventual node count in advance.
-    """
-
-    __slots__ = ("k", "v", "size")
-
-    def __init__(self, k: torch.Tensor, v: torch.Tensor) -> None:
-        self.k = k
-        self.v = v
-        self.size = 0
-
-    def _ensure_capacity(self, extra: int) -> None:
-        needed = self.size + extra
-        capacity = self.k.shape[2]
-        if needed <= capacity:
-            return
-        new_capacity = max(capacity, 1)
-        while new_capacity < needed:
-            new_capacity *= 2
-        new_k = self.k.new_zeros((self.k.shape[0], self.k.shape[1], new_capacity, self.k.shape[3]))
-        new_v = self.v.new_zeros((self.v.shape[0], self.v.shape[1], new_capacity, self.v.shape[3]))
-        new_k[:, :, : self.size, :] = self.k[:, :, : self.size, :]
-        new_v[:, :, : self.size, :] = self.v[:, :, : self.size, :]
-        self.k = new_k
-        self.v = new_v
-
-    def append(self, k_rows: torch.Tensor, v_rows: torch.Tensor) -> list[int]:
-        """`k_rows`/`v_rows`: `[L, H, n, d]`, one row per new node, IN WAVE
-        ORDER. Returns the n arena row indices assigned, same order."""
-        n = k_rows.shape[2]
-        self._ensure_capacity(n)
-        start = self.size
-        self.k[:, :, start : start + n, :] = k_rows
-        self.v[:, :, start : start + n, :] = v_rows
-        self.size += n
-        return list(range(start, start + n))
-
-    def gather_suffix(
-        self, idx: torch.Tensor
-    ) -> list[tuple[torch.Tensor, torch.Tensor]]:
-        """`idx`: `[B, S]` long tensor of arena rows (padding positions may
-        hold any in-bounds row -- caller's own `suffix_mask` is what makes
-        those positions inert to the model, not the value gathered here).
-        Returns the per-layer `[(k, v), ...]` list `forward_decode_grouped`
-        expects, each `[B, H, S, d]` -- ONE indexed gather plus one permute
-        for the whole wave, not a per-node `torch.cat` chain."""
-        gathered_k = self.k[:, :, idx, :].permute(0, 2, 1, 3, 4)  # [L, B, H, S, d]
-        gathered_v = self.v[:, :, idx, :].permute(0, 2, 1, 3, 4)
-        return list(zip(gathered_k.unbind(0), gathered_v.unbind(0)))
-
-
-def _get_or_create_arena(
-    arena: _KVArena | None, k_rows: torch.Tensor, v_rows: torch.Tensor
-) -> _KVArena:
-    if arena is not None:
-        return arena
-    capacity = max(int(k_rows.shape[2]), 16)
-    return _KVArena(
-        k_rows.new_zeros((k_rows.shape[0], k_rows.shape[1], capacity, k_rows.shape[3])),
-        v_rows.new_zeros((v_rows.shape[0], v_rows.shape[1], capacity, v_rows.shape[3])),
-    )
-
-
 @dataclass
 class _TurnState:
     """Everything the server keeps for one live `(worker_id, turn_id)`:
@@ -346,13 +266,11 @@ def _snapshot_turn_state(game: _GameState) -> _TurnState:
 
 @dataclass
 class _ArenaDecodeRequest:
-    """Duck-typed stand-in for `position_evaluator._DecodeRequest`, built
-    from `_KVArena` data instead of `_CachedNode` path_kv chains -- see this
-    module's own docstring for why this satisfies
-    `merged_executors._merge_decode_requests`/`_split_decode_output`
-    unmodified. `nodes` only needs a `len()` (those two functions never read
-    its elements), so a plain `range` stands in for the `_CachedNode` list
-    those functions were originally written against."""
+    """Duck-typed request for the shared cross-group decode merge.
+
+    `nodes` only needs a length, so a range stands in for the in-process
+    evaluator's `_CachedNode` list.
+    """
 
     nodes: range
     new_token_batch: dict[str, Any]
@@ -441,16 +359,24 @@ class ActorInferenceServer:
         # only for diagnosis (IMBA_ACTOR_PROFILE=1), it serializes the device.
         self.profile_sync = bool(profile_sync)
         self.stats: dict[str, float] = {
-            "root_build_s": 0.0, "root_gpu_s": 0.0, "root_post_s": 0.0,
-            "wave_build_s": 0.0, "wave_gpu_s": 0.0, "wave_post_s": 0.0,
-            "root_calls": 0, "root_reqs": 0,
-            "wave_calls": 0, "wave_reqs": 0, "wave_rows": 0,
+            "root_build_s": 0.0,
+            "root_gpu_s": 0.0,
+            "root_post_s": 0.0,
+            "wave_build_s": 0.0,
+            "wave_gpu_s": 0.0,
+            "wave_post_s": 0.0,
+            "root_calls": 0,
+            "root_reqs": 0,
+            "wave_calls": 0,
+            "wave_reqs": 0,
+            "wave_rows": 0,
             # Incremental-root-KV optimization: a DISTINCT bucket from
             # "root_*" above (which stays scoped to the FULL-forward,
             # merged-batch path only) -- see _service_incremental_root's own
             # comment on why mixing the two units would corrupt profiling.
             "incremental_root_gpu_s": 0.0,
-            "incremental_root_calls": 0, "incremental_root_reqs": 0,
+            "incremental_root_calls": 0,
+            "incremental_root_reqs": 0,
             "incremental_root_tokens": 0,
         }
         # Validated ONCE here, not per request. RootEvalResponse.value_stm
@@ -501,7 +427,11 @@ class ActorInferenceServer:
         self._games: dict[int, _GameState] = {}
 
     def register_root(
-        self, worker_id: int, turn_id: int, batch_arrays: dict, legal_vocab_ids: list[int]
+        self,
+        worker_id: int,
+        turn_id: int,
+        batch_arrays: dict,
+        legal_vocab_ids: list[int],
     ) -> RootEvalResponse:
         """Convenience single-request wrapper around `service()`'s root path
         -- still goes through `_service_roots`, so a lone `register_root`
@@ -570,9 +500,7 @@ class ActorInferenceServer:
         frees the whole GAME's growing root prefix."""
         self._games.pop(int(worker_id), None)
 
-    def _service_roots(
-        self, requests: list[RootEvalRequest]
-    ) -> list[RootEvalResponse]:
+    def _service_roots(self, requests: list[RootEvalRequest]) -> list[RootEvalResponse]:
         """Dispatches each request to the FULL (`_service_full_roots`,
         cross-worker batched) or INCREMENTAL (`_service_incremental_root`,
         per-request sequential single-prefix decode) path per its own
@@ -738,8 +666,13 @@ class ActorInferenceServer:
         batched_fields = {
             key: torch.tensor(tokens[key], dtype=torch.long)
             for key in (
-                "piece_ids", "seq_token_id", "turn_id", "castle_id",
-                "ep_file_id", "halfmove_bucket_id", "fullmove_bucket_id",
+                "piece_ids",
+                "seq_token_id",
+                "turn_id",
+                "castle_id",
+                "ep_file_id",
+                "halfmove_bucket_id",
+                "fullmove_bucket_id",
                 "prev_move_id",
             )
         }
@@ -827,32 +760,15 @@ class ActorInferenceServer:
             max_suffix = max((len(c) for c in parent_chains), default=0)
             suffix_kv = suffix_positions = suffix_mask = None
             if max_suffix > 0:
-                # idx/mask must live on the SAME device as the arena
-                # (self._device -- e.g. cuda:0 in production): the arena's
-                # k/v tensors are device-resident (model output), and
-                # advanced indexing (`arena[:, :, idx, :]` in
-                # `_KVArena.gather_suffix`) requires the index tensor to
-                # match, same rationale as merged_executors._merge_decode_
-                # requests's own explicit device= on its fabricated
-                # suffix rows (see that module's comment on the same
-                # footgun).
-                idx = torch.zeros(
-                    (wave_size, max_suffix), dtype=torch.long, device=self._device
+                idx, suffix_mask = _padded_chain_indices(
+                    parent_chains, device=self._device
                 )
-                mask = torch.zeros(
-                    (wave_size, max_suffix), dtype=torch.bool, device=self._device
-                )
-                for row, chain in enumerate(parent_chains):
-                    if chain:
-                        idx[row, : len(chain)] = torch.tensor(
-                            chain, dtype=torch.long, device=self._device
-                        )
-                        mask[row, : len(chain)] = True
                 suffix_kv = turn.arena.gather_suffix(idx)
                 suffix_positions = (
-                    torch.arange(max_suffix, device=self._device) + turn.prefix_len
-                ).unsqueeze(0).expand(wave_size, -1)
-                suffix_mask = mask
+                    (torch.arange(max_suffix, device=self._device) + turn.prefix_len)
+                    .unsqueeze(0)
+                    .expand(wave_size, -1)
+                )
 
             decode_requests.append(
                 _ArenaDecodeRequest(

@@ -62,10 +62,14 @@ def main() -> None:
         for m in mv:
             mid, uci = _cozy_move_id_and_uci(b, m, vocab)
             if mid is not None:
-                ids.append(int(mid)); mvs.append(m); ucis.append(uci)
+                ids.append(int(mid))
+                mvs.append(m)
+                ucis.append(uci)
         mapped.append((ids, mvs, ucis))
-    print(f"mean legal moves/node: {statistics.mean(len(m) for m in movesets):.1f}   "
-          f"mean mapped: {statistics.mean(len(m[0]) for m in mapped):.1f}")
+    print(
+        f"mean legal moves/node: {statistics.mean(len(m) for m in movesets):.1f}   "
+        f"mean mapped: {statistics.mean(len(m[0]) for m in mapped):.1f}"
+    )
 
     def phase_movegen():
         for b in boards:
@@ -77,7 +81,9 @@ def main() -> None:
             for m in mv:
                 mid, uci = _cozy_move_id_and_uci(b, m, vocab)
                 if mid is not None:
-                    ids.append(int(mid)); mvs.append(m); ucis.append(uci)
+                    ids.append(int(mid))
+                    mvs.append(m)
+                    ucis.append(uci)
 
     def phase_sort():
         for ids, mvs, ucis in mapped:
@@ -105,7 +111,8 @@ def main() -> None:
         ("softmax(incl totensor)", phase_softmax),
     ]
     for _, fn in phases:  # warm
-        fn(); fn()
+        fn()
+        fn()
 
     reps = 30
     print(f"\n{'phase':<24}{'us/node':>10}{'share of measured':>20}")
@@ -114,24 +121,34 @@ def main() -> None:
     for name, fn in phases:
         ts = []
         for _ in range(reps):
-            t0 = time.perf_counter(); fn(); ts.append(time.perf_counter() - t0)
+            t0 = time.perf_counter()
+            fn()
+            ts.append(time.perf_counter() - t0)
         results[name] = statistics.median(ts) / len(boards) * 1e6
 
     # softmax phase includes totensor; report the marginal cost.
-    results["softmax(marginal)"] = results["softmax(incl totensor)"] - results["totensor"]
+    results["softmax(marginal)"] = (
+        results["softmax(incl totensor)"] - results["totensor"]
+    )
     order = ["movegen", "mapping", "sort", "totensor", "softmax(marginal)"]
     tot = sum(results[k] for k in order)
     for k in order:
         print(f"{k:<24}{results[k]:>10.2f}{results[k] / tot * 100:>19.1f}%")
     print("-" * 54)
     print(f"{'measured total':<24}{tot:>10.2f}")
-    print(f"\nprofiled decode_project is 54 us/node; the rest is PositionEval "
-          f"construction,\nvalue_scalar, path_kv cat and list overhead.")
+    print(
+        "\nThis total covers legal projection only; arena K/V bookkeeping and "
+        "PositionEval construction are outside the benchmark."
+    )
     torch_share = results["totensor"] + results["softmax(marginal)"]
-    print(f"\nper-node torch dispatch (batchable across a 1,321-node wave): "
-          f"{torch_share:.2f} us/node = {torch_share / tot * 100:.1f}% of measured")
-    print(f"lambda sort (removable):                                     "
-          f"{results['sort']:.2f} us/node = {results['sort'] / tot * 100:.1f}% of measured")
+    print(
+        f"\nper-node torch dispatch (batchable across a 1,321-node wave): "
+        f"{torch_share:.2f} us/node = {torch_share / tot * 100:.1f}% of measured"
+    )
+    print(
+        f"lambda sort (removable):                                     "
+        f"{results['sort']:.2f} us/node = {results['sort'] / tot * 100:.1f}% of measured"
+    )
 
 
 if __name__ == "__main__":
