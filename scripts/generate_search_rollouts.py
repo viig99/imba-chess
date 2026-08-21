@@ -745,8 +745,9 @@ def main() -> None:
 
 
 def _main_with_hard_exit_on_crash() -> None:
-    """Entry-point wrapper: guarantees the process actually terminates on an
-    unhandled exception (or Ctrl-C), instead of hanging.
+    """Entry-point wrapper: guarantees the process actually terminates on
+    every outcome -- success, unhandled exception, or Ctrl-C -- instead of
+    hanging.
 
     Observed in practice on a real GPU run: a crash inside scheduler.run()
     printed its traceback but the process then sat futex-parked forever at
@@ -791,6 +792,18 @@ def _main_with_hard_exit_on_crash() -> None:
         sys.stdout.flush()
         sys.stderr.flush()
         os._exit(1)
+    # Success takes the same escape. A finished run has already written every
+    # output and printed its summary, so nothing is lost by skipping CPython's
+    # ordinary shutdown -- and staying in it risks the same indefinite park,
+    # observed on a real 20-game rollout that completed, wrote its parquet and
+    # sidecar, then held 4 GB of GPU for 11 minutes until killed. A faulthandler
+    # dump of that shutdown showed a native thread calling PyGILState_Release
+    # against a non-current thread state while the runtime was finalizing, so
+    # the failure is not one identifiable joinable thread to daemonize; the
+    # same unconditional exit that covers the crash path covers this one.
+    sys.stdout.flush()
+    sys.stderr.flush()
+    os._exit(0)
 
 
 if __name__ == "__main__":

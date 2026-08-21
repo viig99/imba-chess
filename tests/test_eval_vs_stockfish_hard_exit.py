@@ -89,3 +89,22 @@ def test_hard_exit_wrapper_lets_systemexit_pass_through_unchanged(tmp_path):
 def test_hard_exit_wrapper_is_transparent_on_success(tmp_path):
     result = _run_driver(tmp_path, "    pass\n")
     assert result.returncode == 0
+
+
+def test_hard_exit_terminates_on_success_despite_lingering_non_daemon_thread(
+    tmp_path,
+):
+    # The crash path was hardened; the success path was not. A run that
+    # completes all its work, writes its output and returns normally still
+    # goes through CPython's ordinary shutdown, which blocks joining
+    # non-daemon threads -- observed on a real 20-game rollout that finished
+    # and then sat for 11 minutes holding 4 GB of GPU. A finished run must
+    # release its GPU/shard slot as decisively as a crashed one.
+    result = _run_driver(
+        tmp_path,
+        "    import threading\n"
+        "    threading.Thread(target=lambda: threading.Event().wait(), daemon=False).start()\n"
+        "    print('work complete')\n",
+    )
+    assert result.returncode == 0
+    assert "work complete" in result.stdout
