@@ -146,6 +146,16 @@ class _TimingStats:
                            forward_decode), or the merged forward_decode_
                            grouped call when >1 game's search wave lands in
                            the same tick.
+      decode_prep       -- the decode-wave executor's own CPU work around the
+                           model call, at --concurrent-games > 1: per-game
+                           build_decode_request (board encode + suffix
+                           gather), _merge_decode_requests (jagged -> padded
+                           [G,H,maxP,d] via cat/pad), and
+                           consume_decode_result (legal-move projection back
+                           into PositionEvals). Added 2026-08-20: this region
+                           was previously timed by NOTHING, so total()
+                           understated real work and any optimization landing
+                           here measured as noise.
       search_bookkeeping -- _halving_stepwise's own CPU time between
                            EvalRequest yields (timed directly around each
                            next()/send() by _timed_advance, so unlike
@@ -163,6 +173,7 @@ class _TimingStats:
         self.batch_build = 0.0
         self.root_eval = 0.0
         self.search_gpu = 0.0
+        self.decode_prep = 0.0
         self.search_bookkeeping = 0.0
         self.search_eval_calls = 0
         self.search_eval_items = 0
@@ -173,6 +184,7 @@ class _TimingStats:
             + self.batch_build
             + self.root_eval
             + self.search_gpu
+            + self.decode_prep
             + self.search_bookkeeping
         )
 
@@ -185,6 +197,7 @@ class _TimingStats:
             ("batch_build (tensor construction, sampled plies)", self.batch_build),
             ("root_eval (root forward, GPU)", self.root_eval),
             ("search_gpu (search forward_decode waves, GPU)", self.search_gpu),
+            ("decode_prep (encode+jagged merge+legal projection, CPU)", self.decode_prep),
             ("search_bookkeeping (heap/tree mgmt, CPU)", self.search_bookkeeping),
         ]
         lines = [

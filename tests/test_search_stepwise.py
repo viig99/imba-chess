@@ -84,3 +84,91 @@ def test_d2_and_rerank_wrappers_unchanged_behavior():
     )
     assert legal_moves[idx].uci() == "e2e4"
     assert evaluator.calls  # evaluator was exercised through the wrapper
+
+
+@pytest.mark.parametrize("seed", list(range(24)))
+def test_budget_starvation_falls_back_to_highest_prior_arm(seed):
+    """The starvation fallback must mean what it says.
+
+    `_halving_stepwise` ends with:
+
+        best = max(survivors, key=score)
+        if best.score == -inf:
+            # Budget starvation: fall back to the highest-prior candidate.
+            best = arms[0]          # <-- the bug
+
+    `arms` is built from `picks` = `order[:top_m]`. With
+    gumbel_root_sampling=False `order` is _prior_order, so arms[0] genuinely
+    is the highest-prior candidate. With gumbel_root_sampling=True (the
+    DEFAULT in scripts/generate_search_rollouts.py) `order` is a Gumbel-Top-k
+    permutation, so arms[0] is an arbitrary draw and the fallback silently
+    returned a random move while claiming to return the best-prior one.
+
+    The checkable invariant is over the CANDIDATES, not all legal moves:
+    Gumbel need not sample the globally highest-prior move at all, so the
+    fallback can only be the best prior among the arms that exist -- which
+    `rows` reports for every arm.
+
+    budget=0 forces the branch: the round loop breaks on
+    `spent >= config.budget` before any eval, so every arm keeps score -inf.
+    """
+    board = chess.Board(
+        "r4rk1/1pp1qppp/p1np1n2/2b1p1B1/2B1P1b1/P1NP1N2/1PP1QPPP/R4RK1 w - - 0 10"
+    )
+    legal_moves = list(board.legal_moves)
+    legal_log_priors = [
+        -1.0 - 0.13 * ((i * 7) % len(legal_moves)) for i in range(len(legal_moves))
+    ]
+
+    gen = search._halving_stepwise(
+        extend=lambda handle, uci: None,
+        root_handle=None,
+        board=board,
+        legal_moves=legal_moves,
+        legal_log_priors=legal_log_priors,
+        config=search.HalvingConfig(budget=0, top_m=8, gumbel_root_sampling=True),
+        rng=random.Random(seed),
+    )
+    try:
+        next(gen)
+        raise AssertionError("budget=0 must not request any evaluation")
+    except StopIteration as stop:
+        best_local_idx, rows = stop.value
+
+    assert all(row["backed_value"] is None for row in rows), "budget=0 must score nothing"
+    chosen_prior = legal_log_priors[best_local_idx]
+    best_arm_prior = max(row["policy_log_prob"] for row in rows)
+    assert chosen_prior == best_arm_prior, (
+        f"starvation fallback returned {legal_moves[best_local_idx].uci()} "
+        f"(prior {chosen_prior:.3f}) but the best-prior candidate among the "
+        f"{len(rows)} arms has prior {best_arm_prior:.3f}"
+    )
+
+
+def test_budget_starvation_is_unchanged_for_deterministic_inference():
+    """gumbel off (the inference setting) must keep bit-identical behavior:
+    the fallback is the globally highest-prior legal move, i.e. old arms[0]."""
+    board = chess.Board(
+        "r4rk1/1pp1qppp/p1np1n2/2b1p1B1/2B1P1b1/P1NP1N2/1PP1QPPP/R4RK1 w - - 0 10"
+    )
+    legal_moves = list(board.legal_moves)
+    legal_log_priors = [
+        -1.0 - 0.13 * ((i * 7) % len(legal_moves)) for i in range(len(legal_moves))
+    ]
+    gen = search._halving_stepwise(
+        extend=lambda handle, uci: None,
+        root_handle=None,
+        board=board,
+        legal_moves=legal_moves,
+        legal_log_priors=legal_log_priors,
+        config=search.HalvingConfig(budget=0, top_m=8, gumbel_root_sampling=False),
+    )
+    try:
+        next(gen)
+        raise AssertionError("budget=0 must not request any evaluation")
+    except StopIteration as stop:
+        best_local_idx, _rows = stop.value
+
+    assert best_local_idx == max(
+        range(len(legal_moves)), key=legal_log_priors.__getitem__
+    )

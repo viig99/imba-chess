@@ -39,12 +39,13 @@ class TimingStatsLike(Protocol):
     """Structural type for the timing-stats accumulator these executors
     write into -- matches scripts/generate_search_rollouts.py's
     `_TimingStats` without importing it (that script imports this module,
-    so importing back would cycle); any object with these four mutable
+    so importing back would cycle); any object with these mutable
     numeric attributes works, including `stats=None` at each call site's
     own None-check."""
 
     root_eval: float
     search_gpu: float
+    decode_prep: float
     search_eval_calls: int
     search_eval_items: int
 
@@ -316,8 +317,18 @@ def _make_decode_wave_executor(*, model, device, dtype, stats: "TimingStatsLike 
                 stats.search_eval_items += len(batch)
             return [result]
 
-        requests = [evaluator.build_decode_request(batch) for evaluator, batch in payloads]
+        # Board encoding + jagged->padded merge. Previously untimed: cProfile
+        # attributes a large share of a real run to exactly this region
+        # (encode_cozy, torch.cat, torch._C._nn.pad), so leaving it out of the
+        # buckets made the profile understate total work and made changes here
+        # measure as noise. See tests/test_decode_prep_timing.py.
+        prep0 = time.perf_counter()
+        requests = [
+            evaluator.build_decode_request(batch) for evaluator, batch in payloads
+        ]
         merged = _merge_decode_requests(requests)
+        prep = time.perf_counter() - prep0
+
         t0 = time.perf_counter()
         with torch.inference_mode(), _autocast_context(device, dtype):
             out = model.forward_decode_grouped(
@@ -331,16 +342,23 @@ def _make_decode_wave_executor(*, model, device, dtype, stats: "TimingStatsLike 
                 suffix_positions=merged.suffix_positions,
                 suffix_mask=merged.suffix_mask,
             )
-        if stats is not None:
-            elapsed = time.perf_counter() - t0
-            stats.search_gpu += elapsed
-            stats.search_eval_calls += 1
-            stats.search_eval_items += sum(len(req.nodes) for req in requests)
+        gpu_elapsed = time.perf_counter() - t0
 
+        # Legal-move projection back into PositionEvals -- also previously
+        # untimed, and the single largest Python self-time in the profile.
+        post0 = time.perf_counter()
         split_outs = _split_decode_output(out, [len(req.nodes) for req in requests])
-        return [
+        results = [
             evaluator.consume_decode_result(req, out_g)
             for (evaluator, _), req, out_g in zip(payloads, requests, split_outs)
         ]
+        post = time.perf_counter() - post0
+
+        if stats is not None:
+            stats.search_gpu += gpu_elapsed
+            stats.decode_prep += prep + post
+            stats.search_eval_calls += 1
+            stats.search_eval_items += sum(len(req.nodes) for req in requests)
+        return results
 
     return executor

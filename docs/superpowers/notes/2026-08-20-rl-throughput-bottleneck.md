@@ -314,6 +314,121 @@ scoring 0.5850 and 0.5975 on the same 200-game protocol) means even a working
 RL loop cannot currently be *evaluated* below ~60 Elo of effect. Fixing
 throughput without fixing the ruler produces faster nulls.
 
+## 6. Correctness review: does generation search like inference? (2026-08-20)
+
+Requested check before optimizing further: during rollout generation, do we
+genuinely spend the search budget, and do we pick the best move the same way
+inference does? (Training/label-consumption deliberately out of scope.)
+
+**Three drivers share one generator.** `search._halving_stepwise` is driven by
+`scripts/generate_search_rollouts.py:305` (generation),
+`scripts/eval_vs_stockfish.py:543` (inference), and
+`search.select_value_search_halving:867` (sync wrapper). Selection is therefore
+**identical by construction** — `best = max(survivors, key=score)` at
+`search.py:831` is shared code, not duplicated logic.
+
+**The budget is genuinely spent.** Measured over 48,186 real rollout rows
+(`artifacts/rollouts/nightly/unaligned_archive_20260713_20260715/session_20260715_230000.parquet`,
+all `search_budget=2048`), summing the recorded per-arm `arm_evals_spent`:
+
+| metric | value |
+| --- | --- |
+| evals spent / position | mean 2039.3, median 2048, p10 2047 |
+| budget realization | **mean 99.6%, median 100.0%** |
+| arms / position | mean 15.68, max 28 |
+
+So `max_depth=4` does **not** starve frontiers at budget 2048; the earlier
+worry that the tree runs out of nodes before the budget is spent is dead.
+
+**One real divergence: root arm selection.**
+`generate_search_rollouts.py` defaults `--gumbel-root-sampling` to **True**
+(line 459-461) and no launcher overrides it; `eval_vs_stockfish.py` passes no
+`rng` and `HalvingConfig.gumbel_root_sampling` defaults **False**. So
+generation samples root arms via Gumbel-Top-k while inference takes a
+deterministic top-m-by-prior cut. Scope and consequence, same 48,186 rows:
+
+- Live in **87.2%** of positions (the other 12.8% have fewer mapped legal
+  moves than `top_m=16`, where Gumbel-Top-k selects *every* move and the
+  permutation is irrelevant).
+- But it changes the emitted label in **0.04%** of positions: the chosen best
+  arm sits at prior rank 0 (median) / 3 (p90), and is at rank >=16 — i.e.
+  outside what a deterministic top-16 cut would have contained — only 0.04% of
+  the time.
+
+Verdict: **benign.** Generation and inference agree on the selected move in
+~99.96% of positions despite exploring different arm sets, so the Gumbel
+default buys exploration diversity in the per-arm value rows essentially for
+free. Left as-is.
+
+**Bonus signal, same query:** search overrides the policy's own top-prior arm
+in **39.9%** of positions, so the labels carry real information beyond the
+policy that generated them.
+
+**One real bug, fixed.** `search.py`'s budget-starvation fallback read:
+
+```python
+best = max(survivors, key=lambda arm: arm.score)
+if best.score == float("-inf"):
+    # Budget starvation: fall back to the highest-prior candidate.
+    best = arms[0]
+```
+
+`arms` follows `picks = order[:top_m]`. Under `_prior_order` (inference)
+`arms[0]` genuinely is the highest-prior candidate, but under Gumbel-Top-k
+(**generation's default**) `order` is a permutation, so `arms[0]` is an
+arbitrary draw and the fallback returned a random move while its comment
+claimed otherwise. Now `max(arms, key=lambda arm: arm.root_log_prior)`.
+Deterministic inference play is bit-identical (`arms[0]` is already the global
+prior argmax there), pinned by
+`tests/test_search_stepwise.py::test_budget_starvation_is_unchanged_for_deterministic_inference`;
+the Gumbel path is pinned across 24 seeds by
+`test_budget_starvation_falls_back_to_highest_prior_arm`, which failed on
+20/24 seeds before the fix. Low blast radius (only the ~0.4% of positions that
+starve, and generation drops those rows via the `backed_value is None` filter
+at `generate_search_rollouts.py:328`), but it was silently wrong.
+
+## 7. Measurement hygiene: this laptop cannot see sub-1.2x effects while the desktop is busy
+
+Two consecutive paired A/B/B/A runs of the same two CPU optimizations both
+failed their own drift control, on provably identical work
+(`waves={324} evals={428016}` in every arm):
+
+| run | total | decode_prep (contains the changes) | search_gpu (**cannot** contain them) |
+| --- | --- | --- | --- |
+| first | 1.177x | — | **1.270x** |
+| second | 1.161x | 1.183x | **1.223x** |
+
+`search_gpu` times only `model.forward_decode_grouped`; no Python-side change
+can touch it. Its moving 1.22-1.27x is proof of contamination, and in the
+second run the bucket containing the changes moved **less** than the bucket
+that cannot — the signature of a uniform machine-wide slowdown, not a code
+win. Raw sequence 81.8 -> 71.5 -> 83.4 -> 98.1 s shows a *superlinear* ramp;
+A/B/B/A cancels drift only when it is **linear** (A at positions 1,4 and B at
+2,3 share the same mean position, 2.5).
+
+Cause, confirmed by the user: a **YouTube live stream in Firefox** running in
+the background — already visible in the profile as `_ssl._SSLSocket.read`
+13.45 s (11% of profiled time), plus `nvidia-smi` showing 81% GPU utilization
+with **zero compute processes** (pure compositing) and firefox + four Isolated
+Web Content processes at ~49% CPU.
+
+Rules adopted:
+
+- **Discard the first run.** A cold process pays CUDA context creation and
+  kernel autotune: 66.5 s vs 49.3 s for the *identical* arm. A/B/B/A cannot
+  cancel a one-off spike. `scripts/bench_python_opts_paired.sh` now runs a
+  throwaway arm first.
+- **Always report `search_gpu` as the drift control** and refuse to read
+  `total` unless it is ~1.00x.
+- **No browser/stream/GPU-monitor during timing runs.** Note `gnome-shell`
+  alone holds ~82% SM on this box even when idle (`nvidia-smi pmon`), so it is
+  a constant floor, not a variable — tolerable, unlike a stream.
+- Sub-1.2x CPU wins are **not measurable end-to-end here**; size them with an
+  isolated interleaved microbenchmark and combine with the cProfile share.
+
+Strategic consequence: chasing individual ~1.05x Python wins is unfalsifiable
+on this rig. Prefer structural changes large enough to clear the noise floor.
+
 ## Provenance
 
 - `artifacts/budget_sweep/summary.txt` + per-budget logs (30 games each).

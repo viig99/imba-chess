@@ -299,7 +299,8 @@ def _cozy_move_id_and_uci(
     That pair built a fresh Python string for every legal move of every
     evaluated node (10.5M allocations per 20-game run) plus up to two FFI board
     queries, then hashed the string; here a hit is one dict lookup on the Move
-    itself. Measured 317 -> 76 ns/move (4.2x) on real positions.
+    itself. Measured 311 -> 154 ns/move (2.02x, fully separated distributions)
+    by scripts/bench_move_id_micro.py on real positions.
 
     Castling is never memoized -- see _CASTLE_RAW_TO_UCI.
     """

@@ -830,8 +830,13 @@ def _halving_stepwise(
 
     best = max(survivors, key=lambda arm: arm.score)
     if best.score == float("-inf"):
-        # Budget starvation: fall back to the highest-prior candidate.
-        best = arms[0]
+        # Budget starvation: fall back to the highest-prior candidate. Must be
+        # computed, not assumed to be arms[0]: `arms` follows `picks`, which is
+        # a Gumbel-Top-k permutation when config.gumbel_root_sampling is set
+        # (the default for rollout generation), so arms[0] is then an arbitrary
+        # draw. Under _prior_order this is arms[0] anyway, so deterministic
+        # inference play is bit-identical.
+        best = max(arms, key=lambda arm: arm.root_log_prior)
 
     rows = [
         {

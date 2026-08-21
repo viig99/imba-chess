@@ -62,6 +62,38 @@ def _cc_file_index(file_obj) -> int:
     return _CC_FILES[file_obj]
 
 
+_COZY_ENCODE_CONSTS: tuple | None = None
+
+
+def _cozy_encode_consts() -> tuple:
+    """(White, Black, ((white_id, black_id, Piece), ...)) resolved once.
+
+    `encode_cozy` runs once per evaluated search node -- 428k times in a
+    20-game rollout -- so its original per-call `import cozy_chess as cc` plus
+    ~14 enum attribute lookups were pure repeated overhead.
+
+    cozy stays a LAZY import on purpose: this module is on the training data
+    path, which must not require cozy-chess to be installed.
+    """
+    global _COZY_ENCODE_CONSTS
+    if _COZY_ENCODE_CONSTS is None:
+        import cozy_chess as cc
+
+        _COZY_ENCODE_CONSTS = (
+            cc.Color.White,
+            cc.Color.Black,
+            (
+                (1, 7, cc.Piece.Pawn),
+                (2, 8, cc.Piece.Knight),
+                (3, 9, cc.Piece.Bishop),
+                (4, 10, cc.Piece.Rook),
+                (5, 11, cc.Piece.Queen),
+                (6, 12, cc.Piece.King),
+            ),
+        )
+    return _COZY_ENCODE_CONSTS
+
+
 class BoardStateEncoder:
     def __init__(self, config: BoardTokenConfig | None = None) -> None:
         self.config = config or BoardTokenConfig()
@@ -130,26 +162,29 @@ class BoardStateEncoder:
         return file_idx + 1 if candidates else 0  # xfen: pseudo-legal capturer exists
 
     def encode_cozy(self, board) -> BoardState:
-        import cozy_chess as cc
-
         cfg = self.config
+        white_color, black_color, piece_table = _cozy_encode_consts()
         ids = [0] * 64
-        white = int(board.colors(cc.Color.White))
-        for offset, piece in (
-            (0, cc.Piece.Pawn),
-            (1, cc.Piece.Knight),
-            (2, cc.Piece.Bishop),
-            (3, cc.Piece.Rook),
-            (4, cc.Piece.Queen),
-            (5, cc.Piece.King),
-        ):
+        white = int(board.colors(white_color))
+        not_white = ~white
+        for white_id, black_id, piece in piece_table:
             bb = int(board.pieces(piece))
-            for square in chess.scan_forward(bb & white):
-                ids[square] = offset + 1
-            for square in chess.scan_forward(bb & ~white):
-                ids[square] = offset + 7
-        rights_white = board.castle_rights(cc.Color.White)
-        rights_black = board.castle_rights(cc.Color.Black)
+            # chess.scan_forward inlined: it is a generator, so the original
+            # cost 12 generator objects plus ~32 __next__ dispatches per call,
+            # and this runs once per evaluated search node (428k per 20-game
+            # rollout). Same bit-twiddle, no generator machinery.
+            w = bb & white
+            while w:
+                lsb = w & -w
+                ids[lsb.bit_length() - 1] = white_id
+                w ^= lsb
+            b = bb & not_white
+            while b:
+                lsb = b & -b
+                ids[lsb.bit_length() - 1] = black_id
+                b ^= lsb
+        rights_white = board.castle_rights(white_color)
+        rights_black = board.castle_rights(black_color)
         castle_id = (
             (1 if rights_white.short is not None else 0)
             | (2 if rights_white.long is not None else 0)
@@ -158,7 +193,7 @@ class BoardStateEncoder:
         )
         return BoardState(
             piece_ids=ids,
-            turn_id=int(board.side_to_move() == cc.Color.Black),
+            turn_id=int(board.side_to_move() == black_color),
             castle_id=castle_id,
             ep_file_id=self._ep_file_id_cozy(board),
             halfmove_bucket_id=_bucket(board.halfmove_clock, cfg.halfmove_max, cfg.halfmove_bucket_size),
