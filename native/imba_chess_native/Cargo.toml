@@ -1,0 +1,13 @@
+[package]
+name = "imba_chess_native"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+
+[lib]
+name = "imba_chess_native"
+crate-type = ["cdylib"]
+
+[dependencies]
+cozy-chess = "0.3.4"
+pyo3 = { version = "0.23", features = ["extension-module", "generate-import-lib"] }

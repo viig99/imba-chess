@@ -100,10 +100,15 @@ def _move_fields(move) -> tuple[int, int, str | None, str]:
     promotion = None if move.promotion is None else str(move.promotion)
     return int(move.from_square), int(move.to_square), promotion, str(move)
 
+_RANDOM_BOARDS = _random_boards(200, seed=731)
+_RANDOM_POSITIONS = _RANDOM_BOARDS[
+    :: max(1, len(_RANDOM_BOARDS) // 200)
+][:200]
+
 
 @pytest.mark.parametrize(
     "board",
-    [chess.Board(fen) for fen in EDGE_FENS] + _random_boards(200, seed=731),
+    [chess.Board(fen) for fen in EDGE_FENS] + _RANDOM_POSITIONS,
 )
 def test_native_binding_matches_pinned_binding(board: chess.Board) -> None:
     old = old_cc.Board.from_fen(board.fen())
@@ -454,9 +459,15 @@ Construct old and native boards from the same FEN. Build the projector from move
 Use:
 
 ```python
+_PROJECTOR_RANDOM_BOARDS = _random_boards(200, seed=911)
+_PROJECTOR_RANDOM_POSITIONS = _PROJECTOR_RANDOM_BOARDS[
+    :: max(1, len(_PROJECTOR_RANDOM_BOARDS) // 200)
+][:200]
+
+
 @pytest.mark.parametrize(
     "board",
-    [chess.Board(fen) for fen in EDGE_FENS] + _random_boards(200, seed=911),
+    [chess.Board(fen) for fen in EDGE_FENS] + _PROJECTOR_RANDOM_POSITIONS,
 )
 def test_native_projector_matches_python_oracle(board):
     vocab = MoveVocab.build_static()

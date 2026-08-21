@@ -15,6 +15,7 @@ dependencies = [
   "torch-optimi",
   "tqdm",
   "cozy-chess-py==0.1.1",
+  "imba-chess-native",
 ]
 
 [project.optional-dependencies]
@@ -53,3 +54,4 @@ torch = [
   { index = "pytorch-cu130", marker = "sys_platform == 'linux'" },
   { index = "pytorch-cpu", marker = "sys_platform == 'darwin'" },
 ]
+imba-chess-native = { path = "native/imba_chess_native" }
