@@ -29,7 +29,7 @@ from imba_chess.eval import cozy_bridge
 
 def encode_cozy_old(self, board):
     """Verbatim pre-optimization body (git HEAD:src/imba_chess/data/board_state.py)."""
-    import cozy_chess as cc
+    import imba_chess_native as cc
 
     from imba_chess.data.board_state import BoardState, _bucket
 

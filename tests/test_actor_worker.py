@@ -41,7 +41,6 @@ from imba_chess.eval.actor_protocol import (
 from imba_chess.eval.actor_worker import (
     _WorkerSearchNode,
     _build_engine,
-    _legal_vocab_projection,
     _log_softmax_f32,
     run_eval_worker,
 )
@@ -462,12 +461,13 @@ def test_sigterm_while_blocked_in_engine_play_still_quits_engine(tmp_path: Path)
 # legal-move projection (movegen + UCI-sort + vocab lookup) and the
 # log-softmax over the server's raw logits both moved from the server into
 # this module. These two tests pin their correctness independently of the
-# end-to-end worker/fake-server tests above: `_legal_vocab_projection` must
-# match `position_evaluator._project_legal_logits_cozy`'s mapped+sorted
-# output exactly (over many real random-playout positions, not just the
-# opening), and `_log_softmax_f32` must match `torch.log_softmax`'s float32
-# result to the fp32-exactness suite's 1e-6 bar. Both tests import torch/
-# position_evaluator locally (this module itself must stay torch-free at
+# end-to-end worker/fake-server tests above: the worker's projection must
+# match an INDEPENDENT Python oracle exactly (over many real random-playout
+# positions, not just the opening), and `_log_softmax_f32` must match
+# `torch.log_softmax`'s float32 result to the fp32-exactness suite's 1e-6
+# bar. Comparing against `position_evaluator._project_legal_logits_cozy`
+# would prove nothing now that both route through the same
+# `cozy_bridge.project_legal_moves`. Both tests import torch/
 # import time -- test_actor_protocol_and_worker_stay_torch_free above is the
 # permanent regression test for that -- but nothing prevents a TEST
 # function, as opposed to the module under test, from importing torch for
@@ -475,14 +475,12 @@ def test_sigterm_while_blocked_in_engine_play_still_quits_engine(tmp_path: Path)
 # ---------------------------------------------------------------------------
 
 
-def test_legal_vocab_projection_matches_project_legal_logits_cozy_over_random_playouts() -> None:
+def test_worker_projection_matches_an_independent_oracle_over_random_playouts() -> None:
     import random
-
-    import cozy_chess as cc
 
     from imba_chess.data.move_vocab import MoveVocab
     from imba_chess.eval import cozy_bridge
-    from imba_chess.eval.position_evaluator import _project_legal_logits_cozy
+    from tests.test_native_projection import _python_project
 
     move_vocab = MoveVocab.build_static()
     rng = random.Random(0)
@@ -498,25 +496,19 @@ def test_legal_vocab_projection_matches_project_legal_logits_cozy_over_random_pl
             board.push(rng.choice(legal))
             cozy_board = cozy_bridge.board_to_cozy(board)
 
-            vocab_ids, moves, ucis = _legal_vocab_projection(cozy_board, move_vocab)
-
-            # Reference: the pre-thin-down server-side projection, driven off
-            # a dummy logits tensor (only the move-mapping/order matters
-            # here, not the values) -- fp32-exactness of the actual gathered
-            # VALUES is covered separately by tests/test_actor_server.py.
-            import torch
-
-            dummy_logits = torch.arange(len(move_vocab), dtype=torch.float32)
-            _legal_logits, ref_moves, ref_ucis, _total, _mapped = (
-                _project_legal_logits_cozy(
-                    logits=dummy_logits, cozy_board=cozy_board, move_vocab=move_vocab
-                )
+            vocab_ids, moves, ucis, total = cozy_bridge.project_legal_moves(
+                cozy_board, move_vocab
             )
+            ref_ids, ref_moves, ref_ucis, ref_total = _python_project(
+                cozy_board, move_vocab
+            )
+
             assert ucis == ref_ucis
+            assert vocab_ids == ref_ids
+            assert total == ref_total
             assert [str(m) for m in moves] == [str(m) for m in ref_moves]
-            assert vocab_ids == [move_vocab.token_to_id[u] for u in ucis]
             positions_checked += 1
-    assert positions_checked > 100
+    assert positions_checked > 200, f"weak coverage: {positions_checked}"
 
 
 # ---------------------------------------------------------------------------

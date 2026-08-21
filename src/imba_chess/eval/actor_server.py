@@ -23,7 +23,7 @@ per-ROW Python bottlenecks that this rewrite removes:
      build_decode_request` (58s cum combined) -- ELIMINATED. The wire
      `BoardState` fields ARE the encoded fields; `_tensorize_wave_rows`
      feeds them directly into the decode token batch. No board is ever
-     reconstructed server-side anymore -- `cozy_chess` is not even
+     reconstructed server-side anymore -- `imba_chess_native` is not even
      imported by this module.
   3. Per-node KV-chain `torch.cat`s inside `consume_decode_result`
      (4.2M calls, 19s self) -- ELIMINATED. `_KVArena` preallocates one

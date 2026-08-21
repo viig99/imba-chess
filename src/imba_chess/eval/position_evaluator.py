@@ -4,10 +4,9 @@ import contextlib
 from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any
-from weakref import WeakKeyDictionary
 
 import chess
-import cozy_chess as cc
+import imba_chess_native as cc
 import torch
 
 
@@ -18,6 +17,7 @@ from imba_chess.data.event_builder import (
     TARGET_IGNORE_INDEX,
 )
 from imba_chess.data.move_vocab import MoveVocab
+from imba_chess.eval import cozy_bridge
 from imba_chess.eval.search import PositionEval
 from imba_chess.model import (
     HSTUChessModel,
@@ -319,120 +319,24 @@ def _project_legal_logits(
     return legal_logits, legal_moves_with_ids, total_legal, mapped_legal
 
 
-# cozy encodes castling as king-takes-own-rook, so these four raw move strings
-# are ambiguous: `e1h1` is O-O when a king stands on e1, but an ordinary rook
-# slide otherwise -- the SAME (from, to, promotion) Move with two different
-# correct UCIs. They are therefore the only moves whose mapping depends on the
-# board, and the only ones _cozy_move_id_and_uci must refuse to memoize.
-_CASTLE_RAW_TO_UCI = {
-    "e1h1": "e1g1",
-    "e1a1": "e1c1",
-    "e8h8": "e8g8",
-    "e8a8": "e8c8",
-}
-
-# Per-vocab memo of cozy Move -> (vocab id | None, standard UCI). Keyed weakly
-# on the vocab so two vocabs never share entries and the memo dies with its
-# owner. cozy Move is hashable with value semantics (verified in
-# tests/test_cozy_move_id_cache.py), which is what makes this sound.
-_MOVE_ID_MEMO: "WeakKeyDictionary[MoveVocab, dict[Any, tuple[int | None, str]]]" = (
-    WeakKeyDictionary()
-)
-
-
-def _cozy_move_id_and_uci(
-    cozy_board: "cc.Board", move: "cc.Move", move_vocab: MoveVocab
-) -> tuple[int | None, str]:
-    """(vocab id or None, standard UCI) for a cozy move, memoized per vocab.
-
-    Replaces `cozy_move_to_uci(...)` + `token_to_id.get(...)` on the hot path.
-    That pair built a fresh Python string for every legal move of every
-    evaluated node (10.5M allocations per 20-game run) plus up to two FFI board
-    queries, then hashed the string; here a hit is one dict lookup on the Move
-    itself. Measured 311 -> 154 ns/move (2.02x, fully separated distributions)
-    by scripts/bench_move_id_micro.py on real positions.
-
-    Castling is never memoized -- see _CASTLE_RAW_TO_UCI.
-    """
-    memo = _MOVE_ID_MEMO.get(move_vocab)
-    if memo is None:
-        memo = {}
-        _MOVE_ID_MEMO[move_vocab] = memo
-    hit = memo.get(move)
-    if hit is not None:
-        return hit
-
-    raw = str(move)
-    if raw in _CASTLE_RAW_TO_UCI:
-        if cozy_board.piece_on(move.from_square) == cc.Piece.King:
-            raw = _CASTLE_RAW_TO_UCI[raw]
-        # Board-dependent: deliberately not cached.
-        return (move_vocab.token_to_id.get(raw), raw)
-
-    result = (move_vocab.token_to_id.get(raw), raw)
-    memo[move] = result
-    return result
-
-
-def _legal_moves_ids_ucis(
-    cozy_board: "cc.Board", move_vocab: MoveVocab
-) -> tuple[list[int], list["cc.Move"], list[str], int]:
-    """(vocab ids, moves, UCIs) in canonical UCI order, plus total legal count.
-
-    The single source of the vocab-mapping + UCI-sort discipline for the cozy
-    path: `_project_legal_logits_cozy` wraps this with the per-node tensor
-    gather, while `CachedPositionEvaluator.consume_decode_result` calls it
-    directly and gathers a whole wave at once. Keeping one implementation is
-    what lets tests/test_actor_worker.py keep using
-    `_project_legal_logits_cozy` as the oracle for the eval path's independent
-    twin.
-
-    Single pass on purpose: this runs once per evaluated search node, so the
-    old build-all-UCIs-then-filter shape allocated a throwaway list per node
-    on top of a string per move. Returns empty lists when nothing maps; callers
-    decide whether that is an error.
-    """
-    legal_moves = list(cozy_board.generate_moves())
-    ids: list[int] = []
-    moves: list[cc.Move] = []
-    ucis: list[str] = []
-    for move in legal_moves:
-        move_id, uci = _cozy_move_id_and_uci(cozy_board, move, move_vocab)
-        if move_id is not None:
-            ids.append(int(move_id))
-            moves.append(move)
-            ucis.append(uci)
-    if not ids:
-        return [], [], [], len(legal_moves)
-    # Canonical order: sort by UCI string so python-chess and cozy movegen
-    # produce identical move lists (Stage 3 Step 0). Sort ids/moves/ucis
-    # jointly so the gathered logits stay aligned to both moves and ucis.
-    order = sorted(range(len(moves)), key=lambda i: ucis[i])
-    return (
-        [ids[i] for i in order],
-        [moves[i] for i in order],
-        [ucis[i] for i in order],
-        len(legal_moves),
-    )
-
-
 def _project_legal_logits_cozy(
     *,
     logits: torch.Tensor,
     cozy_board: cc.Board,
     move_vocab: MoveVocab,
 ) -> tuple[torch.Tensor, list[cc.Move], list[str], int, int]:
-    """Cozy-native twin of `_project_legal_logits`: same vocab-mapping and
-    UCI-sort discipline (shared via `_legal_moves_ids_ucis`), but movegen goes
-    through cozy-chess `generate_moves` and the per-move UCI/id pair comes from
-    `_cozy_move_id_and_uci` (memoized; castling-aware). `legal_ucis` is
+    """Native twin of `_project_legal_logits`: the same vocab-mapping and
+    UCI-sort discipline, delegated whole to `cozy_bridge.project_legal_moves`,
+    with only the per-node tensor gather left here. `legal_ucis` is
     index-aligned with the returned `legal_moves`.
 
     Still the reference implementation the eval path is cross-checked against;
-    the rollout wave path calls `_legal_moves_ids_ucis` plus a batched gather
+    the rollout wave path calls the bridge directly plus a batched gather
     instead, to avoid one torch dispatch per node.
     """
-    ids, moves, ucis, total_legal = _legal_moves_ids_ucis(cozy_board, move_vocab)
+    ids, moves, ucis, total_legal = cozy_bridge.project_legal_moves(
+        cozy_board, move_vocab
+    )
     if not ids:
         raise RuntimeError(
             "No legal moves mapped to vocab ids for current board "
@@ -703,7 +607,7 @@ class CachedPositionEvaluator:
         # Arena operations only queue CUDA work. Move generation and vocab
         # mapping overlap the first device-to-host synchronization.
         per_node = [
-            _legal_moves_ids_ucis(cozy_board, self._move_vocab)
+            cozy_bridge.project_legal_moves(cozy_board, self._move_vocab)
             for cozy_board in request.boards
         ]
 

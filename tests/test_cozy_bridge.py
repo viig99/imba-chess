@@ -2,7 +2,7 @@ import copy
 import random
 
 import chess
-import cozy_chess as cc
+import imba_chess_native as cc
 import pytest
 
 from imba_chess.eval.cozy_bridge import (

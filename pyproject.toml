@@ -14,7 +14,6 @@ dependencies = [
   "tensorboard",
   "torch-optimi",
   "tqdm",
-  "cozy-chess-py==0.1.1",
   "imba-chess-native",
 ]
 

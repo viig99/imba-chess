@@ -58,7 +58,7 @@ impl BoardBuilder {
     }
 
     fn castle_rights(&self, color: &Color) -> CastleRights {
-        CastleRights(self.0.castle_rights(color.0).clone())
+        CastleRights(*self.0.castle_rights(color.0))
     }
 
     #[pyo3(signature = (color, short=None, long=None))]

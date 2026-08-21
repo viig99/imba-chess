@@ -20,7 +20,7 @@ from dataclasses import dataclass, field
 from typing import Any, Callable, Generator, NamedTuple, Optional, Protocol
 
 import chess
-import cozy_chess as cc
+import imba_chess_native as cc
 
 from imba_chess.eval import cozy_bridge
 

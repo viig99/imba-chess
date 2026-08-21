@@ -9,6 +9,10 @@ use crate::enums::{Piece, Square};
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
 pub struct ChessMove(pub cozy_chess::Move);
 
+// `from_square`/`to_square` are Python attribute names fixed by the wrapper
+// API this binding reproduces, not Rust constructors/converters -- renaming
+// them to satisfy wrong_self_convention would break every caller.
+#[allow(clippy::wrong_self_convention)]
 #[pymethods]
 impl ChessMove {
     #[new]

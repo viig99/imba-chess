@@ -51,7 +51,7 @@ _CC_FILES = None  # built lazily: {cc.File.X: 0-based index}
 def _cc_file_index(file_obj) -> int:
     global _CC_FILES
     if _CC_FILES is None:
-        import cozy_chess as cc
+        import imba_chess_native as cc
 
         _CC_FILES = {
             f: i
@@ -69,7 +69,7 @@ def _cozy_encode_consts() -> tuple:
     """(White, Black, ((white_id, black_id, Piece), ...)) resolved once.
 
     `encode_cozy` runs once per evaluated search node -- 428k times in a
-    20-game rollout -- so its original per-call `import cozy_chess as cc` plus
+    20-game rollout -- so its original per-call `import imba_chess_native as cc` plus
     ~14 enum attribute lookups were pure repeated overhead.
 
     cozy stays a LAZY import on purpose: this module is on the training data
@@ -77,7 +77,7 @@ def _cozy_encode_consts() -> tuple:
     """
     global _COZY_ENCODE_CONSTS
     if _COZY_ENCODE_CONSTS is None:
-        import cozy_chess as cc
+        import imba_chess_native as cc
 
         _COZY_ENCODE_CONSTS = (
             cc.Color.White,

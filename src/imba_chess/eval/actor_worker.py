@@ -34,7 +34,7 @@ from dataclasses import asdict, dataclass
 
 import chess
 import chess.engine
-import cozy_chess as cc
+import imba_chess_native as cc
 import numpy as np
 
 from imba_chess.data.board_state import BoardStateEncoder
@@ -227,43 +227,6 @@ class _WorkerSearchNode:
         self.move_vocab_id = move_vocab_id
 
 
-def _legal_vocab_projection(
-    cozy_board: "cc.Board", move_vocab: MoveVocab
-) -> tuple[list[int], list["cc.Move"], list[str]]:
-    """Torch-free worker-side mirror of
-    `position_evaluator._project_legal_logits_cozy`'s move-mapping + UCI-sort
-    semantics (profile-driven thin-down, see
-    `docs/superpowers/sdd/thin-report.md`): the worker holds the real cozy
-    board for every search-tree node (and can cheaply derive one for the
-    root from its own live `chess.Board`), so it -- not the server -- runs
-    movegen, derives each move's castling-normalized UCI
-    (`cozy_bridge.cozy_move_to_uci`), keeps only vocab-mapped moves, and
-    sorts the (uci, vocab_id, move) triples jointly by UCI. This is the
-    exact same "drop unmapped, then UCI-sort" discipline
-    `_project_legal_logits_cozy` applies, just computed before the request
-    is sent instead of after a round trip, and never touching a tensor.
-
-    Unlike `_project_legal_logits_cozy`, this never raises on an empty
-    mapped set -- it mirrors `CachedPositionEvaluator.consume_decode_result`'s
-    own `except RuntimeError: legal_moves, legal_ucis, log_priors = [], [], []`
-    for decode-wave rows (empty result, no crash); `_select_model_move` below
-    keeps its own explicit fail-fast raise for the root case, exactly as
-    before.
-    """
-    legal_moves_all = list(cozy_board.generate_moves())
-    ucis_all = [cozy_bridge.cozy_move_to_uci(cozy_board, move) for move in legal_moves_all]
-    triples: list[tuple[str, int, "cc.Move"]] = []
-    for move, uci in zip(legal_moves_all, ucis_all):
-        vocab_id = move_vocab.token_to_id.get(uci)
-        if vocab_id is not None:
-            triples.append((uci, int(vocab_id), move))
-    triples.sort(key=lambda t: t[0])
-    legal_ucis = [t[0] for t in triples]
-    legal_vocab_ids = [t[1] for t in triples]
-    legal_moves = [t[2] for t in triples]
-    return legal_vocab_ids, legal_moves, legal_ucis
-
-
 def _log_softmax_f32(raw_logits: list[float]) -> list[float]:
     """Worker-side pure-Python (numpy) twin of
     `torch.log_softmax(tensor.float(), dim=0)` over the ~30 raw legal-move
@@ -307,7 +270,8 @@ class _WaveEvaluator:
 
     Profile-driven thin-down (`docs/superpowers/sdd/thin-report.md`):
     `evaluate()` now computes each row's legal-move projection ITSELF
-    (`_legal_vocab_projection`, off the real cozy board it already holds)
+    (`cozy_bridge.project_legal_moves`, off the real native board it
+    already holds)
     before sending the `WaveRequest`, and stashes the resulting
     `(legal_moves, legal_ucis)` in `self._pending_legal`, keyed by node_id --
     the server never sees a board or a move string, only the vocab ids and,
@@ -357,9 +321,12 @@ class _WaveEvaluator:
         rows: list[WaveRow] = []
         node_ids: list[int] = []
         for handle, cozy_board in batch:
-            legal_vocab_ids, legal_moves, legal_ucis = _legal_vocab_projection(
-                cozy_board, self._move_vocab
-            )
+            (
+                legal_vocab_ids,
+                legal_moves,
+                legal_ucis,
+                _total_legal,
+            ) = cozy_bridge.project_legal_moves(cozy_board, self._move_vocab)
             self._pending_legal[handle.node_id] = (legal_moves, legal_ucis)
             board_state = self._board_state_encoder.encode_cozy(cozy_board)
             rows.append(
@@ -582,16 +549,19 @@ def _select_model_move(
     # NOTE: legal_moves here must stay python-chess chess.Move objects (the
     # root's `board` is a chess.Board, pushed via board.push(move) by
     # _play_one_game, and search.select_* at the root level is called with
-    # board=<chess.Board> throughout) -- _legal_vocab_projection's own
+    # board=<chess.Board> throughout) -- cozy_bridge.project_legal_moves' own
     # `legal_moves` return is cozy cc.Move (used at the WAVE/decode-tree
     # level below, Stage 3's cozy-only search tree), so it is deliberately
     # discarded here in favor of rebuilding chess.Move from the (still
     # UCI-sorted) uci strings, exactly as the pre-thin-down code built them
     # from the server's response.legal_ucis.
     cozy_board = cozy_bridge.board_to_cozy(board)
-    legal_vocab_ids, _cozy_legal_moves, legal_ucis = _legal_vocab_projection(
-        cozy_board, move_vocab
-    )
+    (
+        legal_vocab_ids,
+        _cozy_legal_moves,
+        legal_ucis,
+        _total_legal,
+    ) = cozy_bridge.project_legal_moves(cozy_board, move_vocab)
     legal_moves = [chess.Move.from_uci(uci) for uci in legal_ucis]
 
     # Incremental-root-KV optimization (docs/superpowers/sdd/increm-report.md):

@@ -34,6 +34,15 @@ if os.environ["IMBA_BENCH_ARM"] == "A":
     from imba_chess.data.board_state import BoardState, _bucket
     from imba_chess.eval import cozy_bridge, position_evaluator as pe
 
+    if not hasattr(pe, "_cozy_move_id_and_uci"):
+        raise SystemExit(
+            "Arm A can no longer be reconstructed: _cozy_move_id_and_uci was "
+            "removed in the native projection cutover, so only the encode_cozy "
+            "half of the A arm can be restored. Reporting that as if it covered "
+            "both changes would be a silently wrong benchmark -- fail instead. "
+            "For the projection speedup, use scripts/bench_native_move_projector.py."
+        )
+
     def _uncached_move_id(cozy_board, move, move_vocab):
         uci = cozy_bridge.cozy_move_to_uci(cozy_board, move)
         return (move_vocab.token_to_id.get(uci), uci)
@@ -41,7 +50,7 @@ if os.environ["IMBA_BENCH_ARM"] == "A":
     pe._cozy_move_id_and_uci = _uncached_move_id
 
     def _old_encode_cozy(self, board):
-        import cozy_chess as cc
+        import imba_chess_native as cc
 
         cfg = self.config
         ids = [0] * 64

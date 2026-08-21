@@ -1,9 +1,10 @@
-"""python-chess <-> cozy-chess interop for search hot paths.
+"""python-chess <-> native-chess interop for search hot paths.
 
-cozy-chess (Rust, via cozy-chess-py) is an internal acceleration detail
-shared by search.py, position_evaluator.py, and board_state.py; python-chess
-remains the interface currency and the correctness oracle
-(tests/test_cozy_differential.py). Convention differences owned here:
+`imba_chess_native` (this repo's owned Rust binding over cozy-chess) is an
+internal acceleration detail shared by search.py, position_evaluator.py, and
+board_state.py; python-chess remains the interface currency and the
+correctness oracle (tests/test_cozy_differential.py). Convention differences
+owned here:
 
 - Castling: python-chess UCI moves the king two files (e1g1); cozy-chess
   represents castling as king-takes-own-rook (e1h1).
@@ -15,9 +16,12 @@ from __future__ import annotations
 
 import copy
 from typing import Sequence
+from weakref import WeakKeyDictionary
 
 import chess
-import cozy_chess as cc
+import imba_chess_native as cc
+
+from imba_chess.data.move_vocab import MoveVocab
 
 _FILE_CHARS = "abcdefgh"
 
@@ -306,3 +310,50 @@ def terminal_value_native(
         if sum(1 for h in target if h == child_hash) >= 2:
             return 0.0
     return None
+
+
+# ── Legal-move projection ───────────────────────────────────────────────────
+
+# One native projector per vocabulary, keyed weakly so the cache dies with its
+# owner instead of pinning every vocab ever projected -- the same discipline
+# the Python move memo this replaces used, and for the same reason. Building a
+# projector walks the whole ~1,970-entry label space, so it must happen once
+# per vocab, not once per evaluated node.
+_PROJECTORS: "WeakKeyDictionary[MoveVocab, cc.MoveProjector]" = WeakKeyDictionary()
+
+
+def project_legal_moves(
+    cozy_board: cc.Board, move_vocab: MoveVocab
+) -> tuple[list[int], list[cc.Move], list[str], int]:
+    """(vocab ids, moves, UCIs) in canonical UCI order, plus total legal count.
+
+    The single production projection path: search wave consumption, the
+    per-node logit gather, and the actor worker all route here, so the
+    vocab-mapping and UCI-sort discipline has exactly one implementation.
+    Everything below the call is Rust -- move generation, castling
+    normalization, vocabulary lookup, and the sort happen in one FFI crossing
+    (2.90 vs 11.63 us/node, scripts/bench_native_move_projector.py).
+
+    Moves come back in raw generated form and stay playable; only the
+    vocabulary sees a castle's normalized king-destination UCI. Unmapped moves
+    are dropped from the three aligned lists but still counted in the total.
+    Callers decide whether an empty result is an error.
+    """
+    projector = _PROJECTORS.get(move_vocab)
+    if projector is None:
+        # Special tokens are not UCI and would be rejected by the projector's
+        # own parse; filter them here rather than teaching Rust about them.
+        special = {
+            move_vocab.config.pad_token,
+            move_vocab.config.start_token,
+            move_vocab.config.unk_token,
+        }
+        projector = cc.MoveProjector(
+            {
+                token: token_id
+                for token, token_id in move_vocab.token_to_id.items()
+                if token not in special
+            }
+        )
+        _PROJECTORS[move_vocab] = projector
+    return projector.project(cozy_board)
