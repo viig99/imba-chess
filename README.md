@@ -244,4 +244,5 @@ uv run --python .venv/bin/python --with pytest pytest -q
 - `FEN_TO_BOARD_STATE.md` for board-state encoding details.
 - `VALUE_HEAD_OPTIONS.md` for value-head design notes.
 - `docs/superpowers/notes/2026-07-06-eval-log-archive.md` for the full eval diaries, per-color splits, and superseded usage examples.
+- `docs/GENERATION_PERF_HANDOFF.md` for rollout-generation throughput: methodology, measured bottlenecks, measurement pitfalls, correctness gates, and ranked next steps toward a fused rollout+training loop.
 - `docs/superpowers/notes/2026-07-12-value-tuning-and-exit-phase1a-review.md` for the `value_weight_alpha` tuning methodology, why search-backed value distillation (ExIt Phase 1a) hasn't paid off yet (with literature review), the visit-adaptive search-lambda experiment and its revert, and the staged plan going forward.

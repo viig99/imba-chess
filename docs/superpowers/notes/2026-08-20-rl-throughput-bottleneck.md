@@ -479,6 +479,11 @@ output. No headroom.
 
 ### What is actually left, ranked
 
+> **Superseded by section 9.** The ranking below rests on a CPU 67.6% / GPU
+> 32.4% split derived from `perf_counter` buckets that were measuring CUDA
+> *enqueue* time. `torch.profiler` puts real device work at 17.1%, so the
+> pipelining ceiling is ~1.21x, not ~1.48x.
+
 1. **CPU/GPU overlap (pipelining) — the biggest remaining lever.** CPU is 67.6%
    and GPU 32.4%, strictly alternating: `d2h` at 21.3% of `decode_project` is
    the first CUDA sync after the forward launch, i.e. 5.3s of GPU wait booked as
@@ -493,6 +498,86 @@ output. No headroom.
    bucket** — ceiling 1.27x for the tree half alone (not the 1.86x previously
    assumed, which was an artifact of the untimed-bucket bug).
 3. `movegen`/`sortlists`/`kv_stack` — 7.2 us/node combined. Not worth it.
+
+
+## 9. torch.profiler: the buckets were measuring enqueue time (2026-08-21)
+
+Every timing bucket in this project is a bare `time.perf_counter()` delta with
+no `torch.cuda.synchronize()`. Per the PyTorch benchmarking guide that measures
+how long the CPU took to **enqueue** CUDA work, not how long the GPU took to
+run it. That single fact explains every attribution puzzle in sections 7-8:
+`search_gpu` wraps only `forward_decode_grouped`, so it saw launch time;
+the real device time surfaced at whatever happened to sync next, which is why
+`d2h` looked like 12.49 us/node of "CPU" work and why hoisting work above that
+sync moved 6.7 us/node out of `d2h` and straight into `kv_path`.
+
+`scripts/profile_torch_waves.py` measures it properly (`torch.profiler`,
+CPU+CUDA activities, `schedule(skip_first=24, warmup=2, active=12)` so CUDA
+context init and early autotune waves are not read as workload). Over 12
+decode waves:
+
+| | |
+| --- | --- |
+| Self CPU time total | **2.467 s** |
+| Self CUDA time total | **422.6 ms** |
+| **GPU busy** | **17.1%** |
+
+So this loop is far more CPU-bound than the buckets implied (they said GPU
+32.4%). Two plans die on this number:
+
+- **CPU/GPU pipelining ceiling is ~1.21x, not ~1.48x.** Total device work is
+  422 ms against 2,467 ms of host work; perfectly hiding *all* of it saves at
+  most that 422 ms. Not worth a two-group scheduler rewrite.
+- **TF32 (`set_float32_matmul_precision('high')`) is pointless here.**
+  `aten::mm` is 61 ms of 422 ms GPU = **2.5% of wall**. There is no version of
+  that trade that justifies risking label precision, which is why fp32 was
+  chosen in the first place.
+
+The confirmed top cost is thousands of tiny tensor ops per wave -- 36,671 over
+12 waves, ~3,056 per wave, essentially all KV-cache plumbing:
+
+| op | calls | CPU total | share |
+| --- | --- | --- | --- |
+| `aten::copy_` | 10,373 | 360.7 ms | 14.6% |
+| `aten::to` | 3,889 | 294.2 ms | 11.9% |
+| `aten::pad` / `constant_pad_nd` | 9,242 | 178.9 ms | 7.3% |
+| `aten::cat` | 17,056 | 151.2 ms | 6.1% (and 23.4% of all GPU time) |
+
+### Rejected after measuring (`scripts/bench_wave_suffixes.py`)
+
+`_wave_suffixes` owns the `pad`+`stack` share, so three replacements were timed
+with `torch.utils.benchmark.Timer` (which synchronizes CUDA correctly -- a bare
+`perf_counter` here would repeat the original mistake). All three produce a
+byte-identical padded batch (`torch.equal` vs current: True):
+
+| variant | B=990 | B=330 |
+| --- | --- | --- |
+| A current (`F.pad` per node + `stack`) | 4.62 us/node | 1.336 ms |
+| B preallocated `new_zeros` + slice copy | 3.98 us/node (1.16x) | 1.517 ms (**slower**) |
+| C **NestedTensor** -> `to_padded_tensor` | **10.70 us/node (2.3x slower)** | 3.206 ms |
+
+- **NestedTensor: rejected.** It is the right tool for *attention over* ragged
+  sequences (the tutorial's 597us vs 951us), but as a pad+stack replacement the
+  prototype API's bookkeeping costs more than the padding it avoids.
+- **Preallocation: rejected.** 1.16x at B=990 inverts to a regression at
+  B=330, i.e. it depends on wave size, and is worth ~0.27s of a 66s run.
+
+`_wave_suffixes` is therefore left alone.
+
+### What the profiler says is actually left
+
+`ProfilerStep` self CPU 403 ms (16.35%) plus `decode_wave` self CPU 446 ms
+(18.08%) = **~34% of wall in the Python interpreter itself** -- movegen, vocab
+mapping, and search bookkeeping. That is the Rust/PyO3 target, and it is now
+the only remaining lever with real headroom. Ranked, with honest ceilings:
+
+1. **Python -> Rust for movegen/mapping + tree bookkeeping** — ~34% of wall.
+2. `torch.compile(mode="reduce-overhead")` / CUDA graphs to kill launch
+   overhead on the ~3,056 small ops per wave. Attractive in principle, but wave
+   shapes vary every tick so it would recompile or re-capture constantly, and
+   Inductor already crashed on the second shape in this codebase (section 4).
+   Needs a shape-bucketing scheme first.
+3. Pipelining — ~1.21x ceiling, large rewrite. Deprioritized.
 
 
 
