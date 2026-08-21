@@ -233,6 +233,54 @@ def _value_scalar_from_logits(value_logits_last: torch.Tensor) -> float:
     return float((probs[2] - probs[0]).item())
 
 
+def _batched_value_scalars(value_logits: torch.Tensor) -> list[float]:
+    """Batched twin of _value_scalar_from_logits: [B, 3] -> B floats.
+
+    The per-node version ran a softmax, two index reads and an .item() for
+    every evaluated node. At budget 2048 a decode wave carries ~1,321 nodes, so
+    that was ~5k torch dispatches per wave over 3-element rows -- measured 11.9
+    us/node together with PositionEval construction. Rows are independent under
+    softmax(dim=-1), so batching is a pure dispatch win.
+    """
+    probs = torch.softmax(value_logits.float(), dim=-1)
+    return (probs[:, 2] - probs[:, 0]).tolist()
+
+
+def _batched_legal_log_priors(
+    logits: torch.Tensor, id_lists: list[list[int]]
+) -> list[list[float]]:
+    """Per-node legal-move log-priors for a whole wave.
+
+    Replaces per-node `torch.tensor(ids)` + `index_select` + `log_softmax` +
+    `.tolist()` (measured 7.0 us/node) with one gather and one masked
+    log_softmax for the wave.
+
+    Nodes have different legal-move counts, so rows are padded to the wave
+    maximum. Padded slots are filled with vocab id 0 and then masked to -inf
+    BEFORE the log_softmax: exp(-inf) is exactly 0.0, so they contribute
+    nothing to either the max or the normalizer, and each row stays normalized
+    over exactly its own moves. Filling without masking would leak logits[.,0]
+    into every short row -- pinned by
+    tests/test_batched_projection.py::test_batched_log_priors_padding_cannot_leak.
+    """
+    lens = [len(ids) for ids in id_lists]
+    width = max(lens)
+    flat: list[int] = []
+    for ids, n in zip(id_lists, lens):
+        flat.extend(ids)
+        if n < width:
+            flat.extend((0,) * (width - n))
+    idx = torch.tensor(flat, device=logits.device, dtype=torch.long).view(
+        len(id_lists), width
+    )
+    picked = logits.gather(1, idx)
+    keep = torch.arange(width, device=logits.device).unsqueeze(0) < torch.tensor(
+        lens, device=logits.device
+    ).unsqueeze(1)
+    picked = picked.masked_fill(~keep, float("-inf"))
+    rows = torch.log_softmax(picked.float(), dim=1).tolist()
+    return [row[:n] for row, n in zip(rows, lens)]
+
 def _project_legal_logits(
     *,
     logits: torch.Tensor,
@@ -324,6 +372,48 @@ def _cozy_move_id_and_uci(
     return result
 
 
+def _legal_moves_ids_ucis(
+    cozy_board: "cc.Board", move_vocab: MoveVocab
+) -> tuple[list[int], list["cc.Move"], list[str], int]:
+    """(vocab ids, moves, UCIs) in canonical UCI order, plus total legal count.
+
+    The single source of the vocab-mapping + UCI-sort discipline for the cozy
+    path: `_project_legal_logits_cozy` wraps this with the per-node tensor
+    gather, while `CachedPositionEvaluator.consume_decode_result` calls it
+    directly and gathers a whole wave at once. Keeping one implementation is
+    what lets tests/test_actor_worker.py keep using
+    `_project_legal_logits_cozy` as the oracle for the eval path's independent
+    twin.
+
+    Single pass on purpose: this runs once per evaluated search node, so the
+    old build-all-UCIs-then-filter shape allocated a throwaway list per node
+    on top of a string per move. Returns empty lists when nothing maps; callers
+    decide whether that is an error.
+    """
+    legal_moves = list(cozy_board.generate_moves())
+    ids: list[int] = []
+    moves: list[cc.Move] = []
+    ucis: list[str] = []
+    for move in legal_moves:
+        move_id, uci = _cozy_move_id_and_uci(cozy_board, move, move_vocab)
+        if move_id is not None:
+            ids.append(int(move_id))
+            moves.append(move)
+            ucis.append(uci)
+    if not ids:
+        return [], [], [], len(legal_moves)
+    # Canonical order: sort by UCI string so python-chess and cozy movegen
+    # produce identical move lists (Stage 3 Step 0). Sort ids/moves/ucis
+    # jointly so the gathered logits stay aligned to both moves and ucis.
+    order = sorted(range(len(moves)), key=lambda i: ucis[i])
+    return (
+        [ids[i] for i in order],
+        [moves[i] for i in order],
+        [ucis[i] for i in order],
+        len(legal_moves),
+    )
+
+
 def _project_legal_logits_cozy(
     *,
     logits: torch.Tensor,
@@ -331,45 +421,24 @@ def _project_legal_logits_cozy(
     move_vocab: MoveVocab,
 ) -> tuple[torch.Tensor, list[cc.Move], list[str], int, int]:
     """Cozy-native twin of `_project_legal_logits`: same vocab-mapping and
-    UCI-sort discipline, but movegen goes through cozy-chess `generate_moves`
-    and the per-move UCI/id pair comes from `_cozy_move_id_and_uci` (memoized;
-    castling-aware). `legal_ucis` is index-aligned with the returned
-    `legal_moves` (computed once here so callers never re-derive it).
+    UCI-sort discipline (shared via `_legal_moves_ids_ucis`), but movegen goes
+    through cozy-chess `generate_moves` and the per-move UCI/id pair comes from
+    `_cozy_move_id_and_uci` (memoized; castling-aware). `legal_ucis` is
+    index-aligned with the returned `legal_moves`.
 
-    Single pass on purpose: this runs once per evaluated search node, so the
-    old build-all-UCIs-then-filter shape allocated a throwaway list per node
-    on top of a string per move.
+    Still the reference implementation the eval path is cross-checked against;
+    the rollout wave path calls `_legal_moves_ids_ucis` plus a batched gather
+    instead, to avoid one torch dispatch per node.
     """
-    legal_moves = list(cozy_board.generate_moves())
-    legal_move_ids: list[int] = []
-    legal_moves_with_ids: list[cc.Move] = []
-    legal_ucis_with_ids: list[str] = []
-    for move in legal_moves:
-        move_id, uci = _cozy_move_id_and_uci(cozy_board, move, move_vocab)
-        if move_id is not None:
-            legal_move_ids.append(int(move_id))
-            legal_moves_with_ids.append(move)
-            legal_ucis_with_ids.append(uci)
-    total_legal = len(legal_moves)
-    mapped_legal = len(legal_move_ids)
-    if not legal_move_ids:
+    ids, moves, ucis, total_legal = _legal_moves_ids_ucis(cozy_board, move_vocab)
+    if not ids:
         raise RuntimeError(
             "No legal moves mapped to vocab ids for current board "
             f"(total legal={total_legal})."
         )
-    # Canonical order: sort by UCI string so python-chess and cozy movegen
-    # produce identical move lists (Stage 3 Step 0). Sort ids/moves/ucis
-    # jointly (before index_select) so legal_logits stays aligned to both
-    # legal_moves_with_ids and legal_ucis_with_ids.
-    order = sorted(range(len(legal_moves_with_ids)), key=lambda i: legal_ucis_with_ids[i])
-    legal_moves_with_ids = [legal_moves_with_ids[i] for i in order]
-    legal_ucis_with_ids = [legal_ucis_with_ids[i] for i in order]
-    legal_move_ids = [legal_move_ids[i] for i in order]
-    legal_ids_tensor = torch.tensor(
-        legal_move_ids, device=logits.device, dtype=torch.long
-    )
+    legal_ids_tensor = torch.tensor(ids, device=logits.device, dtype=torch.long)
     legal_logits = logits.index_select(0, legal_ids_tensor)
-    return legal_logits, legal_moves_with_ids, legal_ucis_with_ids, total_legal, mapped_legal
+    return legal_logits, moves, ucis, total_legal, len(ids)
 
 
 class _CachedNode:
@@ -541,25 +610,45 @@ class CachedPositionEvaluator:
         logits = out["logits"].float().cpu()
         value_logits = out["value_logits"].float().cpu()
 
-        results = []
-        for row, cozy_board in enumerate(request.boards):
-            value_stm = _value_scalar_from_logits(value_logits[row])
-            try:
-                legal_logits, legal_moves, legal_ucis, _, _ = _project_legal_logits_cozy(
-                    logits=logits[row], cozy_board=cozy_board, move_vocab=self._move_vocab
+        # Per-node work is pure Python (movegen + vocab mapping + canonical
+        # sort); every tensor op is hoisted to one call for the whole wave. At
+        # budget 2048 a wave carries ~1,321 nodes, and the old shape ran a
+        # softmax, a torch.tensor, an index_select and a log_softmax per node
+        # over ~31-element rows, where dispatch dominated the arithmetic.
+        per_node = [
+            _legal_moves_ids_ucis(cozy_board, self._move_vocab)
+            for cozy_board in request.boards
+        ]
+        values = _batched_value_scalars(value_logits)
+
+        id_lists = [ids for ids, _, _, _ in per_node]
+        prior_rows: list[list[float]] = [[] for _ in id_lists]
+        if all(id_lists):
+            prior_rows = _batched_legal_log_priors(logits, id_lists)
+        else:
+            # A node whose legal moves map to nothing in the vocab yields an
+            # empty PositionEval, matching the old RuntimeError branch. Gather
+            # only the rows that have moves so the batch stays rectangular.
+            keep = [row for row, ids in enumerate(id_lists) if ids]
+            if keep:
+                sub = _batched_legal_log_priors(
+                    logits.index_select(
+                        0, torch.tensor(keep, device=logits.device, dtype=torch.long)
+                    ),
+                    [id_lists[row] for row in keep],
                 )
-                log_priors = torch.log_softmax(legal_logits.float(), dim=0).tolist()
-            except RuntimeError:
-                legal_moves, legal_ucis, log_priors = [], [], []
-            results.append(
-                PositionEval(
-                    value_stm=value_stm,
-                    legal_moves=legal_moves,
-                    legal_ucis=legal_ucis,
-                    legal_log_priors=log_priors,
-                )
+                for row, priors in zip(keep, sub):
+                    prior_rows[row] = priors
+
+        return [
+            PositionEval(
+                value_stm=values[row],
+                legal_moves=moves,
+                legal_ucis=ucis,
+                legal_log_priors=prior_rows[row],
             )
-        return results
+            for row, (_ids, moves, ucis, _total) in enumerate(per_node)
+        ]
 
     def evaluate(self, batch):
         if not batch:
