@@ -118,11 +118,24 @@ The affected production modules are currently `board_state.py`, `actor_worker.py
 Python constructs one projector for each `MoveVocab`:
 
 ```python
-projector = cc.MoveProjector(move_vocab.token_to_id)
+special_tokens = {
+    move_vocab.config.pad_token,
+    move_vocab.config.start_token,
+    move_vocab.config.unk_token,
+}
+move_tokens = {
+    token: token_id
+    for token, token_id in move_vocab.token_to_id.items()
+    if token not in special_tokens
+}
+projector = cc.MoveProjector(move_tokens)
 ids, moves, ucis, total_legal = projector.project(board)
 ```
 
-The constructor accepts a mapping from canonical standard UCI strings to integer vocabulary IDs. It validates that keys parse as moves and values fit the integer range returned to Python.
+The Python adapter filters the vocabulary's pad/start/unknown tokens once at
+projector construction. The constructor requires every supplied key to parse as
+a canonical UCI move and every value to fit the integer range returned to
+Python; malformed move entries fail loudly rather than being skipped.
 
 The projector stores a Rust lookup indexed by a compact move key. Each entry contains:
 
@@ -256,9 +269,10 @@ Coverage includes:
   - `arm_log_prior` exact;
   - `arm_evals_spent` exact;
   - waves and evaluations unchanged.
-- Existing fixed-composition Stockfish move probe.
 
-A new 200-game Stockfish run is not required for a bit-identical Stage 1 cutover unless the fixed move probe or numeric gates differ.
+A new 200-game Stockfish run is not required for a bit-identical Stage 1
+cutover. The established post-arena baseline is 0.5950 at SF2200; rerun it only
+if actor projection, numeric, or rollout trajectory gates differ.
 
 ## Performance gates
 
