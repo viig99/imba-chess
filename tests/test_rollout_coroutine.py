@@ -78,8 +78,21 @@ def _fake_decode_wave(batch: list[tuple[object, "cc.Board"]]) -> list[PositionEv
         moves = moves[:2]
         ucis = [cozy_bridge.cozy_move_to_uci(cozy_board, m) for m in moves]
         priors = [-0.1 * (i + 1) for i in range(len(moves))]
+        board = chess.Board(cozy_board.fen())
+        forcing = [
+            chess.Move.from_uci(u).promotion is not None
+            or board.is_capture(chess.Move.from_uci(u))
+            or board.gives_check(chess.Move.from_uci(u))
+            for u in ucis
+        ]
         results.append(
-            PositionEval(value_stm=0.0, legal_moves=moves, legal_ucis=ucis, legal_log_priors=priors)
+            PositionEval(
+                value_stm=0.0,
+                legal_moves=moves,
+                legal_ucis=ucis,
+                legal_log_priors=priors,
+                legal_forcing=forcing,
+            )
         )
     return results
 

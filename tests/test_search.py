@@ -29,6 +29,23 @@ def _cozy_legal_moves_sorted(cozy_board):
     return [moves[i] for i in order], [ucis[i] for i in order]
 
 
+def _forcing_flags(cozy_board, ucis):
+    """Forcing flags (promotion/capture/check) via python-chess, for fake
+    evaluators standing in for the native projection. The refutation floor
+    selects on these, so a fake that returned all-False would quietly change
+    what the search explores."""
+    board = chess.Board(cozy_board.fen())
+    flags = []
+    for uci in ucis:
+        move = chess.Move.from_uci(uci)
+        flags.append(
+            move.promotion is not None
+            or board.is_capture(move)
+            or board.gives_check(move)
+        )
+    return flags
+
+
 def test_select_greedy_returns_argmax_index_first_on_ties():
     assert select_greedy([-2.0, -0.5, -1.0]) == 1
     assert select_greedy([-1.0, -1.0]) == 0
@@ -150,7 +167,15 @@ class _ArmValueEvaluator:
             value_stm = value_root_pov if stm_is_root_side else -value_root_pov
             moves, ucis = _cozy_legal_moves_sorted(cozy_board)
             log_prior = math.log(1.0 / len(moves)) if moves else 0.0
-            results.append(PositionEval(value_stm, moves, ucis, [log_prior] * len(moves)))
+            results.append(
+                PositionEval(
+                    value_stm,
+                    moves,
+                    ucis,
+                    [log_prior] * len(moves),
+                    _forcing_flags(cozy_board, ucis),
+                )
+            )
         return results
 
 
@@ -181,7 +206,15 @@ class _MaterialEvaluator:
                 else -0.1
                 for m, u in zip(moves, ucis)
             ]
-            results.append(PositionEval(_material_stm(board), moves, ucis, priors))
+            results.append(
+                PositionEval(
+                    _material_stm(board),
+                    moves,
+                    ucis,
+                    priors,
+                    _forcing_flags(cozy_board, ucis),
+                )
+            )
         return results
 
 

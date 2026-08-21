@@ -589,7 +589,7 @@ class TestMoveProjector:
         mapping = {uci: 1000 - index for index, uci in enumerate(reversed(ucis))}
         projector = imba_chess_native.MoveProjector(mapping)
 
-        ids, moves, got_ucis, total = projector.project(imba_chess_native.Board())
+        ids, moves, got_ucis, _forcing, total = projector.project(imba_chess_native.Board())
 
         assert total == 20
         assert got_ucis == sorted(ucis)
@@ -599,7 +599,7 @@ class TestMoveProjector:
     def test_drops_unmapped_moves_but_keeps_the_total(self):
         projector = imba_chess_native.MoveProjector({"e2e4": 5, "d2d4": 3})
 
-        ids, moves, ucis, total = projector.project(imba_chess_native.Board())
+        ids, moves, ucis, _forcing, total = projector.project(imba_chess_native.Board())
 
         assert total == 20
         assert ucis == ["d2d4", "e2e4"]
@@ -609,7 +609,7 @@ class TestMoveProjector:
     def test_returns_empty_lists_when_nothing_maps(self):
         projector = imba_chess_native.MoveProjector({"a7a6": 1})
 
-        ids, moves, ucis, total = projector.project(imba_chess_native.Board())
+        ids, moves, ucis, _forcing, total = projector.project(imba_chess_native.Board())
 
         assert (ids, moves, ucis) == ([], [], [])
         assert total == 20
@@ -620,7 +620,7 @@ class TestMoveProjector:
         )
         projector = imba_chess_native.MoveProjector({"e1c1": 7, "e1g1": 9})
 
-        ids, moves, ucis, total = projector.project(board)
+        ids, moves, ucis, _forcing, total = projector.project(board)
 
         assert total > 2
         assert ids == [7, 9]
@@ -638,7 +638,7 @@ class TestMoveProjector:
         # become "e1c1" and the move would drop out entirely.
         projector = imba_chess_native.MoveProjector({"e1a1": 1})
 
-        ids, moves, ucis, total = projector.project(board)
+        ids, moves, ucis, _forcing, total = projector.project(board)
 
         assert total > 2
         assert ids == [1]
@@ -680,7 +680,7 @@ class TestMoveProjector:
         )
         projector = imba_chess_native.MoveProjector({"a1a5": 3})
 
-        ids, _moves, ucis, total = projector.project(board)
+        ids, _moves, ucis, _forcing, total = projector.project(board)
 
         assert ids == [3]
         assert ucis == ["a1a5"]
@@ -698,7 +698,7 @@ class TestMoveProjector:
         )
         projector = imba_chess_native.MoveProjector({"e1c1": 31, "e1g1": 37})
 
-        ids, moves, ucis, total = projector.project(board)
+        ids, moves, ucis, _forcing, total = projector.project(board)
 
         assert total > 2
         assert ids == [31, 37]
@@ -712,7 +712,7 @@ class TestMoveProjector:
         board = imba_chess_native.Board.from_fen("8/P6k/8/8/8/8/8/K7 w - - 0 1")
         projector = imba_chess_native.MoveProjector({"a7a8q": 4, "a7a8n": 2})
 
-        ids, moves, ucis, total = projector.project(board)
+        ids, moves, ucis, _forcing, total = projector.project(board)
 
         assert total > 2
         assert ucis == ["a7a8n", "a7a8q"]

@@ -101,9 +101,10 @@ def test_project_legal_moves_reports_unmapped_moves_by_omission():
     board = native_cc.Board()
     vocab = _vocab_for("a2a3")
 
-    ids, moves, ucis, total = cozy_bridge.project_legal_moves(board, vocab)
+    ids, moves, ucis, forcing, total = cozy_bridge.project_legal_moves(board, vocab)
 
     assert ucis == ["a2a3"]
     assert ids == [vocab.token_to_id["a2a3"]]
     assert len(moves) == 1
+    assert forcing == [False]
     assert total == 20

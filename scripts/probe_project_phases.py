@@ -56,7 +56,7 @@ def instrumented_consume(self, request, out):
     t0 = t()
     per_node = []
     for cozy_board in request.boards:
-        ids, mvs, ucis, _total = cozy_bridge.project_legal_moves(
+        ids, mvs, ucis, _forcing, _total = cozy_bridge.project_legal_moves(
             cozy_board, self._move_vocab
         )
         per_node.append((ids, mvs, ucis))

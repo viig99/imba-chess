@@ -109,7 +109,7 @@ def _reference_root_response(fixture: _Fixture, moves: list[str]):
         output = fixture.model(batch, return_loss=False, return_kv=True)
     value_stm = _value_scalar_from_logits(output["value_logits"][-1])
     cozy_board = cozy_bridge.board_to_cozy(board)
-    legal_vocab_ids, legal_moves, legal_ucis, _total = cozy_bridge.project_legal_moves(
+    legal_vocab_ids, legal_moves, legal_ucis, _forcing, _total = cozy_bridge.project_legal_moves(
         cozy_board, fixture.move_vocab
     )
     ids_tensor = torch.tensor(legal_vocab_ids, dtype=torch.long)
@@ -308,7 +308,7 @@ def _wave_row_for_child(
     child.push(move)
     cozy_child = cozy_bridge.board_to_cozy(child)
     state = encoder.encode_cozy(cozy_child)
-    legal_vocab_ids, _legal_moves, _legal_ucis, _total = cozy_bridge.project_legal_moves(
+    legal_vocab_ids, _legal_moves, _legal_ucis, _forcing, _total = cozy_bridge.project_legal_moves(
         cozy_child, move_vocab
     )
     row = WaveRow(
@@ -402,7 +402,7 @@ def test_two_worker_wave_eval_matches_cached_position_evaluator_fp32_exact():
                 atol=ATOL,
                 rtol=RTOL,
             )
-            ref_vocab_ids, _moves, _ucis, _total = cozy_bridge.project_legal_moves(
+            ref_vocab_ids, _moves, _ucis, _forcing, _total = cozy_bridge.project_legal_moves(
                 cozy_child, fixture.move_vocab
             )
             ref_legal_logits = raw_logits[row].index_select(
@@ -468,7 +468,7 @@ def test_depth_two_wave_with_parent_link_matches_reference_and_release_frees_kv(
     torch.testing.assert_close(
         torch.tensor(value_stm), torch.tensor(ref_eval.value_stm), atol=ATOL, rtol=RTOL
     )
-    ref_vocab_ids, _moves, _ucis, _total = cozy_bridge.project_legal_moves(
+    ref_vocab_ids, _moves, _ucis, _forcing, _total = cozy_bridge.project_legal_moves(
         cozy_child2, fixture.move_vocab
     )
     ref_legal_logits = raw_logits2[0].index_select(
@@ -555,7 +555,7 @@ def test_require_value_head_false_allows_construction_and_serves_zero_placeholde
         moves=["e2e4", "e7e5"], move_vocab=move_vocab, encoder=encoder
     )
     cozy_board = cozy_bridge.board_to_cozy(board)
-    legal_vocab_ids, _moves, _ucis, _total = cozy_bridge.project_legal_moves(cozy_board, move_vocab)
+    legal_vocab_ids, _moves, _ucis, _forcing, _total = cozy_bridge.project_legal_moves(cozy_board, move_vocab)
     root_response = server.register_root(
         0, 0, _plain_batch_arrays(batch), legal_vocab_ids
     )
@@ -597,7 +597,7 @@ def test_require_value_head_false_allows_construction_and_serves_zero_placeholde
     incremental_tokens, new_total_len = (
         worker_history.build_incremental_tokens_for_current_position(replay_board)
     )
-    legal_vocab_ids2, _moves2, _ucis2, _total = cozy_bridge.project_legal_moves(
+    legal_vocab_ids2, _moves2, _ucis2, _forcing, _total = cozy_bridge.project_legal_moves(
         cozy_bridge.board_to_cozy(replay_board), move_vocab
     )
     incremental_response = server.service(

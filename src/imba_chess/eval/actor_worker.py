@@ -273,7 +273,8 @@ class _WaveEvaluator:
     (`cozy_bridge.project_legal_moves`, off the real native board it
     already holds)
     before sending the `WaveRequest`, and stashes the resulting
-    `(legal_moves, legal_ucis)` in `self._pending_legal`, keyed by node_id --
+    `(legal_moves, legal_ucis, legal_forcing)` in `self._pending_legal`,
+    keyed by node_id --
     the server never sees a board or a move string, only the vocab ids and,
     on the way back, raw logits. `WaveResponse` rows are matched back to
     their node via `self._pending_legal.pop(node_id)` rather than positional
@@ -297,7 +298,9 @@ class _WaveEvaluator:
         self._move_vocab = move_vocab
         self._board_state_encoder = board_state_encoder
         self._next_node_id = 0
-        self._pending_legal: dict[int, tuple[list["cc.Move"], list[str]]] = {}
+        self._pending_legal: dict[
+            int, tuple[list["cc.Move"], list[str], list[bool]]
+        ] = {}
 
     def extend(self, handle, move_uci: str) -> "_WorkerSearchNode":
         """`handle` is opaque to the caller (search.py); `None` (or
@@ -325,9 +328,14 @@ class _WaveEvaluator:
                 legal_vocab_ids,
                 legal_moves,
                 legal_ucis,
+                legal_forcing,
                 _total_legal,
             ) = cozy_bridge.project_legal_moves(cozy_board, self._move_vocab)
-            self._pending_legal[handle.node_id] = (legal_moves, legal_ucis)
+            self._pending_legal[handle.node_id] = (
+                legal_moves,
+                legal_ucis,
+                legal_forcing,
+            )
             board_state = self._board_state_encoder.encode_cozy(cozy_board)
             rows.append(
                 WaveRow(
@@ -354,13 +362,14 @@ class _WaveEvaluator:
             )
         results: list[search.PositionEval] = []
         for node_id, (value_stm, legal_logits) in zip(node_ids, response.rows):
-            legal_moves, legal_ucis = self._pending_legal.pop(node_id)
+            legal_moves, legal_ucis, legal_forcing = self._pending_legal.pop(node_id)
             results.append(
                 search.PositionEval(
                     value_stm=float(value_stm),
                     legal_moves=legal_moves,
                     legal_ucis=legal_ucis,
                     legal_log_priors=_log_softmax_f32(list(legal_logits)),
+                    legal_forcing=legal_forcing,
                 )
             )
         return results
@@ -560,6 +569,7 @@ def _select_model_move(
         legal_vocab_ids,
         _cozy_legal_moves,
         legal_ucis,
+        _legal_forcing,
         _total_legal,
     ) = cozy_bridge.project_legal_moves(cozy_board, move_vocab)
     legal_moves = [chess.Move.from_uci(uci) for uci in legal_ucis]

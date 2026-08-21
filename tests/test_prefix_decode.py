@@ -381,7 +381,14 @@ class _FullForwardReferenceEvaluator:
                 log_priors = torch.log_softmax(legal_logits.float(), dim=0).tolist()
             except RuntimeError:
                 legal_moves, legal_ucis, log_priors = [], [], []
-            results.append(PositionEval(value_stm, legal_moves, legal_ucis, log_priors))
+            _i, _m, _u, forcing, _t = cozy_bridge.project_legal_moves(
+                cozy_board, self._move_vocab
+            )
+            results.append(
+                PositionEval(
+                    value_stm, legal_moves, legal_ucis, log_priors, forcing
+                )
+            )
         return results
 
 

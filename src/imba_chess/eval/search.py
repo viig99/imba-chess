@@ -33,12 +33,24 @@ class PositionEval(NamedTuple):
     `legal_ucis` is index-aligned with `legal_moves`, computed once during
     projection (via `cozy_move_to_uci`, castling-aware) so search/rows never
     re-derive UCI strings from a move object.
+
+    `legal_forcing` is index-aligned too: True where the move is a promotion,
+    capture, or check. It comes back from the same native projection call that
+    produced the moves, because the search's refutation floor needs exactly
+    that predicate over exactly that (board, moves) pair -- re-deriving it
+    afterwards cost ~19.8us and two FFI crossings per move on every
+    opponent-to-move node.
+
+    Deliberately has no default: an omitted `legal_forcing` would read as "no
+    move is forcing", silently emptying the refutation floor and changing what
+    the search explores. Better a TypeError at construction.
     """
 
     value_stm: float
     legal_moves: list["cc.Move"]
     legal_ucis: list[str]
     legal_log_priors: list[float]
+    legal_forcing: list[bool]
 
 
 class PositionEvaluator(Protocol):
@@ -140,28 +152,6 @@ def _forcing_index_set_root(
         if move.promotion is not None or is_capture:
             forcing.add(idx)
         elif cozy_bridge.gives_check(cozy_board, cozy_bridge.py_move_to_cozy(board, move)):
-            forcing.add(idx)
-    return forcing
-
-
-def _forcing_index_set_tree(
-    legal_moves: list,
-    cozy_board: "cc.Board",
-) -> set[int]:
-    """Indices of forcing moves (promotion/capture/check) at a tree node,
-    one cozy board per node.
-
-    `legal_moves` is cozy-chess Move objects (the tree carries no
-    python-chess board at all as of Task 5, so both the capture and
-    check-detection tests are cozy-native, via cozy_bridge.is_capture_cozy /
-    cozy_bridge.gives_check directly on the move already at hand).
-    """
-    forcing: set[int] = set()
-    for idx, move in enumerate(legal_moves):
-        is_capture = cozy_bridge.is_capture_cozy(cozy_board, move)
-        if move.promotion is not None or is_capture:
-            forcing.add(idx)
-        elif cozy_bridge.gives_check(cozy_board, move):
             forcing.add(idx)
     return forcing
 
@@ -466,7 +456,9 @@ def _d2_stepwise(
         # tactical refutation is often a low-probability move under a
         # human-imitation policy, so policy top-k alone misses it.
         opp_seen = set(opp_indices)
-        opp_forcing = _forcing_index_set_tree(board1_eval.legal_moves, candidate.cozy1)
+        opp_forcing = {
+            idx for idx, flag in enumerate(board1_eval.legal_forcing) if flag
+        }
         for opp_idx in range(len(board1_eval.legal_moves)):
             if opp_idx in opp_seen:
                 continue
@@ -655,7 +647,9 @@ def _push_children(
     opponent_to_move = node_stm_is_white != root_color
     order = _prior_order(position_eval.legal_log_priors)
     if opponent_to_move:
-        forcing = _forcing_index_set_tree(position_eval.legal_moves, node.cozy_board)
+        forcing = {
+            idx for idx, flag in enumerate(position_eval.legal_forcing) if flag
+        }
         # Refutation floor: top-r replies by prior plus ALL forcing replies.
         picks = list(order[: config.refutation_top_r])
         seen = set(picks)

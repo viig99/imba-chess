@@ -64,6 +64,23 @@ def _cozy_move_id_and_uci(cozy_board, move, move_vocab):
     return result
 
 
+def python_forcing(board, moves):
+    """The retired _forcing_index_set_tree: promotion/capture/check per move.
+
+    Kept alongside the retired projection because the two are now fused in
+    Rust, so an honest Python arm has to do both. is_capture_cozy and
+    gives_check are still real cozy_bridge functions, independently validated
+    against python-chess in tests/test_cozy_differential.py.
+    """
+    forcing = set()
+    for idx, move in enumerate(moves):
+        if move.promotion is not None or cozy_bridge.is_capture_cozy(board, move):
+            forcing.add(idx)
+        elif cozy_bridge.gives_check(board, move):
+            forcing.add(idx)
+    return forcing
+
+
 def python_project(board, vocab):
     """Whole retired projection: movegen, mapping, list build, canonical sort."""
     legal_moves = list(board.generate_moves())

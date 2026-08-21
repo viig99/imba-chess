@@ -334,7 +334,7 @@ def _project_legal_logits_cozy(
     the rollout wave path calls the bridge directly plus a batched gather
     instead, to avoid one torch dispatch per node.
     """
-    ids, moves, ucis, total_legal = cozy_bridge.project_legal_moves(
+    ids, moves, ucis, _forcing, total_legal = cozy_bridge.project_legal_moves(
         cozy_board, move_vocab
     )
     if not ids:
@@ -621,7 +621,7 @@ class CachedPositionEvaluator:
         # ~31-element rows, where dispatch dominated the arithmetic.
         values = _batched_value_scalars(value_logits)
 
-        id_lists = [ids for ids, _, _, _ in per_node]
+        id_lists = [ids for ids, _, _, _, _ in per_node]
         prior_rows: list[list[float]] = [[] for _ in id_lists]
         if all(id_lists):
             prior_rows = _batched_legal_log_priors(logits, id_lists)
@@ -646,8 +646,9 @@ class CachedPositionEvaluator:
                 legal_moves=moves,
                 legal_ucis=ucis,
                 legal_log_priors=prior_rows[row],
+                legal_forcing=forcing,
             )
-            for row, (_ids, moves, ucis, _total) in enumerate(per_node)
+            for row, (_ids, moves, ucis, forcing, _total) in enumerate(per_node)
         ]
 
     def evaluate(self, batch):

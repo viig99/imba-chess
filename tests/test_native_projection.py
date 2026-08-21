@@ -23,6 +23,24 @@ from imba_chess.eval import cozy_bridge
 from tests.test_cozy_bridge import EDGE_FENS, _random_boards
 
 
+def _python_forcing(py_board: chess.Board, ucis: list[str]) -> list[bool]:
+    """Forcing flags straight from python-chess -- the project's correctness
+    oracle, and independent of every cozy/native primitive the projector uses.
+
+    Takes the projector's normalized UCIs, which are exactly python-chess's own
+    castling convention (e1g1), so a castle round-trips without special casing.
+    """
+    flags = []
+    for uci in ucis:
+        move = chess.Move.from_uci(uci)
+        flags.append(
+            move.promotion is not None
+            or py_board.is_capture(move)
+            or py_board.gives_check(move)
+        )
+    return flags
+
+
 def _python_project(board, move_vocab: MoveVocab):
     """Independent oracle: what the projector must produce, in plain Python.
 
@@ -100,7 +118,9 @@ def _assert_matches_oracle(board: chess.Board, vocab: MoveVocab) -> None:
     expected_ids, expected_moves, expected_ucis, expected_total = _python_project(
         native_board, vocab
     )
-    ids, moves, ucis, total = cozy_bridge.project_legal_moves(native_board, vocab)
+    ids, moves, ucis, _forcing, total = cozy_bridge.project_legal_moves(
+        native_board, vocab
+    )
 
     assert total == expected_total
     assert ids == expected_ids
@@ -128,7 +148,9 @@ def test_restricted_vocabulary_actually_drops_moves() -> None:
     for board in _POSITIONS:
         native_board = _native_board(board)
         full = len(cozy_bridge.project_legal_moves(native_board, _STATIC_VOCAB)[0])
-        part = len(cozy_bridge.project_legal_moves(native_board, _RESTRICTED_VOCAB)[0])
+        part = len(
+            cozy_bridge.project_legal_moves(native_board, _RESTRICTED_VOCAB)[0]
+        )
         assert part <= full
         dropped += full - part
     assert dropped > 0
@@ -145,7 +167,7 @@ def test_projection_covers_every_legal_move_of_a_full_vocabulary() -> None:
     """The static vocab is a superset of legal standard-chess moves, so nothing
     may be dropped -- a silent drop would starve the search of a candidate."""
     for board in _POSITIONS:
-        ids, _, _, total = cozy_bridge.project_legal_moves(
+        ids, _, _, _forcing, total = cozy_bridge.project_legal_moves(
             _native_board(board), _STATIC_VOCAB
         )
         assert len(ids) == total
@@ -155,7 +177,9 @@ def test_castling_projects_to_the_king_destination_but_stays_playable() -> None:
     """The one convention the oracle and the projector must both encode: the
     vocabulary sees e1g1, the caller gets back the raw king-takes-rook move."""
     board = native_cc.Board.from_fen("r3k2r/8/8/8/8/8/8/R3K2R w KQkq - 0 1")
-    _, moves, ucis, _ = cozy_bridge.project_legal_moves(board, _STATIC_VOCAB)
+    _, moves, ucis, _forcing, _ = cozy_bridge.project_legal_moves(
+        board, _STATIC_VOCAB
+    )
 
     raw_by_uci = {uci: move for uci, move in zip(ucis, moves)}
     assert str(raw_by_uci["e1g1"]) == "e1h1"
@@ -163,3 +187,43 @@ def test_castling_projects_to_the_king_destination_but_stays_playable() -> None:
     for uci in ("e1g1", "e1c1"):
         copy_board = board.__copy__()
         copy_board.play(raw_by_uci[uci])
+
+
+@pytest.mark.parametrize("board", _POSITIONS)
+def test_native_forcing_flags_match_python_chess(board: chess.Board) -> None:
+    """The refutation floor selects on these flags, so a wrong one silently
+    changes which lines the search explores rather than raising."""
+    native_board = _native_board(board)
+    _ids, _moves, ucis, forcing, _total = cozy_bridge.project_legal_moves(
+        native_board, _STATIC_VOCAB
+    )
+
+    assert len(forcing) == len(ucis)
+    assert forcing == _python_forcing(board, ucis)
+
+
+def test_forcing_flags_are_not_vacuously_false() -> None:
+    """Guards the case above: an implementation returning all-False would pass
+    on quiet positions."""
+    total_forcing = 0
+    for board in _POSITIONS:
+        _i, _m, _u, forcing, _t = cozy_bridge.project_legal_moves(
+            _native_board(board), _STATIC_VOCAB
+        )
+        total_forcing += sum(forcing)
+    assert total_forcing > 100, f"suspiciously few forcing moves: {total_forcing}"
+
+
+def test_forcing_covers_promotion_capture_and_check_distinctly() -> None:
+    # Promotion (a7a8*), a capture of the rook on b8, and a quiet check are all
+    # available; a quiet non-checking king move is not forcing.
+    board = native_cc.Board.from_fen("1r5k/P7/8/8/8/8/8/K5R1 w - - 0 1")
+    _i, _m, ucis, forcing, _t = cozy_bridge.project_legal_moves(
+        board, _STATIC_VOCAB
+    )
+    flags = dict(zip(ucis, forcing))
+
+    assert flags["a7a8q"] is True, "promotion"
+    assert flags["a7b8q"] is True, "promotion that is also a capture"
+    assert flags["g1g8"] is True, "quiet move giving check"
+    assert flags["a1a2"] is False, "quiet king move"

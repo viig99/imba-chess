@@ -496,8 +496,8 @@ def test_worker_projection_matches_an_independent_oracle_over_random_playouts() 
             board.push(rng.choice(legal))
             cozy_board = cozy_bridge.board_to_cozy(board)
 
-            vocab_ids, moves, ucis, total = cozy_bridge.project_legal_moves(
-                cozy_board, move_vocab
+            vocab_ids, moves, ucis, _forcing, total = (
+                cozy_bridge.project_legal_moves(cozy_board, move_vocab)
             )
             ref_ids, ref_moves, ref_ucis, ref_total = _python_project(
                 cozy_board, move_vocab

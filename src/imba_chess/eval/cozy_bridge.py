@@ -324,8 +324,9 @@ _PROJECTORS: "WeakKeyDictionary[MoveVocab, cc.MoveProjector]" = WeakKeyDictionar
 
 def project_legal_moves(
     cozy_board: cc.Board, move_vocab: MoveVocab
-) -> tuple[list[int], list[cc.Move], list[str], int]:
-    """(vocab ids, moves, UCIs) in canonical UCI order, plus total legal count.
+) -> tuple[list[int], list[cc.Move], list[str], list[bool], int]:
+    """(vocab ids, moves, UCIs, forcing flags) in canonical UCI order, plus the
+    total legal count.
 
     The single production projection path: search wave consumption, the
     per-node logit gather, and the actor worker all route here, so the
@@ -336,8 +337,13 @@ def project_legal_moves(
 
     Moves come back in raw generated form and stay playable; only the
     vocabulary sees a castle's normalized king-destination UCI. Unmapped moves
-    are dropped from the three aligned lists but still counted in the total.
+    are dropped from the four aligned lists but still counted in the total.
     Callers decide whether an empty result is an error.
+
+    `forcing` (promotion, capture, or check) rides along because the projector
+    has already generated the moves and holds the board. The search's
+    refutation floor needs that predicate over exactly this pair, and used to
+    re-walk it afterwards at ~19.8us per opponent-to-move node.
     """
     projector = _PROJECTORS.get(move_vocab)
     if projector is None:
