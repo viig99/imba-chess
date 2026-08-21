@@ -570,3 +570,122 @@ class TestFunctions:
     def test_line_rays(self):
         line = imba_chess_native.get_line_rays(imba_chess_native.Square.A1, imba_chess_native.Square.H8)
         assert len(line) > 0
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# MoveProjector Tests
+# ═══════════════════════════════════════════════════════════════════════════
+
+class TestMoveProjector:
+    def test_returns_aligned_canonical_lists(self):
+        ucis = [
+            "a2a3", "a2a4", "b1a3", "b1c3", "b2b3", "b2b4",
+            "c2c3", "c2c4", "d2d3", "d2d4", "e2e3", "e2e4",
+            "f2f3", "f2f4", "g1f3", "g1h3", "g2g3", "g2g4",
+            "h2h3", "h2h4",
+        ]
+        # Ids deliberately anti-correlated with UCI order: a mapping-order or
+        # id-order sort would pass with sorted ids, so make it fail loudly.
+        mapping = {uci: 1000 - index for index, uci in enumerate(reversed(ucis))}
+        projector = imba_chess_native.MoveProjector(mapping)
+
+        ids, moves, got_ucis, total = projector.project(imba_chess_native.Board())
+
+        assert total == 20
+        assert got_ucis == sorted(ucis)
+        assert ids == [mapping[uci] for uci in got_ucis]
+        assert [str(move) for move in moves] == got_ucis
+
+    def test_drops_unmapped_moves_but_keeps_the_total(self):
+        projector = imba_chess_native.MoveProjector({"e2e4": 5, "d2d4": 3})
+
+        ids, moves, ucis, total = projector.project(imba_chess_native.Board())
+
+        assert total == 20
+        assert ucis == ["d2d4", "e2e4"]
+        assert ids == [3, 5]
+        assert [str(move) for move in moves] == ["d2d4", "e2e4"]
+
+    def test_returns_empty_lists_when_nothing_maps(self):
+        projector = imba_chess_native.MoveProjector({"a7a6": 1})
+
+        ids, moves, ucis, total = projector.project(imba_chess_native.Board())
+
+        assert (ids, moves, ucis) == ([], [], [])
+        assert total == 20
+
+    def test_normalizes_castling_but_returns_playable_raw_moves(self):
+        board = imba_chess_native.Board.from_fen(
+            "r3k2r/8/8/8/8/8/8/R3K2R w KQkq - 0 1"
+        )
+        projector = imba_chess_native.MoveProjector({"e1c1": 7, "e1g1": 9})
+
+        ids, moves, ucis, total = projector.project(board)
+
+        assert total > 2
+        assert ids == [7, 9]
+        assert ucis == ["e1c1", "e1g1"]
+        assert [str(move) for move in moves] == ["e1a1", "e1h1"]
+        for move in moves:
+            copy_board = board.__copy__()
+            copy_board.play(move)
+
+    def test_does_not_normalize_a_non_king_move_onto_a_castle_square(self):
+        # A queen on e1 reaching a1 stringifies as "e1a1", which is also the
+        # raw form of white long castling. Only the king's move normalizes.
+        board = imba_chess_native.Board.from_fen("k7/8/8/8/8/7K/8/4Q3 w - - 0 1")
+        # Map only the raw form: if normalization wrongly fired, "e1a1" would
+        # become "e1c1" and the move would drop out entirely.
+        projector = imba_chess_native.MoveProjector({"e1a1": 1})
+
+        ids, moves, ucis, total = projector.project(board)
+
+        assert total > 2
+        assert ids == [1]
+        assert ucis == ["e1a1"]
+        assert [str(move) for move in moves] == ["e1a1"]
+
+    def test_keeps_vocabularies_isolated(self):
+        board = imba_chess_native.Board()
+        first = imba_chess_native.MoveProjector({"e2e4": 11})
+        second = imba_chess_native.MoveProjector({"e2e4": 29})
+
+        assert first.project(board)[0] == [11]
+        assert second.project(board)[0] == [29]
+
+    def test_rejects_non_uci_keys(self):
+        with pytest.raises(ValueError, match="invalid UCI move"):
+            imba_chess_native.MoveProjector({"<pad>": 0})
+
+    def test_normalizes_chess960_castling_from_the_board(self):
+        # Rooks on b1/h1, king on e1. The raw long castle is "e1b1", which is
+        # absent from the Python fast path's four-entry castle table, so the
+        # destination file has to come from the board. Deliberately not the
+        # king-on-b1 arrangement: there "b1c1" is both a normal king step and
+        # the normalized long castle, and one token covers two legal moves.
+        board = imba_chess_native.Board.from_fen(
+            "4k3/8/8/8/8/8/8/1R2K2R w BH - 0 1",
+            shredder=True,
+        )
+        projector = imba_chess_native.MoveProjector({"e1c1": 31, "e1g1": 37})
+
+        ids, moves, ucis, total = projector.project(board)
+
+        assert total > 2
+        assert ids == [31, 37]
+        assert ucis == ["e1c1", "e1g1"]
+        assert [str(move) for move in moves] == ["e1b1", "e1h1"]
+        for move in moves:
+            copy_board = board.__copy__()
+            copy_board.play(move)
+
+    def test_maps_promotions_independently(self):
+        board = imba_chess_native.Board.from_fen("8/P6k/8/8/8/8/8/K7 w - - 0 1")
+        projector = imba_chess_native.MoveProjector({"a7a8q": 4, "a7a8n": 2})
+
+        ids, moves, ucis, total = projector.project(board)
+
+        assert total > 2
+        assert ucis == ["a7a8n", "a7a8q"]
+        assert ids == [2, 4]
+        assert [str(move) for move in moves] == ucis

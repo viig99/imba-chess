@@ -9,6 +9,7 @@ pub mod castle_rights;
 pub mod chess_move;
 pub mod enums;
 pub mod functions;
+pub mod move_projector;
 pub mod piece_moves;
 
 #[pymodule]
@@ -21,5 +22,6 @@ fn imba_chess_native(m: &Bound<'_, PyModule>) -> PyResult<()> {
     board::register(m)?;
     board_builder::register(m)?;
     functions::register(m)?;
+    move_projector::register(m)?;
     Ok(())
 }
