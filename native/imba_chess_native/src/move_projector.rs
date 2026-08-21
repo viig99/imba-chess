@@ -9,6 +9,10 @@ use crate::chess_move::ChessMove;
 
 // ── MoveProjector ──────────────────────────────────────────────────────────
 
+/// (vocab ids, raw moves, UCI strings, total legal count) -- the first three
+/// index-aligned.
+type Projection = (Vec<i64>, Vec<ChessMove>, Vec<Py<PyString>>, usize);
+
 /// One vocabulary entry: the id to emit, the UCI text projection sorts by, and
 /// a reusable Python string so a hit never allocates one.
 struct ProjectionEntry {
@@ -85,11 +89,10 @@ impl MoveProjector {
     /// raw generated form -- normalization is for the vocabulary only, and a
     /// normalized castle is not playable. Unmapped moves are dropped but still
     /// counted in the total.
-    fn project(
-        &self,
-        py: Python<'_>,
-        board: &Board,
-    ) -> (Vec<i64>, Vec<ChessMove>, Vec<Py<PyString>>, usize) {
+    ///
+    /// Raises ValueError if two legal moves normalize onto one token, which
+    /// only Chess960 castling geometry can produce; see the check below.
+    fn project(&self, py: Python<'_>, board: &Board) -> PyResult<Projection> {
         let inner = &board.0;
         let mut total = 0usize;
         let mut selected: Vec<(&ProjectionEntry, cozy_chess::Move)> = Vec::with_capacity(32);
@@ -103,9 +106,31 @@ impl MoveProjector {
             false
         });
         // Stable, and by UCI string, so the order matches the Python oracle's
-        // `sorted(..., key=lambda i: ucis[i])` even where one token covers two
-        // legal moves.
+        // `sorted(..., key=lambda i: ucis[i])`.
         selected.sort_by(|a, b| a.0.sort_key.cmp(&b.0.sort_key));
+
+        // Two distinct legal moves can normalize onto the same token when the
+        // king does not start on the e-file: a plain king step to c1/g1 lands
+        // exactly where the long/short castle normalizes. Standard chess cannot
+        // produce this -- a king on e1 can never step to c1 or g1 -- but a
+        // Chess960 board with the king on b1 or d1 can. Returning both would
+        // hand the caller two entries with an identical id and UCI and no way
+        // to tell them apart, and anything building a dict keyed by UCI would
+        // silently drop a legal move. Refuse instead: the ambiguity lives in
+        // the from-to token space itself, not in something this function can
+        // resolve. Two distinct entries can never share a sort_key -- they come
+        // from Python dict keys, which are unique -- so a collision is exactly
+        // the same entry reached twice, and pointer equality decides it without
+        // touching the strings. Colliding entries are adjacent after the sort.
+        if let Some(pair) = selected.windows(2).find(|w| std::ptr::eq(w[0].0, w[1].0)) {
+            return Err(PyValueError::new_err(format!(
+                "ambiguous vocabulary token {:?}: legal moves {} and {} both map \
+                 to it. A castle and a plain king step share a destination, which \
+                 the from-to token space cannot distinguish. Unreachable in \
+                 standard chess; unsupported for this Chess960 castling geometry.",
+                pair[0].0.sort_key, pair[0].1, pair[1].1,
+            )));
+        }
 
         let mut ids = Vec::with_capacity(selected.len());
         let mut moves = Vec::with_capacity(selected.len());
@@ -115,7 +140,7 @@ impl MoveProjector {
             moves.push(ChessMove(mv));
             ucis.push(entry.py_uci.clone_ref(py));
         }
-        (ids, moves, ucis, total)
+        Ok((ids, moves, ucis, total))
     }
 
     fn __len__(&self) -> usize {

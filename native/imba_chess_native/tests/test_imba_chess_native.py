@@ -657,6 +657,35 @@ class TestMoveProjector:
         with pytest.raises(ValueError, match="invalid UCI move"):
             imba_chess_native.MoveProjector({"<pad>": 0})
 
+    def test_rejects_a_chess960_position_where_one_token_covers_two_moves(self):
+        # King on b1 with a rook on a1: the long castle normalizes to "b1c1",
+        # and the ordinary king step b1->c1 already IS "b1c1". Two distinct
+        # legal moves, one token. Returning both would give the caller a
+        # duplicate id/UCI pair with no way to tell them apart, and any dict
+        # keyed by UCI would silently drop one -- so refuse loudly instead.
+        board = imba_chess_native.Board.from_fen(
+            "4k3/8/8/8/8/8/8/RK6 w A - 0 1", shredder=True
+        )
+        projector = imba_chess_native.MoveProjector({"b1c1": 5})
+
+        with pytest.raises(ValueError, match="ambiguous vocabulary token"):
+            projector.project(board)
+
+    def test_allows_the_collision_position_when_the_token_is_unmapped(self):
+        # Only mapped moves can collide: an unmapped one is dropped before the
+        # check, so the same board projects fine against a vocabulary that
+        # simply does not contain the ambiguous token.
+        board = imba_chess_native.Board.from_fen(
+            "4k3/8/8/8/8/8/8/RK6 w A - 0 1", shredder=True
+        )
+        projector = imba_chess_native.MoveProjector({"a1a5": 3})
+
+        ids, _moves, ucis, total = projector.project(board)
+
+        assert ids == [3]
+        assert ucis == ["a1a5"]
+        assert total > 2
+
     def test_normalizes_chess960_castling_from_the_board(self):
         # Rooks on b1/h1, king on e1. The raw long castle is "e1b1", which is
         # absent from the Python fast path's four-entry castle table, so the
