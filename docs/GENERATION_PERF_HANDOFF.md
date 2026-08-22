@@ -404,8 +404,14 @@ unchanged in every case):
 3. `292277b` wave row indices derived once per wave instead of once per layer
    -- `nonzero` was the largest single torch op in a rollout profile (1.019s /
    2,608 calls) and each call was also a device->host sync.
+4. `0cb1067` `PositionEval` carries the vocab id the projector already
+   computed, so `extend()` stops re-deriving it from the UCI string (270k
+   hash+lookup per 4-game run); and `encode_cozy` moves to Rust -- it was the
+   largest Python function left at 0.743s self, one call per node with ~10 FFI
+   crossings each.
 
-**Paired A/B/B/A, A = `d4d1a3e`, B = `292277b`, same machine, same session:**
+**Paired A/B/B/A, A = `d4d1a3e`, B = `292277b`, same machine, same session**
+(changes 1-3):
 
 | bucket | before | after | ratio |
 | --- | --- | --- | --- |
@@ -427,6 +433,37 @@ from the layer loop, so the stall moved to the next sync point -- the `.cpu()`
 inside `consume_decode_result`, which `decode_project` times. The buckets are
 enqueue-timed (section 6, rule 1), so moving syncs reshuffles attribution
 without changing work. Read the total, not the split.
+
+### Change 4 measured separately, and only at bucket level
+
+**Paired A/B/B/A, A = `292277b`, B = `0cb1067`:**
+
+| bucket | before | after | ratio |
+| --- | --- | --- | --- |
+| `decode_prep` | 11.2s | 8.9s | **1.264** |
+| `search_bookkeeping` | 9.9s | 10.3s | 0.97 |
+| `decode_project` | 23.9s | 24.8s | 0.96 |
+| `search_gpu` | 19.7s | 20.4s | 0.97 |
+| total | 67.0s | 66.8s | 1.004 |
+
+**Read only the `decode_prep` row.** That session ran at ~67s where the same
+code had measured ~41s an hour earlier -- roughly 60% slower machine-wide, with
+no compute process on the GPU and `nvidia-smi` reporting 82% "utilization",
+the phantom-load signature in section 6 rule 3. Everything inflated together,
+so the total is unresolvable and the other buckets sit inside the drift band.
+
+`decode_prep` is where `encode_cozy` lives, and its arm ranges do not overlap
+(A 10.8/11.7 vs B 9.1/8.7), so **1.26x there is real** -- about 2.3s, which is
+~5.6% of a healthy ~41s run but only 3.4% of that session's 67s.
+
+The `extend` vocab-id half would surface in `search_bookkeeping` and did not
+(0.97). It was sized at ~1-2% beforehand, i.e. below what any session here has
+resolved. It is kept because it is free and provably identical, not because it
+was measured.
+
+**Do not compare totals across sessions.** Observed spread for materially the
+same code across this work: 40s to 74s. Only same-session paired ratios mean
+anything, and even those need the control buckets checked.
 
 ### Not done: batching the per-group decode loop
 
