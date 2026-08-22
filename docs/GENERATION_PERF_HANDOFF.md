@@ -410,60 +410,53 @@ unchanged in every case):
    largest Python function left at 0.743s self, one call per node with ~10 FFI
    crossings each.
 
-**Paired A/B/B/A, A = `d4d1a3e`, B = `292277b`, same machine, same session**
-(changes 1-3):
+**Paired A/B/B/A, A = `d4d1a3e`, B = `0cb1067`, on a freshly restarted and
+verified-idle machine.** This supersedes the earlier partial measurements in
+this section's history; all four changes are covered.
 
 | bucket | before | after | ratio |
 | --- | --- | --- | --- |
-| `search_gpu` | 16.1s | 11.1s | **1.46** |
-| `search_bookkeeping` | 15.8s | 10.4s | **1.52** |
-| `decode_project` | 8.3s | 11.8s | 0.70 |
-| `decode_prep` | 5.8s | 6.5s | 0.88 |
-| `root_eval` (control) | 0.9s | 0.9s | 1.00 |
-| **total** | **47.0s** | **40.8s** | **1.152** |
+| `search_bookkeeping` | 14.9s | 10.0s | **1.485** |
+| `search_gpu` | 12.9s | 9.1s | **1.418** |
+| `decode_prep` | 4.2s | 3.2s | **1.292** |
+| `decode_project` | 6.5s | 8.9s | 0.721 |
+| `root_eval` (control) | 0.7s | 0.8s | 0.933 |
+| **total** | **39.1s** | **32.1s** | **1.218** |
 
-Within-arm spread was 1.4s (A) and 0.2s (B) against a 6.2s difference, and the
-control bucket came in at exactly 1.00, so **this one is resolved** -- unlike
-the single-shot comparisons, which were repeatedly contaminated by drift of
-0.66x-1.18x in `search_gpu`.
+Within-arm spread was **0.6s (A) and 0.4s (B)** against a **7.0s** difference --
+about 12x signal to noise -- with no drift across the a1/b1/b2/a2 sequence
+(39.4, 32.3, 31.9, 38.8) and identical work in all four runs (324 waves /
+428,016 evaluations). Each change is visible in its own bucket:
+`search_bookkeeping` from changes 1-2, `search_gpu` from change 3,
+`decode_prep` from change 4.
 
-**`decode_project` going 0.70 is expected and is partly an artifact.** Forcing
-detection genuinely moved into it (change 1). But change 3 also removed syncs
-from the layer loop, so the stall moved to the next sync point -- the `.cpu()`
-inside `consume_decode_result`, which `decode_project` times. The buckets are
-enqueue-timed (section 6, rule 1), so moving syncs reshuffles attribution
-without changing work. Read the total, not the split.
+`decode_project` at 0.721 is expected: forcing detection deliberately moved
+into it (change 1), and change 3 also pushed the removed layer-loop sync to the
+next sync point, the `.cpu()` that bucket times. Attribution shifted; work did
+not.
 
-### Change 4 measured separately, and only at bucket level
+### Measurement conditions matter more than any single number here
 
-**Paired A/B/B/A, A = `292277b`, B = `0cb1067`:**
+Materially the same code measured **32s to 79s** across this work. Causes
+identified, in order of size:
 
-| bucket | before | after | ratio |
-| --- | --- | --- | --- |
-| `decode_prep` | 11.2s | 8.9s | **1.264** |
-| `search_bookkeeping` | 9.9s | 10.3s | 0.97 |
-| `decode_project` | 23.9s | 24.8s | 0.96 |
-| `search_gpu` | 19.7s | 20.4s | 0.97 |
-| total | 67.0s | 66.8s | 1.004 |
+1. **Machine state.** Sustained runs degraded the box until a restart; after
+   it, back-to-back 20-game runs came in at 32.7s and 32.5s. Before it, the
+   same code ran 63-79s with the GPU idle and `nvidia-smi` reporting 82%
+   phantom utilization. A pure-compute GPU benchmark was steady at ~8 TFLOP/s
+   afterwards, so this was not the card.
+2. **Desktop contention.** A background YouTube stream inflated runs to 67-74s
+   -- the exact confound section 6 rule 3 already documented.
+3. **Corpus streaming, ~6s per run and stable.** Wall time is ~39s against 32s
+   instrumented; the gap is the shuffle-buffer fill, which is NOT cached
+   (`artifacts/hf_cache` is empty, so every run re-streams from HuggingFace).
+   It was ruled out as the variance source: it is consistent run to run, and
+   the timed buckets exclude it yet were the things ballooning.
 
-**Read only the `decode_prep` row.** That session ran at ~67s where the same
-code had measured ~41s an hour earlier -- roughly 60% slower machine-wide, with
-no compute process on the GPU and `nvidia-smi` reporting 82% "utilization",
-the phantom-load signature in section 6 rule 3. Everything inflated together,
-so the total is unresolvable and the other buckets sit inside the drift band.
-
-`decode_prep` is where `encode_cozy` lives, and its arm ranges do not overlap
-(A 10.8/11.7 vs B 9.1/8.7), so **1.26x there is real** -- about 2.3s, which is
-~5.6% of a healthy ~41s run but only 3.4% of that session's 67s.
-
-The `extend` vocab-id half would surface in `search_bookkeeping` and did not
-(0.97). It was sized at ~1-2% beforehand, i.e. below what any session here has
-resolved. It is kept because it is free and provably identical, not because it
-was measured.
-
-**Do not compare totals across sessions.** Observed spread for materially the
-same code across this work: 40s to 74s. Only same-session paired ratios mean
-anything, and even those need the control buckets checked.
+Only same-session paired ratios with the control buckets checked are worth
+anything. **Materializing the corpus locally would remove the ~6s/run and make
+runs more reproducible; it does not change stream order, so it is
+alignment-safe.**
 
 ### Not done: batching the per-group decode loop
 
