@@ -5,6 +5,7 @@ use pyo3::prelude::*;
 pub mod bitboard;
 pub mod board;
 pub mod board_builder;
+pub mod board_state;
 pub mod castle_rights;
 pub mod chess_move;
 pub mod enums;
@@ -25,5 +26,6 @@ fn imba_chess_native(m: &Bound<'_, PyModule>) -> PyResult<()> {
     functions::register(m)?;
     move_projector::register(m)?;
     terminal::register(m)?;
+    board_state::register(m)?;
     Ok(())
 }

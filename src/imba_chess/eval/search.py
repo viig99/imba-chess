@@ -41,9 +41,14 @@ class PositionEval(NamedTuple):
     afterwards cost ~19.8us and two FFI crossings per move on every
     opponent-to-move node.
 
-    Deliberately has no default: an omitted `legal_forcing` would read as "no
-    move is forcing", silently emptying the refutation floor and changing what
-    the search explores. Better a TypeError at construction.
+    `legal_ids` is the vocabulary id per move, also index-aligned. The
+    projector computes it to gather logits and used to drop it, so `extend()`
+    re-derived the same integer from the UCI string -- a hash and a dict lookup
+    per created child, 270k times per 4-game run.
+
+    Deliberately no defaults: an omitted `legal_forcing` would read as "no move
+    is forcing", silently emptying the refutation floor and changing what the
+    search explores. Better a TypeError at construction.
     """
 
     value_stm: float
@@ -51,6 +56,7 @@ class PositionEval(NamedTuple):
     legal_ucis: list[str]
     legal_log_priors: list[float]
     legal_forcing: list[bool]
+    legal_ids: list[int]
 
 
 class PositionEvaluator(Protocol):
@@ -60,7 +66,9 @@ class PositionEvaluator(Protocol):
     built or carried per tree node). `extend` only needs the played move's
     UCI (vocab encoding); it does not need a board."""
 
-    def extend(self, handle: Any, move_uci: str) -> Any: ...
+    def extend(
+        self, handle: Any, move_uci: str, move_vocab_id: int | None = None
+    ) -> Any: ...
 
     def evaluate(
         self, batch: list[tuple[Any, "cc.Board"]]
@@ -466,7 +474,14 @@ def _d2_stepwise(
             if terminal_value is not None:
                 continue
             board2_batch.append(
-                (extend(candidate.handle1, opp_uci), cozy2)
+                (
+                    extend(
+                        candidate.handle1,
+                        opp_uci,
+                        board1_eval.legal_ids[opp_local_idx],
+                    ),
+                    cozy2,
+                )
             )
             board2_meta.append((candidate, len(candidate.reply_candidates) - 1))
 
@@ -664,7 +679,7 @@ def _push_children(
             child.terminal_value_stm = terminal_stm
             node.children.append(child)
             continue
-        child.handle = extend(node.handle, move_uci)
+        child.handle = extend(node.handle, move_uci, position_eval.legal_ids[idx])
         node.children.append(child)
         heapq.heappush(arm.frontier, (-child.path_log_prior, next(counter), child))
 

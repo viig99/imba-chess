@@ -375,7 +375,7 @@ class _ShadowVerifyingEvaluator:
         )
         self.verified_count = 0
 
-    def extend(self, handle, move_uci):
+    def extend(self, handle, move_uci, move_vocab_id=None):
         new_handle = self.inner.extend(handle, move_uci)
         child_board = self._shadow[handle].copy()
         child_board.push_uci(move_uci)

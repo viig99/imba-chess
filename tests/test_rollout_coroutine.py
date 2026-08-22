@@ -92,6 +92,8 @@ def _fake_decode_wave(batch: list[tuple[object, "cc.Board"]]) -> list[PositionEv
                 legal_ucis=ucis,
                 legal_log_priors=priors,
                 legal_forcing=forcing,
+                # This fake's extend ignores the id; only alignment matters.
+                legal_ids=list(range(len(ucis))),
             )
         )
     return results

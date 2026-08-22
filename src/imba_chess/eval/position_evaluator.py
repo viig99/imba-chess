@@ -496,11 +496,20 @@ class CachedPositionEvaluator:
         self._prefix_len = int(prefix_len)
         self._arena: _KVArena | None = None
 
-    def extend(self, handle, move_uci: str):
-        """Create an opaque child handle backed by the shared K/V arena."""
+    def extend(self, handle, move_uci: str, move_vocab_id: int | None = None):
+        """Create an opaque child handle backed by the shared K/V arena.
+
+        `move_vocab_id` is the vocabulary id for `move_uci`, which the caller
+        already has from projection. It is None at the root, where there is no
+        PositionEval to read it from; the tree path -- the one that runs
+        millions of times -- always passes it, so the id is not re-derived from
+        the string there.
+        """
         parent = handle if isinstance(handle, _CachedNode) else None
         depth = parent.depth + 1 if parent is not None else 0
-        return _CachedNode(parent, int(self._move_vocab.encode(move_uci)), depth)
+        if move_vocab_id is None:
+            move_vocab_id = int(self._move_vocab.encode(move_uci))
+        return _CachedNode(parent, move_vocab_id, depth)
 
     def build_decode_request(self, batch) -> _DecodeRequest:
         """All CPU pre-work for one wave: encode boards, token tensors,
@@ -647,8 +656,9 @@ class CachedPositionEvaluator:
                 legal_ucis=ucis,
                 legal_log_priors=prior_rows[row],
                 legal_forcing=forcing,
+                legal_ids=ids,
             )
-            for row, (_ids, moves, ucis, forcing, _total) in enumerate(per_node)
+            for row, (ids, moves, ucis, forcing, _total) in enumerate(per_node)
         ]
 
     def evaluate(self, batch):

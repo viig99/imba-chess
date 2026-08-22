@@ -20,7 +20,7 @@ class _RecordingEvaluator:
         self.inner = inner
         self.calls: list[list[str]] = []
 
-    def extend(self, handle, move_uci):
+    def extend(self, handle, move_uci, move_vocab_id=None):
         return self.inner.extend(handle, move_uci)
 
     def evaluate(self, batch):

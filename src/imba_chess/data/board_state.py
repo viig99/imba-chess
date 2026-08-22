@@ -105,6 +105,8 @@ class BoardStateEncoder:
             raise ValueError("fullmove_bucket_size must be > 0")
 
         mode = cfg.en_passant
+        # Native encoder's mode code; kept in step with _ep_ok below.
+        self._ep_mode_code = {"fen": 0, "legal": 1, "xfen": 2}.get(mode)
         if mode == "fen":
             self._ep_ok = None
         elif mode == "legal":
@@ -162,6 +164,48 @@ class BoardStateEncoder:
         return file_idx + 1 if candidates else 0  # xfen: pseudo-legal capturer exists
 
     def encode_cozy(self, board) -> BoardState:
+        """Encode one board into model token ids.
+
+        Delegates to the native encoder: this runs once per evaluated search
+        node (428k per 20-game rollout) and the Python below made ~10 FFI
+        crossings before bit-twiddling 64 squares. The import stays lazy for
+        the same reason it always did -- this module is on the training data
+        path, which must not require the native binding to be installed.
+        """
+        import imba_chess_native as cc
+
+        cfg = self.config
+        (
+            piece_ids,
+            turn_id,
+            castle_id,
+            ep_file_id,
+            halfmove_bucket_id,
+            fullmove_bucket_id,
+        ) = cc.encode_board_state(
+            board,
+            self._ep_mode_code,
+            cfg.halfmove_max,
+            cfg.halfmove_bucket_size,
+            cfg.fullmove_max,
+            cfg.fullmove_bucket_size,
+        )
+        return BoardState(
+            piece_ids=list(piece_ids),
+            turn_id=turn_id,
+            castle_id=castle_id,
+            ep_file_id=ep_file_id,
+            halfmove_bucket_id=halfmove_bucket_id,
+            fullmove_bucket_id=fullmove_bucket_id,
+        )
+
+    def _encode_cozy_python(self, board) -> BoardState:
+        """Reference implementation of encode_cozy.
+
+        NOT the production path any more -- kept as the independent oracle
+        tests/test_native_board_state.py checks the Rust against. Do not delete
+        it without replacing that check.
+        """
         cfg = self.config
         white_color, black_color, piece_table = _cozy_encode_consts()
         ids = [0] * 64

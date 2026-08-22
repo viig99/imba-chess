@@ -299,21 +299,32 @@ class _WaveEvaluator:
         self._board_state_encoder = board_state_encoder
         self._next_node_id = 0
         self._pending_legal: dict[
-            int, tuple[list["cc.Move"], list[str], list[bool]]
+            int, tuple[list["cc.Move"], list[str], list[bool], list[int]]
         ] = {}
 
-    def extend(self, handle, move_uci: str) -> "_WorkerSearchNode":
+    def extend(
+        self, handle, move_uci: str, move_vocab_id: int | None = None
+    ) -> "_WorkerSearchNode":
         """`handle` is opaque to the caller (search.py); `None` (or
         anything that isn't a `_WorkerSearchNode`, matching
         `_CachedNode.extend`'s own `isinstance` guard) means "parent is the
-        turn's root prefix"."""
+        turn's root prefix".
+
+        `move_vocab_id` is the vocabulary id for `move_uci`, which the caller
+        already has from projection. It is None at the root, where there is no
+        PositionEval to read it from; the tree path -- the one that runs
+        millions of times -- always passes it, so the id is not re-derived from
+        the string there.
+        """
         parent = handle if isinstance(handle, _WorkerSearchNode) else None
+        if move_vocab_id is None:
+            move_vocab_id = int(self._move_vocab.encode(move_uci))
         node_id = self._next_node_id
         self._next_node_id += 1
         return _WorkerSearchNode(
             node_id=node_id,
             parent_id=None if parent is None else parent.node_id,
-            move_vocab_id=int(self._move_vocab.encode(move_uci)),
+            move_vocab_id=move_vocab_id,
         )
 
     def evaluate(
@@ -335,6 +346,7 @@ class _WaveEvaluator:
                 legal_moves,
                 legal_ucis,
                 legal_forcing,
+                legal_vocab_ids,
             )
             board_state = self._board_state_encoder.encode_cozy(cozy_board)
             rows.append(
@@ -362,7 +374,12 @@ class _WaveEvaluator:
             )
         results: list[search.PositionEval] = []
         for node_id, (value_stm, legal_logits) in zip(node_ids, response.rows):
-            legal_moves, legal_ucis, legal_forcing = self._pending_legal.pop(node_id)
+            (
+                legal_moves,
+                legal_ucis,
+                legal_forcing,
+                legal_vocab_ids,
+            ) = self._pending_legal.pop(node_id)
             results.append(
                 search.PositionEval(
                     value_stm=float(value_stm),
@@ -370,6 +387,7 @@ class _WaveEvaluator:
                     legal_ucis=legal_ucis,
                     legal_log_priors=_log_softmax_f32(list(legal_logits)),
                     legal_forcing=legal_forcing,
+                    legal_ids=legal_vocab_ids,
                 )
             )
         return results

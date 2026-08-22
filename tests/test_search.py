@@ -154,7 +154,7 @@ class _ArmValueEvaluator:
         self.eval_calls = 0
         self.positions_evaluated = 0
 
-    def extend(self, handle, move_uci):
+    def extend(self, handle, move_uci, move_vocab_id=None):
         return (handle or ()) + (move_uci,)
 
     def evaluate(self, batch):
@@ -174,6 +174,7 @@ class _ArmValueEvaluator:
                     ucis,
                     [log_prior] * len(moves),
                     _forcing_flags(cozy_board, ucis),
+                    list(range(len(moves))),
                 )
             )
         return results
@@ -186,7 +187,7 @@ class _MaterialEvaluator:
         self.eval_calls = 0
         self.positions_evaluated = 0
 
-    def extend(self, handle, move_uci):
+    def extend(self, handle, move_uci, move_vocab_id=None):
         return (handle or ()) + (move_uci,)
 
     def evaluate(self, batch):
@@ -213,6 +214,7 @@ class _MaterialEvaluator:
                     ucis,
                     priors,
                     _forcing_flags(cozy_board, ucis),
+                    list(range(len(moves))),
                 )
             )
         return results
