@@ -685,3 +685,244 @@ The post-arena 200-game SF2200/budget-2048 run completed 200/200 games at
 consistent with the previous 0.5850 and 0.5975 baselines; no strength
 regression was observed. Output:
 `artifacts/eval/best_hr10_checkpoint_23_hr10-0.9564_sf2200_value_search_halving_post_arena200.json`.
+
+---
+
+## 13. search_bookkeeping decomposed in situ (2026-08-22)
+
+`scripts/probe_bookkeeping_phases.py` (new) times every advance of the real
+`_halving_stepwise` during a real 4-game rollout. That total IS the
+`search_bookkeeping` bucket by construction. Result, 86,013 nodes / 347 waves:
+
+| phase | us/node | share of bucket |
+| --- | --- | --- |
+| **bucket total** | **23.85** | 100% |
+| `_push_children` (order+forcing+push_and_classify+heappush) | **19.35** | **81.1%** |
+| `_backed_stm` (recursive; wrapper double-counts nested frames — unreliable) | 8.02 | 33.6% |
+| `_prior_order` (inside `_push_children`, not additive) | 1.76 | — |
+| wave-loop remainder (frontier pops, `remaining` dict, EvalRequest build) | ~0 | ~0% |
+
+23.85 us/node independently reproduces the 23.36 us/node implied by §12b's
+10.0s bucket over 428,016 node evals, so the probe is calibrated.
+
+**`_push_children` is ~25% of total wall time in a single function; ceiling
+~1.33x.** This supersedes the "~1.27x for the tree half" estimate in §8/§12,
+which was derived from a bucket *share*, never from a decomposition.
+
+### Do not size this from the synthetic harness
+
+`scripts/bench_search_bookkeeping_decompose.py` reports **3.17 us/node** for the
+same phases — **6.1x under** the in-situ number. Its own output says why:
+`mean history len: 0.10`, against a production `max_depth=8`; and it samples
+only 160 opening positions. The same lesson as §6: only in-situ measurement of
+this workload is trustworthy. Prefer `probe_bookkeeping_phases.py`.
+
+### Prime suspect
+
+`search.py:661-663` marshals `node.hash_history` (a Python list that grows with
+depth) into Rust and marshals a new `child_history` list back, **per child per
+node**. That is exactly the axis the harness under-sampled. Fix: hold the
+repetition history behind an opaque native handle so the crossing carries a
+pointer. Sub-decompose `_push_children` before writing any Rust.
+
+### Operational note
+
+The probe stalled for 8 minutes with 0% CPU and all 38 threads in
+`futex_do_wait`, blocked on the HuggingFace corpus socket (network itself was
+fine — `huggingface.co` answered in 0.13s). `artifacts/hf_cache` is empty, so
+every run re-streams. **Local corpus materialization (§8 lever 5) now blocks
+diagnostics, not just throughput.**
+
+### 13b. `_push_children` sub-decomposed (2026-08-22)
+
+`scripts/probe_push_children.py`, 6 games off the local corpus, 137,210 nodes /
+433,879 children (3.16 children per node):
+
+| phase | us/node (raw) | share | corrected us/node |
+| --- | --- | --- | --- |
+| `_push_children` TOTAL | 29.77 | 100% | **19.35** (un-instrumented, §13) |
+| `cc.push_and_classify` | 5.97 | 20.1% | ~5.97 (~31%) |
+| `CachedPositionEvaluator.extend` | 4.28 | 14.4% | ~4.28 (~22%) |
+| `_prior_order` | 1.94 | 6.5% | ~1.94 (~10%) |
+| unattributed (`_TreeNode` alloc, `heappush`, forcing set, loop) | 17.58 | 59.1% | ~7.2 (~37%) |
+
+The raw total is 29.77 vs §13's un-instrumented 19.35 because four wrappers over
+~1M calls add ~1.1 us each; that overhead is **caller-side, so all of it lands in
+`unattributed`**. The corrected column subtracts it. Read shares, not absolutes.
+
+**The depth hypothesis: CONFIRMED as a scaling effect, REFUTED as the main
+target.** `push_and_classify` median cost by input history length:
+
+| hist_len | 0 | 1 | 3 | 5 | 7 | 11 | 13 |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| median us | 0.344 | 0.462 | 0.605 | 0.689 | 1.619 | 1.622 | 2.070 |
+
+**4.72x from hist 0 -> 13**, monotone. That is exactly why
+`bench_search_bookkeeping_decompose.py` (mean history len 0.10) under-measured by
+6.1x. But `push_and_classify` is only ~31% of `_push_children`, so an opaque
+native history handle buys ~8% of wall at best.
+
+**Scope consequence**: no single sub-phase dominates. Capturing the majority of
+`_push_children` (~25% of wall) requires porting the **tree node and frontier
+representation** into Rust -- `_TreeNode` allocation (3.16 per node), the
+`heappush` with its `itertools.count` tiebreaker, and the forcing-index set --
+not just the history marshalling. That is a materially bigger job than §8's
+"cheaper first step" framing suggests. Decide scope before writing Rust.
+
+### 13c. Local corpus: landed and gated (2026-08-22)
+
+`scripts/materialize_corpus.py` writes the post-filter, post-shuffle rows in
+stream order; `LichessDataset.filtered_shuffled_rows()` (extracted from
+`stream()`) is the capture point, and `stream_local()` replays them.
+`generate_search_rollouts.py --local-corpus PATH` opts in (mutually exclusive
+with `--shard-id`/`--num-shards`, since re-sharding a materialized stream would
+slice a different sequence and silently mis-align `(game_id, ply)`).
+
+- `artifacts/corpus/seed42_train.parquet`: 50,000 rows, 40.5 MB, written in 63s.
+- **Label gate PASS**: the 20-game §7 gate off the local corpus is
+  **bit-identical to `artifacts/rollouts/post_native_seeded.parquet` across all
+  18 label columns**, including `arm_evals_spent` element-for-element, with
+  identical work (209 rows / 20 games, **324 waves / 428,016 evals**). The only
+  differing column is `checkpoint`, an absolute-vs-relative path spelling of the
+  same file.
+- The materializer takes the same unconditional `os._exit(0)` as the other
+  drivers (`590838a`): it too hit `PyGILState_Release ... must be current` during
+  finalization, after the parquet was written and renamed.
+
+---
+
+## 14. Decode-wave campaign: Stages 1 and 2a, measured (2026-08-22)
+
+Four bit-identical changes landed. **None of them moved wall clock.** Two of
+the plan's sizing assumptions turned out to be wrong by 3x or more, and the
+measurements that caught them are the most reusable thing in this section.
+
+### 14a. What landed (all `EXACT` on the §7 gate)
+
+Every item below passes `scripts/label_gate_diff.py` against
+`artifacts/rollouts/post_native_seeded.parquet` with **all 18 label columns
+bit-identical**, including `arm_evals_spent` element-for-element, at unchanged
+work (209 rows / 20 games, **324 waves / 428,016 evals**).
+
+| stage | change | measured |
+|---|---|---|
+| 1a | `group_sizes` replaces `nonzero` row bucketing | G+1 fewer d2h syncs/wave |
+| 1b | bounds check moved host-side | (folded into 1a) |
+| 1c | `GroupedDecodeCache`: layer-invariant scratch built once/wave | **-11.0% aten ops/wave** |
+| 1d | legal-logit gather runs on the device | d2h **11.7 MB -> 184 KB**/wave |
+
+`scripts/label_gate_diff.py` is new and is now the single gate for this work.
+One trap it hit on first use: `human_move_backed_value` is NaN wherever the
+human move was not searched, and `NaN == NaN` is False -- a naive `==`
+comparison reports a phantom difference with `max|d|` of exactly 0. It uses
+`Series.equals`.
+
+### 14b. Wall clock: nothing, four times over
+
+Paired A/B/B/A, 60 games, 8 timed runs, warmups discarded, on a box whose
+desktop held GPU utilisation at 16-28% throughout (no compute contexts).
+
+| | A | B | delta |
+|---|---|---|---|
+| **1a-1c** total | 95.2s | 94.5s | -0.7% |
+| ... `search_gpu` | 25.4s | 19.6s | **-23%** |
+| ... `decode_project` | 27.2s | 31.2s | **+15%** |
+| ... `search_bookkeeping` (control) | 30.9s | 32.0s | +3.6% |
+| **1d** total | 94.70s | 93.70s | -1.1% |
+| ... `decode_project` | 31.40s | 30.85s | -1.8% |
+| ... `search_bookkeeping` (control) | 32.18s | 31.25s | **-2.9%** |
+
+Both are null results, and the drift-control bucket says so: for 1d the
+untouched control moved *more* than the bucket under test.
+
+The 1a-1c `search_gpu` drop is real but is **not** a saving. It is the
+unsynced-bucket artifact §0 of the plan predicted: `search_gpu` measures
+*enqueue*, the wave's only sync is the `.cpu()` inside the `decode_project`
+window, so removing host-side syncs relocates the wait one bucket over. The
+two buckets move by nearly equal and opposite amounts.
+
+**Keep all four anyway**: bit-identical, strictly less work, and they cost
+nothing to carry. Just do not bank a speedup from them.
+
+### 14c. Stage 2a is not worth building -- do not re-attempt
+
+The plan sized 2a from `B=330` and "~1,000-1,300 of ~3,056 ops". Both are
+stale. Measured in situ at production settings (20 games, `--concurrent-games 8`):
+
+- `aten::_softmax` fires exactly once per `(group, layer)` iteration, so it is
+  an exact iteration counter: **62.9 iterations/wave** (G~7.9 x L=8).
+- Wave shapes: `B` **min 31 / med 1486 / max 3998**; `N=max(group_sizes)` med
+  512; `maxP` med 95 / max 145. The per-group tensors are NOT tiny, so the
+  loop is not pure launch overhead.
+- The loop's entire `einsum`+`bmm` host cost is `1,740 + 2,101 = 3.8 ms/wave`
+  = **1.09s of a 35.1s run: 3.1% of wall.** That is the ceiling on 2a even if
+  the loop became free.
+- Collapsing to a `[G, N, H, maxP]` rectangle pays a **3.35x** prefix-attention
+  FLOP tax -- 1.95x on the row axis (`G*N/B`, games have very unequal wave
+  sizes) times ~1.72x on the prefix axis. Score tensors go ~44 MB -> ~148 MB
+  on a 7.66 GiB card.
+
+13% fewer ops for 3.35x the attention FLOPs, against a 3.1% ceiling. And
+Stage 1 had already demonstrated that an 11% op cut buys exactly nothing here.
+
+The alternatives are worse, not better: gathering `prefix_k[group_index]` is
+the ~300 MB/layer blowup grouping exists to avoid, and concatenating prefixes
+along `t` with a block-diagonal mask costs G=8x.
+
+### 14d. What `decode_project` actually is (in-situ, 428,016 nodes)
+
+`consume_decode_result` totals 10.53s against the bucket's 10.8s, so the
+decomposition is calibrated.
+
+| phase | s | us/node | share |
+|---|---|---|---|
+| `.cpu()` d2h | **4.41** | 10.31 | **41.9%** |
+| `project_legal_moves` (428,016 FFI calls) | 2.59 | 6.06 | 24.6% |
+| `_batched_legal_log_priors` | 2.25 | 5.26 | 21.4% |
+| PositionEval + arena + kv stack | 1.14 | 2.66 | 10.8% |
+| `_batched_value_scalars` | 0.14 | 0.33 | 1.3% |
+
+The plan's Stage 1d blamed the FFI crossings. They are a quarter of it. The
+d2h was the largest item -- because the full `[B, 1970]` vocab logits were
+moved to the host to read ~31 entries per node.
+
+1d fixed the traffic (gather on device; `gather` copies exact float values so
+it cannot change a bit). What it revealed is more useful than what it saved:
+after the fix the d2h only fell ~27% (normalised against `project_legal_moves`
+as a control, which is untouched by the change and drifted +15% between probe
+runs). **Most of that bucket was never transfer -- it is the host blocked on
+the GPU**, now absorbed by `value_logits.cpu()` as the wave's first sync
+point. That is ~3.2s of a 35.1s run, ~9% of wall, and it is Stage 4's target.
+
+### 14e. Where the time is now, and what is left
+
+At HEAD, 20 games, `--concurrent-games 8`:
+
+| bucket | share | owner |
+|---|---|---|
+| `search_bookkeeping` | 34.3% | Stage 3 (Rust `_push_children`) |
+| `decode_project` | 30.9% | ~26% of it is movegen; the rest is d2h wait |
+| `search_gpu` | 21.7% | Stage 2 -- ceiling measured at 3.1% of wall |
+| `decode_prep` | 10.9% | Stage 1e |
+| `root_eval` | 2.1% | -- |
+
+Refreshed `torch.profiler` at HEAD (`scripts/profile_torch_waves.py`, now
+pointed at the local corpus so it no longer stalls ~8 min on HF): self CPU
+**1.209s** vs self CUDA **261.9ms** over 12 waves -- **GPU busy 21.7%**,
+confirming the plan's ~17% figure. 999 `cudaLaunchKernel`/wave at 3.3us;
+`aten::as_strided` 4,275/wave, `aten::permute` 1,258/wave, `aten::empty`
+910/wave.
+
+**The campaign's premise does not survive this.** Roughly 60% of wall is
+Python/Rust CPU work outside the GPU wave entirely (`search_bookkeeping` plus
+the movegen inside `decode_project`), and four changes touching ops, syncs and
+PCIe traffic moved wall clock zero times. Only two items still have a large,
+measured ceiling:
+
+- **Stage 3** (~25% of wall, ceiling ~1.33x) -- but per §13b no single
+  sub-phase dominates, so it needs `_TreeNode` and the frontier heap in Rust,
+  not just the history handle.
+- **Stage 4** (~9% of wall is host-blocked-on-GPU, ceiling ~1.21x) -- now
+  better evidenced than any remaining Stage 1 or 2 item.
+
+Stages 1e and 2b should not be started before one of those is done.
