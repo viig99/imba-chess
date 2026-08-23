@@ -31,6 +31,13 @@ class RolloutRow:
     search_lam: float = 0.05
 
 
+# Marker prefix for targets produced by a teacher that is NOT one of this
+# project's checkpoints -- e.g. Lichess's own Stockfish `[%eval]` annotations.
+# See assert_rollout_checkpoint_consistency for why such rows are exempt from
+# the teacher-consistency rule.
+EXTERNAL_TEACHER_PREFIX = "external:"
+
+
 def assert_rollout_checkpoint_consistency(
     rollout_lookup: dict[tuple[str, int], "RolloutRow"],
     resume_checkpoint: str | Path | None,
@@ -42,8 +49,30 @@ def assert_rollout_checkpoint_consistency(
     (Wu, Han & Cai, arXiv:2604.13010) teacher-consistency discussion in
     docs/superpowers/specs/2026-07-13-phase1b-policy-distillation-design.md.
     A no-op when rollout_lookup is empty (nothing to check).
+
+    Rows whose `checkpoint` starts with EXTERNAL_TEACHER_PREFIX are exempt,
+    and the exemption is narrow. The rule exists because a SEARCH target is
+    anchored to the value head that guided the search: reusing it against a
+    different checkpoint distills a teacher the student no longer resembles.
+    An external teacher (Lichess's Stockfish evals) was never produced by any
+    checkpoint, is identical no matter which one trains against it, and is the
+    whole point of using it -- an outside signal rather than the partly
+    self-distilled one a rollout gives. There is no checkpoint it could be
+    consistent OR inconsistent with.
+
+    This is not a bypass for genuine search rollouts: mixing external rows with
+    checkpoint-generated rows still validates the latter, and mislabelling a
+    real rollout as external would reintroduce exactly the mismatch this
+    function exists to catch.
     """
     if not rollout_lookup:
+        return
+    checkpoint_rows = [
+        row
+        for row in rollout_lookup.values()
+        if not str(row.checkpoint).startswith(EXTERNAL_TEACHER_PREFIX)
+    ]
+    if not checkpoint_rows:
         return
     if resume_checkpoint is None:
         raise ValueError(
@@ -55,7 +84,7 @@ def assert_rollout_checkpoint_consistency(
     resolved_resume = Path(resume_checkpoint).resolve()
     mismatched = {
         row.checkpoint
-        for row in rollout_lookup.values()
+        for row in checkpoint_rows
         if Path(row.checkpoint).resolve() != resolved_resume
     }
     if mismatched:

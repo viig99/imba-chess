@@ -39,7 +39,11 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 
-from imba_chess.data.rollout_store import RolloutRow, write_rollout_parquet
+from imba_chess.data.rollout_store import (
+    EXTERNAL_TEACHER_PREFIX,
+    RolloutRow,
+    write_rollout_parquet,
+)
 
 # Mate scores are not centipawns and must not be folded into that scale; they
 # get their own two buckets, signed by who is mating.
@@ -123,7 +127,10 @@ def main() -> None:
             root_wdl_unsearched=(float(p_loss), float(p_draw), float(p_win)),
             arm_move_uci=(), arm_backed_value=(), arm_evals_spent=(), arm_log_prior=(),
             search_budget=0, search_top_m=0, search_max_depth=0,
-            checkpoint="lichess-stockfish-eval",
+            # EXTERNAL_TEACHER_PREFIX: these targets came from Lichess's own
+            # Stockfish analysis, not from any checkpoint of this project, so
+            # the teacher-consistency rule does not apply to them.
+            checkpoint=f"{EXTERNAL_TEACHER_PREFIX}lichess-stockfish-eval",
         )
         for gid, ply, out, (p_loss, p_draw, p_win) in zip(
             d["game_id"], d["ply"], d["real_outcome_stm"], wdl
