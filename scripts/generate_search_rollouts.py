@@ -495,6 +495,16 @@ def _parse_args() -> argparse.Namespace:
         "games_processed, so a resume skips rather than retries them.",
     )
     parser.add_argument(
+        "--local-corpus",
+        type=Path,
+        default=None,
+        help="Replay a corpus materialized by scripts/materialize_corpus.py "
+        "instead of streaming from HuggingFace. The file holds the same "
+        "post-filter/post-shuffle rows in the same order, so labels are "
+        "bit-identical -- gated, not assumed. Mutually exclusive with "
+        "--shard-id/--num-shards.",
+    )
+    parser.add_argument(
         "--sample-every-n-games",
         type=int,
         default=1,
@@ -632,7 +642,20 @@ def main() -> None:
     games_skipped = 0
     total_streamed = 0
     stats = _TimingStats() if args.profile else None
-    game_stream = lichess_dataset.stream(shard_id=args.shard_id, num_shards=args.num_shards)
+    if args.local_corpus is not None:
+        # The local file is a single pre-materialized stream captured after
+        # filter+shuffle, so re-sharding it would slice a different sequence
+        # than --shard-id slices upstream. Refuse rather than silently
+        # mis-align (game_id, ply) keys.
+        if args.shard_id is not None or args.num_shards is not None:
+            raise ValueError(
+                "--local-corpus is mutually exclusive with --shard-id/--num-shards"
+            )
+        game_stream = lichess_dataset.stream_local(str(args.local_corpus))
+    else:
+        game_stream = lichess_dataset.stream(
+            shard_id=args.shard_id, num_shards=args.num_shards
+        )
 
     def _game_records() -> Iterator[dict]:
         # Cheap skip: never builds a game coroutine for a skipped game (so

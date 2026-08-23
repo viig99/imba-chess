@@ -96,12 +96,20 @@ class LichessDataset:
         self.board_state_encoder = BoardStateEncoder(board_state_config)
         self._validate_split_settings()
 
-    def stream(
+    def filtered_shuffled_rows(
         self,
         *,
         shard_id: Optional[int] = None,
         num_shards: Optional[int] = None,
-    ) -> Iterator[Dict[str, Any]]:
+    ) -> tuple[Optional[Iterable[Dict[str, Any]]], bool]:
+        """The exact raw-row iterable `stream()` parses, plus its prefiltered flag.
+
+        Split out of `stream()` so a local corpus can be materialized from the
+        SAME point in the pipeline -- after `.filter()` and after
+        `.shuffle(seed=train_month_shuffle_seed)`. Capturing rows here is what
+        makes materialization order-identical, and therefore alignment-safe for
+        the `(game_id, ply)` keys that join rollouts to training.
+        """
         if self.cache_dir is not None:
             Path(self.cache_dir).mkdir(parents=True, exist_ok=True)
 
@@ -112,7 +120,7 @@ class LichessDataset:
             num_shards=num_shards,
         )
         if not data_files:
-            return
+            return None, False
 
         load_kwargs = self._build_load_kwargs(data_files=data_files)
 
@@ -141,11 +149,50 @@ class LichessDataset:
                 seed=self.train_month_shuffle_seed,
                 buffer_size=self.train_shuffle_buffer_size,
             )
+        return rows, prefiltered
+
+    def stream(
+        self,
+        *,
+        shard_id: Optional[int] = None,
+        num_shards: Optional[int] = None,
+    ) -> Iterator[Dict[str, Any]]:
+        rows, prefiltered = self.filtered_shuffled_rows(
+            shard_id=shard_id, num_shards=num_shards
+        )
+        if rows is None:
+            return
 
         yield from self.stream_from_rows(
             rows,
             max_games=self._max_games_for_split(),
             assume_prefiltered=prefiltered,
+        )
+
+    def stream_local(
+        self,
+        path: str,
+        *,
+        max_games: Optional[int] = None,
+    ) -> Iterator[Dict[str, Any]]:
+        """Replay a corpus materialized by `scripts/materialize_corpus.py`.
+
+        The local file holds the post-filter, post-shuffle rows in stream order,
+        so this yields games IDENTICAL to `stream()` for as far as it reaches --
+        gated by a bit-identical rollout diff, not by assumption. Rows were
+        already filtered upstream, hence `assume_prefiltered=True`.
+        """
+        import pyarrow.parquet as pq
+
+        def _rows() -> Iterator[Dict[str, Any]]:
+            handle = pq.ParquetFile(path)
+            for batch in handle.iter_batches(batch_size=self.parquet_batch_size):
+                yield from batch.to_pylist()
+
+        yield from self.stream_from_rows(
+            _rows(),
+            max_games=max_games if max_games is not None else self._max_games_for_split(),
+            assume_prefiltered=True,
         )
 
     def _game_filter(self, row: Dict[str, Any]) -> bool:
