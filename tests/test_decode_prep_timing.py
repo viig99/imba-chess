@@ -77,6 +77,7 @@ def _install_fakes(monkeypatch, stats):
         prefix_kv_grouped = []
         prefix_lens = None
         prefix_lens_list = [1]
+        group_sizes = [1]
         suffix_kv = None
         suffix_positions = None
         suffix_mask = None

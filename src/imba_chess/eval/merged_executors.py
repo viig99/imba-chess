@@ -145,6 +145,7 @@ class _MergedDecodeRequest:
     prefix_kv_grouped: list[tuple[torch.Tensor, torch.Tensor]]
     prefix_lens: torch.Tensor
     prefix_lens_list: list[int]
+    group_sizes: list[int]
     suffix_kv: list[tuple[torch.Tensor, torch.Tensor]] | None
     suffix_positions: torch.Tensor | None
     suffix_mask: torch.Tensor | None
@@ -171,10 +172,16 @@ def _merge_decode_requests(requests: list[Any]) -> _MergedDecodeRequest:
     gathered its own arena ancestor rows; this merge only aligns games.
     """
     num_layers = len(requests[0].prefix_kv)
+    # One source of truth for the layout: a game's rows are contiguous, and
+    # group_sizes names those spans on the host. group_index is the same
+    # information as a [B] device tensor, kept for callers/validation that
+    # still want it -- forward_decode_grouped(group_sizes=...) does not read
+    # it, which is what removes its per-wave syncs.
+    group_sizes = [len(req.nodes) for req in requests]
     group_index = torch.cat(
         [
-            torch.full((len(req.nodes),), g, dtype=torch.long)
-            for g, req in enumerate(requests)
+            torch.full((n,), g, dtype=torch.long)
+            for g, n in enumerate(group_sizes)
         ]
     )
     new_token_batch = {
@@ -282,6 +289,7 @@ def _merge_decode_requests(requests: list[Any]) -> _MergedDecodeRequest:
         prefix_kv_grouped=prefix_kv_grouped,
         prefix_lens=prefix_lens,
         prefix_lens_list=prefix_lens_list,
+        group_sizes=group_sizes,
         suffix_kv=suffix_kv,
         suffix_positions=suffix_positions,
         suffix_mask=suffix_mask,
@@ -354,6 +362,7 @@ def _make_decode_wave_executor(
                 suffix_kv=merged.suffix_kv,
                 suffix_positions=merged.suffix_positions,
                 suffix_mask=merged.suffix_mask,
+                group_sizes=merged.group_sizes,
             )
         gpu_elapsed = time.perf_counter() - t0
 

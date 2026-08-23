@@ -799,6 +799,7 @@ class ActorInferenceServer:
                 suffix_kv=merged.suffix_kv,
                 suffix_positions=merged.suffix_positions,
                 suffix_mask=merged.suffix_mask,
+                group_sizes=merged.group_sizes,
             )
         self._sync_if_profiling()
         _t2 = time.perf_counter()

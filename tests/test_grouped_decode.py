@@ -479,3 +479,140 @@ def test_forward_decode_grouped_empty_prefix_lens_raises():
             prefix_lens=torch.zeros(0, dtype=torch.long),
             prefix_lens_list=[],
         )
+
+
+def _grouped_wave_with_suffix(seed: int):
+    """A 3-row / 2-group wave WITH suffix tokens, plus its call kwargs.
+
+    Suffix rows are the part of the decode path the group_sizes fast path
+    and the per-wave cache both touch (relative bias, mask negation), so the
+    equivalence tests below need a wave that actually has them.
+    """
+    model = _tiny_model()
+    num_layers = len(model.layers)
+    num_heads = model.config.num_heads
+    attn_dim = model.config.attention_dim
+    linear_dim = model.config.linear_hidden_dim
+    T0, T1 = 6, 4
+    ids0 = _random_token_ids(T0 + 2, seed=seed)
+    ids1 = _random_token_ids(T1 + 1, seed=seed + 1)
+    prefix_kv0 = _prefill(model, ids0, T0)
+    prefix_kv1 = _prefill(model, ids1, T1)
+
+    row_a = {key: value[T0 : T0 + 1] for key, value in ids0.items()}
+    row_b = {key: value[T0 + 1 : T0 + 2] for key, value in ids0.items()}
+    row_c = {key: value[T1 : T1 + 1] for key, value in ids1.items()}
+    new_token_batch = {
+        key: torch.cat([row_a[key], row_b[key], row_c[key]], dim=0) for key in row_a
+    }
+    prefix_kv_grouped, prefix_lens = _pad_prefix_kv_grouped(
+        [prefix_kv0, prefix_kv1], num_layers
+    )
+
+    gen = torch.Generator().manual_seed(seed + 2)
+    s = 2
+    suffix_kv = [
+        (
+            torch.randn(3, num_heads, s, attn_dim, generator=gen),
+            torch.randn(3, num_heads, s, linear_dim, generator=gen),
+        )
+        for _ in range(num_layers)
+    ]
+    # Row 2 has only one real suffix token: a ragged mask is what makes the
+    # cached, pre-negated mask distinguishable from a wrong one.
+    suffix_mask = torch.tensor(
+        [[True, True], [True, True], [True, False]], dtype=torch.bool
+    )
+    suffix_positions = torch.tensor([[T0 - 2, T0 - 1], [T0 - 2, T0 - 1], [T1 - 1, 0]])
+
+    return model, dict(
+        new_token_batch=new_token_batch,
+        positions=torch.tensor([T0, T0, T1]),
+        prefix_kv_grouped=prefix_kv_grouped,
+        prefix_lens=prefix_lens,
+        prefix_lens_list=prefix_lens.tolist(),
+        suffix_kv=suffix_kv,
+        suffix_positions=suffix_positions,
+        suffix_mask=suffix_mask,
+    )
+
+
+def test_group_sizes_fast_path_is_bit_identical_to_group_index():
+    """`group_sizes` removes G+1 device syncs by replacing `nonzero` with
+    host-side aranges. It reorders no arithmetic, so it must be EXACTLY
+    equal to the group_index path -- not merely close."""
+    model, kwargs = _grouped_wave_with_suffix(seed=800)
+    group_index = torch.tensor([0, 0, 1], dtype=torch.long)
+
+    with torch.no_grad():
+        slow = model.forward_decode_grouped(group_index=group_index, **kwargs)
+        fast = model.forward_decode_grouped(
+            group_index=group_index, group_sizes=[2, 1], **kwargs
+        )
+
+    for key in ("logits", "value_logits"):
+        assert torch.equal(slow[key], fast[key]), f"{key} differs"
+    for layer_idx in range(len(model.layers)):
+        for slow_t, fast_t in zip(slow["kv"][layer_idx], fast["kv"][layer_idx]):
+            assert torch.equal(slow_t, fast_t)
+
+
+def test_group_sizes_is_validated_host_side():
+    """The device-side bounds check is skipped on the group_sizes path, so
+    that path must catch a malformed layout itself -- silently dropping rows
+    would return uninitialized attn_output as plausible logits."""
+    model, kwargs = _grouped_wave_with_suffix(seed=810)
+    group_index = torch.tensor([0, 0, 1], dtype=torch.long)
+
+    for bad, reason in (
+        ([2], "wrong length"),
+        ([2, 1, 0, 0], "wrong length"),
+        ([3, -1], "negative"),
+        ([2, 0], "does not cover the batch"),
+        ([2, 2], "overruns the batch"),
+    ):
+        with pytest.raises(ValueError):
+            model.forward_decode_grouped(
+                group_index=group_index, group_sizes=bad, **kwargs
+            )
+
+
+def test_decode_cache_built_per_layer_matches_built_per_wave():
+    """The layer builds its own cache when the model does not pass one (the
+    standalone/test path). Both routes must agree exactly, or the two
+    callers of forward_decode_grouped would silently diverge."""
+    from imba_chess.model.hstu_attention import build_grouped_decode_cache
+
+    model, kwargs = _grouped_wave_with_suffix(seed=820)
+    layer = model.layers[0]
+    row_idx_per_group = [torch.tensor([0, 1]), torch.tensor([2])]
+    prefix_k, prefix_v = kwargs["prefix_kv_grouped"][0]
+    suffix_k, suffix_v = kwargs["suffix_kv"][0]
+    x_new = torch.randn(3, model.config.model_dim, generator=torch.Generator().manual_seed(821))
+
+    shared = dict(
+        prefix_k=prefix_k,
+        prefix_v=prefix_v,
+        prefix_lens_list=kwargs["prefix_lens_list"],
+        group_index=torch.tensor([0, 0, 1], dtype=torch.long),
+        row_idx_per_group=row_idx_per_group,
+        q_positions=kwargs["positions"],
+        suffix_k=suffix_k,
+        suffix_v=suffix_v,
+        suffix_positions=kwargs["suffix_positions"],
+        suffix_mask=kwargs["suffix_mask"],
+    )
+    cache = build_grouped_decode_cache(
+        row_idx_per_group=row_idx_per_group,
+        prefix_lens_list=kwargs["prefix_lens_list"],
+        q_positions=kwargs["positions"],
+        suffix_positions=kwargs["suffix_positions"],
+        suffix_mask=kwargs["suffix_mask"],
+        max_seq_len=layer._max_seq_len,
+    )
+    with torch.no_grad():
+        built_here = layer.forward_decode_grouped(x_new, **shared)
+        passed_in = layer.forward_decode_grouped(x_new, decode_cache=cache, **shared)
+
+    for a, b in zip(built_here, passed_in):
+        assert torch.equal(a, b)

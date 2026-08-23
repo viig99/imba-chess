@@ -9,7 +9,10 @@ import torch.nn.functional as F
 from attn_gym.masks import generate_doc_mask_mod, generate_prefix_lm_mask
 from torch.nn.attention.flex_attention import BlockMask, create_block_mask
 
-from .hstu_attention import SequentialTransductionUnitJagged
+from .hstu_attention import (
+    SequentialTransductionUnitJagged,
+    build_grouped_decode_cache,
+)
 from .position_embedding import PositionEmbedding
 
 _compiled_create_block_mask = torch.compile(create_block_mask, dynamic=True)
@@ -717,9 +720,19 @@ class HSTUChessModel(nn.Module):
         suffix_kv: list[tuple[torch.Tensor, torch.Tensor]] | None = None,
         suffix_positions: torch.Tensor | None = None,
         suffix_mask: torch.Tensor | None = None,
+        group_sizes: list[int] | None = None,
     ) -> dict[str, Any]:
         """Decode one new token per batch row against per-game grouped
         prefix K/V caches (cross-game merged wave).
+
+        `group_sizes` is an optional host-side promise that the rows are
+        already laid out contiguously by group -- group g owning
+        [sum(group_sizes[:g]), +group_sizes[g]). When given, `group_index`
+        is never read: the bounds check and the per-group row indices both
+        become Python integer arithmetic, removing G+1 device->host syncs
+        per wave from the critical path ahead of the layer loop. Omit it and
+        the arbitrary-order `nonzero` path is used instead, which is what
+        an interleaved group_index needs.
 
         Companion to forward_decode for the multi-game batched search
         executor: rows from up to G different games share one call, each
@@ -747,7 +760,8 @@ class HSTUChessModel(nn.Module):
         assert not self.training, "forward_decode_grouped is inference-only"
         device = self.piece_square_embedding.weight.device
         positions = positions.to(device=device, dtype=torch.long)
-        group_index = group_index.to(device=device, dtype=torch.long)
+        if group_sizes is None:
+            group_index = group_index.to(device=device, dtype=torch.long)
         prefix_lens = prefix_lens.to(device=device, dtype=torch.long)
         content = self._build_content(new_token_batch)
         batch_size = int(content.shape[0])
@@ -767,15 +781,39 @@ class HSTUChessModel(nn.Module):
             raise ValueError(
                 "group_index must have shape [B] matching new_token_batch"
             )
-        # No `num_groups > 0` short-circuit here: a non-empty batch with
-        # zero groups (empty prefix_lens) must still raise below rather than
-        # let every row skip the per-group loop and return uninitialized
-        # (torch.empty) attn_output as silent NaN logits. With num_groups==0
-        # the comparison `group_index >= 0` is already sufficient to catch
-        # any row (since no g in range(0) will ever claim it), and .any() on
-        # an empty group_index (batch_size==0) is correctly False.
-        if bool(((group_index < 0) | (group_index >= num_groups)).any()):
-            raise ValueError("group_index values must be in [0, num_groups)")
+        if group_sizes is not None:
+            # Contiguous-groups fast path. The caller asserts that row i
+            # belongs to the unique group g with
+            # offset_g <= i < offset_g + group_sizes[g] -- which is exactly
+            # how _merge_decode_requests lays a wave out (it builds
+            # group_index by concatenating one torch.full per request, so a
+            # game's rows are adjacent by construction). Under that promise
+            # the same "no row goes unclaimed" property the check below
+            # enforces follows from sum(group_sizes) == batch_size, and it
+            # costs no device round trip.
+            if len(group_sizes) != num_groups:
+                raise ValueError(
+                    "group_sizes must have length num_groups "
+                    f"(== {num_groups}), got {len(group_sizes)}"
+                )
+            if any(n < 0 for n in group_sizes):
+                raise ValueError("group_sizes entries must be non-negative")
+            if sum(group_sizes) != batch_size:
+                raise ValueError(
+                    "group_sizes must sum to the batch size "
+                    f"({batch_size}), got {sum(group_sizes)}"
+                )
+        else:
+            # No `num_groups > 0` short-circuit here: a non-empty batch with
+            # zero groups (empty prefix_lens) must still raise below rather
+            # than let every row skip the per-group loop and return
+            # uninitialized (torch.empty) attn_output as silent NaN logits.
+            # With num_groups==0 the comparison `group_index >= 0` is already
+            # sufficient to catch any row (since no g in range(0) will ever
+            # claim it), and .any() on an empty group_index (batch_size==0)
+            # is correctly False.
+            if bool(((group_index < 0) | (group_index >= num_groups)).any()):
+                raise ValueError("group_index values must be in [0, num_groups)")
         x = self.position_embedding.at_positions(content, positions)
 
         new_kv: list[tuple[torch.Tensor, torch.Tensor]] = []
@@ -784,9 +822,42 @@ class HSTUChessModel(nn.Module):
         # wave ran 64 `nonzero` calls where 8 suffice -- and since nonzero's
         # output shape is data-dependent, each was a device->host sync too. It
         # measured as the largest single torch op in a rollout profile.
-        row_idx_per_group = [
-            (group_index == g).nonzero(as_tuple=True)[0] for g in range(num_groups)
-        ]
+        if group_sizes is not None:
+            # ...and when the caller names the group boundaries, the G
+            # surviving `nonzero` syncs go away too: each group's rows are
+            # the contiguous span [offset, offset + n).
+            row_idx_per_group = []
+            offset = 0
+            for n in group_sizes:
+                row_idx_per_group.append(
+                    torch.arange(offset, offset + n, device=device, dtype=torch.long)
+                )
+                offset += n
+        else:
+            row_idx_per_group = [
+                (group_index == g).nonzero(as_tuple=True)[0] for g in range(num_groups)
+            ]
+
+        # The rest of the per-group decode scratch is layer-invariant as
+        # well, so build it once here instead of num_layers times inside the
+        # loop below. It needs the layers' shared _max_seq_len: they are all
+        # constructed from config.max_position_embeddings, but a layer that
+        # disagreed would silently receive the wrong relative bias, so check
+        # rather than assume.
+        max_seq_lens = {int(layer._max_seq_len) for layer in self.layers}
+        if len(max_seq_lens) != 1:
+            raise ValueError(
+                "layers must share a single _max_seq_len for the per-wave "
+                f"decode cache; got {sorted(max_seq_lens)}"
+            )
+        decode_cache = build_grouped_decode_cache(
+            row_idx_per_group=row_idx_per_group,
+            prefix_lens_list=prefix_lens_list,
+            q_positions=positions,
+            suffix_positions=suffix_positions,
+            suffix_mask=suffix_mask,
+            max_seq_len=next(iter(max_seq_lens)),
+        )
 
         for layer_idx, layer in enumerate(self.layers):
             prefix_k, prefix_v = prefix_kv_grouped[layer_idx]
@@ -806,6 +877,7 @@ class HSTUChessModel(nn.Module):
                 suffix_v=layer_suffix_v,
                 suffix_positions=suffix_positions,
                 suffix_mask=suffix_mask,
+                decode_cache=decode_cache,
             )
             new_kv.append((k_new, v_new))
 
