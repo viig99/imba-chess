@@ -41,11 +41,23 @@ def main() -> None:
     ap.add_argument("--config", type=Path, default=DEFAULT_CONFIG_PATH)
     ap.add_argument("--output", type=Path, required=True)
     ap.add_argument("--max-rows", type=int, default=50_000)
+    ap.add_argument(
+        "--split",
+        choices=["train", "val", "test"],
+        default="train",
+        help="Which month window to materialize. Only 'train' carries the "
+             "rollout-alignment constraint (and therefore the seed guard); "
+             "val/test are read straight through in file order.",
+    )
     ap.add_argument("--chunk-rows", type=int, default=5_000)
     args = ap.parse_args()
 
     cfg = load_repo_config(args.config).dataset
-    if cfg.train_month_shuffle_seed is None:
+    # The seed guard exists so a materialized TRAIN copy replays the exact
+    # order the (game_id, ply) rollout keys were generated against. val/test
+    # are never sharded against rollouts and are not shuffled, so the guard
+    # would only block a legitimate use.
+    if args.split == "train" and cfg.train_month_shuffle_seed is None:
         raise ValueError(
             "config leaves train_month_shuffle_seed unset -- the stream order would "
             "be OS-entropy-seeded and a materialized copy would align with nothing. "
@@ -55,10 +67,16 @@ def main() -> None:
     dataset = LichessDataset(
         min_avg_elo=cfg.min_avg_elo,
         min_time_control_sec=cfg.min_time_control_sec,
-        split="train",
+        split=args.split,
         dataset_name=cfg.dataset_name,
         train_start_month=cfg.train_start_month,
         train_end_month=cfg.train_end_month,
+        val_start_month=cfg.val_start_month,
+        val_end_month=cfg.val_end_month,
+        test_start_month=cfg.test_start_month,
+        test_end_month=cfg.test_end_month,
+        val_max_games=cfg.val_max_games,
+        test_max_games=cfg.test_max_games,
         cache_dir=cfg.cache_dir,
         parquet_batch_size=cfg.parquet_batch_size,
         max_seq_len=cfg.max_seq_len,
@@ -71,7 +89,7 @@ def main() -> None:
     if rows is None:
         raise RuntimeError("no data files resolved for this config's month window")
     print(
-        f"streaming (prefiltered={prefiltered}, shuffle_seed="
+        f"streaming split={args.split} (prefiltered={prefiltered}, shuffle_seed="
         f"{cfg.train_month_shuffle_seed}, buffer={cfg.train_shuffle_buffer_size}) "
         f"-> {args.output}",
         flush=True,

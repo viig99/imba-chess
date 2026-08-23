@@ -35,6 +35,13 @@ class DatasetConfig:
     train_month_shuffle_seed: Optional[int] = None
     # Game-level shuffle buffer for the train stream; 0 disables.
     train_shuffle_buffer_size: int = 0
+    # Replay a corpus materialized by scripts/materialize_corpus.py instead of
+    # streaming from HuggingFace. Removes an ~8 minute per-run stall and makes
+    # short experiments practical. TRAIN SPLIT ONLY -- it is a single captured
+    # stream, so re-sharding it would slice a different sequence than sharding
+    # slices upstream and would silently mis-align the (game_id, ply) keys that
+    # join rollout/eval targets to training (see stream()).
+    local_corpus_path: Optional[str] = None
 
 
 @dataclass(frozen=True)

@@ -54,6 +54,7 @@ class LichessDataset:
         shuffle_train_month_files_on_start: bool = False,
         train_month_shuffle_seed: Optional[int] = None,
         train_shuffle_buffer_size: int = 0,
+        local_corpus_path: Optional[str] = None,
         board_state_config: Optional[BoardTokenConfig] = None,
     ) -> None:
         self.min_avg_elo = min_avg_elo
@@ -93,6 +94,7 @@ class LichessDataset:
         if train_shuffle_buffer_size < 0:
             raise ValueError("train_shuffle_buffer_size must be >= 0")
         self.train_shuffle_buffer_size = int(train_shuffle_buffer_size)
+        self.local_corpus_path = local_corpus_path
         self.board_state_encoder = BoardStateEncoder(board_state_config)
         self._validate_split_settings()
 
@@ -157,6 +159,21 @@ class LichessDataset:
         shard_id: Optional[int] = None,
         num_shards: Optional[int] = None,
     ) -> Iterator[Dict[str, Any]]:
+        if self.local_corpus_path is not None:
+            # A materialized corpus is ONE captured stream. Slicing it per
+            # dataloader worker would hand each worker a different subsequence
+            # than upstream sharding would, silently breaking the
+            # (game_id, ply) alignment that rollout and eval value targets
+            # depend on -- the same failure mode as the 2026-07-25 sharding
+            # bug, which zeroed every rollout target without erroring.
+            # Refuse loudly instead.
+            if num_shards is not None and int(num_shards) > 1:
+                raise ValueError(
+                    "dataset.local_corpus_path cannot be sharded (num_shards="
+                    f"{num_shards}); set dataloader.num_workers = 0"
+                )
+            yield from self.stream_local(self.local_corpus_path)
+            return
         rows, prefiltered = self.filtered_shuffled_rows(
             shard_id=shard_id, num_shards=num_shards
         )

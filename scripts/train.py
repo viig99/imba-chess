@@ -148,6 +148,11 @@ def _make_dataset(config, *, split: str) -> LichessDataset:
         shuffle_train_month_files_on_start=dataset_cfg.shuffle_train_month_files_on_start,
         train_month_shuffle_seed=dataset_cfg.train_month_shuffle_seed,
         train_shuffle_buffer_size=dataset_cfg.train_shuffle_buffer_size,
+        # Train split only: the materialized corpus IS the train stream, and
+        # pointing val/test at it would evaluate on training games.
+        local_corpus_path=(
+            dataset_cfg.local_corpus_path if split == "train" else None
+        ),
         board_state_config=config.board_state,
     )
 
