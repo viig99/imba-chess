@@ -261,6 +261,14 @@ def _batched_legal_log_priors(
     over exactly its own moves. Filling without masking would leak logits[.,0]
     into every short row -- pinned by
     tests/test_batched_projection.py::test_batched_log_priors_padding_cannot_leak.
+
+    `logits` may be on any device, and passing it in DEVICE-RESIDENT is the
+    point: the gather runs where the logits already are, and only the gathered
+    [B, width] rows cross to the host. Bringing the full [B, vocab] matrix
+    over first moved ~1,970 floats per node to use ~31 of them -- 11.7 MB per
+    wave at B=1486, measured 10.31 us/node (41.9% of consume_decode_result)
+    against 184 KB for the gathered rows. `gather` copies exact float values,
+    so where it runs cannot change a single bit of the result.
     """
     lens = [len(ids) for ids in id_lists]
     width = max(lens)
@@ -272,10 +280,11 @@ def _batched_legal_log_priors(
     idx = torch.tensor(flat, device=logits.device, dtype=torch.long).view(
         len(id_lists), width
     )
-    picked = logits.gather(1, idx)
-    keep = torch.arange(width, device=logits.device).unsqueeze(0) < torch.tensor(
-        lens, device=logits.device
-    ).unsqueeze(1)
+    # The one device->host crossing, now [B, width] instead of [B, vocab].
+    # Everything after it is host arithmetic on exactly the values the old
+    # code had at this point.
+    picked = logits.gather(1, idx).cpu()
+    keep = torch.arange(width).unsqueeze(0) < torch.tensor(lens).unsqueeze(1)
     picked = picked.masked_fill(~keep, float("-inf"))
     rows = torch.log_softmax(picked.float(), dim=1).tolist()
     return [row[:n] for row, n in zip(rows, lens)]
@@ -621,7 +630,11 @@ class CachedPositionEvaluator:
         ]
 
         # One device->host transfer per wave instead of two syncs per node.
-        logits = out["logits"].float().cpu()
+        # `logits` deliberately stays on the device: only the ~31 legal
+        # entries per row are ever read, and _batched_legal_log_priors gathers
+        # them there so the crossing carries [B, width], not [B, vocab].
+        # value_logits is [B, 3] -- already negligible.
+        logits = out["logits"].float()
         value_logits = out["value_logits"].float().cpu()
 
         # Every remaining tensor op is one call for the whole wave. At budget
