@@ -21,6 +21,7 @@ Run:
 
 from __future__ import annotations
 
+import os
 import runpy
 import sys
 
@@ -97,15 +98,22 @@ def main() -> None:
             "--config", "config/imba_chess_exit_seeded_rollout.toml",
             "--checkpoint",
             "artifacts/checkpoints/best_hr10_checkpoint_23_hr10=0.9564.pt",
+            "--local-corpus", "artifacts/corpus/seed42_train.parquet",
             "--output-path", "/tmp/torchprof.parquet",
             "--max-games", GAMES, "--search-budget", "2048",
             "--concurrent-games", "6",
             "--dtype", "float32", "--sample-seed", "42",
         ]
+        real_exit = os._exit
+        # generate_search_rollouts.py hard-exits on success (590838a), which
+        # would kill the process before the tables below are printed.
+        os._exit = lambda code: (_ for _ in ()).throw(SystemExit(code))
         try:
             runpy.run_path("scripts/generate_search_rollouts.py", run_name="__main__")
         except SystemExit:
             pass
+        finally:
+            os._exit = real_exit
 
     for t in tables:
         print(t)
