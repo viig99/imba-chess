@@ -97,7 +97,10 @@ def test_run_limit_flags_parse(monkeypatch):
     assert args.max_games == 2_000_000
 
 
-def test_make_dataset_enables_inline_parsing_only_for_train():
+def test_make_dataset_parses_evals_on_all_splits_but_filters_only_train():
+    # Val/test parse evals too, so the evaluator's value_loss is measured
+    # against the same soft targets the head is trained on; only the train
+    # stream drops un-annotated games.
     config = RepoConfig(
         dataset=DatasetConfig(
             require_stockfish_eval=True,
@@ -110,5 +113,8 @@ def test_make_dataset_enables_inline_parsing_only_for_train():
     val_dataset = train._make_dataset(config, split="val")
     assert train_dataset.parse_stockfish_evals is True
     assert train_dataset.require_stockfish_eval is True
-    assert val_dataset.parse_stockfish_evals is False
+    assert val_dataset.parse_stockfish_evals is True
     assert val_dataset.require_stockfish_eval is False
+
+    no_calibration = RepoConfig(dataset=DatasetConfig(require_stockfish_eval=True))
+    assert train._make_dataset(no_calibration, split="val").parse_stockfish_evals is False

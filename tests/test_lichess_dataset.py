@@ -91,12 +91,17 @@ def test_rejects_games_with_corrupt_movetext():
     assert games == []
 
 
-def test_respects_max_seq_len_truncation():
+def test_rejects_games_longer_than_max_seq_len():
+    # The fixture game has 4 plies. Truncating would label the prefix with the
+    # full game's result and tell the moves-left head the game ends at the
+    # cut, so over-length games are dropped instead.
     dataset = LichessDataset(min_avg_elo=2000, max_seq_len=2)
-    games = list(dataset.stream_from_rows([_row()]))
+    assert list(dataset.stream_from_rows([_row()])) == []
 
+    dataset = LichessDataset(min_avg_elo=2000, max_seq_len=4)
+    games = list(dataset.stream_from_rows([_row()]))
     assert len(games) == 1
-    assert len(games[0]["plays"]) == 2
+    assert len(games[0]["plays"]) == 4
 
 
 def test_invalid_max_seq_len_raises():

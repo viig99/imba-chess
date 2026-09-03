@@ -973,3 +973,111 @@ def test_build_hstu_chess_config_policy_kl_defaults_are_off():
     model_cfg = build_hstu_chess_config(ModelConfig(), move_vocab_size=64)
     assert model_cfg.policy_kl_weight == 0.0
     assert model_cfg.policy_kl_sigma == 1.0
+
+
+def test_hstu_chess_model_soft_target_weighting_knobs():
+    # value_soft_target_weight_alpha=0 + no Elo scale + hard weight 0 turns
+    # the value loss into a plain mean of soft CE over soft-target tokens:
+    # the engine-eval finetune recipe.
+    config = HSTUChessConfig(
+        move_vocab_size=128,
+        model_dim=64,
+        linear_hidden_dim=16,
+        attention_dim=16,
+        num_heads=2,
+        num_layers=0,
+        max_position_embeddings=32,
+        enable_value_head=True,
+        elo_loss_weight_strength=1.0,
+        value_weight_alpha=1.5,
+        value_soft_target_weight_alpha=0.0,
+        value_soft_target_elo_weighting=False,
+        value_hard_target_weight=0.0,
+    )
+    model = HSTUChessModel(config)
+    batch = _batch()
+    total_tokens = batch["seq_token_id"].numel()
+
+    value_target_soft = torch.zeros((total_tokens, 3), dtype=torch.float32)
+    value_target_soft[1] = torch.tensor([0.1, 0.2, 0.7])
+    value_target_soft[4] = torch.tensor([0.5, 0.3, 0.2])
+    has_soft = torch.zeros(total_tokens, dtype=torch.bool)
+    has_soft[1] = True
+    has_soft[4] = True
+    batch["value_target_soft"] = value_target_soft
+    batch["has_rollout_value_target"] = has_soft
+
+    out = model(batch, return_loss=True)
+    soft_loss = -(value_target_soft * F.log_softmax(out["value_logits"].float(), dim=-1)).sum(dim=-1)
+    expected = soft_loss[has_soft].mean()
+    assert torch.allclose(out["value_loss"], expected, atol=1e-6, rtol=1e-6)
+    assert torch.allclose(out["value_weight_sum"], torch.tensor(2.0))
+
+
+def test_hstu_chess_model_soft_target_weighting_defaults_are_unchanged():
+    # Defaults (alpha=None, elo weighting on, hard weight 1) must weight
+    # soft tokens exactly like outcome tokens: progress^alpha * elo_scale.
+    config = HSTUChessConfig(
+        move_vocab_size=128,
+        model_dim=64,
+        linear_hidden_dim=16,
+        attention_dim=16,
+        num_heads=2,
+        num_layers=0,
+        max_position_embeddings=32,
+        enable_value_head=True,
+        elo_loss_weight_strength=1.0,
+    )
+    model = HSTUChessModel(config)
+    batch = _batch()
+    total_tokens = batch["seq_token_id"].numel()
+    value_target_soft = torch.zeros((total_tokens, 3), dtype=torch.float32)
+    value_target_soft[1] = torch.tensor([0.1, 0.2, 0.7])
+    has_soft = torch.zeros(total_tokens, dtype=torch.bool)
+    has_soft[1] = True
+    batch["value_target_soft"] = value_target_soft
+    batch["has_rollout_value_target"] = has_soft
+
+    out = model(batch, return_loss=True)
+    value_logits = out["value_logits"].float()
+    seq_offsets = batch["seq_offsets"].to(dtype=torch.long)
+    counts = seq_offsets[1:] - seq_offsets[:-1]
+    token_game_id = torch.repeat_interleave(torch.arange(batch["num_games"]), counts)
+    z_token = batch["game_result_white"].to(dtype=torch.long)[token_game_id]
+    turn_id = batch["turn_id"].to(dtype=torch.long)
+    value_target = (torch.where(turn_id == 0, z_token, -z_token) + 1).clamp(min=0, max=2)
+    hard_loss = F.cross_entropy(value_logits, value_target, reduction="none")
+    soft_loss = -(value_target_soft * F.log_softmax(value_logits, dim=-1)).sum(dim=-1)
+    per_token = torch.where(has_soft, soft_loss, hard_loss)
+
+    token_pos = torch.arange(total_tokens) - seq_offsets[token_game_id]
+    progress = token_pos.float() / (counts[token_game_id].float() - 1.0).clamp_min(1.0)
+    valid = batch["target_move_id"] != config.ignore_index
+    elo_norm = ((batch["played_by_elo"].float() - 2200) / 600).clamp(0, 1)
+    weights = progress.pow(1.5) * valid.float() * (1.0 + elo_norm)
+    expected = (per_token * weights).sum() / weights.sum()
+    assert torch.allclose(out["value_loss"], expected, atol=1e-6, rtol=1e-6)
+
+
+def test_hstu_chess_model_value_weight_sum_is_zero_when_no_value_tokens():
+    config = HSTUChessConfig(
+        move_vocab_size=128,
+        model_dim=64,
+        linear_hidden_dim=16,
+        attention_dim=16,
+        num_heads=2,
+        num_layers=0,
+        max_position_embeddings=32,
+        enable_value_head=True,
+        value_hard_target_weight=0.0,
+    )
+    model = HSTUChessModel(config)
+    batch = _batch()
+    total_tokens = batch["seq_token_id"].numel()
+    batch["value_target_soft"] = torch.zeros((total_tokens, 3), dtype=torch.float32)
+    batch["has_rollout_value_target"] = torch.zeros(total_tokens, dtype=torch.bool)
+
+    out = model(batch, return_loss=True)
+    assert float(out["value_weight_sum"]) == 0.0
+    assert float(out["value_loss"]) == 0.0
+    assert torch.isfinite(out["loss"])

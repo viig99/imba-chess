@@ -95,6 +95,12 @@ class ModelConfig:
     value_loss_weight: float = 0.15
     value_weight_alpha: float = 1.5
     value_label_smoothing: float = 0.0
+    # See HSTUChessConfig in model/hstu_model.py for the semantics of the
+    # three soft-target weighting knobs. Defaults reproduce the pre-existing
+    # behaviour (soft tokens weighted exactly like outcome tokens).
+    value_soft_target_weight_alpha: Optional[float] = None
+    value_soft_target_elo_weighting: bool = True
+    value_hard_target_weight: float = 1.0
     moves_left_loss_weight: float = 0.05
 
 

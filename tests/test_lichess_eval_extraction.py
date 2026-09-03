@@ -90,11 +90,15 @@ def test_unannotated_and_broken_games_yield_nothing():
     assert extract_game(PGN, "g", "*", max_seq_len=None) == []
 
 
-def test_max_seq_len_truncation_matches_the_dataset_walk():
-    """LichessDataset._extract_plays stops at max_seq_len; ply indices past
-    the cut do not exist, so no eval may be emitted for them."""
-    rows = extract_game(PGN, "g", "1-0", max_seq_len=3)
-    assert sorted(r["ply"] for r in rows) == [1, 2]
+def test_max_seq_len_rejection_matches_the_dataset_walk():
+    """LichessDataset._extract_plays rejects games longer than max_seq_len
+    (truncating would mislabel the prefix), so the extractor emits nothing
+    for them; a game that fits is extracted in full."""
+    assert extract_game(PGN, "g", "1-0", max_seq_len=3) == []
+    full = extract_game(PGN, "g", "1-0", max_seq_len=None)
+    assert full
+    n_plies = len(list(chess.pgn.read_game(io.StringIO(PGN)).mainline_moves()))
+    assert extract_game(PGN, "g", "1-0", max_seq_len=n_plies) == full
 
 
 def _annotated_row(movetext=PGN):
@@ -118,7 +122,15 @@ def test_inline_dataset_capture_matches_offline_extractor(max_seq_len):
         max_seq_len=max_seq_len,
         parse_stockfish_evals=True,
     )
-    game = list(dataset.stream_from_rows([_annotated_row()]))[0]
+    games = list(dataset.stream_from_rows([_annotated_row()]))
+    if max_seq_len is not None and max_seq_len < len(
+        list(chess.pgn.read_game(io.StringIO(PGN)).mainline_moves())
+    ):
+        # Both sides reject an over-length game.
+        assert games == []
+        assert extract_game(PGN, "g", "1-0", max_seq_len) == []
+        return
+    game = games[0]
     expected = {
         row["ply"]: row
         for row in extract_game(PGN, game["game_id"], "1-0", max_seq_len)

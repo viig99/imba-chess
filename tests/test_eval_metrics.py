@@ -11,6 +11,7 @@ from imba_chess.eval.metrics import (
     NextMoveMRR,
     NextMoveTokenCount,
     NextMoveTopKAccuracy,
+    WeightedValueLoss,
 )
 
 
@@ -81,3 +82,18 @@ def test_metrics_raise_when_all_targets_ignored():
         metric.reset()
         with pytest.raises(ValueError, match="no valid targets"):
             metric.update(output)
+
+
+def test_weighted_value_loss_pools_by_weight_sum():
+    metric = WeightedValueLoss()
+    metric.reset()
+    metric.update({"value_loss": 1.0, "value_weight_sum": 1.0})
+    metric.update({"value_loss": 3.0, "value_weight_sum": 3.0})
+    # (1*1 + 3*3) / (1 + 3), not the mean of batch means (2.0).
+    assert metric.compute() == pytest.approx(2.5)
+    # A batch with no weighted value tokens must not move the metric.
+    metric.update({"value_loss": 0.0, "value_weight_sum": 0.0})
+    assert metric.compute() == pytest.approx(2.5)
+
+    metric.reset()
+    assert math.isnan(metric.compute())

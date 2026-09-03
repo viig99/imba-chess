@@ -93,6 +93,38 @@ class NextMoveCrossEntropy(_BaseNextMoveMetric):
         return self._loss_sum / self._token_count
 
 
+class WeightedValueLoss(Metric):
+    """Pools the model's per-batch weighted-mean value_loss over an epoch.
+
+    forward() returns value_loss = sum(w_i * l_i) / sum(w_i) plus that
+    denominator as value_weight_sum; re-weighting by it recovers the epoch's
+    true weighted mean instead of a mean of batch means.
+    """
+
+    required_output_keys = ("value_loss", "value_weight_sum")
+
+    @reinit__is_reduced
+    def reset(self) -> None:
+        self._loss_sum = 0.0
+        self._weight_sum = 0.0
+        super().reset()
+
+    @reinit__is_reduced
+    def update(self, output: Any) -> None:
+        if not isinstance(output, dict):
+            raise TypeError("WeightedValueLoss expects a dict evaluator output")
+        value_loss = output["value_loss"]
+        weight_sum = output["value_weight_sum"]
+        self._loss_sum += float(value_loss) * float(weight_sum)
+        self._weight_sum += float(weight_sum)
+
+    @sync_all_reduce("_loss_sum", "_weight_sum")
+    def compute(self) -> float:
+        if self._weight_sum == 0.0:
+            return float("nan")
+        return self._loss_sum / self._weight_sum
+
+
 class NextMoveTopKAccuracy(_BaseNextMoveMetric):
     """Top-k accuracy over non-ignore-index tokens."""
 

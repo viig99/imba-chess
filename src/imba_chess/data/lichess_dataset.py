@@ -397,6 +397,13 @@ class LichessDataset:
             plays.append(play)
             board.push(move)
 
+        if node.variations:
+            # Longer than max_seq_len: reject rather than truncate. A truncated
+            # prefix would carry the full game's result as its value label,
+            # tell the moves-left head the game ends at the cut, and put
+            # progress=1.0 mid-game.
+            return []
+
         return plays
 
     def _build_load_kwargs(self, *, data_files: list[str]) -> Dict[str, Any]:

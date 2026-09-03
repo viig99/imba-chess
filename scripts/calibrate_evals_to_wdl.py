@@ -52,7 +52,21 @@ MATE_BUCKET = 1e9
 
 def fit_calibration(train_evals: Path, *, bins: int) -> dict:
     d = pd.read_parquet(train_evals)
-    cp = d[d["cp_stm"].notna()].copy()
+    cp_all = d[d["cp_stm"].notna()]
+    # Exactly 0.00 is a point mass (~7% of this corpus's evals): engines
+    # report it for known draws (repetition, fortress, tablebase), whose draw
+    # rate is several times that of positions at +-5 cp. Hold it out as its
+    # own bucket so quantile bins / interpolation do not smear its draw mass
+    # over the neighbouring near-equal bins.
+    zero = cp_all[cp_all["cp_stm"] == 0.0]
+    cp = cp_all[cp_all["cp_stm"] != 0.0].copy()
+    zero_out = zero["real_outcome_stm"].to_numpy()
+    cp_zero = {
+        "n": int(len(zero_out)),
+        "p_loss": float((zero_out == -1).mean()),
+        "p_draw": float((zero_out == 0).mean()),
+        "p_win": float((zero_out == 1).mean()),
+    }
     # Quantile edges: dense where the data is, which is near cp=0.
     qs = np.linspace(0, 1, bins + 1)
     edges = np.unique(np.quantile(cp["cp_stm"], qs))
@@ -80,7 +94,12 @@ def fit_calibration(train_evals: Path, *, bins: int) -> dict:
             "p_draw": float((o == 0).mean()),
             "p_win": float((o == 1).mean()),
         }
-    return {"cp_bins": out, "mate": mate_cal, "source": str(train_evals)}
+    return {
+        "cp_bins": out,
+        "cp_zero": cp_zero,
+        "mate": mate_cal,
+        "source": str(train_evals),
+    }
 
 
 def apply_calibration(cal: dict, cp_stm, mate_stm):
@@ -90,6 +109,9 @@ def apply_calibration(cal: dict, cp_stm, mate_stm):
     cp = np.asarray(cp_stm, dtype=float)
     # Linear interpolation between bin centers, flat outside the range.
     out = np.stack([np.interp(cp, centers, P[:, k]) for k in range(3)], axis=1)
+    if "cp_zero" in cal:
+        z = cal["cp_zero"]
+        out[cp == 0.0] = [z["p_loss"], z["p_draw"], z["p_win"]]
     mate = np.asarray(mate_stm, dtype=float)
     has_mate = ~np.isnan(mate)
     for sign_key, vals in cal["mate"].items():
@@ -138,6 +160,8 @@ def main() -> None:
     ]
     write_rollout_parquet(rows, args.output)
     print(f"calibration bins : {len(cal['cp_bins'])}  (fit on {args.train_evals.name})")
+    print(f"cp==0 bucket     : n={cal['cp_zero']['n']} "
+          f"P(draw)={cal['cp_zero']['p_draw']:.3f}")
     print(f"mate buckets     : "
           f"{ {k: round(v['p_win'], 3) for k, v in cal['mate'].items()} } P(win)")
     print(f"rows written     : {len(rows)} -> {args.output}")

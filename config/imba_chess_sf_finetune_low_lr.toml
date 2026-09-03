@@ -50,7 +50,10 @@ halfmove_vocab_size = 128
 fullmove_vocab_size = 128
 ignore_index = -100
 relative_attention_bias = "position"
-label_smoothing = 0.05
+# No label smoothing in the finetune: 0.05 spread over ~1900 UCI classes
+# forces ~5% mass onto (mostly illegal) moves and distorts the softmax that
+# value_rerank / search read.
+label_smoothing = 0.0
 elo_weight_min_elo = 2000
 elo_weight_max_elo = 2800
 elo_loss_weight_alpha = 1.0
@@ -59,6 +62,14 @@ enable_value_head = true
 value_loss_weight = 1.0
 value_weight_alpha = 0.9
 value_label_smoothing = 0.0
+# Engine-eval targets: label quality is independent of game progress and of
+# the mover's Elo, so weight every evaluated token equally ...
+value_soft_target_weight_alpha = 0.0
+value_soft_target_elo_weighting = false
+# ... and train the value head ONLY toward engine WDL: un-evaluated plies
+# (first ply, last ply, partially annotated games) contribute no value loss
+# instead of a realised-result label mixed into the same game.
+value_hard_target_weight = 0.0
 moves_left_loss_weight = 0.05
 
 [training]
@@ -123,7 +134,9 @@ save_games = true
 save_games_dir = "artifacts/eval/games"
 
 [expert_iteration]
-stockfish_eval_calibration_path = "artifacts/corpus/cp_to_wdl_600k.json"
+# Refit with an exact-0.00 bucket held out of the continuous bins
+# (scripts/calibrate_evals_to_wdl.py); see docs/loss_audit_2026-09.md.
+stockfish_eval_calibration_path = "artifacts/corpus/cp_to_wdl_600k_zero.json"
 beta = 1.0
 policy_kl_weight = 0.0
 policy_kl_sigma = 1.0

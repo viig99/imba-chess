@@ -66,6 +66,12 @@ class CpToWdlCalibration:
     centers: tuple[float, ...]
     probs: tuple[tuple[float, float, float], ...]
     mate_probs: dict[int, tuple[float, float, float]]
+    # WDL for an eval of exactly 0.00 cp, when the calibration was fit with
+    # that point mass held out of the continuous bins. Engines report 0.00
+    # for known draws (repetition, fortress, tablebase), which is a different
+    # population from "roughly equal" positions at +-5 cp; interpolating it
+    # into the neighbours would lend them draw mass they do not have.
+    zero_probs: tuple[float, float, float] | None = None
 
     @classmethod
     def load(cls, path: str | Path) -> "CpToWdlCalibration":
@@ -105,10 +111,14 @@ class CpToWdlCalibration:
             sign: _read_wdl(mate[str(sign)], label=f"mate[{sign}]")
             for sign in (-1, 1)
         }
+        zero_probs = None
+        if "cp_zero" in raw:
+            zero_probs = _read_wdl(raw["cp_zero"], label="cp_zero")
         return cls(
             centers=centers,
             probs=tuple(probabilities for _, probabilities in parsed_bins),
             mate_probs=mate_probs,
+            zero_probs=zero_probs,
         )
 
     def wdl(
@@ -129,6 +139,8 @@ class CpToWdlCalibration:
         cp = float(cp_stm)
         if not math.isfinite(cp):
             raise ValueError("cp_stm must be finite")
+        if cp == 0.0 and self.zero_probs is not None:
+            return _normalise_wdl(self.zero_probs, label="cp_zero WDL")
         if cp <= self.centers[0]:
             values = self.probs[0]
         elif cp >= self.centers[-1]:

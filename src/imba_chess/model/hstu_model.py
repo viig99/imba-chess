@@ -41,6 +41,21 @@ class HSTUChessConfig:
     value_loss_weight: float = 0.15
     value_weight_alpha: float = 1.5
     value_label_smoothing: float = 0.0
+    # Weighting of value tokens that carry a soft (rollout / engine-eval)
+    # target. None inherits value_weight_alpha, i.e. the same progress^alpha
+    # curve as outcome-labelled tokens; 0.0 gives every soft token weight 1,
+    # which is right when the label's quality does not depend on game
+    # progress (a full-depth engine eval).
+    value_soft_target_weight_alpha: float | None = None
+    # Whether soft-target tokens also get the mover-Elo scale. Mover strength
+    # says nothing about an engine label's quality, so finetunes on engine
+    # evals turn this off.
+    value_soft_target_elo_weighting: bool = True
+    # Multiplier on outcome-labelled tokens in a batch that carries soft
+    # targets. 0.0 masks them, so the value head is trained only toward the
+    # soft target's quantity instead of a per-token mix of engine WDL and
+    # realised result.
+    value_hard_target_weight: float = 1.0
     moves_left_loss_weight: float = 0.05
     policy_kl_weight: float = 0.0
     policy_kl_sigma: float = 1.0
@@ -84,6 +99,15 @@ def build_hstu_chess_config(
         value_loss_weight=float(model_config.value_loss_weight),
         value_weight_alpha=float(model_config.value_weight_alpha),
         value_label_smoothing=float(model_config.value_label_smoothing),
+        value_soft_target_weight_alpha=(
+            None
+            if model_config.value_soft_target_weight_alpha is None
+            else float(model_config.value_soft_target_weight_alpha)
+        ),
+        value_soft_target_elo_weighting=bool(
+            model_config.value_soft_target_elo_weighting
+        ),
+        value_hard_target_weight=float(model_config.value_hard_target_weight),
         moves_left_loss_weight=float(model_config.moves_left_loss_weight),
         policy_kl_weight=float(policy_kl_weight),
         policy_kl_sigma=float(policy_kl_sigma),
@@ -244,6 +268,13 @@ class HSTUChessModel(nn.Module):
             raise ValueError("value_weight_alpha must be > 0")
         if not 0.0 <= float(config.value_label_smoothing) < 1.0:
             raise ValueError("value_label_smoothing must be in [0.0, 1.0)")
+        if (
+            config.value_soft_target_weight_alpha is not None
+            and float(config.value_soft_target_weight_alpha) < 0.0
+        ):
+            raise ValueError("value_soft_target_weight_alpha must be >= 0 when set")
+        if float(config.value_hard_target_weight) < 0.0:
+            raise ValueError("value_hard_target_weight must be >= 0")
         if float(config.moves_left_loss_weight) < 0.0:
             raise ValueError("moves_left_loss_weight must be >= 0")
         d = config.model_dim
@@ -557,11 +588,32 @@ class HSTUChessModel(nn.Module):
                     per_token_value_loss = torch.where(
                         rollout_mask, per_token_soft_loss, per_token_value_loss
                     )
+                    # Soft-target tokens get their own weighting curve (see
+                    # HSTUChessConfig): the progress^alpha discount exists
+                    # because the *outcome* label is noisy early in a game,
+                    # which need not hold for the soft target's source.
+                    soft_alpha = self.config.value_soft_target_weight_alpha
+                    if soft_alpha is None:
+                        soft_alpha = self.config.value_weight_alpha
+                    soft_weights = progress.pow(soft_alpha) * valid_mask.to(
+                        progress.dtype
+                    )
+                    if (
+                        elo_scale is not None
+                        and self.config.value_soft_target_elo_weighting
+                    ):
+                        soft_weights = soft_weights * elo_scale.to(soft_weights.dtype)
+                    hard_weights = value_weights * self.config.value_hard_target_weight
+                    value_weights = torch.where(rollout_mask, soft_weights, hard_weights)
 
                 value_loss_sum = (per_token_value_loss * value_weights).sum()
-                value_weight_sum = value_weights.sum().clamp_min(1.0)
-                value_loss = value_loss_sum / value_weight_sum
+                raw_value_weight_sum = value_weights.sum()
+                value_loss = value_loss_sum / raw_value_weight_sum.clamp_min(1.0)
                 output["value_loss"] = value_loss
+                # The UNclamped sum: an evaluator pooling batch means by it
+                # must see 0 for a batch with no weighted value tokens, not a
+                # phantom weight-1 zero-loss contribution.
+                output["value_weight_sum"] = raw_value_weight_sum
                 total_loss = total_loss + self.config.value_loss_weight * value_loss
 
             has_rollout_policy_target = batch.get("has_rollout_policy_target")

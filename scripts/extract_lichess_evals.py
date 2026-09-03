@@ -71,6 +71,10 @@ def extract_game(
         node = node.variations[0]
         trailing.append(_eval_from_comment(node.comment or ""))
         n_plies += 1
+    if node.variations:
+        # Over max_seq_len: the dataset rejects the game rather than
+        # truncating it, so the extractor must emit nothing for it too.
+        return []
 
     rows: list[dict] = []
     for i, (cp, mate) in enumerate(trailing):

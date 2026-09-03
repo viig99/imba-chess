@@ -14,6 +14,7 @@ from .metrics import (
     NextMoveMRR,
     NextMoveTokenCount,
     NextMoveTopKAccuracy,
+    WeightedValueLoss,
     normalize_topk,
 )
 
@@ -33,7 +34,12 @@ def create_next_move_evaluator(
     dtype: torch.dtype,
     ignore_index: int,
     topk: Iterable[int] = (1, 3, 5, 10),
+    track_value_loss: bool = False,
 ) -> Engine:
+    """track_value_loss: also run the model's loss path and report the
+    weighted value_loss as metric "value_loss". The value head is what
+    engine-eval finetunes actually train, and the policy metrics alone are
+    blind to it. Requires a model with a value head."""
     resolved_topk = normalize_topk(topk)
     use_amp = device.type == "cuda" and dtype in (torch.float16, torch.bfloat16)
 
@@ -53,23 +59,36 @@ def create_next_move_evaluator(
             else contextlib.nullcontext()
         )
         with autocast_ctx:
-            output = model(batch, block_mask=block_mask, return_loss=False)
+            output = model(
+                batch, block_mask=block_mask, return_loss=track_value_loss
+            )
 
         logits = output["logits"].detach()
         targets = batch["target_move_id"].to(  # type: ignore[union-attr]
             device=logits.device, dtype=torch.long, non_blocking=True
         )
-        return {
+        result: dict[str, object] = {
             "y_pred": logits,
             "y": targets,
             "logits": logits,
             "targets": targets,
             "num_games": float(int(batch["num_games"])),  # type: ignore[arg-type]
         }
+        if track_value_loss:
+            if "value_loss" not in output:
+                raise KeyError(
+                    "track_value_loss=True but the model produced no value_loss "
+                    "(enable_value_head is off?)"
+                )
+            result["value_loss"] = float(output["value_loss"].item())
+            result["value_weight_sum"] = float(output["value_weight_sum"].item())
+        return result
 
     evaluator = Engine(_eval_step)
 
     NextMoveCrossEntropy(ignore_index=ignore_index).attach(evaluator, "loss_ce")
+    if track_value_loss:
+        WeightedValueLoss().attach(evaluator, "value_loss")
     NextMoveMRR(ignore_index=ignore_index).attach(evaluator, "mrr")
     NextMoveTokenCount(ignore_index=ignore_index).attach(evaluator, "token_count")
     BatchCount().attach(evaluator, "batch_count")

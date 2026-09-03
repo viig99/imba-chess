@@ -62,6 +62,30 @@ def test_scalar_calibration_matches_vectorised_reference(tmp_path):
     np.testing.assert_allclose(actual, expected, atol=1e-12, rtol=0.0)
 
 
+def test_exact_zero_bucket_overrides_interpolation(tmp_path):
+    payload = _calibration_payload()
+    payload["cp_zero"] = {"n": 10, "p_loss": 0.3, "p_draw": 0.6, "p_win": 0.1}
+    calibration = CpToWdlCalibration.load(_write_calibration(tmp_path, payload))
+
+    assert calibration.wdl(0.0, None) == pytest.approx((0.3, 0.6, 0.1))
+    # Neighbours still interpolate the continuous bins, untouched by the
+    # point mass.
+    without_zero = CpToWdlCalibration.load(
+        _write_calibration(tmp_path, _calibration_payload())
+    )
+    assert calibration.wdl(1.0, None) == pytest.approx(without_zero.wdl(1.0, None))
+    assert calibration.wdl(-1.0, None) == pytest.approx(without_zero.wdl(-1.0, None))
+    # Without the bucket, 0.0 interpolates as before (old JSONs still load).
+    assert without_zero.zero_probs is None
+    assert without_zero.wdl(0.0, None) != pytest.approx((0.3, 0.6, 0.1))
+
+    cp = np.array([0.0, 1.0])
+    mate = np.array([np.nan, np.nan])
+    vectorised = _load_vectorised_calibrator()(payload, cp, mate)
+    np.testing.assert_allclose(vectorised[0], (0.3, 0.6, 0.1), atol=1e-12)
+    np.testing.assert_allclose(vectorised[1], calibration.wdl(1.0, None), atol=1e-12)
+
+
 @pytest.mark.parametrize(
     ("comment", "expected"),
     [

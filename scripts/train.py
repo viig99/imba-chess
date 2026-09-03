@@ -168,9 +168,13 @@ def _make_dataset(config, *, split: str) -> LichessDataset:
         local_corpus_path=(
             dataset_cfg.local_corpus_path if split == "train" else None
         ),
-        parse_stockfish_evals=(
-            split == "train"
-            and bool(config.expert_iteration.stockfish_eval_calibration_path)
+        # All splits: val/test need the same soft targets as train so the
+        # evaluator's value_loss measures the quantity the head is trained
+        # toward. Un-annotated games are not filtered out of val/test (see
+        # require_stockfish_eval below), so they contribute policy metrics
+        # only when value_hard_target_weight is 0.
+        parse_stockfish_evals=bool(
+            config.expert_iteration.stockfish_eval_calibration_path
         ),
         require_stockfish_eval=(
             split == "train" and bool(dataset_cfg.require_stockfish_eval)
@@ -325,6 +329,8 @@ def _print_eval_metrics(split: str, metrics: dict[str, float]) -> None:
     print(f"  token_count: {int(metrics['token_count'])}")
     print(f"  loss_ce: {metrics['loss_ce']:.6f}")
     print(f"  ppl: {metrics['ppl']:.4f}")
+    if "value_loss" in metrics:
+        print(f"  value_loss: {metrics['value_loss']:.6f}")
     print(f"  top1_acc: {metrics['top1_acc']:.6f}")
     print(f"  top3_acc: {metrics['top3_acc']:.6f}")
     print(f"  top5_acc: {metrics['top5_acc']:.6f}")
@@ -461,25 +467,35 @@ def main() -> None:
         repo_config,
         test_max_games=repo_config.dataset.test_max_games,
     )
+    eval_calibration = None
+    calibration_path = repo_config.expert_iteration.stockfish_eval_calibration_path
+    if calibration_path:
+        eval_calibration = CpToWdlCalibration.load(calibration_path)
+        print(f"Loaded inline Stockfish eval calibration from {calibration_path}")
+    eval_loader_kwargs: dict[str, Any] = {
+        "move_vocab": move_vocab,
+        "rollout_beta": float(repo_config.expert_iteration.beta),
+        "eval_calibration": eval_calibration,
+    }
     fast_val_loader = build_event_dataloader(
         lichess_dataset=_make_dataset(eval_runtime_fast_val, split="val"),
         config=eval_runtime_fast_val,
-        move_vocab=move_vocab,
+        **eval_loader_kwargs,
     )
     full_val_loader = build_event_dataloader(
         lichess_dataset=_make_dataset(eval_runtime_full_val, split="val"),
         config=eval_runtime_full_val,
-        move_vocab=move_vocab,
+        **eval_loader_kwargs,
     )
     fast_test_loader = build_event_dataloader(
         lichess_dataset=_make_dataset(eval_runtime_fast_test, split="test"),
         config=eval_runtime_fast_test,
-        move_vocab=move_vocab,
+        **eval_loader_kwargs,
     )
     test_loader = build_event_dataloader(
         lichess_dataset=_make_dataset(eval_runtime_test, split="test"),
         config=eval_runtime_test,
-        move_vocab=move_vocab,
+        **eval_loader_kwargs,
     )
 
     model_cfg = build_hstu_chess_config(
@@ -499,6 +515,7 @@ def main() -> None:
         dtype=dtype,
         ignore_index=repo_config.model.ignore_index,
         topk=(1, 3, 5, 10),
+        track_value_loss=bool(repo_config.model.enable_value_head),
     )
     full_val_evaluator = create_next_move_evaluator(
         model=model,
@@ -506,6 +523,7 @@ def main() -> None:
         dtype=dtype,
         ignore_index=repo_config.model.ignore_index,
         topk=(1, 3, 5, 10),
+        track_value_loss=bool(repo_config.model.enable_value_head),
     )
     fast_test_evaluator = create_next_move_evaluator(
         model=model,
@@ -513,6 +531,7 @@ def main() -> None:
         dtype=dtype,
         ignore_index=repo_config.model.ignore_index,
         topk=(1, 3, 5, 10),
+        track_value_loss=bool(repo_config.model.enable_value_head),
     )
     test_evaluator = create_next_move_evaluator(
         model=model,
@@ -520,6 +539,7 @@ def main() -> None:
         dtype=dtype,
         ignore_index=repo_config.model.ignore_index,
         topk=(1, 3, 5, 10),
+        track_value_loss=bool(repo_config.model.enable_value_head),
     )
 
     fast_val_pbar = ProgressBar(persist=False, desc="val_fast")
@@ -579,11 +599,6 @@ def main() -> None:
             f"policy_kl_weight={repo_config.expert_iteration.policy_kl_weight})"
         )
 
-    eval_calibration = None
-    calibration_path = repo_config.expert_iteration.stockfish_eval_calibration_path
-    if calibration_path:
-        eval_calibration = CpToWdlCalibration.load(calibration_path)
-        print(f"Loaded inline Stockfish eval calibration from {calibration_path}")
     train_dataset: Any = _make_dataset(repo_config, split="train")
 
     train_loader = build_event_dataloader(
