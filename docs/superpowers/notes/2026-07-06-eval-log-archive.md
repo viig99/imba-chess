@@ -72,6 +72,11 @@ Understanding at the time:
   they repeat.
 - v3 checkpoints remain evaluable via `--config config/imba_chess_v3.toml`
   after the v4 architecture change.
+  Caveat (2026-09-03): that config's `[eval_vs_stockfish]` block was resynced to
+  the current nodes-calibrated ruler (SF2200 @ 40k nodes, fp32,
+  `opening_random_plies = 0`). Its `[model]` block is unchanged, so v3
+  checkpoints still load -- but a re-run will NOT reproduce the scores in this
+  archive, which were taken on the retired 0.05 s/move bf16 protocol.
 
 ## v4 trunk + value-net blend (SF1800)
 

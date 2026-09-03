@@ -443,6 +443,11 @@ so openings must be paired with colour reversal. 750 games/arm gives SE ≈ 0.01
 
 ### Value-distillation result (`artifacts/value_distill/`)
 
+Reproduce with `scripts/value_distill_run.sh` (trains both arms) then
+`scripts/value_distill_eval.sh` (750 games/arm vs SF2200, same protocol as the
+ckpt23 anchor). Both wrap `scripts/train.py` / `scripts/eval_vs_stockfish.py`
+over `config/imba_chess_exit_kl_probe_nw0.toml`.
+
 Two arms from ckpt23, identical corpus (88,926 annotated games), identical
 1,500 steps at lr 5e-5, differing **only** in the value target
 (`beta` 0 vs 1). 79,580 games consumed by each, single pass, 97.4% ply coverage.
@@ -496,6 +501,8 @@ z = 1.26. No effect. `policy_kl_weight` should be 0 in any new run.
 | `scripts/label_gate_diff.py` | exact diff of two rollout parquets across all 18 label columns | seconds |
 | `scripts/eval_vs_stockfish.py` | the Elo ruler | ~2.5 h per 750-game arm |
 | `scripts/match_two_checkpoints.py` | head-to-head, no Stockfish, far more sample-efficient | **never been run** |
+| `scripts/value_distill_run.sh` | trains the paired control/distill arms for the value-target experiment | ~1 h |
+| `scripts/value_distill_eval.sh` | the 750-game/arm verdict run for those two arms | ~5 h |
 
 `train.py` logs `train/policy_loss`, `train/value_loss`,
 `train/policy_kl_loss`, `train/moves_left_loss`, `train/lr`, `train/games`,

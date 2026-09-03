@@ -1,3 +1,14 @@
+# v3 model geometry (512d x 6L, ~10M params), superseded by the v4 trunk in
+# config/imba_chess.toml (768d x 8L, ~27M). Kept for one reason only: a
+# checkpoint can only be loaded under the geometry it was trained with, so v3
+# checkpoints stay evaluable via `--config config/imba_chess_v3.toml`. The
+# [model] block is therefore frozen -- do not retune it.
+#
+# [eval_vs_stockfish] is deliberately kept in lockstep with imba_chess.toml so
+# v3 and v4 numbers land on the SAME ruler. It previously sat on the retired
+# pre-2026-07-19 protocol (time-based SF at 0.05s/move, bf16, random first
+# ply), which silently produced scores not comparable to the ckpt23 anchor.
+
 [dataset]
 min_avg_elo = 2000
 test_min_avg_elo = 2400
@@ -97,21 +108,22 @@ games = 1000
 max_plies = 512
 seed = 42
 stockfish_path = "/usr/bin/stockfish"
-stockfish_time_sec = 0.05
+stockfish_time_sec = 5.0   # safety CEILING only since 2026-07-19; stockfish_nodes binds first (load-invariant protocol)
+stockfish_nodes = 40000    # calibrated 2026-07-19 (see scripts/calibrate_stockfish_nodes.py; frozen time-based configs needed to recalibrate)
+concurrent_games = 6       # actor-mode eval default; 8 OOMs at fp32/2048-budget on the local 7.66GiB card (retune per GPU)
 stockfish_threads = 1
 stockfish_hash_mb = 64
 stockfish_limit_strength = false
 # Optional when limit-strength mode is enabled.
 # stockfish_elo = 1600
-# Optional search limits. If omitted, only stockfish_time_sec is used.
-# stockfish_nodes = 1000
+# Optional search limit. stockfish_nodes is set above.
 # stockfish_depth = 10
 # Optional ladder mode.
-ladder_elos = "1320,1600,1800,2000"
+ladder_elos = "2200"
 ladder_games_per_segment = 100
 # include_full_strength_segment = true
 device = "auto"
-dtype = "bfloat16"
+dtype = "float32"     # adopted 2026-07-19: batched evals make fp32 nearly free; removes bf16 near-tie noise
 compile = true
 model_move_policy = "value_search_halving"
 value_rerank_top_k = 16
@@ -125,7 +137,7 @@ halving_rounds = 0
 search_refutation_top_r = 2
 search_expand_top = 3
 search_max_depth = 4
-opening_random_plies = 1
+opening_random_plies = 0  # adopted 2026-07-19: random first ply was a -0.045 handicap; keep >=1 for full-strength (deterministic) SF segments
 debug_trace_games = 3
 debug_trace_max_plies = 80
 debug_topk = 5
