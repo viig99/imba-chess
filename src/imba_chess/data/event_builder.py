@@ -3,11 +3,8 @@ from __future__ import annotations
 from typing import Any, Dict
 
 from .move_vocab import MoveVocab
-from .policy_target_kl import POLICY_KL_MAX_ARMS, arm_vocab_ids_and_qhat
-from .rollout_store import RolloutRow
-from .stockfish_evals import CpToWdlCalibration
+from .stockfish_evals import winpercent_wdl
 from .types import EventSequence
-from .value_target_blend import compute_blended_value_target
 
 EVENT_TOKEN_ID = 0
 BOS_TOKEN_ID = 1
@@ -26,24 +23,17 @@ def _result_to_game_result_white(value: Any) -> int:
 
 
 class EventBuilder:
-    """Build BOS+ply event sequences for next-move prediction."""
+    """Build BOS+ply event sequences for next-move prediction.
 
-    def __init__(
-        self,
-        move_vocab: MoveVocab,
-        *,
-        rollout_lookup: Dict[tuple[str, int], RolloutRow] | None = None,
-        beta: float = 0.0,
-        eval_calibration: CpToWdlCalibration | None = None,
-    ) -> None:
-        if rollout_lookup is not None and eval_calibration is not None:
-            raise ValueError(
-                "rollout_lookup and eval_calibration are mutually exclusive"
-            )
+    The value target for a ply is its Lichess Stockfish eval mapped through
+    winpercent_wdl; plies without an eval (always the first ply and the
+    final position, plus any un-annotated game) get has_value_target=0 and
+    contribute no value loss. The game result is carried per game for
+    reporting only; the model does not train on it.
+    """
+
+    def __init__(self, move_vocab: MoveVocab) -> None:
         self.move_vocab = move_vocab
-        self.rollout_lookup = rollout_lookup
-        self.beta = beta
-        self.eval_calibration = eval_calibration
 
     def build_game(self, game: Dict[str, Any]) -> EventSequence:
         game_result_white = _result_to_game_result_white(game["result"])
@@ -58,6 +48,8 @@ class EventBuilder:
         prev_move_id = [self.move_vocab.start_id]
         target_move_id = [TARGET_IGNORE_INDEX]
         played_by_elo = [0]
+        value_target: list[list[float]] = [[0.0, 0.0, 0.0]]
+        has_value_target = [0]
 
         previous_move = self.move_vocab.start_id
         for play in game["plays"]:
@@ -76,9 +68,18 @@ class EventBuilder:
             target_move_id.append(current_move)
             played_by_elo.append(current_played_by_elo)
 
+            cp_stm = play.get("eval_cp_stm")
+            mate_stm = play.get("eval_mate_stm")
+            if cp_stm is None and mate_stm is None:
+                value_target.append([0.0, 0.0, 0.0])
+                has_value_target.append(0)
+            else:
+                value_target.append(list(winpercent_wdl(cp_stm, mate_stm)))
+                has_value_target.append(1)
+
             previous_move = current_move
 
-        result: EventSequence = {
+        return {
             "game_id": game["game_id"],
             "game_result_white": game_result_white,
             "seq_token_id": seq_token_id,
@@ -91,102 +92,6 @@ class EventBuilder:
             "prev_move_id": prev_move_id,
             "target_move_id": target_move_id,
             "played_by_elo": played_by_elo,
+            "value_target": value_target,
+            "has_value_target": has_value_target,
         }
-        if self.rollout_lookup is not None or self.eval_calibration is not None:
-            value_target_soft, has_rollout_value_target = self._build_soft_value_targets(
-                game, game_result_white
-            )
-            result["value_target_soft"] = value_target_soft
-            result["has_rollout_value_target"] = has_rollout_value_target
-        if self.rollout_lookup is not None:
-            (
-                policy_kl_arm_ids,
-                policy_kl_arm_qhat,
-                policy_kl_arm_mask,
-                has_rollout_policy_target,
-            ) = self._build_rollout_policy_targets(game)
-            result["policy_kl_arm_ids"] = policy_kl_arm_ids
-            result["policy_kl_arm_qhat"] = policy_kl_arm_qhat
-            result["policy_kl_arm_mask"] = policy_kl_arm_mask
-            result["has_rollout_policy_target"] = has_rollout_policy_target
-        return result
-
-    def _build_soft_value_targets(
-        self, game: Dict[str, Any], game_result_white: int
-    ) -> tuple[list[list[float]], list[int]]:
-        num_tokens = len(game["plays"]) + 1
-        value_target_soft: list[list[float]] = [[0.0, 0.0, 0.0] for _ in range(num_tokens)]
-        has_rollout_value_target = [0] * num_tokens
-        game_id = game["game_id"]
-
-        for ply_idx, play in enumerate(game["plays"]):
-            token_idx = ply_idx + 1
-            if self.rollout_lookup is not None:
-                row = self.rollout_lookup.get((game_id, ply_idx))
-                if row is None:
-                    continue
-                value_target_soft[token_idx] = compute_blended_value_target(
-                    root_wdl_unsearched=row.root_wdl_unsearched,
-                    backed_value=row.best_arm_backed_value,
-                    real_outcome_stm=row.real_outcome_stm,
-                    beta=self.beta,
-                )
-            else:
-                assert self.eval_calibration is not None
-                cp_stm = play.get("eval_cp_stm")
-                mate_stm = play.get("eval_mate_stm")
-                if cp_stm is None and mate_stm is None:
-                    continue
-                p_loss, p_draw, p_win = self.eval_calibration.wdl(
-                    cp_stm=cp_stm, mate_stm=mate_stm
-                )
-                stm_white = int(play["state"]["turn_id"]) == 0
-                real_outcome_stm = (
-                    game_result_white if stm_white else -game_result_white
-                )
-                value_target_soft[token_idx] = compute_blended_value_target(
-                    root_wdl_unsearched=(p_loss, p_draw, p_win),
-                    backed_value=p_win - p_loss,
-                    real_outcome_stm=real_outcome_stm,
-                    beta=self.beta,
-                )
-            has_rollout_value_target[token_idx] = 1
-
-        return value_target_soft, has_rollout_value_target
-
-    def _build_rollout_policy_targets(
-        self, game: Dict[str, Any]
-    ) -> tuple[list[list[int]], list[list[float]], list[list[bool]], list[int]]:
-        assert self.rollout_lookup is not None
-        num_tokens = len(game["plays"]) + 1
-        policy_kl_arm_ids: list[list[int]] = [
-            [0] * POLICY_KL_MAX_ARMS for _ in range(num_tokens)
-        ]
-        policy_kl_arm_qhat: list[list[float]] = [
-            [0.0] * POLICY_KL_MAX_ARMS for _ in range(num_tokens)
-        ]
-        policy_kl_arm_mask: list[list[bool]] = [
-            [False] * POLICY_KL_MAX_ARMS for _ in range(num_tokens)
-        ]
-        has_rollout_policy_target = [0] * num_tokens
-        game_id = game["game_id"]
-
-        for ply_idx in range(len(game["plays"])):
-            row = self.rollout_lookup.get((game_id, ply_idx))
-            if row is None:
-                continue
-            arm_ids, arm_qhat, arm_mask = arm_vocab_ids_and_qhat(row, self.move_vocab)
-            if not any(arm_mask):
-                # Every arm was excluded (unmappable move) -- leave this
-                # token as "no target" rather than flag a row whose softmax
-                # would be over an all-masked (all -inf) row, which
-                # hstu_model.py's forward() assumes never happens for a
-                # has_rollout_policy_target=True token.
-                continue
-            token_idx = ply_idx + 1
-            policy_kl_arm_ids[token_idx] = arm_ids
-            policy_kl_arm_qhat[token_idx] = arm_qhat
-            policy_kl_arm_mask[token_idx] = arm_mask
-            has_rollout_policy_target[token_idx] = 1
-
-        return policy_kl_arm_ids, policy_kl_arm_qhat, policy_kl_arm_mask, has_rollout_policy_target

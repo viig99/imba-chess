@@ -91,16 +91,12 @@ class ModelConfig:
     elo_weight_max_elo: int = 2800
     elo_loss_weight_alpha: float = 1.0
     elo_loss_weight_strength: float = 0.0
+    # Value head: side-to-move WDL trained ONLY on plies that carry a Lichess
+    # Stockfish eval (stockfish_evals.winpercent_wdl). Enabling it turns on
+    # [%eval] parsing for every split; dataset.require_stockfish_eval
+    # additionally drops un-annotated games from the train stream.
     enable_value_head: bool = False
     value_loss_weight: float = 0.15
-    value_weight_alpha: float = 1.5
-    value_label_smoothing: float = 0.0
-    # See HSTUChessConfig in model/hstu_model.py for the semantics of the
-    # three soft-target weighting knobs. Defaults reproduce the pre-existing
-    # behaviour (soft tokens weighted exactly like outcome tokens).
-    value_soft_target_weight_alpha: Optional[float] = None
-    value_soft_target_elo_weighting: bool = True
-    value_hard_target_weight: float = 1.0
     moves_left_loss_weight: float = 0.05
 
 
@@ -175,28 +171,6 @@ class EvalVsStockfishConfig:
 
 
 @dataclass(frozen=True)
-class ExpertIterationConfig:
-    # Path to a rollout parquet written by scripts/generate_search_rollouts.py.
-    # Unset (default) => training is byte-identical to today.
-    rollout_path: Optional[str] = None
-    # Enables inline Lichess [%eval] -> WDL soft value targets. Uses beta
-    # below and is intentionally mutually exclusive with rollout_path.
-    stockfish_eval_calibration_path: Optional[str] = None
-    # blend(real_outcome, searched_value; beta). 0 = today's exact target,
-    # 1 = pure searched estimate.
-    beta: float = 0.0
-    # Weight of the search-backed policy-KL loss term (Phase 1b). 0.0 (the
-    # default) reproduces today's exact training -- no policy-KL loss is
-    # added regardless of whether rollout_path is set.
-    policy_kl_weight: float = 0.0
-    # Fixed scale on completedQ in the target softmax(logits + sigma*q_hat).
-    # A single constant, deliberately not the visit-adaptive scale Gumbel
-    # MuZero uses -- see docs/superpowers/specs/
-    # 2026-07-13-phase1b-policy-distillation-design.md.
-    policy_kl_sigma: float = 1.0
-
-
-@dataclass(frozen=True)
 class RepoConfig:
     dataset: DatasetConfig = field(default_factory=DatasetConfig)
     board_state: BoardStateConfig = field(default_factory=BoardStateConfig)
@@ -207,9 +181,6 @@ class RepoConfig:
     eval_vs_stockfish: EvalVsStockfishConfig = field(
         default_factory=EvalVsStockfishConfig
     )
-    expert_iteration: ExpertIterationConfig = field(
-        default_factory=ExpertIterationConfig
-    )
 
 
 def load_repo_config(path: str | Path | None = None) -> RepoConfig:
@@ -219,6 +190,13 @@ def load_repo_config(path: str | Path | None = None) -> RepoConfig:
 
     with config_path.open("rb") as handle:
         payload = tomllib.load(handle)
+
+    known_sections = {field.name for field in fields(RepoConfig)}
+    unknown_sections = sorted(set(payload) - known_sections)
+    if unknown_sections:
+        raise ValueError(
+            f"Unknown sections in {config_path}: {', '.join(unknown_sections)}"
+        )
 
     return RepoConfig(
         dataset=_read_section(DatasetConfig, payload.get("dataset", {}), "dataset"),
@@ -231,9 +209,6 @@ def load_repo_config(path: str | Path | None = None) -> RepoConfig:
             EvalVsStockfishConfig,
             payload.get("eval_vs_stockfish", {}),
             "eval_vs_stockfish",
-        ),
-        expert_iteration=_read_section(
-            ExpertIterationConfig, payload.get("expert_iteration", {}), "expert_iteration"
         ),
     )
 

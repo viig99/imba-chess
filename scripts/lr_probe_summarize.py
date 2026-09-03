@@ -44,16 +44,6 @@ def _summarize_run(ckpt_dir: Path) -> dict | None:
         return None
     first, last = _mean(pl[:WINDOW]), _mean(pl[-WINDOW:])
 
-    # Only present when the KL term actually fired (train.py logs it
-    # conditionally on has_policy_kl_loss), so absence means "KL never
-    # applied", not "metric missing".
-    kl_first = kl_last = kl_n = None
-    if "train/policy_kl_loss" in tags:
-        kl = [e.value for e in ea.Scalars("train/policy_kl_loss")]
-        kl_n = len(kl)
-        if len(kl) >= 2 * WINDOW:
-            kl_first, kl_last = _mean(kl[:WINDOW]), _mean(kl[-WINDOW:])
-
     hr10 = None
     if "val_fast/top10_acc" in tags:
         hr10 = [(e.step, e.value) for e in ea.Scalars("val_fast/top10_acc")]
@@ -68,9 +58,6 @@ def _summarize_run(ckpt_dir: Path) -> dict | None:
         "delta": last - first,
         "hr10": hr10,
         "lr": lr,
-        "kl_first": kl_first,
-        "kl_last": kl_last,
-        "kl_n": kl_n,
     }
 
 
@@ -102,22 +89,6 @@ def main() -> None:
             f"{s['policy_loss_last']:>9.4f} {s['delta']:>+9.4f}  {verdict}"
         )
 
-    if any(s["kl_n"] for _, s in rows):
-        print()
-        print("policy_kl_loss (only logged on batches where the KL term fired):")
-        print(f"  {'run':<12} {'batches':>8} {'kl_i':>9} {'kl_f':>9} {'delta':>9}")
-        for name, s in rows:
-            if not s["kl_n"]:
-                print(f"  {name:<12} {'0':>8}   (KL never fired)")
-                continue
-            if s["kl_first"] is None:
-                print(f"  {name:<12} {s['kl_n']:>8}   (too few points to average)")
-                continue
-            print(
-                f"  {name:<12} {s['kl_n']:>8} {s['kl_first']:>9.4f} "
-                f"{s['kl_last']:>9.4f} {s['kl_last'] - s['kl_first']:>+9.4f}"
-            )
-
     print()
     print("held-out fast-val hr@10 (top10_acc) by step:")
     for name, s in rows:
@@ -131,7 +102,7 @@ def main() -> None:
     print(
         "Read: a negative delta with flat/rising hr@10 means the lr is low enough\n"
         "that continuation actually trains rather than random-walks the checkpoint.\n"
-        "Pick the largest such lr for the Phase 1b distillation runs."
+        "Pick the largest such lr for fine-tune runs."
     )
 
 

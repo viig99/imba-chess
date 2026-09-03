@@ -26,11 +26,6 @@ from imba_chess.data import (
     build_event_dataloader,
     load_or_create_static_move_vocab,
 )
-from imba_chess.data.rollout_store import (
-    assert_rollout_checkpoint_consistency,
-    load_rollout_lookup,
-)
-from imba_chess.data.stockfish_evals import CpToWdlCalibration
 from imba_chess.eval import create_next_move_evaluator
 from imba_chess.model import (
     HSTUChessModel,
@@ -168,14 +163,11 @@ def _make_dataset(config, *, split: str) -> LichessDataset:
         local_corpus_path=(
             dataset_cfg.local_corpus_path if split == "train" else None
         ),
-        # All splits: val/test need the same soft targets as train so the
-        # evaluator's value_loss measures the quantity the head is trained
-        # toward. Un-annotated games are not filtered out of val/test (see
-        # require_stockfish_eval below), so they contribute policy metrics
-        # only when value_hard_target_weight is 0.
-        parse_stockfish_evals=bool(
-            config.expert_iteration.stockfish_eval_calibration_path
-        ),
+        # All splits: the value head trains and is evaluated only on plies
+        # with a Lichess eval, so val/test parse them too. Un-annotated games
+        # are not filtered out of val/test (require_stockfish_eval below is
+        # train-only); they contribute policy metrics and no value loss.
+        parse_stockfish_evals=bool(config.model.enable_value_head),
         require_stockfish_eval=(
             split == "train" and bool(dataset_cfg.require_stockfish_eval)
         ),
@@ -467,42 +459,30 @@ def main() -> None:
         repo_config,
         test_max_games=repo_config.dataset.test_max_games,
     )
-    eval_calibration = None
-    calibration_path = repo_config.expert_iteration.stockfish_eval_calibration_path
-    if calibration_path:
-        eval_calibration = CpToWdlCalibration.load(calibration_path)
-        print(f"Loaded inline Stockfish eval calibration from {calibration_path}")
-    eval_loader_kwargs: dict[str, Any] = {
-        "move_vocab": move_vocab,
-        "rollout_beta": float(repo_config.expert_iteration.beta),
-        "eval_calibration": eval_calibration,
-    }
     fast_val_loader = build_event_dataloader(
         lichess_dataset=_make_dataset(eval_runtime_fast_val, split="val"),
         config=eval_runtime_fast_val,
-        **eval_loader_kwargs,
+        move_vocab=move_vocab,
     )
     full_val_loader = build_event_dataloader(
         lichess_dataset=_make_dataset(eval_runtime_full_val, split="val"),
         config=eval_runtime_full_val,
-        **eval_loader_kwargs,
+        move_vocab=move_vocab,
     )
     fast_test_loader = build_event_dataloader(
         lichess_dataset=_make_dataset(eval_runtime_fast_test, split="test"),
         config=eval_runtime_fast_test,
-        **eval_loader_kwargs,
+        move_vocab=move_vocab,
     )
     test_loader = build_event_dataloader(
         lichess_dataset=_make_dataset(eval_runtime_test, split="test"),
         config=eval_runtime_test,
-        **eval_loader_kwargs,
+        move_vocab=move_vocab,
     )
 
     model_cfg = build_hstu_chess_config(
         repo_config.model,
         move_vocab_size=len(move_vocab),
-        policy_kl_weight=float(repo_config.expert_iteration.policy_kl_weight),
-        policy_kl_sigma=float(repo_config.expert_iteration.policy_kl_sigma),
     )
     model: torch.nn.Module = HSTUChessModel(model_cfg).to(device)
     _print_model_summary(model)
@@ -588,26 +568,12 @@ def main() -> None:
         _run_eval_only()
         return
 
-    rollout_lookup = None
-    if repo_config.expert_iteration.rollout_path:
-        rollout_lookup = load_rollout_lookup(repo_config.expert_iteration.rollout_path)
-        assert_rollout_checkpoint_consistency(rollout_lookup, args.resume)
-        print(
-            f"Loaded {len(rollout_lookup)} rollout value targets from "
-            f"{repo_config.expert_iteration.rollout_path} "
-            f"(beta={repo_config.expert_iteration.beta}, "
-            f"policy_kl_weight={repo_config.expert_iteration.policy_kl_weight})"
-        )
-
     train_dataset: Any = _make_dataset(repo_config, split="train")
 
     train_loader = build_event_dataloader(
         lichess_dataset=train_dataset,
         config=repo_config,
         move_vocab=move_vocab,
-        rollout_lookup=rollout_lookup,
-        rollout_beta=float(repo_config.expert_iteration.beta),
-        eval_calibration=eval_calibration,
     )
     optimizer = _build_optimizer(model, repo_config, device=device)
     scheduler = _build_scheduler(optimizer, repo_config)
@@ -624,20 +590,13 @@ def main() -> None:
             raise TypeError("batch['target_move_id'] must be a torch.Tensor")
         valid_targets = target_move_id != int(repo_config.model.ignore_index)
         valid_value_tokens = int(valid_targets.sum().item())
-        has_soft_value_target = batch.get("has_rollout_value_target")
-        if has_soft_value_target is None:
-            soft_value_tokens = 0
-        else:
-            if not isinstance(has_soft_value_target, torch.Tensor):
-                raise TypeError(
-                    "batch['has_rollout_value_target'] must be a torch.Tensor"
-                )
-            soft_value_tokens = int(
-                (has_soft_value_target.to(dtype=torch.bool) & valid_targets)
-                .sum()
-                .item()
-            )
-        soft_value_coverage = soft_value_tokens / max(1, valid_value_tokens)
+        has_value_target = batch["has_value_target"]
+        if not isinstance(has_value_target, torch.Tensor):
+            raise TypeError("batch['has_value_target'] must be a torch.Tensor")
+        value_tokens = int(
+            (has_value_target.to(dtype=torch.bool) & valid_targets).sum().item()
+        )
+        value_coverage = value_tokens / max(1, valid_value_tokens)
 
         if should_sync_check:
             if not bool(valid_targets.any().item()):
@@ -669,10 +628,6 @@ def main() -> None:
             has_value_loss = value_loss is not None
             if value_loss is None:
                 value_loss = torch.zeros_like(loss)
-            policy_kl_loss = output.get("policy_kl_loss")
-            has_policy_kl_loss = policy_kl_loss is not None
-            if policy_kl_loss is None:
-                policy_kl_loss = torch.zeros_like(loss)
             moves_left_loss = output.get("moves_left_loss")
             if moves_left_loss is None:
                 moves_left_loss = torch.zeros_like(loss)
@@ -703,11 +658,9 @@ def main() -> None:
             "policy_loss": policy_loss.detach(),
             "value_loss": value_loss.detach(),
             "has_value_loss": 1.0 if has_value_loss else 0.0,
-            "policy_kl_loss": policy_kl_loss.detach(),
-            "has_policy_kl_loss": 1.0 if has_policy_kl_loss else 0.0,
             "moves_left_loss": moves_left_loss.detach(),
-            "soft_value_tokens": float(soft_value_tokens),
-            "soft_value_coverage": float(soft_value_coverage),
+            "value_tokens": float(value_tokens),
+            "value_coverage": float(value_coverage),
             "lr": float(optimizer.param_groups[0]["lr"]),
             "tokens": float(int(batch["total_tokens"])),
             "games": float(batch_games),
@@ -734,13 +687,8 @@ def main() -> None:
                 if float(out["has_value_loss"]) > 0.5
                 else "--"
             ),
-            "policy_kl": (
-                f"{float(out['policy_kl_loss'].item()):.4f}"
-                if float(out["has_policy_kl_loss"]) > 0.5
-                else "--"
-            ),
             "moves_left": f"{float(out['moves_left_loss'].item()):.4f}",
-            "soft_cov": f"{float(out['soft_value_coverage']):.3f}",
+            "val_cov": f"{float(out['value_coverage']):.3f}",
             "lr": f"{out['lr']:.6f}",
             "tokens": int(out["tokens"]),
             "games": int(out["games"]),
@@ -792,8 +740,8 @@ def main() -> None:
                 "total_loss": float(output["total_loss"].item()),
                 "policy_loss": float(output["policy_loss"].item()),
                 "moves_left_loss": float(output["moves_left_loss"].item()),
-                "soft_value_tokens": float(output["soft_value_tokens"]),
-                "soft_value_coverage": float(output["soft_value_coverage"]),
+                "value_tokens": float(output["value_tokens"]),
+                "value_coverage": float(output["value_coverage"]),
                 "lr": float(output["lr"]),
                 "tokens": float(output["tokens"]),
                 "games": float(output["games"]),
@@ -802,11 +750,6 @@ def main() -> None:
             | (
                 {"value_loss": float(output["value_loss"].item())}
                 if float(output["has_value_loss"]) > 0.5
-                else {}
-            )
-            | (
-                {"policy_kl_loss": float(output["policy_kl_loss"].item())}
-                if float(output["has_policy_kl_loss"]) > 0.5
                 else {}
             )
         ),

@@ -39,44 +39,15 @@ class HSTUChessConfig:
     elo_loss_weight_strength: float = 0.0
     enable_value_head: bool = False
     value_loss_weight: float = 0.15
-    value_weight_alpha: float = 1.5
-    value_label_smoothing: float = 0.0
-    # Weighting of value tokens that carry a soft (rollout / engine-eval)
-    # target. None inherits value_weight_alpha, i.e. the same progress^alpha
-    # curve as outcome-labelled tokens; 0.0 gives every soft token weight 1,
-    # which is right when the label's quality does not depend on game
-    # progress (a full-depth engine eval).
-    value_soft_target_weight_alpha: float | None = None
-    # Whether soft-target tokens also get the mover-Elo scale. Mover strength
-    # says nothing about an engine label's quality, so finetunes on engine
-    # evals turn this off.
-    value_soft_target_elo_weighting: bool = True
-    # Multiplier on outcome-labelled tokens in a batch that carries soft
-    # targets. 0.0 masks them, so the value head is trained only toward the
-    # soft target's quantity instead of a per-token mix of engine WDL and
-    # realised result.
-    value_hard_target_weight: float = 1.0
     moves_left_loss_weight: float = 0.05
-    policy_kl_weight: float = 0.0
-    policy_kl_sigma: float = 1.0
 
 
 def build_hstu_chess_config(
     model_config: Any,
     *,
     move_vocab_size: int,
-    policy_kl_weight: float = 0.0,
-    policy_kl_sigma: float = 1.0,
 ) -> HSTUChessConfig:
-    """Create model config from repo config model section + runtime vocab size.
-
-    policy_kl_weight/policy_kl_sigma come from RepoConfig.expert_iteration
-    (Phase 1b), not model_config -- ExpertIterationConfig is the pipeline
-    section governing rollout-derived training signals, matching where beta
-    (the value-blend weight) already lives. Kept as optional kwargs
-    defaulting to "off" so every existing call site (tests, eval scripts,
-    scripts/generate_search_rollouts.py) needs no changes.
-    """
+    """Create model config from repo config model section + runtime vocab size."""
     return HSTUChessConfig(
         move_vocab_size=move_vocab_size,
         model_dim=int(model_config.model_dim),
@@ -97,20 +68,7 @@ def build_hstu_chess_config(
         elo_loss_weight_strength=float(model_config.elo_loss_weight_strength),
         enable_value_head=bool(model_config.enable_value_head),
         value_loss_weight=float(model_config.value_loss_weight),
-        value_weight_alpha=float(model_config.value_weight_alpha),
-        value_label_smoothing=float(model_config.value_label_smoothing),
-        value_soft_target_weight_alpha=(
-            None
-            if model_config.value_soft_target_weight_alpha is None
-            else float(model_config.value_soft_target_weight_alpha)
-        ),
-        value_soft_target_elo_weighting=bool(
-            model_config.value_soft_target_elo_weighting
-        ),
-        value_hard_target_weight=float(model_config.value_hard_target_weight),
         moves_left_loss_weight=float(model_config.moves_left_loss_weight),
-        policy_kl_weight=float(policy_kl_weight),
-        policy_kl_sigma=float(policy_kl_sigma),
     )
 
 
@@ -264,17 +222,6 @@ class HSTUChessModel(nn.Module):
             raise ValueError("elo_loss_weight_strength must be >= 0")
         if float(config.value_loss_weight) < 0.0:
             raise ValueError("value_loss_weight must be >= 0")
-        if float(config.value_weight_alpha) <= 0.0:
-            raise ValueError("value_weight_alpha must be > 0")
-        if not 0.0 <= float(config.value_label_smoothing) < 1.0:
-            raise ValueError("value_label_smoothing must be in [0.0, 1.0)")
-        if (
-            config.value_soft_target_weight_alpha is not None
-            and float(config.value_soft_target_weight_alpha) < 0.0
-        ):
-            raise ValueError("value_soft_target_weight_alpha must be >= 0 when set")
-        if float(config.value_hard_target_weight) < 0.0:
-            raise ValueError("value_hard_target_weight must be >= 0")
         if float(config.moves_left_loss_weight) < 0.0:
             raise ValueError("moves_left_loss_weight must be >= 0")
         d = config.model_dim
@@ -521,171 +468,30 @@ class HSTUChessModel(nn.Module):
             seq_len_for_token = counts.index_select(0, token_game_id).clamp_min(1)
 
             if value_logits is not None:
-                game_result_white = batch["game_result_white"].to(
-                    device=policy_logits.device, dtype=torch.long, non_blocking=True
+                # Side-to-move WDL target from the ply's Lichess eval
+                # (data/stockfish_evals.winpercent_wdl). Only plies that carry
+                # an eval train the head; everything else has weight 0. No
+                # data-dependent Python branching: torch.compile(fullgraph)
+                # traces the static key structure only.
+                value_target = batch["value_target"].to(
+                    device=policy_logits.device, dtype=torch.float32, non_blocking=True
                 )
-                if game_result_white.ndim != 1 or int(game_result_white.shape[0]) != batch_games:
-                    raise ValueError(
-                        "game_result_white must have shape [B] where B == num_games"
-                    )
-                z_token = game_result_white.index_select(0, token_game_id)
-                turn_id = batch["turn_id"].to(
-                    device=policy_logits.device, dtype=torch.long, non_blocking=True
+                has_value_target = batch["has_value_target"].to(
+                    device=policy_logits.device, dtype=torch.bool, non_blocking=True
                 )
-                y = torch.where(turn_id == 0, z_token, -z_token)
-                value_target = (y + 1).clamp(min=0, max=2)
-
-                progress = token_pos_in_game.to(torch.float32) / (
-                    seq_len_for_token.to(torch.float32) - 1.0
-                ).clamp_min(1.0)
-                value_weights = progress.pow(self.config.value_weight_alpha)
-                value_weights = value_weights * valid_mask.to(value_weights.dtype)
-                if elo_scale is not None:
-                    value_weights = value_weights * elo_scale.to(value_weights.dtype)
-
-                per_token_value_loss = F.cross_entropy(
-                    value_logits.float(),
-                    value_target,
-                    reduction="none",
-                    label_smoothing=self.config.value_label_smoothing,
-                )
-
-                has_rollout_value_target = batch.get("has_rollout_value_target")
-                value_target_soft = batch.get("value_target_soft")
-                if has_rollout_value_target is not None and value_target_soft is not None:
-                    # No data-dependent `if mask.any():` short-circuit here:
-                    # torch.compile(..., fullgraph=True) (this repo's actual
-                    # training config) cannot trace a Python branch on a
-                    # tensor's runtime content -- only on the batch's static
-                    # key structure (the outer `is not None` check above,
-                    # which Dynamo handles via guards). torch.where with an
-                    # all-False mask is already a correct, cheap no-op.
-                    #
-                    # Rollout-covered tokens keep the same progress^alpha
-                    # weight as everyone else: the search backing them is a
-                    # fixed max_depth lookahead, which resolves a much
-                    # smaller fraction of "what's left" early in a game than
-                    # late, so it is noisier early for the same reason the
-                    # raw outcome label is -- an earlier attempt to give
-                    # these tokens a constant weight instead made held-out
-                    # value_loss worse (especially at higher beta), so their
-                    # label quality is not actually progress-independent.
-                    rollout_mask = has_rollout_value_target.to(
-                        device=policy_logits.device, dtype=torch.bool
-                    )
-                    soft_targets = value_target_soft.to(
-                        device=policy_logits.device, dtype=torch.float32
-                    )
-                    value_eps = self.config.value_label_smoothing
-                    if value_eps > 0.0:
-                        num_value_classes = soft_targets.shape[-1]
-                        soft_targets = (
-                            1.0 - value_eps
-                        ) * soft_targets + value_eps / num_value_classes
-                    per_token_soft_loss = -(
-                        soft_targets * F.log_softmax(value_logits.float(), dim=-1)
-                    ).sum(dim=-1)
-                    per_token_value_loss = torch.where(
-                        rollout_mask, per_token_soft_loss, per_token_value_loss
-                    )
-                    # Soft-target tokens get their own weighting curve (see
-                    # HSTUChessConfig): the progress^alpha discount exists
-                    # because the *outcome* label is noisy early in a game,
-                    # which need not hold for the soft target's source.
-                    soft_alpha = self.config.value_soft_target_weight_alpha
-                    if soft_alpha is None:
-                        soft_alpha = self.config.value_weight_alpha
-                    soft_weights = progress.pow(soft_alpha) * valid_mask.to(
-                        progress.dtype
-                    )
-                    if (
-                        elo_scale is not None
-                        and self.config.value_soft_target_elo_weighting
-                    ):
-                        soft_weights = soft_weights * elo_scale.to(soft_weights.dtype)
-                    hard_weights = value_weights * self.config.value_hard_target_weight
-                    value_weights = torch.where(rollout_mask, soft_weights, hard_weights)
-
+                per_token_value_loss = -(
+                    value_target * F.log_softmax(value_logits.float(), dim=-1)
+                ).sum(dim=-1)
+                value_weights = (has_value_target & valid_mask).to(torch.float32)
                 value_loss_sum = (per_token_value_loss * value_weights).sum()
                 raw_value_weight_sum = value_weights.sum()
                 value_loss = value_loss_sum / raw_value_weight_sum.clamp_min(1.0)
                 output["value_loss"] = value_loss
-                # The UNclamped sum: an evaluator pooling batch means by it
-                # must see 0 for a batch with no weighted value tokens, not a
-                # phantom weight-1 zero-loss contribution.
+                # The UNclamped count: an evaluator pooling batch means by it
+                # must see 0 for a batch with no value tokens, not a phantom
+                # weight-1 zero-loss contribution.
                 output["value_weight_sum"] = raw_value_weight_sum
                 total_loss = total_loss + self.config.value_loss_weight * value_loss
-
-            has_rollout_policy_target = batch.get("has_rollout_policy_target")
-            policy_kl_arm_ids = batch.get("policy_kl_arm_ids")
-            policy_kl_arm_qhat = batch.get("policy_kl_arm_qhat")
-            policy_kl_arm_mask = batch.get("policy_kl_arm_mask")
-            if (
-                self.config.policy_kl_weight != 0.0
-                and has_rollout_policy_target is not None
-                and policy_kl_arm_ids is not None
-                and policy_kl_arm_qhat is not None
-                and policy_kl_arm_mask is not None
-            ):
-                # Same no-data-dependent-branching discipline as the
-                # has_rollout_value_target block above: only the batch's
-                # static key structure is checked, never tensor content.
-                #
-                # Invariant relied on here (enforced by event_builder.py's
-                # _build_rollout_policy_targets): every token with
-                # has_rollout_policy_target=True has at least one True in
-                # its arm_mask row. A fully-masked-but-flagged row would
-                # produce an all -inf softmax input -> NaN, silently
-                # corrupting the whole batch's loss via the weighted sum
-                # below; this is a precondition validated at the data layer,
-                # not re-checked here (see the repo's general rule: only
-                # validate at system boundaries, not on internal invariants
-                # already guaranteed upstream).
-                arm_ids = policy_kl_arm_ids.to(
-                    device=policy_logits.device, dtype=torch.long, non_blocking=True
-                )
-                arm_qhat = policy_kl_arm_qhat.to(
-                    device=policy_logits.device, dtype=torch.float32, non_blocking=True
-                )
-                arm_mask = policy_kl_arm_mask.to(
-                    device=policy_logits.device, dtype=torch.bool, non_blocking=True
-                )
-                rollout_policy_mask = has_rollout_policy_target.to(
-                    device=policy_logits.device, dtype=torch.bool, non_blocking=True
-                )
-
-                student_arm_logits = torch.gather(
-                    policy_logits, dim=-1, index=arm_ids
-                ).float()
-                # detach(): the target's base must not receive gradient
-                # through the student -- otherwise this becomes a
-                # self-referential/degenerate loss (target chasing itself).
-                target_arm_logits = (
-                    student_arm_logits.detach()
-                    + self.config.policy_kl_sigma * arm_qhat
-                )
-                neg_inf_fill = torch.finfo(student_arm_logits.dtype).min
-                masked_target_logits = target_arm_logits.masked_fill(
-                    ~arm_mask, neg_inf_fill
-                )
-                masked_student_logits = student_arm_logits.masked_fill(
-                    ~arm_mask, neg_inf_fill
-                )
-                target = F.softmax(masked_target_logits, dim=-1)
-                student_log_probs = F.log_softmax(masked_student_logits, dim=-1)
-                per_token_policy_kl_loss = -(target * student_log_probs).sum(dim=-1)
-
-                policy_kl_token_weights = (
-                    rollout_policy_mask.to(per_token_policy_kl_loss.dtype)
-                    * valid_mask.to(per_token_policy_kl_loss.dtype)
-                )
-                policy_kl_loss_sum = (
-                    per_token_policy_kl_loss * policy_kl_token_weights
-                ).sum()
-                policy_kl_mask_sum = policy_kl_token_weights.sum().clamp_min(1.0)
-                policy_kl_loss = policy_kl_loss_sum / policy_kl_mask_sum
-                output["policy_kl_loss"] = policy_kl_loss
-                total_loss = total_loss + self.config.policy_kl_weight * policy_kl_loss
 
             # log1p compresses the target so errors near the end of the game
             # (where decidedness is informative) dominate errors at move 10.

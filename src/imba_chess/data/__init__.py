@@ -38,13 +38,10 @@ __all__ = [
     "BoardTokenConfig",
     "BoardState",
     "TorchLichessIterableDataset",
-    "compute_blended_value_target",
-    "POLICY_KL_MAX_ARMS",
-    "arm_vocab_ids_and_qhat",
     "RolloutRow",
-    "assert_rollout_checkpoint_consistency",
     "load_rollout_lookup",
     "write_rollout_parquet",
+    "winpercent_wdl",
 ]
 
 # name -> submodule (relative to this package) it is defined in.
@@ -64,16 +61,13 @@ _SOURCE_MODULE = {
     "MoveVocabConfig": "move_vocab",
     "load_or_create_static_move_vocab": "move_vocab",
     "MaxTokensJaggedBatchDataset": "packing",
-    "POLICY_KL_MAX_ARMS": "policy_target_kl",
-    "arm_vocab_ids_and_qhat": "policy_target_kl",
     "RolloutRow": "rollout_store",
-    "assert_rollout_checkpoint_consistency": "rollout_store",
     "load_rollout_lookup": "rollout_store",
     "write_rollout_parquet": "rollout_store",
+    "winpercent_wdl": "stockfish_evals",
     "TorchLichessIterableDataset": "torch_iterable",
     "EventSequence": "types",
     "JaggedBatch": "types",
-    "compute_blended_value_target": "value_target_blend",
 }
 
 

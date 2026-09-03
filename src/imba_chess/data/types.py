@@ -3,16 +3,7 @@ from __future__ import annotations
 from typing import Any, TypedDict
 
 
-class _RolloutEventFields(TypedDict, total=False):
-    value_target_soft: list[list[float]]
-    has_rollout_value_target: list[int]
-    policy_kl_arm_ids: list[list[int]]
-    policy_kl_arm_qhat: list[list[float]]
-    policy_kl_arm_mask: list[list[bool]]
-    has_rollout_policy_target: list[int]
-
-
-class EventSequence(_RolloutEventFields):
+class EventSequence(TypedDict):
     game_id: str
     game_result_white: int
     seq_token_id: list[int]
@@ -25,18 +16,13 @@ class EventSequence(_RolloutEventFields):
     prev_move_id: list[int]
     target_move_id: list[int]
     played_by_elo: list[int]
+    # Per-token side-to-move [p_loss, p_draw, p_win] from the ply's Lichess
+    # eval (stockfish_evals.winpercent_wdl); zeros where has_value_target is 0.
+    value_target: list[list[float]]
+    has_value_target: list[int]
 
 
-class _RolloutJaggedFields(TypedDict, total=False):
-    value_target_soft: Any
-    has_rollout_value_target: Any
-    policy_kl_arm_ids: Any
-    policy_kl_arm_qhat: Any
-    policy_kl_arm_mask: Any
-    has_rollout_policy_target: Any
-
-
-class JaggedBatch(_RolloutJaggedFields):
+class JaggedBatch(TypedDict):
     game_id: list[str]
     game_result_white: Any
     num_games: int
@@ -53,3 +39,5 @@ class JaggedBatch(_RolloutJaggedFields):
     prev_move_id: Any
     target_move_id: Any
     played_by_elo: Any
+    value_target: Any
+    has_value_target: Any

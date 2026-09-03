@@ -5,14 +5,11 @@ Replays games from LichessDataset(split="train") and, at a sampled subset of
 plies per game, calls the same value_search_halving search used at inference.
 Each row records both the scalar value-distillation target inputs
 (best/human-move backed_value, root_wdl_unsearched, real_outcome_stm) and the
-full per-arm data needed for policy distillation (every searched arm's
-move_uci, negamax-backed q-hat, evals spent, and policy log-prior) -- which
-target(s) a training run actually uses is a downstream config choice
-([expert_iteration].beta for value, a future policy-KL weight for policy),
-not a generation-time one, so this script always records both. Writes one
-row per sampled position to a rollout parquet consumed by scripts/train.py.
-Generates data only; trains nothing (mirrors scripts/train_value_net.py's
-role as a small, focused, non-Ignite script).
+full per-arm data that can support policy-distillation analysis (every
+searched arm's move_uci, negamax-backed q-hat, evals spent, and policy
+log-prior). This script always records both scalar and per-arm data and writes
+one row per sampled position. Training no longer consumes rollout files
+directly; see docs/VALUE_TARGET_WINPERCENT_HANDOFF.md. Generates data only.
 
 Usage: python scripts/generate_search_rollouts.py --checkpoint <path> --output-path <path>
 """

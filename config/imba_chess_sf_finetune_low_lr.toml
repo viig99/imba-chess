@@ -58,18 +58,11 @@ elo_weight_min_elo = 2000
 elo_weight_max_elo = 2800
 elo_loss_weight_alpha = 1.0
 elo_loss_weight_strength = 1.0
+# Value head: side-to-move WDL from each ply's Lichess Stockfish eval via the
+# fixed Lichess WinPercent function; plies without an eval carry no value
+# loss. See docs/VALUE_TARGET_WINPERCENT_HANDOFF.md.
 enable_value_head = true
 value_loss_weight = 1.0
-value_weight_alpha = 0.9
-value_label_smoothing = 0.0
-# Engine-eval targets: label quality is independent of game progress and of
-# the mover's Elo, so weight every evaluated token equally ...
-value_soft_target_weight_alpha = 0.0
-value_soft_target_elo_weighting = false
-# ... and train the value head ONLY toward engine WDL: un-evaluated plies
-# (first ply, last ply, partially annotated games) contribute no value loss
-# instead of a realised-result label mixed into the same game.
-value_hard_target_weight = 0.0
 moves_left_loss_weight = 0.05
 
 [training]
@@ -97,7 +90,7 @@ optimizer_kahan_sum = true
 compile_model = true
 device = "auto"
 dtype = "bfloat16"
-checkpoint_dir = "artifacts/stockfish_finetune/ckpt_stockfish_low_lr_beta1_8k"
+checkpoint_dir = "artifacts/stockfish_finetune/ckpt_winpercent_low_lr_8k"
 checkpoint_keep = 1
 
 [eval_vs_stockfish]
@@ -132,11 +125,3 @@ debug_trace_max_plies = 80
 debug_topk = 5
 save_games = true
 save_games_dir = "artifacts/eval/games"
-
-[expert_iteration]
-# Refit with an exact-0.00 bucket held out of the continuous bins
-# (scripts/calibrate_evals_to_wdl.py); see docs/loss_audit_2026-09.md.
-stockfish_eval_calibration_path = "artifacts/corpus/cp_to_wdl_600k_zero.json"
-beta = 1.0
-policy_kl_weight = 0.0
-policy_kl_sigma = 1.0

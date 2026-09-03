@@ -4,7 +4,7 @@ from pathlib import Path
 import pytest
 import torch
 
-from imba_chess.config import DatasetConfig, ExpertIterationConfig, RepoConfig
+from imba_chess.config import DatasetConfig, ModelConfig, RepoConfig
 
 _TRAIN_PATH = Path(__file__).resolve().parents[1] / "scripts" / "train.py"
 _spec = importlib.util.spec_from_file_location("_train_for_lr_test", _TRAIN_PATH)
@@ -98,16 +98,12 @@ def test_run_limit_flags_parse(monkeypatch):
 
 
 def test_make_dataset_parses_evals_on_all_splits_but_filters_only_train():
-    # Val/test parse evals too, so the evaluator's value_loss is measured
-    # against the same soft targets the head is trained on; only the train
-    # stream drops un-annotated games.
+    # The value head trains and is evaluated only on plies with a Lichess
+    # eval, so every split parses them; only the train stream drops
+    # un-annotated games.
     config = RepoConfig(
-        dataset=DatasetConfig(
-            require_stockfish_eval=True,
-        ),
-        expert_iteration=ExpertIterationConfig(
-            stockfish_eval_calibration_path="calibration.json"
-        ),
+        dataset=DatasetConfig(require_stockfish_eval=True),
+        model=ModelConfig(enable_value_head=True),
     )
     train_dataset = train._make_dataset(config, split="train")
     val_dataset = train._make_dataset(config, split="val")
@@ -116,5 +112,5 @@ def test_make_dataset_parses_evals_on_all_splits_but_filters_only_train():
     assert val_dataset.parse_stockfish_evals is True
     assert val_dataset.require_stockfish_eval is False
 
-    no_calibration = RepoConfig(dataset=DatasetConfig(require_stockfish_eval=True))
-    assert train._make_dataset(no_calibration, split="val").parse_stockfish_evals is False
+    no_value_head = RepoConfig(dataset=DatasetConfig(require_stockfish_eval=True))
+    assert train._make_dataset(no_value_head, split="val").parse_stockfish_evals is False

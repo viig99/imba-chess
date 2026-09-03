@@ -31,32 +31,11 @@ def collate_jagged_batch(batch: List[EventSequence]) -> JaggedBatch:
         "played_by_elo",
     ]
     per_game_scalar_keys = ["game_result_white"]
-    rollout_keys = (
-        "value_target_soft",
-        "has_rollout_value_target",
-        "policy_kl_arm_ids",
-        "policy_kl_arm_qhat",
-        "policy_kl_arm_mask",
-        "has_rollout_policy_target",
-    )
-
-    sample_has_rollout = ["value_target_soft" in sample for sample in batch]
-    if any(sample_has_rollout) and not all(sample_has_rollout):
-        raise ValueError(
-            "Mixed presence of rollout value-target keys across a collated batch: "
-            "every sample from one EventBuilder must consistently include or "
-            "omit value_target_soft/has_rollout_value_target."
-        )
-    include_rollout = all(sample_has_rollout)
 
     flat_scalars = {key: [] for key in scalar_keys}
     flat_piece_ids: list[list[int]] = []
-    flat_value_target_soft: list[list[float]] = []
-    flat_has_rollout_value_target: list[int] = []
-    flat_policy_kl_arm_ids: list[list[int]] = []
-    flat_policy_kl_arm_qhat: list[list[float]] = []
-    flat_policy_kl_arm_mask: list[list[bool]] = []
-    flat_has_rollout_policy_target: list[int] = []
+    flat_value_target: list[list[float]] = []
+    flat_has_value_target: list[int] = []
     seq_lens: list[int] = []
     per_game_scalars = {key: [] for key in per_game_scalar_keys}
 
@@ -69,51 +48,21 @@ def collate_jagged_batch(batch: List[EventSequence]) -> JaggedBatch:
                 f"Sample {game_id} has piece_ids length {len(piece_ids)} "
                 f"but seq_token_id length {seq_len}"
             )
-        for key in scalar_keys:
+        for key in (*scalar_keys, "value_target", "has_value_target"):
             values = sample[key]
             if len(values) != seq_len:
                 raise ValueError(
                     f"Sample {game_id} has {key} length {len(values)} "
                     f"but seq_token_id length {seq_len}"
                 )
-        if include_rollout:
-            for key in rollout_keys:
-                # The four policy-KL keys are optional even within a rollout
-                # batch: EventBuilder may not populate them yet (they're only
-                # produced once search-to-policy distillation is wired up),
-                # while value_target_soft/has_rollout_value_target remain
-                # mandatory whenever include_rollout is True.
-                if key not in sample:
-                    continue
-                values = sample[key]
-                if len(values) != seq_len:
-                    raise ValueError(
-                        f"Sample {game_id} has {key} length {len(values)} "
-                        f"but seq_token_id length {seq_len}"
-                    )
         seq_lens.append(seq_len)
         flat_piece_ids.extend(piece_ids)
         for key in scalar_keys:
             flat_scalars[key].extend(sample[key])
         for key in per_game_scalar_keys:
             per_game_scalars[key].append(sample[key])
-        if include_rollout:
-            flat_value_target_soft.extend(sample["value_target_soft"])
-            flat_has_rollout_value_target.extend(sample["has_rollout_value_target"])
-            # Default to zero-width/empty when a sample doesn't carry the
-            # policy-KL keys yet (see comment above).
-            flat_policy_kl_arm_ids.extend(
-                sample.get("policy_kl_arm_ids", [[] for _ in range(seq_len)])
-            )
-            flat_policy_kl_arm_qhat.extend(
-                sample.get("policy_kl_arm_qhat", [[] for _ in range(seq_len)])
-            )
-            flat_policy_kl_arm_mask.extend(
-                sample.get("policy_kl_arm_mask", [[] for _ in range(seq_len)])
-            )
-            flat_has_rollout_policy_target.extend(
-                sample.get("has_rollout_policy_target", [0] * seq_len)
-            )
+        flat_value_target.extend(sample["value_target"])
+        flat_has_value_target.extend(sample["has_value_target"])
 
     offsets = [0]
     for length in seq_lens:
@@ -132,16 +81,7 @@ def collate_jagged_batch(batch: List[EventSequence]) -> JaggedBatch:
         output[key] = torch.tensor(flat_scalars[key], dtype=torch.long)
     for key in per_game_scalar_keys:
         output[key] = torch.tensor(per_game_scalars[key], dtype=torch.long)
-    if include_rollout:
-        output["value_target_soft"] = torch.tensor(flat_value_target_soft, dtype=torch.float32)
-        output["has_rollout_value_target"] = torch.tensor(
-            flat_has_rollout_value_target, dtype=torch.bool
-        )
-        output["policy_kl_arm_ids"] = torch.tensor(flat_policy_kl_arm_ids, dtype=torch.long)
-        output["policy_kl_arm_qhat"] = torch.tensor(flat_policy_kl_arm_qhat, dtype=torch.float32)
-        output["policy_kl_arm_mask"] = torch.tensor(flat_policy_kl_arm_mask, dtype=torch.bool)
-        output["has_rollout_policy_target"] = torch.tensor(
-            flat_has_rollout_policy_target, dtype=torch.bool
-        )
+    output["value_target"] = torch.tensor(flat_value_target, dtype=torch.float32)
+    output["has_value_target"] = torch.tensor(flat_has_value_target, dtype=torch.bool)
 
     return output

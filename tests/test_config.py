@@ -132,44 +132,19 @@ def test_eval_vs_stockfish_search_knob_defaults():
     assert config.search_max_depth == 4
 
 
-def test_expert_iteration_config_defaults():
-    config = RepoConfig()
-    assert config.expert_iteration.rollout_path is None
-    assert config.expert_iteration.stockfish_eval_calibration_path is None
-    assert config.expert_iteration.beta == 0.0
-    assert config.expert_iteration.policy_kl_weight == 0.0
-    assert config.expert_iteration.policy_kl_sigma == 1.0
+def test_load_repo_config_unknown_section_raises(tmp_path):
+    path = tmp_path / "cfg.toml"
+    path.write_text("[expert_iteration]\nbeta = 1.0\n", encoding="utf-8")
+    with pytest.raises(ValueError, match="Unknown sections.*expert_iteration"):
+        load_repo_config(path)
 
 
-def test_load_repo_config_reads_expert_iteration_section(tmp_path):
-    config_path = tmp_path / "config.toml"
-    config_path.write_text(
-        """
-[expert_iteration]
-rollout_path = "artifacts/rollouts/ckpt23.parquet"
-stockfish_eval_calibration_path = "artifacts/corpus/cp_to_wdl.json"
-beta = 0.3
-policy_kl_weight = 0.1
-policy_kl_sigma = 1.5
-"""
-    )
-    config = load_repo_config(config_path)
-    assert config.expert_iteration.rollout_path == "artifacts/rollouts/ckpt23.parquet"
-    assert (
-        config.expert_iteration.stockfish_eval_calibration_path
-        == "artifacts/corpus/cp_to_wdl.json"
-    )
-    assert config.expert_iteration.beta == 0.3
-    assert config.expert_iteration.policy_kl_weight == 0.1
-    assert config.expert_iteration.policy_kl_sigma == 1.5
-
-
-def test_stockfish_low_lr_recipe_uses_inline_targets():
+def test_stockfish_finetune_recipe_loads():
     config = load_repo_config(
-        Path(__file__).resolve().parents[1]
+        Path(__file__).resolve().parent.parent
         / "config"
         / "imba_chess_sf_finetune_low_lr.toml"
     )
-    assert config.training.max_lr == 5e-5
-    assert config.expert_iteration.beta == 1.0
+    assert config.model.enable_value_head is True
+    assert config.model.label_smoothing == 0.0
     assert config.dataset.require_stockfish_eval is True

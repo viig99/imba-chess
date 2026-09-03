@@ -3,8 +3,7 @@ import pytest
 from imba_chess.data.event_builder import BOS_TOKEN_ID, EventBuilder, TARGET_IGNORE_INDEX
 from imba_chess.data.lichess_dataset import LichessDataset
 from imba_chess.data.move_vocab import MoveVocab
-from imba_chess.data.rollout_store import RolloutRow
-from imba_chess.data.stockfish_evals import CpToWdlCalibration
+from imba_chess.data.stockfish_evals import winpercent_wdl
 
 
 def _row():
@@ -24,14 +23,6 @@ def _row():
         "Opening": "King's Pawn Game",
         "movetext": "1. e4 e5 2. Nf3 Nc6 1-0",
     }
-
-
-def _calibration():
-    return CpToWdlCalibration(
-        centers=(-100.0, 100.0),
-        probs=((0.7, 0.2, 0.1), (0.1, 0.2, 0.7)),
-        mate_probs={-1: (0.95, 0.03, 0.02), 1: (0.02, 0.03, 0.95)},
-    )
 
 
 def _annotated_game():
@@ -64,178 +55,50 @@ def test_event_builder_builds_bos_plus_plies():
     assert len(sample["piece_ids"][1]) == 64
 
 
-def test_event_builder_without_rollout_lookup_omits_new_keys():
+def test_event_builder_masks_value_target_without_evals():
     dataset = LichessDataset(min_avg_elo=2000)
     game = list(dataset.stream_from_rows([_row()]))[0]
     vocab = MoveVocab.build_from_games([game])
 
-    builder = EventBuilder(vocab)
-    sample = builder.build_game(game)
+    sample = EventBuilder(vocab).build_game(game)
 
-    assert "value_target_soft" not in sample
-    assert "has_rollout_value_target" not in sample
-    assert "policy_kl_arm_ids" not in sample
-    assert "policy_kl_arm_qhat" not in sample
-    assert "policy_kl_arm_mask" not in sample
-    assert "has_rollout_policy_target" not in sample
+    assert sample["has_value_target"] == [0, 0, 0, 0, 0]
+    assert sample["value_target"] == [[0.0, 0.0, 0.0]] * 5
 
 
-def test_event_builder_with_inline_calibration_builds_only_value_targets():
+def test_event_builder_builds_winpercent_value_targets_from_evals():
     game = _annotated_game()
     vocab = MoveVocab.build_from_games([game])
-    calibration = _calibration()
-    sample = EventBuilder(vocab, beta=1.0, eval_calibration=calibration).build_game(game)
 
-    assert sample["has_rollout_value_target"] == [0, 0, 1, 1, 1]
-    assert sample["value_target_soft"][2] == pytest.approx(
-        calibration.wdl(cp_stm=-20.0, mate_stm=None)
-    )
-    assert "policy_kl_arm_ids" not in sample
-    assert "has_rollout_policy_target" not in sample
+    sample = EventBuilder(vocab).build_game(game)
+
+    # BOS and the first ply never carry an eval (the comment after move k
+    # targets the state before move k+1); plies 2..4 do.
+    assert sample["has_value_target"] == [0, 0, 1, 1, 1]
+    assert sample["value_target"][0] == [0.0, 0.0, 0.0]
+    assert sample["value_target"][1] == [0.0, 0.0, 0.0]
+    # Ply 2 (Black to move) sees White's +0.20 as -20 cp from its own side.
+    assert sample["value_target"][2] == pytest.approx(list(winpercent_wdl(-20.0, None)))
+    # Ply 3 (White to move) sees the +0.10 after 1...e5 as +10 cp.
+    assert sample["value_target"][3] == pytest.approx(list(winpercent_wdl(10.0, None)))
+    assert sample["value_target"][4] == pytest.approx(list(winpercent_wdl(-30.0, None)))
+    for token in sample["value_target"]:
+        assert token[1] == 0.0
+    assert len(sample["value_target"]) == len(sample["seq_token_id"])
+    assert len(sample["has_value_target"]) == len(sample["seq_token_id"])
 
 
-def test_event_builder_rejects_two_value_target_sources():
-    game = _annotated_game()
+def test_event_builder_maps_mate_evals_to_ceiling():
+    row = _row()
+    row["movetext"] = "1. e4 { [%eval #5] } 1... e5 { [%eval #-3] } 2. Nf3 Nc6 1-0"
+    dataset = LichessDataset(min_avg_elo=2000, parse_stockfish_evals=True)
+    game = list(dataset.stream_from_rows([row]))[0]
     vocab = MoveVocab.build_from_games([game])
-    with pytest.raises(ValueError, match="mutually exclusive"):
-        EventBuilder(vocab, rollout_lookup={}, eval_calibration=_calibration())
 
+    sample = EventBuilder(vocab).build_game(game)
 
-def test_event_builder_with_rollout_lookup_blends_value_target():
-    dataset = LichessDataset(min_avg_elo=2000)
-    game = list(dataset.stream_from_rows([_row()]))[0]
-    vocab = MoveVocab.build_from_games([game])
-    game_id = game["game_id"]
-
-    # Rollout for ply 1 (the second play, token index 2) only.
-    rollout_row = RolloutRow(
-        game_id=game_id,
-        ply=1,
-        human_move_uci=game["plays"][1]["move_uci"],
-        human_move_backed_value=0.2,
-        real_outcome_stm=1,
-        best_arm_move_uci=game["plays"][1]["move_uci"],
-        best_arm_backed_value=0.6,
-        root_wdl_unsearched=(0.2, 0.3, 0.5),
-        arm_move_uci=(game["plays"][1]["move_uci"],),
-        arm_backed_value=(0.6,),
-        arm_evals_spent=(100,),
-        arm_log_prior=(-0.1,),
-        search_budget=256,
-        search_top_m=1,
-        search_max_depth=4,
-        checkpoint="dummy.pt",
-    )
-    lookup = {(game_id, 1): rollout_row}
-
-    builder = EventBuilder(vocab, rollout_lookup=lookup, beta=1.0)
-    sample = builder.build_game(game)
-
-    assert len(sample["value_target_soft"]) == len(sample["seq_token_id"])
-    assert len(sample["has_rollout_value_target"]) == len(sample["seq_token_id"])
-    # Only token 2 (== ply 1) has a rollout row; every other token (BOS at 0,
-    # ply 0 at 1, ply 2 at 3, ply 3 at 4) must be untouched.
-    for token_idx in range(len(sample["seq_token_id"])):
-        if token_idx == 2:
-            continue
-        assert sample["has_rollout_value_target"][token_idx] == 0
-        assert sample["value_target_soft"][token_idx] == [0.0, 0.0, 0.0]
-    # Token 2 == ply 1 gets the blended target (beta=1.0 -> pure searched_vec).
-    assert sample["has_rollout_value_target"][2] == 1
-    assert abs(sum(sample["value_target_soft"][2]) - 1.0) < 1e-9
-    assert sample["value_target_soft"][2][1] == pytest.approx(0.3)
-
-
-def test_event_builder_with_rollout_lookup_builds_policy_kl_arm_targets():
-    dataset = LichessDataset(min_avg_elo=2000)
-    game = list(dataset.stream_from_rows([_row()]))[0]
-    vocab = MoveVocab.build_from_games([game])
-    game_id = game["game_id"]
-
-    rollout_row = RolloutRow(
-        game_id=game_id,
-        ply=1,
-        human_move_uci=game["plays"][1]["move_uci"],
-        human_move_backed_value=0.2,
-        real_outcome_stm=1,
-        best_arm_move_uci=game["plays"][1]["move_uci"],
-        best_arm_backed_value=0.6,
-        root_wdl_unsearched=(0.2, 0.3, 0.5),
-        arm_move_uci=(game["plays"][1]["move_uci"], game["plays"][0]["move_uci"]),
-        arm_backed_value=(0.6, -0.2),
-        arm_evals_spent=(100, 50),
-        arm_log_prior=(-0.1, -0.4),
-        search_budget=256,
-        search_top_m=2,
-        search_max_depth=4,
-        checkpoint="dummy.pt",
-    )
-    lookup = {(game_id, 1): rollout_row}
-
-    builder = EventBuilder(vocab, rollout_lookup=lookup, beta=1.0)
-    sample = builder.build_game(game)
-
-    seq_len = len(sample["seq_token_id"])
-    assert len(sample["policy_kl_arm_ids"]) == seq_len
-    assert len(sample["policy_kl_arm_qhat"]) == seq_len
-    assert len(sample["policy_kl_arm_mask"]) == seq_len
-    assert len(sample["has_rollout_policy_target"]) == seq_len
-
-    # Only token 2 (== ply 1) has a rollout row.
-    for token_idx in range(seq_len):
-        if token_idx == 2:
-            continue
-        assert sample["has_rollout_policy_target"][token_idx] == 0
-        assert sample["policy_kl_arm_mask"][token_idx] == [False] * 24
-
-    assert sample["has_rollout_policy_target"][2] == 1
-    assert sample["policy_kl_arm_mask"][2][:2] == [True, True]
-    assert sample["policy_kl_arm_mask"][2][2:] == [False] * 22
-    expected_id_0 = vocab.token_to_id[game["plays"][1]["move_uci"]]
-    expected_id_1 = vocab.token_to_id[game["plays"][0]["move_uci"]]
-    assert sample["policy_kl_arm_ids"][2][0] == expected_id_0
-    assert sample["policy_kl_arm_ids"][2][1] == expected_id_1
-    assert sample["policy_kl_arm_qhat"][2][0] == pytest.approx(0.6)
-    assert sample["policy_kl_arm_qhat"][2][1] == pytest.approx(-0.2)
-
-
-def test_event_builder_with_rollout_lookup_all_arms_unmappable_leaves_no_target():
-    dataset = LichessDataset(min_avg_elo=2000)
-    game = list(dataset.stream_from_rows([_row()]))[0]
-    vocab = MoveVocab.build_from_games([game])
-    game_id = game["game_id"]
-
-    # Both arms use moves that never appear in this game's plies, so
-    # MoveVocab.build_from_games([game]) never added them -- they are
-    # genuinely unmappable to the vocab.
-    rollout_row = RolloutRow(
-        game_id=game_id,
-        ply=1,
-        human_move_uci=game["plays"][1]["move_uci"],
-        human_move_backed_value=0.2,
-        real_outcome_stm=1,
-        best_arm_move_uci="z9z9",
-        best_arm_backed_value=0.6,
-        root_wdl_unsearched=(0.2, 0.3, 0.5),
-        arm_move_uci=("z9z9", "a1a1"),
-        arm_backed_value=(0.6, -0.2),
-        arm_evals_spent=(100, 50),
-        arm_log_prior=(-0.1, -0.4),
-        search_budget=256,
-        search_top_m=2,
-        search_max_depth=4,
-        checkpoint="dummy.pt",
-    )
-    lookup = {(game_id, 1): rollout_row}
-
-    builder = EventBuilder(vocab, rollout_lookup=lookup, beta=1.0)
-    sample = builder.build_game(game)
-
-    seq_len = len(sample["seq_token_id"])
-    # Token 2 (== ply 1) has a rollout row, but every arm is unmappable, so
-    # it must NOT be flagged as having a policy target.
-    assert sample["has_rollout_policy_target"][2] == 0
-    assert sample["policy_kl_arm_mask"][2] == [False] * 24
-    for token_idx in range(seq_len):
-        assert sample["has_rollout_policy_target"][token_idx] == 0
-        assert sample["policy_kl_arm_mask"][token_idx] == [False] * 24
+    assert sample["has_value_target"] == [0, 0, 1, 1, 0]
+    # White mates in 5 -> Black to move at ply 2 is losing.
+    assert sample["value_target"][2] == pytest.approx(list(winpercent_wdl(None, -1)))
+    # Black mates in 3 after 1...e5 -> White to move at ply 3 is losing.
+    assert sample["value_target"][3] == pytest.approx(list(winpercent_wdl(None, -1)))
