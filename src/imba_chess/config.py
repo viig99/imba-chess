@@ -35,9 +35,6 @@ class DatasetConfig:
     train_month_shuffle_seed: Optional[int] = None
     # Game-level shuffle buffer for the train stream; 0 disables.
     train_shuffle_buffer_size: int = 0
-    # Train split only: discard rows without inline Lichess [%eval] comments
-    # before the comparatively expensive PGN parse.
-    require_stockfish_eval: bool = False
     # Replay a corpus materialized by scripts/materialize_corpus.py instead of
     # streaming from HuggingFace. Removes an ~8 minute per-run stall and makes
     # short experiments practical. TRAIN SPLIT ONLY -- it is a single captured
@@ -93,8 +90,7 @@ class ModelConfig:
     elo_loss_weight_strength: float = 0.0
     # Value head: side-to-move WDL trained ONLY on plies that carry a Lichess
     # Stockfish eval (stockfish_evals.winpercent_wdl). Enabling it turns on
-    # [%eval] parsing for every split; dataset.require_stockfish_eval
-    # additionally drops un-annotated games from the train stream.
+    # [%eval] parsing for every split; unannotated plies have zero value weight.
     enable_value_head: bool = False
     value_loss_weight: float = 0.15
     moves_left_loss_weight: float = 0.05

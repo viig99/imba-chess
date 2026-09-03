@@ -163,14 +163,10 @@ def _make_dataset(config, *, split: str) -> LichessDataset:
         local_corpus_path=(
             dataset_cfg.local_corpus_path if split == "train" else None
         ),
-        # All splits: the value head trains and is evaluated only on plies
-        # with a Lichess eval, so val/test parse them too. Un-annotated games
-        # are not filtered out of val/test (require_stockfish_eval below is
-        # train-only); they contribute policy metrics and no value loss.
+        # All splits parse Lichess evals when the value head is enabled. Only
+        # evaluated plies receive value weight; all games still train policy
+        # and moves-left.
         parse_stockfish_evals=bool(config.model.enable_value_head),
-        require_stockfish_eval=(
-            split == "train" and bool(dataset_cfg.require_stockfish_eval)
-        ),
         board_state_config=config.board_state,
     )
 

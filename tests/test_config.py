@@ -20,7 +20,6 @@ test_end_month = "2025-09"
 val_max_games = 100000
 test_max_games = 100000
 max_seq_len = 256
-require_stockfish_eval = true
 
 [vocab]
 path = "tmp_vocab.json"
@@ -62,7 +61,6 @@ last_checkpoint_keep = 2
     assert config.dataset.val_max_games == 100000
     assert config.dataset.test_max_games == 100000
     assert config.dataset.max_seq_len == 256
-    assert config.dataset.require_stockfish_eval is True
     assert config.vocab.path == "tmp_vocab.json"
     assert config.dataloader.max_tokens_per_batch == 4096
     assert config.model.num_layers == 8
@@ -147,4 +145,3 @@ def test_stockfish_finetune_recipe_loads():
     )
     assert config.model.enable_value_head is True
     assert config.model.label_smoothing == 0.0
-    assert config.dataset.require_stockfish_eval is True

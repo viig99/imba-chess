@@ -4,7 +4,7 @@ from pathlib import Path
 import pytest
 import torch
 
-from imba_chess.config import DatasetConfig, ModelConfig, RepoConfig
+from imba_chess.config import ModelConfig, RepoConfig
 
 _TRAIN_PATH = Path(__file__).resolve().parents[1] / "scripts" / "train.py"
 _spec = importlib.util.spec_from_file_location("_train_for_lr_test", _TRAIN_PATH)
@@ -97,20 +97,12 @@ def test_run_limit_flags_parse(monkeypatch):
     assert args.max_games == 2_000_000
 
 
-def test_make_dataset_parses_evals_on_all_splits_but_filters_only_train():
-    # The value head trains and is evaluated only on plies with a Lichess
-    # eval, so every split parses them; only the train stream drops
-    # un-annotated games.
-    config = RepoConfig(
-        dataset=DatasetConfig(require_stockfish_eval=True),
-        model=ModelConfig(enable_value_head=True),
-    )
+def test_make_dataset_parses_evals_on_all_splits_when_value_head_enabled():
+    config = RepoConfig(model=ModelConfig(enable_value_head=True))
     train_dataset = train._make_dataset(config, split="train")
     val_dataset = train._make_dataset(config, split="val")
     assert train_dataset.parse_stockfish_evals is True
-    assert train_dataset.require_stockfish_eval is True
     assert val_dataset.parse_stockfish_evals is True
-    assert val_dataset.require_stockfish_eval is False
 
-    no_value_head = RepoConfig(dataset=DatasetConfig(require_stockfish_eval=True))
+    no_value_head = RepoConfig()
     assert train._make_dataset(no_value_head, split="val").parse_stockfish_evals is False

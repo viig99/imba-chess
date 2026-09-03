@@ -58,14 +58,14 @@ This is pure imitation learning: no reward signal, no self-play.
 When `[model].enable_value_head = true`, a 3-logit MLP head (`Linear → SiLU → Linear`, private capacity so the policy objective doesn't crowd it out of the shared trunk) is trained to predict the side-to-move Stockfish assessment of every position that carries a Lichess `[%eval]` annotation:
 
 - The target is Lichess's own fixed win-percent function of the eval (`src/imba_chess/data/stockfish_evals.py::winpercent_wdl`, the same function scalachess/lila use for accuracy and insights): `p_win = 1 / (1 + exp(-0.00368208 * clamp(cp, ±1000)))`, mate → ±1000 cp, `[p_loss, p_draw, p_win] = [1-p, 0, p]`. No corpus fitting, no draw term.
-- Only plies with an eval train the head (the first ply and the final position never have one; un-annotated games have none). Every such token has weight 1: no progress or Elo weighting, no game-outcome fallback. Enabling the head turns on `[%eval]` parsing for every split, so the evaluators report a held-out `value_loss` against the same targets; `[dataset].require_stockfish_eval = true` additionally drops un-annotated games from the train stream.
+- Only plies with an eval train the head (the first ply and the final position never have one; unannotated games have none). Every such token has weight 1: no progress or Elo weighting, no game-outcome fallback. All games continue to train policy and moves-left; enabling the head turns on `[%eval]` parsing for every split so evaluators report held-out `value_loss` against the same targets.
 - The 3-logit shape is kept because search, checkpoints and rollouts speak WDL; under this target the draw logit is driven to zero and the head is a scalar `v = p(win) - p(loss)` in disguise. Why this replaced the outcome-label head, the corpus calibration and the outcome blend, with numbers: `docs/VALUE_TARGET_WINPERCENT_HANDOFF.md`.
 
 Training logs include `total_loss`, `policy_loss`, `value_loss`, `moves_left_loss` and `value_coverage` (fraction of policy tokens carrying a value target).
 
 ## Stockfish-supervised fine-tuning
 
-The fine-tune recipe is the same objective on the annotated subset of the train stream, resumed from the best pretrain checkpoint at a constant low learning rate:
+The fine-tune recipe continues on the full train stream at a constant low learning rate. Inline evaluations supervise the value head where present; every game continues to supervise policy and moves-left:
 
 ```bash
 python scripts/train.py \
