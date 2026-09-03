@@ -111,10 +111,18 @@ class WeightedValueLoss(Metric):
 
     @reinit__is_reduced
     def update(self, output: Any) -> None:
-        if not isinstance(output, dict):
-            raise TypeError("WeightedValueLoss expects a dict evaluator output")
-        value_loss = output["value_loss"]
-        weight_sum = output["value_weight_sum"]
+        if isinstance(output, dict):
+            value_loss = output["value_loss"]
+            weight_sum = output["value_weight_sum"]
+        elif isinstance(output, (tuple, list)) and len(output) == 2:
+            # Ignite converts mappings to a tuple in required_output_keys
+            # order before calling update() on an attached metric.
+            value_loss, weight_sum = output
+        else:
+            raise TypeError(
+                "WeightedValueLoss expects a dict or "
+                "(value_loss, value_weight_sum) tuple"
+            )
         self._loss_sum += float(value_loss) * float(weight_sum)
         self._weight_sum += float(weight_sum)
 

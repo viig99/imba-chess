@@ -3,6 +3,7 @@ import math
 import pytest
 
 torch = pytest.importorskip("torch")
+from ignite.engine import Engine
 
 from imba_chess.eval.metrics import (
     BatchCount,
@@ -97,3 +98,16 @@ def test_weighted_value_loss_pools_by_weight_sum():
 
     metric.reset()
     assert math.isnan(metric.compute())
+
+
+def test_weighted_value_loss_accepts_ignite_required_keys_tuple():
+    evaluator = Engine(lambda _engine, batch: batch)
+    WeightedValueLoss().attach(evaluator, "value_loss")
+    evaluator.run(
+        [
+            {"value_loss": 1.0, "value_weight_sum": 1.0},
+            {"value_loss": 3.0, "value_weight_sum": 3.0},
+            {"value_loss": 0.0, "value_weight_sum": 0.0},
+        ]
+    )
+    assert evaluator.state.metrics["value_loss"] == pytest.approx(2.5)

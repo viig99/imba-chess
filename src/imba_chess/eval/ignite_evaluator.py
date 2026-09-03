@@ -43,7 +43,11 @@ def create_next_move_evaluator(
     resolved_topk = normalize_topk(topk)
     use_amp = device.type == "cuda" and dtype in (torch.float16, torch.bfloat16)
 
-    @torch.inference_mode()
+    # Keep ordinary (non-inference) tensor dispatch keys so BlockMask creation
+    # shares its compiled graph with training. inference_mode() creates
+    # inference tensors here and forces a second create_block_mask compile when
+    # the first training batch switches back to ordinary tensors.
+    @torch.no_grad()
     def _eval_step(engine: Engine, batch: dict[str, object]) -> dict[str, object]:
         seq_offsets = batch["seq_offsets"].to(  # type: ignore[union-attr]
             device=device, dtype=torch.long, non_blocking=True
