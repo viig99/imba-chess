@@ -21,7 +21,7 @@ Inspiration:
 - Ignite-based training loop (StableAdamW + OneCycleLR, mixed precision, periodic fast val/test + periodic full val, TensorBoard logging, best/last checkpointing).
 - Head-to-head engine evaluation (`scripts/eval_vs_stockfish.py`) with pluggable value-guided search at inference (`src/imba_chess/eval/search.py`): depth-2 minimax and budgeted sequential-halving tree search (MCTS-lite).
 - Per-game PGN + self-contained HTML replay viewer (board animation, clickable move list) for traced eval games.
-- Search-backed rollout generation (`scripts/generate_search_rollouts.py`) for Expert-Iteration-style value-target distillation experiments.
+- Search-backed rollout generation (`scripts/generate_search_rollouts.py`) for offline search analysis and future experiments.
 
 ## Data and training flow
 
@@ -53,35 +53,29 @@ Token-level cross-entropy against the move the human actually played (full move-
 
 This is pure imitation learning: no reward signal, no self-play.
 
-### Value head: win/draw/loss classification
+### Value head: engine-score W/D/L
 
-When `[model].enable_value_head = true`, a 3-class MLP head (`Linear → SiLU → Linear`, private capacity so the policy objective doesn't crowd it out of the shared trunk) is trained to predict the final result of the game from every position, from the perspective of the player about to move:
+When `[model].enable_value_head = true`, a 3-logit MLP head (`Linear → SiLU → Linear`, private capacity so the policy objective doesn't crowd it out of the shared trunk) is trained to predict the side-to-move Stockfish assessment of every position that carries a Lichess `[%eval]` annotation:
 
-- The label for every position in a game is that game's final outcome (`game_result_white`, flipped by `turn_id`). The head therefore learns "among training games that passed through positions like this, how often did the side to move end up winning?"
-- The target itself is not discounted, but the per-token loss is weighted by game progress (`progress ^ [model].value_weight_alpha`, `progress` in `[0, 1]`): the final outcome is a noisy label for early positions and a clean one for late positions, so early positions contribute little gradient and the last positions contribute full gradient.
-- The same Elo weighting as the policy loss (`elo_loss_weight_strength` > 0) also scales the value loss: stronger players' outcomes are lower-noise value labels (they convert winning positions more reliably), so their tokens pull the value gradient harder.
-- 3-class classification is deliberate (rather than a scalar regression head): win/draw/loss outcomes are genuinely 3-modal — a scalar `0.0` cannot distinguish "certain draw" from "unclear, 50/50 win-or-lose" — and cross-entropy on categories optimizes better than MSE on a bounded scalar. A scalar is recovered at inference as `v = p(win) - p(loss)` in `[-1, 1]`.
+- The target is Lichess's own fixed win-percent function of the eval (`src/imba_chess/data/stockfish_evals.py::winpercent_wdl`, the same function scalachess/lila use for accuracy and insights): `p_win = 1 / (1 + exp(-0.00368208 * clamp(cp, ±1000)))`, mate → ±1000 cp, `[p_loss, p_draw, p_win] = [1-p, 0, p]`. No corpus fitting, no draw term.
+- Only plies with an eval train the head (the first ply and the final position never have one; un-annotated games have none). Every such token has weight 1: no progress or Elo weighting, no game-outcome fallback. Enabling the head turns on `[%eval]` parsing for every split, so the evaluators report a held-out `value_loss` against the same targets; `[dataset].require_stockfish_eval = true` additionally drops un-annotated games from the train stream.
+- The 3-logit shape is kept because search, checkpoints and rollouts speak WDL; under this target the draw logit is driven to zero and the head is a scalar `v = p(win) - p(loss)` in disguise. Why this replaced the outcome-label head, the corpus calibration and the outcome blend, with numbers: `docs/VALUE_TARGET_WINPERCENT_HANDOFF.md`.
 
-Known limitation: game outcomes are high-variance Monte-Carlo labels (a winning position that the player later threw away gets labeled "loss"). `value_weight_alpha` (recency discount on early/mid-game positions, where this noise is worst) is the main lever tuned so far — see `docs/superpowers/notes/2026-07-12-value-tuning-and-exit-phase1a-review.md`. A standalone Stockfish-distilled value net was tried as a second opinion blended in at inference; removed after an audit found it had never actually been wired into any shipped config (trained, but a silent no-op in practice) — see that same note for what superseded it (search-backed rollout distillation, also not yet a net win).
-
-Training logs include `total_loss`, `policy_loss`, and `value_loss`.
+Training logs include `total_loss`, `policy_loss`, `value_loss`, `moves_left_loss` and `value_coverage` (fraction of policy tokens carrying a value target).
 
 ## Stockfish-supervised fine-tuning
 
-Lichess `[%eval]` comments can provide calibrated soft W/D/L targets to the
-value head. The production recipe filters for annotated training games before
-PGN parsing and leaves validation and test unchanged:
+The fine-tune recipe is the same objective on the annotated subset of the train stream, resumed from the best pretrain checkpoint at a constant low learning rate:
 
 ```bash
 python scripts/train.py \
   --config config/imba_chess_sf_finetune_low_lr.toml \
   --resume artifacts/checkpoints/best_hr10_checkpoint_23_hr10=0.9564.pt \
-  --lr-override 5e-5 --max-games 1800000
+  --lr-override 5e-5
 ```
 
-`--max-games` limits additional games processed by this invocation, with at
-most one final batch of overshoot. Inline Stockfish supervision and
-`expert_iteration.rollout_path` are mutually exclusive.
+`--max-games` limits additional games processed by one invocation, with at
+most one final batch of overshoot.
 
 ## Evaluation during training
 
@@ -213,10 +207,9 @@ All runtime settings are in `config/imba_chess.toml`:
 - `[board_state]` board-state encoding buckets/options
 - `[vocab]` static move vocab location
 - `[dataloader]` max tokens per jagged batch, workers
-- `[model]` HSTU dimensions/layers + label smoothing + Elo loss weighting + value head knobs
+- `[model]` HSTU dimensions/layers + label smoothing + Elo loss weighting + value / moves-left head weights
 - `[training]` optimizer/scheduler/eval cadence/checkpointing/device/precision
 - `[eval_vs_stockfish]` engine path/limits, ladder settings, move-selection policy and knobs, debug controls
-- `[expert_iteration]` rollout or inline Stockfish value supervision and value-target blend weight (`beta`)
 
 ## Quickstart
 
@@ -250,7 +243,7 @@ uv run --python .venv/bin/python --with pytest pytest -q
 - Training is single-process (no end-to-end DDP launcher yet).
 - No legal-move masking in the prediction head during training (full-vocab classification); legality is enforced at inference.
 - Prefix K/V caching is per-turn only: the cache is rebuilt each model turn (no cross-turn reuse) and games are played sequentially (no cross-game batching).
-- The big model's value labels are raw game outcomes (noisy). A standalone Stockfish-distilled value net previously mitigated this at inference (see "Results vs Stockfish" below for its historical numbers) but was removed as dead code — it had never been wired into any shipped config. Search-backed value distillation (ExIt Phase 1a) was tried as a replacement approach and is not yet a net win; see `docs/superpowers/notes/2026-07-12-value-tuning-and-exit-phase1a-review.md`.
+- The value head is supervised only where games carry inline Lichess Stockfish evals; unannotated games still train the policy and moves-left heads. Historical outcome-label and search-distillation experiments are described in `docs/superpowers/notes/2026-07-12-value-tuning-and-exit-phase1a-review.md`.
 - Checkpoints trained before the placement-aware board encoding / 1,970-token vocab are incompatible with current code (check out an older commit to evaluate them; keep a copy of the old `[model]` block and pass `--config` when evaluating old checkpoints after architecture changes).
 
 ## References
@@ -263,6 +256,7 @@ uv run --python .venv/bin/python --with pytest pytest -q
 - `docs/superpowers/notes/2026-07-06-eval-log-archive.md` for the full eval diaries, per-color splits, and superseded usage examples.
 - `docs/GENERATION_PERF_HANDOFF.md` for rollout-generation throughput: methodology, measured bottlenecks, measurement pitfalls, correctness gates, and ranked next steps toward a fused rollout+training loop.
 - `docs/superpowers/notes/2026-07-12-value-tuning-and-exit-phase1a-review.md` for the `value_weight_alpha` tuning methodology, why search-backed value distillation (ExIt Phase 1a) hasn't paid off yet (with literature review), the visit-adaptive search-lambda experiment and its revert, and the staged plan going forward.
-- `docs/STOCKFISH_SUPERVISION_HANDOFF.md` for the Stockfish-supervision track: extracting Lichess's inline engine evals, calibrating cp -> WDL, and the paired train/eval protocol. It is the entry point for `scripts/extract_lichess_evals.py`, `scripts/filter_annotated_corpus.py`, `scripts/calibrate_evals_to_wdl.py`, `scripts/match_two_checkpoints.py`, `scripts/value_head_vs_stockfish.py` and `scripts/phase1b_paired_run.sh`.
+- `docs/VALUE_TARGET_WINPERCENT_HANDOFF.md` for the current fixed-function Stockfish value target and fine-tune/evaluation protocol.
+- `docs/STOCKFISH_SUPERVISION_HANDOFF.md` (**historical**) for the superseded corpus-calibration and search-distillation experiments.
 - `docs/loss_audit_2026-09.md` for the 2026-09 audit of the training losses and how `config/imba_chess_sf_finetune_low_lr.toml` was derived from it.
 - `STOCKFISH_EVAL_PLAN.md` (**historical**, 2026-02) for the original head-to-head evaluation plan, superseded by `EVAL_SPEC.md` and the nodes-calibrated protocol.

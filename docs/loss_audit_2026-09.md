@@ -1,3 +1,9 @@
+> **Superseded the same day.** The value target and every knob discussed
+> below were replaced by a single fixed function and the surrounding code
+> deleted; see `docs/VALUE_TARGET_WINPERCENT_HANDOFF.md`. This file is kept
+> as the record of what was wrong with the outcome-label / calibration
+> design and why.
+
 # Loss audit, 2026-09-03
 
 Audit of the training objectives used by `config/imba_chess_sf_finetune_low_lr.toml`
