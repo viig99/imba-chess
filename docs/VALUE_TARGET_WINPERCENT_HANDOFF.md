@@ -8,10 +8,12 @@ This supersedes an earlier draft (`SCALAR_VALUE_HEAD_HANDOFF.md`, deleted) that
 proposed a separate scalar value head. That idea is kept in §9 as a rejected
 alternative, with the reason.
 
-**Status 2026-09-03: implemented and cleaned up.** §5 and §8 describe what
-was done, not what is to do. The calibration arm A was stopped by hand before
-the change and is not kept; there is one value target in the tree. The
-fine-tune from ckpt23 with the new target is the run to evaluate (§6).
+**Status 2026-09-03: adopted.** The ckpt27 fine-tune scored 0.6640 over 750
+games against the ckpt23 protocol's 0.6107 anchor (§6). The preserved model is
+`artifacts/checkpoints/best_winpercent_checkpoint_27_hr10=0.9613_sf2200=0.6640.pt`.
+The calibration arm A was stopped before the change and is not kept; there is
+one value target in the tree. Subsequent training uses the full game stream,
+with value loss masked to evaluated plies, rather than filtering whole games.
 
 ---
 
@@ -40,9 +42,9 @@ removed.
 
 **Scope.** The fixed function is the only value target in the tree; the
 calibration pipeline, blend, weighting knobs, policy-KL and rollout-training
-hook are deleted (§8). What remains is to evaluate the fine-tune from ckpt23
-against the ckpt23 anchor (§6) and, if it is not worse, use the same recipe
-for the next from-scratch run.
+hook are deleted (§8). The ckpt27 evaluation passed the adoption gate (§6);
+the same full-stream recipe is now the default for continuation and the next
+from-scratch run.
 
 ---
 
@@ -79,11 +81,11 @@ than Black at that setting: always pair openings with colour reversal.
   is on: White-POV eval flipped to side to move, the comment after move k
   attached to the state before move k+1. The first ply and the final position
   never carry an eval.
-- `dataset.require_stockfish_eval = true` keeps only games with at least one
-  `[%eval]`. Prior-session figures (corpus parquets were removed from
-  `artifacts/corpus/` on 2026-09-03, so not re-verifiable from disk): ~15% of
-  qualifying games are annotated; within an annotated game ~98.7% of usable
-  plies carry an eval.
+- Prior-session figures (corpus parquets were removed from `artifacts/corpus/`
+  on 2026-09-03, so not re-verifiable from disk): ~15% of qualifying games are
+  annotated; within an annotated game ~98.7% of usable plies carry an eval.
+  Training keeps the full stream: every game supervises policy and moves-left,
+  while only evaluated plies supervise value.
 - Games longer than `max_seq_len` are rejected, not truncated.
 - **The centipawn scale is not uniform across the corpus.** Lichess evals are
   produced by whatever Stockfish version fishnet ran at analysis time. Since
@@ -208,9 +210,11 @@ total         = policy + value_loss_weight * value + 0.05 * moves-left
 No beta, no blend, no progress weighting, no Elo weighting on value, no
 hard-outcome fallback, no policy KL. Tokens without an eval have value weight
 0. The policy loss stays on the full stream; only the value loss is gated.
-In a from-scratch run about 15% of games carry value targets; `value_loss_weight`
-may need raising to compensate for the smaller share of the gradient. Start
-at 1.0 and read the value curve.
+In a from-scratch or continuation run about 15% of games carry value targets.
+The value loss is normalized over evaluated tokens in each batch, and batches
+contain many games, so this does not simply dilute its configured weight to
+15%. The ckpt27 held-out alignment result supports keeping
+`value_loss_weight = 1.0` (§6).
 
 ---
 
@@ -234,7 +238,8 @@ at 1.0 and read the value curve.
 - `config.py`: `ModelConfig` keeps `enable_value_head`, `value_loss_weight`,
   `moves_left_loss_weight`; the `[expert_iteration]` section is gone and an
   unknown top-level section now fails loudly.
-- `config/imba_chess_sf_finetune_low_lr.toml` is the recipe config
+- `config/imba_chess_sf_finetune_low_lr.toml` is the full-stream continuation
+  recipe config
   (`checkpoint_dir = artifacts/stockfish_finetune/ckpt_winpercent_low_lr_8k`).
 - Tests: `test_stockfish_evals.py` checks the function against the scalachess
   definition, symmetry, clamp and mate rule; `test_event_builder.py` checks
@@ -250,11 +255,11 @@ at 1.0 and read the value curve.
   --lr-override 5e-5
 ```
 
-### 5.3 From-scratch config (after the fine-tune is judged)
+### 5.3 Next from-scratch config
 
-`config/imba_chess_v4.toml`: the v3 config with `enable_value_head = true`,
-`require_stockfish_eval = false` (policy on all games), `label_smoothing =
-0`. Nothing else: the recipe has no other value-side keys.
+`config/imba_chess_v4.toml`: the v3 config with `enable_value_head = true` and
+`label_smoothing = 0`. Nothing else: all games train policy and moves-left,
+evaluated plies train value, and the recipe has no other value-side keys.
 
 ### 5.4 Held-out measurement
 
@@ -268,38 +273,43 @@ this change (outcome or calibration targets) are not comparable.
 
 ---
 
-## 6. Experiment protocol
+## 6. Experiment result
 
-One arm: the WinPercent fine-tune from ckpt23 ("C" below), constant lr
-5e-5, annotated stream, seed 42. The calibration arm was stopped before the
-change and is not evaluated; the two targets agree within 0.03 across the
-band that matters, so an A-vs-C match would be inside the ruler's band.
+The WinPercent fine-tune from ckpt23 used constant lr 5e-5 and seed 42. The
+calibration arm was stopped before the change and was not evaluated.
 
-**The question that decides anything is C versus ckpt23**: does the
-fine-tune beat the base? ckpt23 already has a 750-game anchor (0.6107, SE
-0.0147, §2.3).
+The decisive comparison was ckpt27 versus ckpt23. Ckpt23's 750-game anchor was
+0.6107 (SE 0.0147, §2.3). Ckpt27 completed the same protocol at 0.6640:
+416 wins, 164 draws, 170 losses; 375 games per colour; legal coverage 1.0.
+Its empirical SE is about 0.0150. The +0.0533 score-rate improvement is about
+2.54 independent-sample standard errors of the difference and roughly +40
+protocol Elo. The fixed WinPercent recipe therefore cleared the predeclared
+~0.04 adoption threshold.
 
-**Cheap signals (hours).** §5.4 metrics for ckpt23 and C. Coverage column in
-C's train log near 0.98, as for A.
+The result JSON is
+`artifacts/eval/winpercent_ckpt27_sf2200_750.json`; checksums and preserved
+training evidence are recorded in
+`artifacts/eval/winpercent_ckpt27_manifest.txt`.
 
-**Decisive test.** `scripts/eval_vs_stockfish.py` with the config's
-`[eval_vs_stockfish]` block: `value_search_halving`, budget 2048, Stockfish
-2200 at 40k nodes, 750 games, colour-paired openings, C only. ~11.4 s per
-game, ~2.4 h. Same-model repeat band ~0.02.
+### 6.1 Held-out value alignment
 
-**Decision rule.**
+The full 100,000-game validation split contained 1,214,415 evaluated positions.
+For checkpoint 27:
 
-1. C beats ckpt23 by more than two standard errors of the difference
-   (~0.04): adopt the recipe, run the cleanup (§8), use it for the v4
-   from-scratch run.
-2. C is within the band of ckpt23: the fine-tune is not doing much either
-   way. Adopt the recipe anyway for the simplification, and treat the value
-   head's contribution as the open question (search budget / lambda sweeps,
-   not the target function).
-3. C is clearly worse than ckpt23: the first suspect is tail optimism (try
-   `CP_CEILING = 600`), the second is the fine-tune itself (lr, data mix);
-   ckpt23's own value head can be re-measured with the evaluator's
-   `value_loss` for a same-target comparison.
+- cross-entropy: 0.607045
+- target entropy (irreducible even at perfect prediction): 0.581452
+- excess KL: 0.025593
+- scalar MAE / RMSE: 0.123561 / 0.202862
+- scalar Pearson correlation: 0.888742
+- nonzero-target sign accuracy: 0.875169
+- mean predicted draw mass: 0.00000094
+
+Only 4.2% of the reported cross-entropy is avoidable KL; the remainder is the
+soft target's own entropy. Predictions are somewhat compressed toward zero in
+the ±200-to-400 cp bands and tails, but the aggregate bias is small
+(mean predicted scalar 0.03393 versus target 0.03106). This result does not
+support increasing `value_loss_weight` above 1.0. Full bucket measurements are
+in `artifacts/eval/winpercent_ckpt27_value_alignment_val100k.json`.
 
 
 ---
@@ -341,6 +351,8 @@ Deleted in the same change as the new target:
   `value_hard_target_weight`; the hard-outcome CE path and the progress /
   Elo weighting of value tokens in `forward`; `game_result_white` stays only
   if something else needs it.
+- The whole-game `require_stockfish_eval` fast-filter and its config flag;
+  value masking alone now determines where the head trains.
 - Rename `value_target_soft` / `has_rollout_value_target` to
   `value_target` / `has_value_target` across `event_builder.py`,
   `collate.py`, `types.py`, `hstu_model.py`.
