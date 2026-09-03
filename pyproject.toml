@@ -17,8 +17,8 @@ dependencies = [
   "torch-optimi",
   "tqdm",
   "imba-chess-native",
-  # 1.x closes and then reuses its HTTP client after a transient connect error.
-  "huggingface-hub>=0.36,<1",
+  # 1.29 reacquires the HTTP client after a transient connection failure.
+  "huggingface-hub>=1.29,<1.30",
 ]
 
 [project.optional-dependencies]
