@@ -12,6 +12,7 @@ from datasets import load_dataset
 from .board_state import BoardStateEncoder
 from .models import BoardTokenConfig
 from .parsing import parse_elo, parse_time_control_seconds, to_text
+from .stockfish_evals import eval_from_comment
 from .torch_iterable import TorchLichessIterableDataset
 
 VALID_RESULTS = {"1-0", "0-1", "1/2-1/2"}
@@ -55,6 +56,8 @@ class LichessDataset:
         train_month_shuffle_seed: Optional[int] = None,
         train_shuffle_buffer_size: int = 0,
         local_corpus_path: Optional[str] = None,
+        parse_stockfish_evals: bool = False,
+        require_stockfish_eval: bool = False,
         board_state_config: Optional[BoardTokenConfig] = None,
     ) -> None:
         self.min_avg_elo = min_avg_elo
@@ -95,6 +98,8 @@ class LichessDataset:
             raise ValueError("train_shuffle_buffer_size must be >= 0")
         self.train_shuffle_buffer_size = int(train_shuffle_buffer_size)
         self.local_corpus_path = local_corpus_path
+        self.parse_stockfish_evals = bool(parse_stockfish_evals)
+        self.require_stockfish_eval = bool(require_stockfish_eval)
         self.board_state_encoder = BoardStateEncoder(board_state_config)
         self._validate_split_settings()
 
@@ -134,13 +139,24 @@ class LichessDataset:
             rows = load_dataset(**load_kwargs)
         prefiltered = False
         if hasattr(rows, "filter"):
+            filter_fn = self._game_filter_from_columns
+            filter_columns = ["WhiteElo", "BlackElo", "TimeControl"]
+            row_filter_fn = self._game_filter
+            if self.require_stockfish_eval:
+                # datasets 5.0.0 cannot reliably chain filter() calls when the
+                # first FilteredExamplesIterable has features=None. Apply one
+                # combined predicate instead, which also avoids an extra lazy
+                # iterable layer in every worker.
+                filter_fn = self._annotated_game_filter_from_columns
+                filter_columns.append("movetext")
+                row_filter_fn = self._annotated_game_filter
             try:
                 rows = rows.filter(
-                    self._game_filter_from_columns,
-                    input_columns=["WhiteElo", "BlackElo", "TimeControl"],
+                    filter_fn,
+                    input_columns=filter_columns,
                 )
             except TypeError:
-                rows = rows.filter(self._game_filter)
+                rows = rows.filter(row_filter_fn)
             prefiltered = True
         if (
             self.split.lower() == "train"
@@ -220,6 +236,22 @@ class LichessDataset:
             row.get("TimeControl"),
         )
 
+    def _annotated_game_filter(self, row: Dict[str, Any]) -> bool:
+        return self._game_filter(row) and self._row_has_stockfish_eval(row)
+
+    def _annotated_game_filter_from_columns(
+        self,
+        white_elo_raw: Any,
+        black_elo_raw: Any,
+        time_control_raw: Any,
+        movetext_raw: Any,
+    ) -> bool:
+        return self._game_filter_from_columns(
+            white_elo_raw,
+            black_elo_raw,
+            time_control_raw,
+        ) and self._has_stockfish_eval(movetext_raw)
+
     def _game_filter_from_columns(
         self,
         white_elo_raw: Any,
@@ -263,6 +295,12 @@ class LichessDataset:
     ) -> Iterator[Dict[str, Any]]:
         emitted_games = 0
         for row in rows:
+            # The remote HF iterable applies this predicate before shuffling
+            # and PGN parsing. Keep the same guard here for plain iterables,
+            # local corpora, and older datasets implementations whose filter
+            # method does not execute lazily.
+            if self.require_stockfish_eval and not self._row_has_stockfish_eval(row):
+                continue
             white_elo = parse_elo(row.get("WhiteElo"))
             black_elo = parse_elo(row.get("BlackElo"))
             if white_elo is None or black_elo is None:
@@ -328,6 +366,7 @@ class LichessDataset:
         plays: list[dict[str, Any]] = []
         board = game.board()
         node = game
+        pending_eval_white: tuple[float | None, int | None] = (None, None)
 
         while node.variations and (
             self.max_seq_len is None or len(plays) < self.max_seq_len
@@ -335,17 +374,27 @@ class LichessDataset:
             node = node.variations[0]
             move = node.move
             state = self.board_state_encoder.encode(board)
-            plays.append(
-                {
-                    "move_uci": move.uci(),
-                    # vars() is a shallow, zero-copy view of the frozen
-                    # BoardState; consumers must not mutate it.
-                    "state": vars(state),
-                    "played_by_elo": (
-                        white_elo if board.turn == chess.WHITE else black_elo
-                    ),
-                }
-            )
+            play = {
+                "move_uci": move.uci(),
+                # vars() is a shallow, zero-copy view of the frozen
+                # BoardState; consumers must not mutate it.
+                "state": vars(state),
+                "played_by_elo": (
+                    white_elo if board.turn == chess.WHITE else black_elo
+                ),
+            }
+            if self.parse_stockfish_evals:
+                cp_white, mate_white = pending_eval_white
+                sign = 1.0 if board.turn == chess.WHITE else -1.0
+                play["eval_cp_stm"] = None if cp_white is None else cp_white * sign
+                play["eval_mate_stm"] = (
+                    None if mate_white is None else int(mate_white * sign)
+                )
+                # This node's comment follows this node's move, so it targets
+                # the next play/state. The final pending eval is intentionally
+                # discarded because the final position has no play token.
+                pending_eval_white = eval_from_comment(node.comment or "")
+            plays.append(play)
             board.push(move)
 
         return plays
@@ -393,6 +442,14 @@ class LichessDataset:
         if split_name == "test":
             return self.test_max_games
         return None
+
+    @staticmethod
+    def _has_stockfish_eval(movetext: Any) -> bool:
+        return "[%eval" in to_text(movetext, default="")
+
+    @classmethod
+    def _row_has_stockfish_eval(cls, row: Dict[str, Any]) -> bool:
+        return cls._has_stockfish_eval(row.get("movetext"))
 
     def _month_window_for_split(self) -> tuple[str, str]:
         split_name = self.split.lower()

@@ -4,6 +4,8 @@ from pathlib import Path
 import pytest
 import torch
 
+from imba_chess.config import DatasetConfig, ExpertIterationConfig, RepoConfig
+
 _TRAIN_PATH = Path(__file__).resolve().parents[1] / "scripts" / "train.py"
 _spec = importlib.util.spec_from_file_location("_train_for_lr_test", _TRAIN_PATH)
 train = importlib.util.module_from_spec(_spec)
@@ -75,3 +77,38 @@ def test_lr_override_flag_defaults_to_none_and_parses(monkeypatch):
         "sys.argv", ["train.py", "--config", "c.toml", "--lr-override", "5e-5"]
     )
     assert train.parse_args().lr_override == pytest.approx(5e-5)
+
+
+def test_run_limit_flags_parse(monkeypatch):
+    monkeypatch.setattr(
+        "sys.argv",
+        [
+            "train.py",
+            "--config",
+            "c.toml",
+            "--max-steps",
+            "34000",
+            "--max-games",
+            "2000000",
+        ],
+    )
+    args = train.parse_args()
+    assert args.max_steps == 34_000
+    assert args.max_games == 2_000_000
+
+
+def test_make_dataset_enables_inline_parsing_only_for_train():
+    config = RepoConfig(
+        dataset=DatasetConfig(
+            require_stockfish_eval=True,
+        ),
+        expert_iteration=ExpertIterationConfig(
+            stockfish_eval_calibration_path="calibration.json"
+        ),
+    )
+    train_dataset = train._make_dataset(config, split="train")
+    val_dataset = train._make_dataset(config, split="val")
+    assert train_dataset.parse_stockfish_evals is True
+    assert train_dataset.require_stockfish_eval is True
+    assert val_dataset.parse_stockfish_evals is False
+    assert val_dataset.require_stockfish_eval is False

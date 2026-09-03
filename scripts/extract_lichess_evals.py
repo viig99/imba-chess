@@ -44,32 +44,10 @@ import pyarrow as pa
 import pyarrow.parquet as pq
 
 from imba_chess.config import DEFAULT_CONFIG_PATH, load_repo_config
-
-_RESULT_TO_WHITE_SCORE = {"1-0": 1, "0-1": -1, "1/2-1/2": 0}
-
-
-def _eval_from_comment(comment: str) -> tuple[float | None, int | None]:
-    """(centipawns, mate_in) from a PGN comment, White's POV.
-
-    Returns (None, None) when the comment carries no `[%eval]`. Exactly one of
-    the two is non-None otherwise.
-    """
-    start = comment.find("[%eval ")
-    if start < 0:
-        return None, None
-    end = comment.find("]", start)
-    if end < 0:
-        return None, None
-    token = comment[start + 7 : end].strip()
-    if token.startswith("#"):
-        try:
-            return None, int(token[1:])
-        except ValueError:
-            return None, None
-    try:
-        return float(token) * 100.0, None
-    except ValueError:
-        return None, None
+from imba_chess.data.stockfish_evals import (
+    RESULT_TO_WHITE_SCORE as _RESULT_TO_WHITE_SCORE,
+    eval_from_comment as _eval_from_comment,
+)
 
 
 def extract_game(

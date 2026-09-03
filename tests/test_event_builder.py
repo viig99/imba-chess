@@ -4,6 +4,7 @@ from imba_chess.data.event_builder import BOS_TOKEN_ID, EventBuilder, TARGET_IGN
 from imba_chess.data.lichess_dataset import LichessDataset
 from imba_chess.data.move_vocab import MoveVocab
 from imba_chess.data.rollout_store import RolloutRow
+from imba_chess.data.stockfish_evals import CpToWdlCalibration
 
 
 def _row():
@@ -23,6 +24,24 @@ def _row():
         "Opening": "King's Pawn Game",
         "movetext": "1. e4 e5 2. Nf3 Nc6 1-0",
     }
+
+
+def _calibration():
+    return CpToWdlCalibration(
+        centers=(-100.0, 100.0),
+        probs=((0.7, 0.2, 0.1), (0.1, 0.2, 0.7)),
+        mate_probs={-1: (0.95, 0.03, 0.02), 1: (0.02, 0.03, 0.95)},
+    )
+
+
+def _annotated_game():
+    row = _row()
+    row["movetext"] = (
+        "1. e4 { [%eval 0.20] } 1... e5 { [%eval 0.10] } "
+        "2. Nf3 { [%eval 0.30] } 2... Nc6 { [%eval 0.25] } 1-0"
+    )
+    dataset = LichessDataset(min_avg_elo=2000, parse_stockfish_evals=True)
+    return list(dataset.stream_from_rows([row]))[0]
 
 
 def test_event_builder_builds_bos_plus_plies():
@@ -59,6 +78,27 @@ def test_event_builder_without_rollout_lookup_omits_new_keys():
     assert "policy_kl_arm_qhat" not in sample
     assert "policy_kl_arm_mask" not in sample
     assert "has_rollout_policy_target" not in sample
+
+
+def test_event_builder_with_inline_calibration_builds_only_value_targets():
+    game = _annotated_game()
+    vocab = MoveVocab.build_from_games([game])
+    calibration = _calibration()
+    sample = EventBuilder(vocab, beta=1.0, eval_calibration=calibration).build_game(game)
+
+    assert sample["has_rollout_value_target"] == [0, 0, 1, 1, 1]
+    assert sample["value_target_soft"][2] == pytest.approx(
+        calibration.wdl(cp_stm=-20.0, mate_stm=None)
+    )
+    assert "policy_kl_arm_ids" not in sample
+    assert "has_rollout_policy_target" not in sample
+
+
+def test_event_builder_rejects_two_value_target_sources():
+    game = _annotated_game()
+    vocab = MoveVocab.build_from_games([game])
+    with pytest.raises(ValueError, match="mutually exclusive"):
+        EventBuilder(vocab, rollout_lookup={}, eval_calibration=_calibration())
 
 
 def test_event_builder_with_rollout_lookup_blends_value_target():

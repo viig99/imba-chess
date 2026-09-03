@@ -185,3 +185,28 @@ def test_build_event_dataloader_without_rollout_lookup_omits_fields():
     batch = next(iter(loader))
     assert "value_target_soft" not in batch
     assert "has_rollout_value_target" not in batch
+
+
+def test_build_event_dataloader_threads_inline_calibration():
+    from imba_chess.data.stockfish_evals import CpToWdlCalibration
+
+    games = [_game("g1", "e2e4", "e7e5")]
+    games[0]["plays"][1]["eval_cp_stm"] = -20.0
+    games[0]["plays"][1]["eval_mate_stm"] = None
+    vocab = MoveVocab.build_from_games(games)
+    calibration = CpToWdlCalibration(
+        centers=(-100.0, 100.0),
+        probs=((0.7, 0.2, 0.1), (0.1, 0.2, 0.7)),
+        mate_probs={-1: (0.95, 0.03, 0.02), 1: (0.02, 0.03, 0.95)},
+    )
+    loader = build_event_dataloader(
+        lichess_dataset=DummyLichessDataset(games),
+        config=RepoConfig(dataloader=DataloaderConfig(max_tokens_per_batch=1024)),
+        move_vocab=vocab,
+        rollout_beta=1.0,
+        eval_calibration=calibration,
+    )
+
+    batch = next(iter(loader))
+    assert batch["has_rollout_value_target"].tolist() == [False, False, True]
+    assert batch["policy_kl_arm_ids"].shape == (3, 0)

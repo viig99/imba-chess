@@ -8,7 +8,9 @@ dependencies = [
   "datasets>=2.20.0",
   "python-chess>=1.999",
   "tomli>=2.0.0; python_version < '3.11'",
-  "torch",
+  # Torch 2.14 is known-good with training block-mask construction kept
+  # outside the compiled model graph (see scripts/train.py).
+  "torch>=2.14,<2.15",
   "pytorch-ignite",
   "attn_gym",
   "tensorboard",

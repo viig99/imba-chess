@@ -13,6 +13,7 @@ from pathlib import Path
 
 import chess
 import chess.pgn
+import pytest
 
 _spec = importlib.util.spec_from_file_location(
     "extract_lichess_evals",
@@ -94,6 +95,49 @@ def test_max_seq_len_truncation_matches_the_dataset_walk():
     the cut do not exist, so no eval may be emitted for them."""
     rows = extract_game(PGN, "g", "1-0", max_seq_len=3)
     assert sorted(r["ply"] for r in rows) == [1, 2]
+
+
+def _annotated_row(movetext=PGN):
+    return {
+        "Site": "https://lichess.org/annotated",
+        "Result": "1-0",
+        "WhiteElo": "2200",
+        "BlackElo": "2200",
+        "Termination": "Normal",
+        "TimeControl": "600+0",
+        "movetext": movetext,
+    }
+
+
+@pytest.mark.parametrize("max_seq_len", [None, 3])
+def test_inline_dataset_capture_matches_offline_extractor(max_seq_len):
+    from imba_chess.data.lichess_dataset import LichessDataset
+
+    dataset = LichessDataset(
+        min_avg_elo=2000,
+        max_seq_len=max_seq_len,
+        parse_stockfish_evals=True,
+    )
+    game = list(dataset.stream_from_rows([_annotated_row()]))[0]
+    expected = {
+        row["ply"]: row
+        for row in extract_game(PGN, game["game_id"], "1-0", max_seq_len)
+    }
+    for ply, play in enumerate(game["plays"]):
+        row = expected.get(ply)
+        assert play["eval_cp_stm"] == (None if row is None else row["cp_stm"])
+        assert play["eval_mate_stm"] == (
+            None if row is None else row["mate_stm"]
+        )
+
+
+def test_inline_eval_capture_is_opt_in():
+    from imba_chess.data.lichess_dataset import LichessDataset
+
+    dataset = LichessDataset(min_avg_elo=2000)
+    game = list(dataset.stream_from_rows([_annotated_row()]))[0]
+    assert all("eval_cp_stm" not in play for play in game["plays"])
+    assert all("eval_mate_stm" not in play for play in game["plays"])
 
 
 # ── dataset.local_corpus_path routing ───────────────────────────────────────

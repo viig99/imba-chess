@@ -35,6 +35,9 @@ class DatasetConfig:
     train_month_shuffle_seed: Optional[int] = None
     # Game-level shuffle buffer for the train stream; 0 disables.
     train_shuffle_buffer_size: int = 0
+    # Train split only: discard rows without inline Lichess [%eval] comments
+    # before the comparatively expensive PGN parse.
+    require_stockfish_eval: bool = False
     # Replay a corpus materialized by scripts/materialize_corpus.py instead of
     # streaming from HuggingFace. Removes an ~8 minute per-run stall and makes
     # short experiments practical. TRAIN SPLIT ONLY -- it is a single captured
@@ -170,6 +173,9 @@ class ExpertIterationConfig:
     # Path to a rollout parquet written by scripts/generate_search_rollouts.py.
     # Unset (default) => training is byte-identical to today.
     rollout_path: Optional[str] = None
+    # Enables inline Lichess [%eval] -> WDL soft value targets. Uses beta
+    # below and is intentionally mutually exclusive with rollout_path.
+    stockfish_eval_calibration_path: Optional[str] = None
     # blend(real_outcome, searched_value; beta). 0 = today's exact target,
     # 1 = pure searched estimate.
     beta: float = 0.0

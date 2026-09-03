@@ -6,6 +6,7 @@ from ..config import RepoConfig
 from .event_builder import EventBuilder
 from .move_vocab import MoveVocab, load_or_create_static_move_vocab
 from .packing import MaxTokensJaggedBatchDataset
+from .stockfish_evals import CpToWdlCalibration
 from .types import EventSequence
 
 try:
@@ -39,6 +40,7 @@ def build_event_dataloader(
     move_vocab: Optional[MoveVocab] = None,
     rollout_lookup: Optional[dict] = None,
     rollout_beta: float = 0.0,
+    eval_calibration: CpToWdlCalibration | None = None,
 ) -> Any:
     if not TORCH_AVAILABLE:  # pragma: no cover
         raise ImportError("torch is required to build DataLoader")
@@ -70,7 +72,10 @@ def build_event_dataloader(
         world_size=runtime.dataloader.world_size,
     )
     event_builder = EventBuilder(
-        resolved_move_vocab, rollout_lookup=rollout_lookup, beta=rollout_beta
+        resolved_move_vocab,
+        rollout_lookup=rollout_lookup,
+        beta=rollout_beta,
+        eval_calibration=eval_calibration,
     )
     event_dataset = ChessEventIterableDataset(game_iterable_dataset, event_builder)
     packed_dataset = MaxTokensJaggedBatchDataset(

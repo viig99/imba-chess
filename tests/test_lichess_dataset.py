@@ -152,9 +152,17 @@ class _FakeStream:
 
     def __init__(self, rows):
         self.rows = rows
+        self.filter_calls: list[list[str] | None] = []
         self.shuffle_calls: list[dict] = []
 
     def filter(self, fn, input_columns=None):
+        self.filter_calls.append(input_columns)
+        if input_columns is None:
+            self.rows = [row for row in self.rows if fn(row)]
+        else:
+            self.rows = [
+                row for row in self.rows if fn(*(row.get(key) for key in input_columns))
+            ]
         return self
 
     def shuffle(self, *, seed, buffer_size):
@@ -200,6 +208,56 @@ def test_stream_does_not_shuffle_val_split(monkeypatch):
 
     assert games
     assert fake.shuffle_calls == []
+
+
+def test_require_stockfish_eval_filters_before_parse_and_shuffle(monkeypatch):
+    annotated = _row(
+        Site="https://lichess.org/annotated",
+        WhiteElo="2200",
+        BlackElo="2200",
+        movetext="1. e4 {[%eval 0.20]} e5 1-0",
+    )
+    plain = _row(
+        Site="https://lichess.org/plain",
+        WhiteElo="2200",
+        BlackElo="2200",
+        movetext="1. e4 e5 1-0",
+    )
+    fake = _FakeStream([plain, annotated])
+    monkeypatch.setattr(
+        "imba_chess.data.lichess_dataset.load_dataset", lambda **kwargs: fake
+    )
+    dataset = LichessDataset(
+        min_avg_elo=2000,
+        split="train",
+        train_start_month="2025-07",
+        train_end_month="2025-07",
+        train_shuffle_buffer_size=100,
+        train_month_shuffle_seed=123,
+        require_stockfish_eval=True,
+    )
+
+    games = list(dataset.stream())
+
+    assert [game["game_id"] for game in games] == ["https://lichess.org/annotated"]
+    assert fake.filter_calls == [["WhiteElo", "BlackElo", "TimeControl", "movetext"]]
+    assert fake.shuffle_calls == [{"seed": 123, "buffer_size": 100}]
+
+
+def test_require_stockfish_eval_also_filters_plain_row_iterables():
+    dataset = LichessDataset(min_avg_elo=2000, require_stockfish_eval=True)
+    games = list(
+        dataset.stream_from_rows(
+            [
+                _row(Site="https://lichess.org/plain"),
+                _row(
+                    Site="https://lichess.org/annotated",
+                    movetext="1. e4 {[%eval 0.20]} e5 1-0",
+                ),
+            ]
+        )
+    )
+    assert [game["game_id"] for game in games] == ["https://lichess.org/annotated"]
 
 
 def test_temporal_mode_uses_reverse_month_order(monkeypatch):

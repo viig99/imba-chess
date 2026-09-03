@@ -30,8 +30,13 @@ from imba_chess.data.rollout_store import (
     assert_rollout_checkpoint_consistency,
     load_rollout_lookup,
 )
+from imba_chess.data.stockfish_evals import CpToWdlCalibration
 from imba_chess.eval import create_next_move_evaluator
-from imba_chess.model import HSTUChessModel, build_hstu_chess_config
+from imba_chess.model import (
+    HSTUChessModel,
+    build_hstu_chess_config,
+    create_batch_block_mask,
+)
 
 torch.set_float32_matmul_precision("high")
 torch.backends.cudnn.benchmark = True
@@ -94,6 +99,16 @@ def parse_args() -> argparse.Namespace:
         ),
     )
     parser.add_argument(
+        "--max-games",
+        type=int,
+        default=None,
+        help=(
+            "Stop after processing at least this many additional training games "
+            "in this run, saving a final checkpoint. The final batch may exceed "
+            "the requested count slightly."
+        ),
+    )
+    parser.add_argument(
         "--lr-override",
         type=float,
         default=None,
@@ -152,6 +167,13 @@ def _make_dataset(config, *, split: str) -> LichessDataset:
         # pointing val/test at it would evaluate on training games.
         local_corpus_path=(
             dataset_cfg.local_corpus_path if split == "train" else None
+        ),
+        parse_stockfish_evals=(
+            split == "train"
+            and bool(config.expert_iteration.stockfish_eval_calibration_path)
+        ),
+        require_stockfish_eval=(
+            split == "train" and bool(dataset_cfg.require_stockfish_eval)
         ),
         board_state_config=config.board_state,
     )
@@ -557,6 +579,11 @@ def main() -> None:
             f"policy_kl_weight={repo_config.expert_iteration.policy_kl_weight})"
         )
 
+    eval_calibration = None
+    calibration_path = repo_config.expert_iteration.stockfish_eval_calibration_path
+    if calibration_path:
+        eval_calibration = CpToWdlCalibration.load(calibration_path)
+        print(f"Loaded inline Stockfish eval calibration from {calibration_path}")
     train_dataset: Any = _make_dataset(repo_config, split="train")
 
     train_loader = build_event_dataloader(
@@ -565,6 +592,7 @@ def main() -> None:
         move_vocab=move_vocab,
         rollout_lookup=rollout_lookup,
         rollout_beta=float(repo_config.expert_iteration.beta),
+        eval_calibration=eval_calibration,
     )
     optimizer = _build_optimizer(model, repo_config, device=device)
     scheduler = _build_scheduler(optimizer, repo_config)
@@ -576,11 +604,27 @@ def main() -> None:
         should_sync_check = (
             engine.state.iteration % int(repo_config.training.log_every_steps) == 0
         )
+        target_move_id = batch["target_move_id"]
+        if not isinstance(target_move_id, torch.Tensor):
+            raise TypeError("batch['target_move_id'] must be a torch.Tensor")
+        valid_targets = target_move_id != int(repo_config.model.ignore_index)
+        valid_value_tokens = int(valid_targets.sum().item())
+        has_soft_value_target = batch.get("has_rollout_value_target")
+        if has_soft_value_target is None:
+            soft_value_tokens = 0
+        else:
+            if not isinstance(has_soft_value_target, torch.Tensor):
+                raise TypeError(
+                    "batch['has_rollout_value_target'] must be a torch.Tensor"
+                )
+            soft_value_tokens = int(
+                (has_soft_value_target.to(dtype=torch.bool) & valid_targets)
+                .sum()
+                .item()
+            )
+        soft_value_coverage = soft_value_tokens / max(1, valid_value_tokens)
+
         if should_sync_check:
-            target_move_id = batch["target_move_id"]
-            if not isinstance(target_move_id, torch.Tensor):
-                raise TypeError("batch['target_move_id'] must be a torch.Tensor")
-            valid_targets = target_move_id != int(repo_config.model.ignore_index)
             if not bool(valid_targets.any().item()):
                 raise ValueError(
                     "No valid target tokens in training batch (all target_move_id == ignore_index). "
@@ -589,13 +633,21 @@ def main() -> None:
         batch_games = int(batch["num_games"])
         prior_epoch_games = int(getattr(engine.state, "epoch_game_count", 0))
         engine.state.epoch_game_count = prior_epoch_games + batch_games
+        prior_run_games = int(getattr(engine.state, "run_game_count", 0))
+        engine.state.run_game_count = prior_run_games + batch_games
         autocast_ctx = (
             torch.autocast(device_type="cuda", dtype=dtype)
             if use_amp
             else contextlib.nullcontext()
         )
+        with torch.no_grad():
+            block_mask = create_batch_block_mask(
+                batch["seq_offsets"].to(device=device, non_blocking=True),
+                total_tokens=int(batch["total_tokens"]),
+                device=device,
+            )
         with autocast_ctx:
-            output = model(batch, return_loss=True)
+            output = model(batch, block_mask=block_mask, return_loss=True)
             loss = output["loss"]
             policy_loss = output.get("policy_loss", loss)
             value_loss = output.get("value_loss")
@@ -639,9 +691,12 @@ def main() -> None:
             "policy_kl_loss": policy_kl_loss.detach(),
             "has_policy_kl_loss": 1.0 if has_policy_kl_loss else 0.0,
             "moves_left_loss": moves_left_loss.detach(),
+            "soft_value_tokens": float(soft_value_tokens),
+            "soft_value_coverage": float(soft_value_coverage),
             "lr": float(optimizer.param_groups[0]["lr"]),
             "tokens": float(int(batch["total_tokens"])),
             "games": float(batch_games),
+            "games_run": float(engine.state.run_game_count),
         }
 
     trainer = Engine(_train_step)
@@ -670,9 +725,11 @@ def main() -> None:
                 else "--"
             ),
             "moves_left": f"{float(out['moves_left_loss'].item()):.4f}",
+            "soft_cov": f"{float(out['soft_value_coverage']):.3f}",
             "lr": f"{out['lr']:.6f}",
             "tokens": int(out["tokens"]),
             "games": int(out["games"]),
+            "games_run": int(out["games_run"]),
         },
     )
     checkpoint_dir = Path(repo_config.training.checkpoint_dir)
@@ -688,6 +745,10 @@ def main() -> None:
         checkpoint = torch.load(args.resume, map_location="cpu")
         Checkpoint.load_objects(to_load=checkpoint_objects, checkpoint=checkpoint)
         print(f"Resumed training from checkpoint: {args.resume}")
+
+    # This is deliberately per invocation rather than restored checkpoint
+    # state: --max-games means additional games processed by the current run.
+    trainer.state.run_game_count = 0
 
     if args.lr_override is not None:
         # Must run AFTER load_objects: that call restores the OneCycleLR state
@@ -716,9 +777,12 @@ def main() -> None:
                 "total_loss": float(output["total_loss"].item()),
                 "policy_loss": float(output["policy_loss"].item()),
                 "moves_left_loss": float(output["moves_left_loss"].item()),
+                "soft_value_tokens": float(output["soft_value_tokens"]),
+                "soft_value_coverage": float(output["soft_value_coverage"]),
                 "lr": float(output["lr"]),
                 "tokens": float(output["tokens"]),
                 "games": float(output["games"]),
+                "games_run": float(output["games_run"]),
             }
             | (
                 {"value_loss": float(output["value_loss"].item())}
@@ -783,19 +847,31 @@ def main() -> None:
         last_ckpt_handler,
     )
 
-    if args.max_steps is not None:
-        stop_at_iteration = int(getattr(trainer.state, "iteration", 0)) + int(
-            args.max_steps
-        )
+    if args.max_steps is not None and args.max_steps < 1:
+        raise ValueError("--max-steps must be >= 1")
+    if args.max_games is not None and args.max_games < 1:
+        raise ValueError("--max-games must be >= 1")
+    if args.max_steps is not None or args.max_games is not None:
+        stop_at_iteration = None
+        if args.max_steps is not None:
+            stop_at_iteration = int(getattr(trainer.state, "iteration", 0)) + int(
+                args.max_steps
+            )
 
         @trainer.on(Events.ITERATION_COMPLETED)
-        def _stop_after_max_steps(engine: Engine) -> None:
-            if engine.state.iteration >= stop_at_iteration:
+        def _stop_after_run_limit(engine: Engine) -> None:
+            hit_step_limit = (
+                stop_at_iteration is not None
+                and engine.state.iteration >= stop_at_iteration
+            )
+            hit_game_limit = args.max_games is not None and int(
+                getattr(engine.state, "run_game_count", 0)
+            ) >= int(args.max_games)
+            if hit_step_limit or hit_game_limit:
                 # Force a checkpoint at the exact requested stop point --
                 # save_last_every_steps may not divide max_steps evenly, and
-                # a wall-clock `timeout` kill (the previous stopping
-                # mechanism) could leave the last checkpoint several steps
-                # short of what was actually requested. Skip the redundant
+                # an external stop could leave the last checkpoint several
+                # steps short of what was actually requested. Skip the redundant
                 # call when the periodic handler already saved this exact
                 # iteration: calling `last_ckpt_handler` twice in the same
                 # ITERATION_COMPLETED dispatch corrupts `engine.last_event_name`

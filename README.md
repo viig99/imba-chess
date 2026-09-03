@@ -66,6 +66,23 @@ Known limitation: game outcomes are high-variance Monte-Carlo labels (a winning 
 
 Training logs include `total_loss`, `policy_loss`, and `value_loss`.
 
+## Stockfish-supervised fine-tuning
+
+Lichess `[%eval]` comments can provide calibrated soft W/D/L targets to the
+value head. The production recipe filters for annotated training games before
+PGN parsing and leaves validation and test unchanged:
+
+```bash
+python scripts/train.py \
+  --config config/imba_chess_sf_finetune_low_lr.toml \
+  --resume artifacts/checkpoints/best_hr10_checkpoint_23_hr10=0.9564.pt \
+  --lr-override 5e-5 --max-games 1800000
+```
+
+`--max-games` limits additional games processed by this invocation, with at
+most one final batch of overshoot. Inline Stockfish supervision and
+`expert_iteration.rollout_path` are mutually exclusive.
+
 ## Evaluation during training
 
 Held-out next-move prediction: `fast_val`/`fast_test` on a fixed prefix of games every `eval_every_steps`, `full_val` per epoch (checkpoint selection by `hr@10`), `full_test` in `--eval-only` mode. Metrics: `loss_ce`, `ppl`, `top1/3/5_acc`, `hr@10`, `mrr`. `--resume` restores full trainer state and runs an immediate health check. Config-key details: `docs/superpowers/notes/2026-07-06-eval-log-archive.md`.
@@ -199,7 +216,7 @@ All runtime settings are in `config/imba_chess.toml`:
 - `[model]` HSTU dimensions/layers + label smoothing + Elo loss weighting + value head knobs
 - `[training]` optimizer/scheduler/eval cadence/checkpointing/device/precision
 - `[eval_vs_stockfish]` engine path/limits, ladder settings, move-selection policy and knobs, debug controls
-- `[expert_iteration]` rollout parquet path and value-target blend weight (`beta`) for search-backed distillation experiments
+- `[expert_iteration]` rollout or inline Stockfish value supervision and value-target blend weight (`beta`)
 
 ## Quickstart
 

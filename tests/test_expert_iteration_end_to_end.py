@@ -11,6 +11,7 @@ from imba_chess.data.event_builder import EventBuilder
 from imba_chess.data.lichess_dataset import LichessDataset
 from imba_chess.data.move_vocab import MoveVocab
 from imba_chess.data.rollout_store import RolloutRow, load_rollout_lookup, write_rollout_parquet
+from imba_chess.data.stockfish_evals import CpToWdlCalibration
 from imba_chess.model import HSTUChessModel, build_hstu_chess_config
 
 
@@ -31,6 +32,49 @@ def _row():
         "Opening": "King's Pawn Game",
         "movetext": "1. e4 e5 2. Nf3 Nc6 1-0",
     }
+
+
+def test_end_to_end_training_step_with_inline_stockfish_targets():
+    row = _row()
+    row["movetext"] = (
+        "1. e4 { [%eval 0.20] } 1... e5 { [%eval 0.10] } "
+        "2. Nf3 { [%eval 0.30] } 2... Nc6 { [%eval 0.25] } 1-0"
+    )
+    dataset = LichessDataset(min_avg_elo=2000, parse_stockfish_evals=True)
+    game = list(dataset.stream_from_rows([row]))[0]
+    vocab = MoveVocab.build_from_games([game])
+    calibration = CpToWdlCalibration(
+        centers=(-100.0, 100.0),
+        probs=((0.7, 0.2, 0.1), (0.1, 0.2, 0.7)),
+        mate_probs={-1: (0.95, 0.03, 0.02), 1: (0.02, 0.03, 0.95)},
+    )
+    sample = EventBuilder(vocab, eval_calibration=calibration, beta=1.0).build_game(game)
+    assert sum(sample["has_rollout_value_target"]) > 0
+    assert "policy_kl_arm_ids" not in sample
+    batch = collate_jagged_batch([sample])
+
+    model_cfg = build_hstu_chess_config(
+        ModelConfig(
+            model_dim=32,
+            linear_hidden_dim=16,
+            attention_dim=16,
+            num_heads=2,
+            num_layers=1,
+            max_position_embeddings=32,
+            enable_value_head=True,
+            value_loss_weight=0.2,
+        ),
+        move_vocab_size=len(vocab),
+    )
+    model = HSTUChessModel(model_cfg)
+    out = model(batch, return_loss=True)
+    assert torch.isfinite(out["loss"])
+    assert torch.isfinite(out["value_loss"])
+    out["loss"].backward()
+    assert any(
+        parameter.grad is not None and parameter.grad.norm().item() > 0.0
+        for parameter in model.value_head.parameters()
+    )
 
 
 def test_end_to_end_training_step_with_rollout_targets(tmp_path):

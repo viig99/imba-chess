@@ -5,6 +5,7 @@ from typing import Any, Dict
 from .move_vocab import MoveVocab
 from .policy_target_kl import POLICY_KL_MAX_ARMS, arm_vocab_ids_and_qhat
 from .rollout_store import RolloutRow
+from .stockfish_evals import CpToWdlCalibration
 from .types import EventSequence
 from .value_target_blend import compute_blended_value_target
 
@@ -33,10 +34,16 @@ class EventBuilder:
         *,
         rollout_lookup: Dict[tuple[str, int], RolloutRow] | None = None,
         beta: float = 0.0,
+        eval_calibration: CpToWdlCalibration | None = None,
     ) -> None:
+        if rollout_lookup is not None and eval_calibration is not None:
+            raise ValueError(
+                "rollout_lookup and eval_calibration are mutually exclusive"
+            )
         self.move_vocab = move_vocab
         self.rollout_lookup = rollout_lookup
         self.beta = beta
+        self.eval_calibration = eval_calibration
 
     def build_game(self, game: Dict[str, Any]) -> EventSequence:
         game_result_white = _result_to_game_result_white(game["result"])
@@ -85,10 +92,13 @@ class EventBuilder:
             "target_move_id": target_move_id,
             "played_by_elo": played_by_elo,
         }
-        if self.rollout_lookup is not None:
-            value_target_soft, has_rollout_value_target = self._build_rollout_value_targets(game)
+        if self.rollout_lookup is not None or self.eval_calibration is not None:
+            value_target_soft, has_rollout_value_target = self._build_soft_value_targets(
+                game, game_result_white
+            )
             result["value_target_soft"] = value_target_soft
             result["has_rollout_value_target"] = has_rollout_value_target
+        if self.rollout_lookup is not None:
             (
                 policy_kl_arm_ids,
                 policy_kl_arm_qhat,
@@ -101,26 +111,45 @@ class EventBuilder:
             result["has_rollout_policy_target"] = has_rollout_policy_target
         return result
 
-    def _build_rollout_value_targets(
-        self, game: Dict[str, Any]
+    def _build_soft_value_targets(
+        self, game: Dict[str, Any], game_result_white: int
     ) -> tuple[list[list[float]], list[int]]:
-        assert self.rollout_lookup is not None
         num_tokens = len(game["plays"]) + 1
         value_target_soft: list[list[float]] = [[0.0, 0.0, 0.0] for _ in range(num_tokens)]
         has_rollout_value_target = [0] * num_tokens
         game_id = game["game_id"]
 
-        for ply_idx in range(len(game["plays"])):
-            row = self.rollout_lookup.get((game_id, ply_idx))
-            if row is None:
-                continue
+        for ply_idx, play in enumerate(game["plays"]):
             token_idx = ply_idx + 1
-            value_target_soft[token_idx] = compute_blended_value_target(
-                root_wdl_unsearched=row.root_wdl_unsearched,
-                backed_value=row.best_arm_backed_value,
-                real_outcome_stm=row.real_outcome_stm,
-                beta=self.beta,
-            )
+            if self.rollout_lookup is not None:
+                row = self.rollout_lookup.get((game_id, ply_idx))
+                if row is None:
+                    continue
+                value_target_soft[token_idx] = compute_blended_value_target(
+                    root_wdl_unsearched=row.root_wdl_unsearched,
+                    backed_value=row.best_arm_backed_value,
+                    real_outcome_stm=row.real_outcome_stm,
+                    beta=self.beta,
+                )
+            else:
+                assert self.eval_calibration is not None
+                cp_stm = play.get("eval_cp_stm")
+                mate_stm = play.get("eval_mate_stm")
+                if cp_stm is None and mate_stm is None:
+                    continue
+                p_loss, p_draw, p_win = self.eval_calibration.wdl(
+                    cp_stm=cp_stm, mate_stm=mate_stm
+                )
+                stm_white = int(play["state"]["turn_id"]) == 0
+                real_outcome_stm = (
+                    game_result_white if stm_white else -game_result_white
+                )
+                value_target_soft[token_idx] = compute_blended_value_target(
+                    root_wdl_unsearched=(p_loss, p_draw, p_win),
+                    backed_value=p_win - p_loss,
+                    real_outcome_stm=real_outcome_stm,
+                    beta=self.beta,
+                )
             has_rollout_value_target[token_idx] = 1
 
         return value_target_soft, has_rollout_value_target
