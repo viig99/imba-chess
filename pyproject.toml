@@ -19,6 +19,7 @@ dependencies = [
   "imba-chess-native",
   # 1.29 reacquires the HTTP client after a transient connection failure.
   "huggingface-hub>=1.29,<1.30",
+  "setuptools<82",
 ]
 
 [project.optional-dependencies]
