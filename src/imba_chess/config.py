@@ -93,6 +93,11 @@ class ModelConfig:
     # [%eval] parsing for every split; unannotated plies have zero value weight.
     enable_value_head: bool = False
     value_loss_weight: float = 0.15
+    # Value readout depth/width. Defaults reproduce the original
+    # single-hidden-layer head, so existing checkpoints keep loading.
+    value_head_width: Optional[int] = None
+    value_head_blocks: int = 0
+    value_head_expansion: int = 2
     moves_left_loss_weight: float = 0.05
 
 

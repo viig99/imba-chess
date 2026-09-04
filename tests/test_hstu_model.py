@@ -459,3 +459,64 @@ def test_hstu_chess_model_value_loss_gradient_flows_only_from_target_tokens():
     (grad,) = torch.autograd.grad(out["value_loss"], out["value_logits"])
     assert grad[2].abs().sum() > 0
     assert grad[[0, 1, 3, 4]].abs().sum() == 0
+
+
+def test_value_head_default_keeps_legacy_module_names():
+    # blocks=0 must stay module-for-module identical to the pre-deep-head
+    # shape, or ckpt23/ckpt27 stop loading under strict=True.
+    model = HSTUChessModel(_value_config())
+    keys = sorted(k for k in model.state_dict() if k.startswith("value_head"))
+    assert keys == [
+        "value_head.0.bias",
+        "value_head.0.weight",
+        "value_head.2.bias",
+        "value_head.2.weight",
+    ]
+    assert model.state_dict()["value_head.0.weight"].shape == (32, 64)
+
+
+def test_value_block_starts_as_identity_but_is_trainable():
+    from imba_chess.model.hstu_model import _ValueBlock
+
+    block = _ValueBlock(dim=8, expansion=2)
+    x = torch.randn(4, 8)
+    assert torch.allclose(block(x), x)
+
+    block(x).sum().backward()
+    # The zero-init projection must still receive gradient, or the block is
+    # permanently dead rather than merely starting as the identity.
+    assert block.mlp[2].weight.grad.abs().sum() > 0
+
+
+def test_deep_value_head_shape_and_training_step():
+    config = _value_config(
+        value_head_width=32, value_head_blocks=2, value_head_expansion=2
+    )
+    model = HSTUChessModel(config)
+    names = [k for k in model.state_dict() if k.startswith("value_head")]
+    assert "value_head.1.mlp.0.weight" in names
+    assert "value_head.2.norm.weight" in names
+    # Input projection, 2 blocks, final norm, output projection.
+    assert model.value_head[-1].out_features == 3
+
+    batch = _batch()
+    batch["value_target"][1] = torch.tensor([0.3, 0.0, 0.7])
+    batch["has_value_target"][1] = True
+    out = model(batch, return_loss=True)
+    assert out["value_logits"].shape == (5, 3)
+    assert torch.isfinite(out["value_loss"])
+    out["loss"].backward()
+    assert model.value_head[0].weight.grad.abs().sum() > 0
+
+
+@pytest.mark.parametrize(
+    ("overrides", "message"),
+    [
+        ({"value_head_width": 0}, "value_head_width"),
+        ({"value_head_blocks": -1}, "value_head_blocks"),
+        ({"value_head_expansion": 0}, "value_head_expansion"),
+    ],
+)
+def test_value_head_config_validation(overrides, message):
+    with pytest.raises(ValueError, match=message):
+        HSTUChessModel(_value_config(**overrides))

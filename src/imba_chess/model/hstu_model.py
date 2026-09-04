@@ -39,6 +39,12 @@ class HSTUChessConfig:
     elo_loss_weight_strength: float = 0.0
     enable_value_head: bool = False
     value_loss_weight: float = 0.15
+    # Value readout shape. blocks=0 is the original single-hidden-layer MLP
+    # and is kept as the default so checkpoints trained before the deep head
+    # still load under strict=True. width defaults to model_dim // 2.
+    value_head_width: int | None = None
+    value_head_blocks: int = 0
+    value_head_expansion: int = 2
     moves_left_loss_weight: float = 0.05
 
 
@@ -68,6 +74,13 @@ def build_hstu_chess_config(
         elo_loss_weight_strength=float(model_config.elo_loss_weight_strength),
         enable_value_head=bool(model_config.enable_value_head),
         value_loss_weight=float(model_config.value_loss_weight),
+        value_head_width=(
+            None
+            if model_config.value_head_width is None
+            else int(model_config.value_head_width)
+        ),
+        value_head_blocks=int(model_config.value_head_blocks),
+        value_head_expansion=int(model_config.value_head_expansion),
         moves_left_loss_weight=float(model_config.moves_left_loss_weight),
     )
 
@@ -140,6 +153,55 @@ def create_batch_dense_mask(
 _BOARD_ENCODER_DIM = 64
 _BOARD_ENCODER_HEADS = 4
 _BOARD_ENCODER_LAYERS = 2
+
+
+class _ValueBlock(nn.Module):
+    """Pre-norm residual MLP block for the value head.
+
+    The output projection is zero-initialised, so a freshly built deep head
+    starts out as exactly the plain linear readout it replaces. Without that,
+    a deep head pushes a large and meaningless gradient into the trunk on
+    step 0, before the trunk has any features worth reading.
+    """
+
+    def __init__(self, *, dim: int, expansion: int) -> None:
+        super().__init__()
+        self.norm = nn.LayerNorm(dim)
+        self.mlp = nn.Sequential(
+            nn.Linear(dim, expansion * dim),
+            nn.SiLU(),
+            nn.Linear(expansion * dim, dim),
+        )
+        nn.init.zeros_(self.mlp[2].weight)
+        nn.init.zeros_(self.mlp[2].bias)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return x + self.mlp(self.norm(x))
+
+
+def _build_value_head(
+    *, dim: int, width: int | None, blocks: int, expansion: int
+) -> nn.Sequential:
+    """Value readout: `dim` trunk features -> 3 WDL logits.
+
+    blocks=0 reproduces the original head module-for-module (same indices,
+    same parameter names), so pre-deep-head checkpoints load unchanged.
+    """
+    hidden = dim // 2 if width is None else int(width)
+    if blocks == 0:
+        return nn.Sequential(
+            nn.Linear(dim, hidden),
+            nn.SiLU(),
+            nn.Linear(hidden, 3),
+        )
+    return nn.Sequential(
+        nn.Linear(dim, hidden),
+        *(_ValueBlock(dim=hidden, expansion=expansion) for _ in range(blocks)),
+        # Pre-norm blocks leave the residual stream unnormalised; this is
+        # required, not cosmetic.
+        nn.LayerNorm(hidden),
+        nn.Linear(hidden, 3),
+    )
 
 
 class _SquareAttentionBlock(nn.Module):
@@ -222,6 +284,12 @@ class HSTUChessModel(nn.Module):
             raise ValueError("elo_loss_weight_strength must be >= 0")
         if float(config.value_loss_weight) < 0.0:
             raise ValueError("value_loss_weight must be >= 0")
+        if config.value_head_width is not None and int(config.value_head_width) < 1:
+            raise ValueError("value_head_width must be >= 1 when set")
+        if int(config.value_head_blocks) < 0:
+            raise ValueError("value_head_blocks must be >= 0")
+        if int(config.value_head_expansion) < 1:
+            raise ValueError("value_head_expansion must be >= 1")
         if float(config.moves_left_loss_weight) < 0.0:
             raise ValueError("moves_left_loss_weight must be >= 0")
         d = config.model_dim
@@ -273,10 +341,11 @@ class HSTUChessModel(nn.Module):
         # Small private MLP: trunk features are dominated by the policy
         # objective, so the value head needs its own capacity.
         self.value_head = (
-            nn.Sequential(
-                nn.Linear(d, d // 2),
-                nn.SiLU(),
-                nn.Linear(d // 2, 3),
+            _build_value_head(
+                dim=d,
+                width=config.value_head_width,
+                blocks=int(config.value_head_blocks),
+                expansion=int(config.value_head_expansion),
             )
             if config.enable_value_head
             else None
