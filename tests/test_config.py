@@ -19,6 +19,7 @@ test_start_month = "2025-09"
 test_end_month = "2025-09"
 val_max_games = 100000
 test_max_games = 100000
+val_local_corpus_path = "artifacts/corpus/val.parquet"
 max_seq_len = 256
 
 [vocab]
@@ -60,6 +61,7 @@ last_checkpoint_keep = 2
     assert config.dataset.test_end_month == "2025-09"
     assert config.dataset.val_max_games == 100000
     assert config.dataset.test_max_games == 100000
+    assert config.dataset.val_local_corpus_path == "artifacts/corpus/val.parquet"
     assert config.dataset.max_seq_len == 256
     assert config.vocab.path == "tmp_vocab.json"
     assert config.dataloader.max_tokens_per_batch == 4096

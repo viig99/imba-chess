@@ -4,7 +4,7 @@ from pathlib import Path
 import pytest
 import torch
 
-from imba_chess.config import ModelConfig, RepoConfig
+from imba_chess.config import DatasetConfig, ModelConfig, RepoConfig
 
 _TRAIN_PATH = Path(__file__).resolve().parents[1] / "scripts" / "train.py"
 _spec = importlib.util.spec_from_file_location("_train_for_lr_test", _TRAIN_PATH)
@@ -106,3 +106,22 @@ def test_make_dataset_parses_evals_on_all_splits_when_value_head_enabled():
 
     no_value_head = RepoConfig()
     assert train._make_dataset(no_value_head, split="val").parse_stockfish_evals is False
+
+
+def test_make_dataset_routes_distinct_local_train_and_validation_corpora():
+    config = RepoConfig(
+        dataset=DatasetConfig(
+            local_corpus_path="artifacts/corpus/train.parquet",
+            val_local_corpus_path="artifacts/corpus/val.parquet",
+        )
+    )
+
+    assert (
+        train._make_dataset(config, split="train").local_corpus_path
+        == "artifacts/corpus/train.parquet"
+    )
+    assert (
+        train._make_dataset(config, split="val").local_corpus_path
+        == "artifacts/corpus/val.parquet"
+    )
+    assert train._make_dataset(config, split="test").local_corpus_path is None

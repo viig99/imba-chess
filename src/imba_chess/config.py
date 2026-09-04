@@ -42,6 +42,10 @@ class DatasetConfig:
     # slices upstream and would silently mis-align the (game_id, ply) keys that
     # join rollout/eval targets to training (see stream()).
     local_corpus_path: Optional[str] = None
+    # Optional deterministic validation corpus materialized by
+    # scripts/materialize_corpus.py. Validation runs with one loader process,
+    # so unlike the train corpus this needs no worker-sharding protocol.
+    val_local_corpus_path: Optional[str] = None
 
 
 @dataclass(frozen=True)

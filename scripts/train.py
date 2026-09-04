@@ -158,11 +158,14 @@ def _make_dataset(config, *, split: str) -> LichessDataset:
         shuffle_train_month_files_on_start=dataset_cfg.shuffle_train_month_files_on_start,
         train_month_shuffle_seed=dataset_cfg.train_month_shuffle_seed,
         train_shuffle_buffer_size=dataset_cfg.train_shuffle_buffer_size,
-        # Train split only: the materialized corpus IS the train stream, and
-        # pointing val/test at it would evaluate on training games.
-        local_corpus_path=(
-            dataset_cfg.local_corpus_path if split == "train" else None
-        ),
+        # Train and validation use distinct materialized corpora. Test remains
+        # remote unless it gains its own explicit path; never fall through to
+        # the train corpus for an evaluation split.
+        local_corpus_path={
+            "train": dataset_cfg.local_corpus_path,
+            "val": dataset_cfg.val_local_corpus_path,
+            "test": None,
+        }[split],
         # All splits parse Lichess evals when the value head is enabled. Only
         # evaluated plies receive value weight; all games still train policy
         # and moves-left.
