@@ -147,3 +147,31 @@ def test_stockfish_finetune_recipe_loads():
     )
     assert config.model.enable_value_head is True
     assert config.model.label_smoothing == 0.0
+
+
+def test_v4_config_geometry_and_size():
+    from imba_chess.model import HSTUChessModel, build_hstu_chess_config
+
+    config = load_repo_config(
+        Path(__file__).resolve().parent.parent / "config" / "imba_chess_v4.toml"
+    )
+    assert config.model.model_dim == 1024
+    assert config.model.num_layers == 8
+    assert config.model.num_heads == 16
+    assert config.model.label_smoothing == 0.0
+    # Convex Elo curve: shape AND magnitude both move (see the config header).
+    assert config.model.elo_loss_weight_alpha == 2.0
+    assert config.model.elo_loss_weight_strength == 3.0
+    assert config.model.enable_value_head is True
+    assert config.model.value_head_blocks == 2
+    assert config.model.value_head_width == 512
+    # Eval must stay on the ckpt23 anchor ruler.
+    assert config.eval_vs_stockfish.search_budget == 2048
+    assert config.eval_vs_stockfish.search_max_depth == 8
+    assert config.eval_vs_stockfish.stockfish_nodes == 40000
+
+    model = HSTUChessModel(
+        build_hstu_chess_config(config.model, move_vocab_size=1970)
+    )
+    params = sum(p.numel() for p in model.parameters())
+    assert 46_000_000 < params < 50_000_000, params

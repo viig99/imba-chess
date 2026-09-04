@@ -1,0 +1,175 @@
+# v4: from-scratch run, ~48M params, WinPercent value target.
+#
+# Three deliberate changes from the ckpt23/ckpt27 lineage (768d x 8L, ~27M):
+#
+#   1. Trunk widened 768 -> 1024 at the same depth. At the compute already
+#      spent on ckpt23 (70-210 tokens/param) the compute-optimal model was
+#      50-86M, so 27M was 2-3x undersized. 48M stays cheap enough at
+#      inference, which matters because search runs ~1300 forward passes per
+#      move and the eval card is 8GB.
+#   2. Convex Elo weighting (alpha 2, strength 3). The old alpha 1 /
+#      strength 1 curve capped at 2x. Raising the exponent alone would have
+#      made the weighting WEAKER (a 2400 mover drops from 1.50 to 1.12);
+#      shape and magnitude are separate knobs and both move here. Resulting
+#      weights: 2000 -> 1.00, 2200 -> 1.19, 2400 -> 1.75, 2600 -> 2.69,
+#      2800 -> 4.00. The 2800 cap stays: raising it flattens the curve, and
+#      uncapping puts unbounded weight on a thin, provisional-rating tail.
+#   3. Deep residual value head (512 wide, 2 blocks, 2x expansion, ~2.6M vs
+#      the old 296k). ckpt27's alignment showed systematic shrinkage toward
+#      zero in decisive positions (cp<=-400: target -0.80, predicted -0.69),
+#      which is a capacity symptom. Blocks are zero-initialised so the head
+#      starts as the plain linear readout.
+#
+# Sized for a 32GB card (5090). [eval_vs_stockfish] is held in lockstep with
+# imba_chess.toml / the ckpt23 anchor protocol so v4 numbers land on the SAME
+# ruler: SF2200, 40000 nodes, budget 2048 / depth 8, fp32, no random opening.
+# The anchor to beat is ckpt23 = 0.6107 (SE 0.0147, 750 games) and
+# ckpt27 = 0.6640.
+
+[dataset]
+min_avg_elo = 2000
+test_min_avg_elo = 2400
+# Drop bullet/hyperbullet: estimated duration (base + 40 * increment) >= 180s.
+min_time_control_sec = 180
+split = "train"
+dataset_name = "Lichess/standard-chess-games"
+train_start_month = "2021-01"
+train_end_month = "2025-06"
+val_start_month = "2025-07"
+val_end_month = "2025-07"
+test_start_month = "2025-08"
+test_end_month = "2025-09"
+val_max_games = 100000
+test_max_games = 100000
+cache_dir = "artifacts/hf_cache"
+# Materialize once on each training host:
+# .venv/bin/python scripts/materialize_corpus.py --config config/imba_chess_v4.toml
+#   --split val --output artifacts/corpus/v4_val_125k.parquet --max-rows 125000
+# Fast and full validation then avoid repeated remote Parquet range requests.
+val_local_corpus_path = "artifacts/corpus/v4_val_125k.parquet"
+parquet_batch_size = 8192
+max_seq_len = 512
+shuffle_train_month_files_on_start = true
+# Raw PGN rows, not parsed games, so 10000 per worker is ~15MB each.
+train_shuffle_buffer_size = 10000
+# Pinned so two v4 runs see the same stream in the same order.
+train_month_shuffle_seed = 42
+
+[board_state]
+en_passant = "legal"
+halfmove_max = 100
+halfmove_bucket_size = 2
+fullmove_max = 200
+fullmove_bucket_size = 2
+
+[vocab]
+path = "artifacts/move_vocab_static_uci.json"
+include_unk = false
+
+[dataloader]
+# 32GB budget: ~2.5GB weights+optimizer+context, ~0.65GB of activations per
+# 1024 tokens at 1024d x 8L (measured 0.45-0.55 at 768d, scaled by width).
+# 32768 used ~19GB at steady 99% GPU utilization on the remote 5090.
+# 40960 is the next bounded throughput probe; verify its peak stays below
+# ~29-30GB to leave room for transient checkpointed-backward allocations.
+max_tokens_per_batch = 40960
+num_workers = 12
+pin_memory = true
+prefetch_factor = 2
+persistent_workers = true
+
+[model]
+model_dim = 1024
+linear_hidden_dim = 64
+attention_dim = 64
+num_heads = 16
+num_layers = 8
+dropout = 0.0
+max_position_embeddings = 513
+halfmove_vocab_size = 128
+fullmove_vocab_size = 128
+ignore_index = -100
+relative_attention_bias = "position"
+# No smoothing: 0.05 over ~1970 mostly-illegal move classes puts a floor under
+# the reported policy loss and distorts the softmax that search reads.
+label_smoothing = 0.0
+elo_weight_min_elo = 2000
+elo_weight_max_elo = 2800
+elo_loss_weight_alpha = 2.0
+elo_loss_weight_strength = 3.0
+enable_value_head = true
+value_loss_weight = 1.0
+value_head_width = 512
+value_head_blocks = 2
+value_head_expansion = 2
+moves_left_loss_weight = 0.05
+
+[training]
+epochs = 100
+steps_per_epoch = 10000
+eval_every_steps = 5000
+log_every_steps = 10
+full_val_every_epochs = 1
+fast_val_max_games = 10000
+fast_test_max_games = 10000
+# 7e-4 was tuned for the 27M model at the same 40960-token batch. Keep a
+# conservative 5e-4 for the 1.33x wider, newly initialised trunk.
+max_lr = 5e-4
+# Start at full LR: StableAdamW's update clipping plus grad_clip_norm cover
+# early second-moment instability, and warmup wastes the most
+# sample-efficient steps.
+lr_start_factor = 1.0
+lr_end_factor = 0.5
+onecycle_warmup_fraction_first_epoch = 0.1
+weight_decay = 0.01
+grad_clip_norm = 1.0
+seed = 42
+deterministic_eval = true
+eval_num_workers = 0
+save_last_every_steps = 1000
+last_checkpoint_keep = 1
+optimizer_triton = true
+optimizer_kahan_sum = true
+compile_model = true
+device = "auto"
+dtype = "bfloat16"
+# Separate from artifacts/checkpoints so the ckpt23/ckpt27 lineage is not
+# overwritten or picked up by train_autorestart.sh.
+checkpoint_dir = "artifacts/checkpoints_v4"
+checkpoint_keep = 3
+
+[eval_vs_stockfish]
+games = 750
+max_plies = 512
+seed = 42
+stockfish_path = "/usr/bin/stockfish"
+# Safety ceiling only; stockfish_nodes binds first (load-invariant protocol).
+stockfish_time_sec = 5.0
+stockfish_nodes = 40000
+# Tuned for the local 8GB card at 27M/fp32/budget 2048. The v4 trunk is 1.33x
+# wider, so drop to 4 if this OOMs locally; raise well past 6 on the 5090.
+concurrent_games = 6
+stockfish_threads = 1
+stockfish_hash_mb = 64
+stockfish_limit_strength = false
+ladder_elos = "2200"
+ladder_games_per_segment = 750
+include_full_strength_segment = false
+device = "auto"
+dtype = "float32"
+compile = true
+model_move_policy = "value_search_halving"
+value_rerank_top_k = 16
+value_rerank_lambda = 0.05
+search_budget = 2048
+search_top_m = 16
+halving_rounds = 0
+search_refutation_top_r = 2
+search_expand_top = 3
+search_max_depth = 8
+opening_random_plies = 0
+debug_trace_games = 3
+debug_trace_max_plies = 80
+debug_topk = 5
+save_games = true
+save_games_dir = "artifacts/eval/games"
