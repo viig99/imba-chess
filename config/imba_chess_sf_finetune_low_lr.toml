@@ -71,7 +71,6 @@ eval_every_steps = 200
 log_every_steps = 10
 full_val_every_epochs = 1
 fast_val_max_games = 300
-fast_test_max_games = 300
 # --lr-override 5e-5 is the effective resumed LR; this documents the recipe.
 max_lr = 5e-5
 lr_start_factor = 1.0

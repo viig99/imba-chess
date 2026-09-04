@@ -79,7 +79,7 @@ most one final batch of overshoot.
 
 ## Evaluation during training
 
-Held-out next-move prediction: `fast_val`/`fast_test` on a fixed prefix of games every `eval_every_steps`, `full_val` per epoch (checkpoint selection by `hr@10`), `full_test` in `--eval-only` mode. Metrics: `loss_ce`, `ppl`, `top1/3/5_acc`, `hr@10`, `mrr`. `--resume` restores full trainer state and runs an immediate health check. Config-key details: `docs/superpowers/notes/2026-07-06-eval-log-archive.md`.
+Held-out next-move prediction: `fast_val` on a fixed prefix every `eval_every_steps`, `full_val` per epoch (checkpoint selection by `hr@10`), and `full_test` only in `--eval-only` mode. Metrics: `loss_ce`, `ppl`, `top1/3/5_acc`, `hr@10`, `mrr`. `--resume` restores full trainer state and runs an immediate validation health check. Config-key details: `docs/superpowers/notes/2026-07-06-eval-log-archive.md`.
 
 ## Playing against Stockfish
 

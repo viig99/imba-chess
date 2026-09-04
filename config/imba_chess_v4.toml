@@ -111,7 +111,6 @@ eval_every_steps = 5000
 log_every_steps = 10
 full_val_every_epochs = 1
 fast_val_max_games = 10000
-fast_test_max_games = 10000
 # 7e-4 was tuned for the 27M model at the same 40960-token batch. Keep a
 # conservative 5e-4 for the 1.33x wider, newly initialised trunk.
 max_lr = 5e-4

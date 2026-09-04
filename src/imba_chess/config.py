@@ -113,7 +113,6 @@ class TrainingConfig:
     log_every_steps: int = 100
     full_val_every_epochs: int = 1
     fast_val_max_games: int = 10_000
-    fast_test_max_games: int = 10_000
     max_lr: float = 1e-3
     lr_start_factor: float = 0.1
     lr_end_factor: float = 0.5
