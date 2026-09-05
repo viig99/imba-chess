@@ -11,6 +11,7 @@ Inspiration:
 - Streaming dataset pipeline over `Lichess/standard-chess-games` (Hugging Face).
 - Temporal month-window splits for `train` / `val` / `test`.
 - Avg-Elo filtering (`(WhiteElo + BlackElo) / 2 >= min_avg_elo`) with optional stricter test filter (`test_min_avg_elo`).
+- Exclusion of games where either player has the Lichess `BOT` title.
 - Time-control filtering (`min_time_control_sec`, estimated duration = base + 40 × increment) to drop bullet games full of tactical mistakes.
 - PGN parsing into per-move records with board-state tokens.
 - Static UCI move vocabulary: all geometrically reachable from→to pairs + promotions (1,970 tokens incl. specials) — provably covers every legal standard-chess move.

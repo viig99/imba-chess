@@ -1,6 +1,8 @@
 import datetime as dt
 import json
 
+import pyarrow as pa
+import pyarrow.parquet as pq
 import pytest
 
 from imba_chess.data.lichess_dataset import LichessDataset
@@ -14,6 +16,8 @@ def _row(**overrides):
         "UTCTime": "12:00:00",
         "White": "Alice",
         "Black": "Bob",
+        "WhiteTitle": None,
+        "BlackTitle": None,
         "WhiteElo": "2100",
         "BlackElo": "1900",
         "Result": "1-0",
@@ -39,6 +43,31 @@ def test_elo_filter_uses_average_threshold():
     games = list(dataset.stream_from_rows(rows))
     assert len(games) == 1
     assert games[0]["game_id"] != "https://lichess.org/low"
+
+
+@pytest.mark.parametrize(
+    "titles",
+    [
+        {"WhiteTitle": "BOT"},
+        {"BlackTitle": "BOT"},
+        {"WhiteTitle": "bot"},
+    ],
+)
+def test_bot_games_are_dropped(titles):
+    dataset = LichessDataset(min_avg_elo=2000)
+    assert list(dataset.stream_from_rows([_row(**titles)])) == []
+
+
+def test_local_corpus_without_bot_titles_requires_rematerialization(tmp_path):
+    path = tmp_path / "legacy.parquet"
+    row = _row()
+    del row["WhiteTitle"]
+    del row["BlackTitle"]
+    pq.write_table(pa.Table.from_pylist([row]), path)
+
+    dataset = LichessDataset(min_avg_elo=2000)
+    with pytest.raises(ValueError, match="rematerialize.*BOT"):
+        list(dataset.stream_local(str(path)))
 
 
 def test_move_parsing_yields_lean_records():
@@ -298,7 +327,32 @@ def test_time_control_filter_drops_fast_and_unknown_games():
 
 def test_time_control_column_prefilter_matches_row_filter():
     dataset = LichessDataset(min_avg_elo=2000, min_time_control_sec=180)
-    assert dataset._game_filter_from_columns("2100", "2100", "300+0")
-    assert not dataset._game_filter_from_columns("2100", "2100", "60+0")
-    assert not dataset._game_filter_from_columns("2100", "2100", "-")
-    assert not dataset._game_filter_from_columns("1700", "1800", "300+0")
+    assert dataset._game_filter_from_columns("2100", "2100", None, None, "300+0")
+    assert not dataset._game_filter_from_columns("2100", "2100", None, None, "60+0")
+    assert not dataset._game_filter_from_columns("2100", "2100", None, None, "-")
+    assert not dataset._game_filter_from_columns("1700", "1800", None, None, "300+0")
+    assert not dataset._game_filter_from_columns("2100", "2100", "BOT", None, "300+0")
+
+
+def test_stream_prefilter_requests_bot_title_columns(monkeypatch):
+    fake = _FakeStream([_row(WhiteElo="2200", BlackElo="2200")])
+    monkeypatch.setattr(
+        "imba_chess.data.lichess_dataset.load_dataset", lambda **kwargs: fake
+    )
+    dataset = LichessDataset(
+        min_avg_elo=2000,
+        split="train",
+        train_start_month="2025-07",
+        train_end_month="2025-07",
+    )
+
+    assert list(dataset.stream())
+    assert fake.filter_calls == [
+        [
+            "WhiteElo",
+            "BlackElo",
+            "WhiteTitle",
+            "BlackTitle",
+            "TimeControl",
+        ]
+    ]

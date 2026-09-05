@@ -21,6 +21,8 @@ DEFAULT_STREAM_COLUMNS = [
     "Result",
     "WhiteElo",
     "BlackElo",
+    "WhiteTitle",
+    "BlackTitle",
     "TimeControl",
     "Termination",
     "movetext",
@@ -140,7 +142,13 @@ class LichessDataset:
             try:
                 rows = rows.filter(
                     self._game_filter_from_columns,
-                    input_columns=["WhiteElo", "BlackElo", "TimeControl"],
+                    input_columns=[
+                        "WhiteElo",
+                        "BlackElo",
+                        "WhiteTitle",
+                        "BlackTitle",
+                        "TimeControl",
+                    ],
                 )
             except TypeError:
                 rows = rows.filter(self._game_filter)
@@ -204,8 +212,19 @@ class LichessDataset:
         """
         import pyarrow.parquet as pq
 
+        handle = pq.ParquetFile(path)
+        required_title_columns = {"WhiteTitle", "BlackTitle"}
+        missing_title_columns = required_title_columns.difference(
+            handle.schema_arrow.names
+        )
+        if missing_title_columns:
+            missing = ", ".join(sorted(missing_title_columns))
+            raise ValueError(
+                f"local corpus {path!r} is missing {missing}; rematerialize it "
+                "so Lichess BOT games can be excluded"
+            )
+
         def _rows() -> Iterator[Dict[str, Any]]:
-            handle = pq.ParquetFile(path)
             for batch in handle.iter_batches(batch_size=self.parquet_batch_size):
                 yield from batch.to_pylist()
 
@@ -220,6 +239,8 @@ class LichessDataset:
         return self._game_filter_from_columns(
             row.get("WhiteElo"),
             row.get("BlackElo"),
+            row.get("WhiteTitle"),
+            row.get("BlackTitle"),
             row.get("TimeControl"),
         )
 
@@ -227,8 +248,12 @@ class LichessDataset:
         self,
         white_elo_raw: Any,
         black_elo_raw: Any,
+        white_title_raw: Any,
+        black_title_raw: Any,
         time_control_raw: Any,
     ) -> bool:
+        if self._is_bot_title(white_title_raw) or self._is_bot_title(black_title_raw):
+            return False
         white_elo = parse_elo(white_elo_raw)
         black_elo = parse_elo(black_elo_raw)
         if white_elo is None or black_elo is None:
@@ -236,6 +261,10 @@ class LichessDataset:
         if ((white_elo + black_elo) / 2) < self.min_avg_elo:
             return False
         return self._passes_time_control(time_control_raw)
+
+    @staticmethod
+    def _is_bot_title(value: Any) -> bool:
+        return to_text(value, default="").upper() == "BOT"
 
     def _passes_time_control(self, time_control_raw: Any) -> bool:
         if self.min_time_control_sec is None:
@@ -273,6 +302,13 @@ class LichessDataset:
             white_elo = parse_elo(row.get("WhiteElo"))
             black_elo = parse_elo(row.get("BlackElo"))
             if white_elo is None or black_elo is None:
+                continue
+            # Keep this guard even for prefiltered/local rows. It makes BOT
+            # exclusion a source invariant rather than an optimization that
+            # only applies when Hugging Face's lazy filter is available.
+            if self._is_bot_title(row.get("WhiteTitle")) or self._is_bot_title(
+                row.get("BlackTitle")
+            ):
                 continue
             if not assume_prefiltered:
                 if ((white_elo + black_elo) / 2) < self.min_avg_elo:

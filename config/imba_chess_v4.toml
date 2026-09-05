@@ -44,9 +44,9 @@ test_max_games = 100000
 cache_dir = "artifacts/hf_cache"
 # Materialize once on each training host:
 # .venv/bin/python scripts/materialize_corpus.py --config config/imba_chess_v4.toml
-#   --split val --output artifacts/corpus/v4_val_125k.parquet --max-rows 125000
+#   --split val --output artifacts/corpus/v4_val_no_bots_125k.parquet --max-rows 125000
 # Fast and full validation then avoid repeated remote Parquet range requests.
-val_local_corpus_path = "artifacts/corpus/v4_val_125k.parquet"
+val_local_corpus_path = "artifacts/corpus/v4_val_no_bots_125k.parquet"
 parquet_batch_size = 8192
 max_seq_len = 512
 shuffle_train_month_files_on_start = true
