@@ -9,7 +9,7 @@ import random
 import sys
 import traceback
 import time
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
 from multiprocessing import connection as mp_connection
 from pathlib import Path
 from typing import Any, Callable, Generator, Iterator
@@ -79,6 +79,8 @@ class EvalSummary:
     legal_moves_total: int = 0
     legal_moves_mapped_total: int = 0
     turns_with_no_vocab_legal_move: int = 0
+    search_stats: dict[str, int] = field(default_factory=dict)
+    model_selection_seconds: float = 0.0
 
     @property
     def avg_plies(self) -> float:
@@ -192,6 +194,14 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--search-refutation-top-r", type=int, default=None)
     parser.add_argument("--search-expand-top", type=int, default=None)
     parser.add_argument("--search-max-depth", type=int, default=None)
+    parser.add_argument(
+        "--search-tactical-coverage", action=argparse.BooleanOptionalAction, default=None,
+        help="Include forcing moves on both sides and all legal check evasions in halving search.",
+    )
+    parser.add_argument(
+        "--search-quiescence-plies", type=int, default=None,
+        help="Extra capture/promotion/evasion plies within the existing halving budget (default 0).",
+    )
     parser.add_argument(
         "--opening-random-plies",
         type=int,
@@ -400,6 +410,7 @@ def _select_model_move(
     if policy == "value_search_halving":
         debug["search_budget"] = int(halving_config.budget)
         debug["value_search_halving_candidates"] = halving_rows
+        debug["search_stats"] = search.summarize_search_rows(halving_rows)
     if debug_topk > 0:
         k = min(int(debug_topk), mapped_legal)
         top_values, top_indices = torch.topk(legal_logits, k=k, largest=True)
@@ -569,6 +580,7 @@ def _select_model_move_stepwise(
     if policy == "value_search_halving":
         debug["search_budget"] = int(halving_config.budget)
         debug["value_search_halving_candidates"] = halving_rows
+        debug["search_stats"] = search.summarize_search_rows(halving_rows)
     if debug_topk > 0:
         k = min(int(debug_topk), mapped_legal)
         top_values, top_indices = torch.topk(legal_logits, k=k, largest=True)
@@ -643,7 +655,7 @@ def _summary_to_payload(
     value_rerank_top_k: int,
     value_rerank_lambda: float,
     opening_random_plies: int,
-    search_knobs: dict[str, int],
+    search_knobs: dict[str, int | bool],
 ) -> dict[str, Any]:
     if summary.completed_games > 0:
         win_rate = summary.wins / summary.completed_games
@@ -673,6 +685,11 @@ def _summary_to_payload(
         "average_plies_per_game": summary.avg_plies,
         "average_full_moves_per_game": summary.avg_full_moves,
         "model_turns": summary.model_turns,
+        "search_stats": dict(summary.search_stats),
+        "model_selection_seconds": summary.model_selection_seconds,
+        "mean_model_selection_seconds": (
+            summary.model_selection_seconds / summary.model_turns if summary.model_turns else 0.0
+        ),
         "legal_moves_total": summary.legal_moves_total,
         "legal_moves_mapped_total": summary.legal_moves_mapped_total,
         "legal_move_coverage_rate": summary.legal_coverage_rate,
@@ -948,6 +965,7 @@ def _play_game(
                     f"opening_random selected={move.uci()}"
                 )
         elif board.turn == model_color:
+            selection_start = time.perf_counter()
             batch = history.build_batch_for_current_position(board)
             move, debug_info = yield from _select_model_move_stepwise(
                 model=model,
@@ -964,6 +982,8 @@ def _play_game(
                 halving_config=halving_config,
             )
             summary.model_turns += 1
+            summary.model_selection_seconds += time.perf_counter() - selection_start
+            search.merge_search_stats(summary.search_stats, debug_info.get("search_stats", {}))
             summary.legal_moves_total += int(debug_info["total_legal_moves"])
             summary.legal_moves_mapped_total += int(
                 debug_info["mapped_legal_moves"]
@@ -1837,6 +1857,8 @@ def _accumulate_summary(target: EvalSummary, fragment: EvalSummary) -> None:
     target.legal_moves_total += fragment.legal_moves_total
     target.legal_moves_mapped_total += fragment.legal_moves_mapped_total
     target.turns_with_no_vocab_legal_move += fragment.turns_with_no_vocab_legal_move
+    target.model_selection_seconds += fragment.model_selection_seconds
+    search.merge_search_stats(target.search_stats, fragment.search_stats)
 
 
 def _merge_summaries(summaries: list[EvalSummary]) -> EvalSummary:
@@ -1947,6 +1969,14 @@ def main() -> None:
         if args.search_max_depth is None
         else args.search_max_depth
     )
+    args.search_tactical_coverage = bool(
+        eval_cfg.search_tactical_coverage
+        if args.search_tactical_coverage is None else args.search_tactical_coverage
+    )
+    args.search_quiescence_plies = int(
+        eval_cfg.search_quiescence_plies
+        if args.search_quiescence_plies is None else args.search_quiescence_plies
+    )
     args.opening_random_plies = int(
         eval_cfg.opening_random_plies
         if args.opening_random_plies is None
@@ -2019,6 +2049,10 @@ def main() -> None:
         raise ValueError("--search-expand-top must be >= 1")
     if args.search_max_depth < 1:
         raise ValueError("--search-max-depth must be >= 1")
+    if args.search_quiescence_plies < 0:
+        raise ValueError("--search-quiescence-plies must be >= 0")
+    if (args.search_tactical_coverage or args.search_quiescence_plies) and args.model_move_policy != "value_search_halving":
+        raise ValueError("Tactical coverage and quiescence require --model-move-policy value_search_halving")
     if args.concurrent_games < 1:
         raise ValueError("--concurrent-games must be >= 1")
     if not args.stockfish_path.exists():
@@ -2108,6 +2142,8 @@ def main() -> None:
             expand_top=int(args.search_expand_top),
             max_depth=int(args.search_max_depth),
             lam=float(args.value_rerank_lambda),
+            tactical_coverage=bool(args.search_tactical_coverage),
+            quiescence_plies=int(args.search_quiescence_plies),
         )
         if actor_mode:
             segment_summary = _run_segment_actor_mode(
@@ -2181,6 +2217,8 @@ def main() -> None:
                 "search_refutation_top_r": int(args.search_refutation_top_r),
                 "search_expand_top": int(args.search_expand_top),
                 "search_max_depth": int(args.search_max_depth),
+                "search_tactical_coverage": bool(args.search_tactical_coverage),
+                "search_quiescence_plies": int(args.search_quiescence_plies),
             },
         )
         _print_segment_summary(segment_name=spec.name, payload=segment_payload)
@@ -2229,6 +2267,8 @@ def main() -> None:
             "search_refutation_top_r": int(args.search_refutation_top_r),
             "search_expand_top": int(args.search_expand_top),
             "search_max_depth": int(args.search_max_depth),
+            "search_tactical_coverage": bool(args.search_tactical_coverage),
+            "search_quiescence_plies": int(args.search_quiescence_plies),
         },
     )
     _print_segment_summary(segment_name="aggregate", payload=aggregate_payload)

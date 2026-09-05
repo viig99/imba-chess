@@ -42,11 +42,13 @@ def _drive_by_hand(gen, evaluator):
     "r1bqkbnr/pppp1ppp/2n5/1B2p3/4P3/5N2/PPPP1PPP/RNBQK2R b KQkq - 3 3",
     "r4rk1/1pp1qppp/p1np1n2/2b1p1B1/2B1P1b1/P1NP1N2/1PP1QPPP/R4RK1 w - - 0 10",
 ])
-def test_halving_generator_matches_sync_wrapper(fen):
+@pytest.mark.parametrize("coverage,q", [(False, 0), (True, 0), (False, 2), (True, 2)])
+def test_halving_generator_matches_sync_wrapper(fen, coverage, q):
     board = chess.Board(fen)
     legal_moves = list(board.legal_moves)
     legal_log_priors = [-1.0 - 0.01 * i for i in range(len(legal_moves))]
-    config = search.HalvingConfig(budget=64, top_m=8, max_depth=3)
+    config = search.HalvingConfig(budget=64, top_m=8, max_depth=3,
+                                 tactical_coverage=coverage, quiescence_plies=q)
 
     sync_eval = _RecordingEvaluator(_MaterialEvaluator())
     sync_result = search.select_value_search_halving(

@@ -125,6 +125,31 @@ d2 spends its budget uniformly — the obviously losing move gets as much attent
 
 ### Tuning the halving knobs
 
+Two independent evaluation switches enable tactical-search experiments. Both
+default to disabled, preserving the original move selection:
+
+| Variant | Additional CLI flags |
+|---|---|
+| Baseline | `--no-search-tactical-coverage --search-quiescence-plies 0` |
+| Coverage only | `--search-tactical-coverage --search-quiescence-plies 0` |
+| Quiescence only | `--no-search-tactical-coverage --search-quiescence-plies 2` |
+| Both | `--search-tactical-coverage --search-quiescence-plies 2` |
+
+These flags apply to `--model-move-policy value_search_halving` in serial and
+actor evaluation. TOML equivalents under `[eval_vs_stockfish]` are
+`search_tactical_coverage = false` and `search_quiescence_plies = 0`; explicit
+CLI values override TOML, including false/zero. Keep checkpoint, lambda,
+reply count, normal depth, and budget fixed when comparing the four variants.
+
+Coverage adds our forcing moves and all legal check evasions. Quiescence adds
+bounded capture/promotion continuations (all evasions when in check), with
+stand pat outside check, within the **same** neural evaluation budget. The
+normal depth counts from the board after the root candidate move. JSON results
+record the resolved switches, pooled `search_stats` (including actual Q
+evaluations), and model-selection timing including inference/actor waiting.
+These are experimental controls; playing-strength improvements require matches.
+See [the experiment handoff](docs/CKPT34_TACTICAL_SEARCH_HANDOFF.md) for commands.
+
 | Knob | Default | What it controls | How to tune |
 |---|---|---|---|
 | `search_budget` | 256 | Total value evaluations per move — the strength ↔ wall-clock dial (cost ≈ linear) | The biggest lever; raise first. |

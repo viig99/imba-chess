@@ -155,7 +155,7 @@ def _run_fake_server(conn, received: list) -> None:
             raise AssertionError(f"unexpected message from worker: {msg!r}")
 
 
-def _run_two_short_games(*, model_move_policy: str) -> tuple[list, dict]:
+def _run_two_short_games(*, model_move_policy: str, halving_config=None) -> tuple[list, dict]:
     """Drives `run_eval_worker` over a real `multiprocessing.Pipe()` for 2
     short (max_plies=2) games, worker on a background thread, this thread
     playing the fake server. Returns (received_messages, engine)."""
@@ -172,6 +172,7 @@ def _run_two_short_games(*, model_move_policy: str) -> tuple[list, dict]:
         "max_plies": 2,
         "opening_random_plies": 0,
         "model_move_policy": model_move_policy,
+        "halving_config": halving_config,
         "value_rerank_top_k": 1,
         "value_rerank_lambda": 0.0,
         "vocab_path": str(STATIC_VOCAB_PATH),
@@ -191,6 +192,27 @@ def _run_two_short_games(*, model_move_policy: str) -> tuple[list, dict]:
         assert not server_thread.is_alive(), "fake server thread did not finish"
 
     return received, {"engine": fake_engine}
+
+
+@pytest.mark.parametrize("coverage,q", [(False, 0), (True, 0), (False, 2), (True, 2)])
+def test_halving_flags_and_stats_through_worker_protocol(coverage, q):
+    from dataclasses import asdict
+    from imba_chess.eval.search import HalvingConfig
+
+    received, _ = _run_two_short_games(
+        model_move_policy="value_search_halving",
+        halving_config=asdict(HalvingConfig(budget=16, max_depth=1,
+                                          tactical_coverage=coverage, quiescence_plies=q)),
+    )
+    games = [m for m in received if isinstance(m, GameDone)]
+    assert len(games) == 2
+    for game in games:
+        stats = game.summary_fragment["search_stats"]
+        assert 0 < stats["evals_spent"] <= 16
+        assert stats["max_depth"] <= 1 + q
+        assert game.summary_fragment["model_selection_seconds"] > 0
+        if not q:
+            assert stats["quiescence_evals"] == 0
 
 
 def test_two_short_games_end_to_end_message_ordering_and_summaries() -> None:

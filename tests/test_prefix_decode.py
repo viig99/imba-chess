@@ -46,9 +46,10 @@ def test_forward_return_kv_output_unchanged():
     assert v.shape == (2, 10, 8)  # [H, S, linear_hidden_dim]
 
 
-def test_layer_decode_matches_full_forward_token_by_token():
+@pytest.mark.parametrize("S,T", [(13, 9), (74, 63)])
+def test_layer_decode_matches_full_forward_token_by_token(S, T):
     layer = _layer()
-    S, T = 13, 9  # prefill 9 tokens, decode tokens 9..12 sequentially
+    # Also cover an eleven-ply search suffix across the positional-bias limit.
     x = torch.randn(S, 32)
     full = _full_forward(layer, x)
 

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import importlib.util
+import json
 import multiprocessing
 from dataclasses import asdict
 from pathlib import Path
@@ -32,6 +33,86 @@ def _load_eval_script_module():
     sys.modules[spec.name] = module
     spec.loader.exec_module(module)
     return module
+
+
+@pytest.mark.parametrize("coverage,q", [(False, 0), (True, 0), (False, 2), (True, 2)])
+@pytest.mark.parametrize("concurrency", [1, 2])
+@pytest.mark.parametrize("use_cli", [False, True])
+def test_tactical_config_cli_and_result_roundtrip(tmp_path, monkeypatch, coverage, q, concurrency, use_cli):
+    module = _load_eval_script_module()
+    config_path = tmp_path / "experiment.toml"
+    # When CLI overrides are present, deliberately put opposite values in TOML.
+    config_coverage = not coverage if use_cli else coverage
+    config_q = (0 if q else 2) if use_cli else q
+    config_path.write_text(
+        '[eval_vs_stockfish]\nmodel_move_policy = "value_search_halving"\n'
+        f'search_tactical_coverage = {str(config_coverage).lower()}\n'
+        f'search_quiescence_plies = {config_q}\n', encoding="utf-8",
+    )
+    output_path = tmp_path / "result.json"
+    argv = [
+        "eval_vs_stockfish.py", "--config", str(config_path),
+        "--checkpoint", "unused.pt", "--stockfish-path", sys.executable,
+        "--device", "cpu", "--no-compile", "--no-save-games",
+        "--ladder-elos", "2200", "--ladder-games-per-segment", "1",
+        "--no-include-full-strength-segment", "--concurrent-games", str(concurrency),
+        "--output-json", str(output_path),
+    ]
+    if use_cli:
+        argv += ["--search-tactical-coverage" if coverage else "--no-search-tactical-coverage",
+                 "--search-quiescence-plies", str(q)]
+    monkeypatch.setattr(sys, "argv", argv)
+    monkeypatch.setattr(module, "load_or_create_static_move_vocab", lambda **kwargs: _mini_vocab())
+    monkeypatch.setattr(module, "load_hstu_checkpoint", lambda **kwargs: (None, False))
+    observed = []
+
+    def run_segment(**kwargs):
+        cfg = kwargs["halving_config"]
+        observed.append(cfg)
+        assert cfg.tactical_coverage is coverage
+        assert cfg.quiescence_plies == q
+        if concurrency > 1:
+            worker = module._build_worker_config(
+                worker_id=0, game_indices=[0], seed=42, max_plies=2,
+                opening_random_plies=0, model_move_policy="value_search_halving",
+                value_rerank_top_k=2, value_rerank_lambda=.05, halving_config=cfg,
+                vocab_path=STATIC_VOCAB_PATH, vocab_include_unk=False,
+                board_state_config={}, engine_config={},
+            )
+            assert module.HalvingConfig(**worker["halving_config"]) == cfg
+        return module.EvalSummary(
+            games=1, completed_games=1, draws=1, model_turns=2,
+            model_selection_seconds=.4,
+            search_stats={"evals_spent": 9, "quiescence_evals": q, "max_depth": 4 + q},
+        )
+
+    monkeypatch.setattr(module, "_run_segment_actor_mode" if concurrency > 1 else "_run_segment", run_segment)
+    module.main()
+    assert len(observed) == 1
+    payload = json.loads(output_path.read_text())
+    for result in (payload["segments"][0]["results"], payload["aggregate"]):
+        assert result["run_config"]["search"]["search_tactical_coverage"] is coverage
+        assert result["run_config"]["search"]["search_quiescence_plies"] == q
+        assert result["search_stats"]["quiescence_evals"] == q
+        assert result["search_stats"]["max_depth"] == 4 + q
+        assert result["mean_model_selection_seconds"] == pytest.approx(.2)
+
+
+def test_search_stats_merge_sums_counts_but_takes_maximum_depth():
+    module = _load_eval_script_module()
+    merged = module._merge_summaries([
+        module.EvalSummary(search_stats={"evals_spent": 7, "max_depth": 4}),
+        module.EvalSummary(search_stats={"evals_spent": 9, "max_depth": 3}),
+    ])
+    assert merged.search_stats == {"evals_spent": 16, "max_depth": 4}
+
+
+def test_negative_quiescence_rejected_before_loading_checkpoint(monkeypatch):
+    module = _load_eval_script_module()
+    monkeypatch.setattr(sys, "argv", ["eval_vs_stockfish.py", "--checkpoint", "unused.pt",
+                                    "--search-quiescence-plies", "-1"])
+    with pytest.raises(ValueError, match="search-quiescence-plies"):
+        module.main()
 
 
 def _dummy_kv(total_tokens: int) -> list[tuple[torch.Tensor, torch.Tensor]]:
@@ -1274,4 +1355,3 @@ def test_join_and_verify_workers_terminates_all_when_worker_never_exits():
 
     assert stuck.terminate_calls == 1
     assert other.terminate_calls == 1
-

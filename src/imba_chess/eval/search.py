@@ -112,6 +112,12 @@ class HalvingConfig:
     max_depth: int = 4
     lam: float = 0.05
     gumbel_root_sampling: bool = False
+    tactical_coverage: bool = False
+    quiescence_plies: int = 0
+
+    def __post_init__(self) -> None:
+        if self.quiescence_plies < 0:
+            raise ValueError("quiescence_plies must be >= 0")
 
 
 def _auto_rounds(num_arms: int) -> int:
@@ -578,6 +584,10 @@ class _TreeNode:
     value_stm: Optional[float] = None  # set when evaluated by the value head
     terminal_value_stm: Optional[float] = None  # exact, side-to-move POV
     children: list["_TreeNode"] = field(default_factory=list)
+    stand_pat: bool = False
+    in_check: bool | None = None
+    coverage_added: bool = False
+    check_evasion: bool = False
 
     @property
     def scored(self) -> bool:
@@ -597,6 +607,8 @@ class _Arm:
     eliminated_round: Optional[int] = None
     backed_value: Optional[float] = None
     score: float = float("-inf")
+    root_coverage_added: bool = False
+    root_check_evasion: bool = False
 
 
 def _backed_stm(node: _TreeNode) -> float:
@@ -604,6 +616,9 @@ def _backed_stm(node: _TreeNode) -> float:
     if node.terminal_value_stm is not None:
         return node.terminal_value_stm
     child_values = [-_backed_stm(child) for child in node.children if child.scored]
+    if node.stand_pat:
+        assert node.value_stm is not None
+        return max([node.value_stm, *child_values])
     if child_values:
         return max(child_values)
     assert node.value_stm is not None
@@ -632,12 +647,26 @@ def _push_children(
     counter: "itertools.count",
     root_color: chess.Color,
 ) -> None:
-    if node.depth >= config.max_depth or not position_eval.legal_moves:
+    node.in_check = bool(node.cozy_board.checkers())
+    quiescence = config.quiescence_plies > 0 and node.depth >= config.max_depth
+    # Set this even at the hard cap and when there are no tactical children.
+    node.stand_pat = quiescence and not node.in_check
+    if node.depth >= config.max_depth + config.quiescence_plies or not position_eval.legal_moves:
         return
     node_stm_is_white = node.cozy_board.side_to_move() == cc.Color.White
     opponent_to_move = node_stm_is_white != root_color
     order = _prior_order(position_eval.legal_log_priors)
-    if opponent_to_move:
+    if quiescence:
+        # Evasions may be quiet; outside check only captures/promotions extend.
+        forcing = set()
+        picks = [
+            idx for idx in order
+            if node.in_check
+            or position_eval.legal_moves[idx].promotion is not None
+            or cozy_bridge.is_capture_cozy(node.cozy_board, position_eval.legal_moves[idx])
+        ]
+        coverage_added = set()
+    elif opponent_to_move:
         forcing = {
             idx for idx, flag in enumerate(position_eval.legal_forcing) if flag
         }
@@ -652,6 +681,16 @@ def _push_children(
         forcing = set()
         picks = list(order[: config.expand_top])
 
+    if not quiescence:
+        legacy_picks = set(picks)
+        if config.tactical_coverage:
+            forcing = {idx for idx, flag in enumerate(position_eval.legal_forcing) if flag}
+            picks.extend(
+                idx for idx in range(len(position_eval.legal_moves))
+                if idx not in legacy_picks and (node.in_check or idx in forcing)
+            )
+        coverage_added = set(picks) - legacy_picks
+
     for idx in picks:
         move_uci = position_eval.legal_ucis[idx]
         move_cozy = position_eval.legal_moves[idx]
@@ -664,7 +703,11 @@ def _push_children(
         # Forcing replies inherit the parent's priority (no decay for their
         # own low prior): a refutation must compete at the plausibility of
         # the line it refutes, not of the reply itself.
-        floor_pick = opponent_to_move and idx in forcing
+        floor_pick = (
+            quiescence
+            or (opponent_to_move and idx in forcing)
+            or (config.tactical_coverage and (node.in_check or idx in forcing))
+        )
         child_prior = node.path_log_prior + (
             0.0 if floor_pick else position_eval.legal_log_priors[idx]
         )
@@ -674,6 +717,8 @@ def _push_children(
             handle=None,
             depth=node.depth + 1,
             path_log_prior=child_prior,
+            coverage_added=idx in coverage_added,
+            check_evasion=node.in_check,
         )
         if terminal_stm is not None:
             child.terminal_value_stm = terminal_stm
@@ -682,6 +727,60 @@ def _push_children(
         child.handle = extend(node.handle, move_uci, position_eval.legal_ids[idx])
         node.children.append(child)
         heapq.heappush(arm.frontier, (-child.path_log_prior, next(counter), child))
+
+
+def merge_search_stats(target: dict[str, int], fragment: dict[str, int]) -> None:
+    """Pool counts over arms/games; maximum depths are maxima, not sums."""
+    for key, value in fragment.items():
+        if key.startswith("max_"):
+            target[key] = max(target.get(key, 0), value)
+        else:
+            target[key] = target.get(key, 0) + value
+
+
+def summarize_search_rows(rows: list[dict[str, Any]]) -> dict[str, int]:
+    stats: dict[str, int] = {}
+    for row in rows:
+        merge_search_stats(stats, row.get("search_stats", {}))
+    return stats
+
+
+def _arm_search_stats(arm: _Arm, config: HalvingConfig) -> dict[str, int]:
+    """Measure the final tree once, including eliminated arms and unscored children."""
+    stats = dict.fromkeys((
+        "evals_spent", "quiescence_evals", "horizon_evals",
+        "coverage_added_generated", "coverage_added_evaluated",
+        "check_evasions_generated", "check_evasions_evaluated",
+        "max_depth", "max_quiescence_depth",
+        "unresolved_in_check_depth", "unresolved_in_check_other",
+    ), 0)
+    # Terminal root candidates have no _TreeNode but were still generated.
+    if arm.root_node is None:
+        stats["coverage_added_generated"] = int(arm.root_coverage_added)
+        stats["check_evasions_generated"] = int(arm.root_check_evasion)
+    stack = [arm.root_node] if arm.root_node is not None else []
+    while stack:
+        node = stack.pop()
+        stack.extend(node.children)
+        evaluated = node.value_stm is not None
+        stats["coverage_added_generated"] += int(node.coverage_added)
+        stats["coverage_added_evaluated"] += int(node.coverage_added and evaluated)
+        stats["check_evasions_generated"] += int(node.check_evasion)
+        stats["check_evasions_evaluated"] += int(node.check_evasion and evaluated)
+        if evaluated:
+            stats["evals_spent"] += 1
+            stats["quiescence_evals"] += int(node.depth > config.max_depth)
+            stats["horizon_evals"] += int(node.depth == config.max_depth)
+            stats["max_depth"] = max(stats["max_depth"], node.depth)
+            stats["max_quiescence_depth"] = max(
+                stats["max_quiescence_depth"], node.depth - config.max_depth
+            )
+        if node.terminal_value_stm is None and not any(child.scored for child in node.children):
+            in_check = node.in_check if node.in_check is not None else bool(node.cozy_board.checkers())
+            if in_check:
+                cutoff = "depth" if node.depth >= config.max_depth + config.quiescence_plies else "other"
+                stats[f"unresolved_in_check_{cutoff}"] += 1
+    return stats
 
 
 def _halving_stepwise(
@@ -719,6 +818,11 @@ def _halving_stepwise(
             picks.append(idx)
             seen.add(idx)
 
+    legacy_picks = set(picks)
+    root_in_check = board.is_check()
+    if config.tactical_coverage and root_in_check:
+        picks.extend(idx for idx in range(len(legal_moves)) if idx not in legacy_picks)
+
     counter = itertools.count()
     arms: list[_Arm] = []
     for idx in picks:
@@ -740,6 +844,9 @@ def _halving_stepwise(
                     "backed_value": 1.0,
                     "search_score": 1.0,
                     "eliminated_round": None,
+                    "search_stats": _arm_search_stats(
+                        _Arm(idx, move, float(legal_log_priors[idx]), None, terminal_root), config
+                    ),
                 }
             ]
         arm = _Arm(
@@ -748,6 +855,8 @@ def _halving_stepwise(
             root_log_prior=float(legal_log_priors[idx]),
             root_node=None,
             terminal_value_root=terminal_root,
+            root_coverage_added=idx not in legacy_picks,
+            root_check_evasion=root_in_check,
         )
         if terminal_root is None:
             node = _TreeNode(
@@ -756,6 +865,8 @@ def _halving_stepwise(
                 handle=extend(root_handle, move.uci()),
                 depth=0,
                 path_log_prior=float(legal_log_priors[idx]),
+                coverage_added=idx not in legacy_picks,
+                check_evasion=root_in_check,
             )
             arm.root_node = node
             heapq.heappush(arm.frontier, (-node.path_log_prior, next(counter), node))
@@ -830,6 +941,7 @@ def _halving_stepwise(
             "backed_value": arm.backed_value,
             "search_score": None if arm.score == float("-inf") else arm.score,
             "eliminated_round": arm.eliminated_round,
+            "search_stats": _arm_search_stats(arm, config),
         }
         for arm in arms
     ]

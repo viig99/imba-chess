@@ -79,6 +79,8 @@ def test_halving_config_defaults_match_spec():
     assert config.max_depth == 4
     assert config.lam == 0.05
     assert config.gumbel_root_sampling is False
+    assert config.tactical_coverage is False
+    assert config.quiescence_plies == 0
 
 
 def test_gumbel_top_k_order_is_a_valid_permutation():

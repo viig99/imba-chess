@@ -130,6 +130,8 @@ def test_eval_vs_stockfish_search_knob_defaults():
     assert config.search_refutation_top_r == 2
     assert config.search_expand_top == 3
     assert config.search_max_depth == 4
+    assert config.search_tactical_coverage is False
+    assert config.search_quiescence_plies == 0
 
 
 def test_load_repo_config_unknown_section_raises(tmp_path):

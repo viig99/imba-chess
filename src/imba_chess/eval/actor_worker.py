@@ -30,7 +30,8 @@ from __future__ import annotations
 import itertools
 import random
 import signal
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
+from time import perf_counter
 
 import chess
 import chess.engine
@@ -426,6 +427,8 @@ class _EvalSummaryFragment:
     legal_moves_total: int = 0
     legal_moves_mapped_total: int = 0
     turns_with_no_vocab_legal_move: int = 0
+    search_stats: dict[str, int] = field(default_factory=dict)
+    model_selection_seconds: float = 0.0
 
 
 def _update_summary_fragment(
@@ -680,6 +683,8 @@ def _select_model_move(
         "total_legal_moves": total_legal_moves,
         "mapped_legal_moves": mapped_legal_moves,
     }
+    if policy == "value_search_halving":
+        debug_info["search_stats"] = search.summarize_search_rows(_rows)
     return legal_moves[chosen_index], debug_info
 
 
@@ -732,6 +737,7 @@ def _play_one_game(
                 break
             move = rng.choice(legal)
         elif board.turn == model_color:
+            selection_start = perf_counter()
             turn_id = next(turn_counter)
             move, debug_info = _select_model_move(
                 conn=conn,
@@ -747,6 +753,8 @@ def _play_one_game(
                 halving_config=halving_config,
             )
             summary.model_turns += 1
+            summary.model_selection_seconds += perf_counter() - selection_start
+            search.merge_search_stats(summary.search_stats, debug_info.get("search_stats", {}))
             summary.legal_moves_total += int(debug_info["total_legal_moves"])
             summary.legal_moves_mapped_total += int(debug_info["mapped_legal_moves"])
             if int(debug_info["mapped_legal_moves"]) == 0:
