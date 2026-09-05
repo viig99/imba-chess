@@ -150,11 +150,19 @@ evaluations), and model-selection timing including inference/actor waiting.
 These are experimental controls; playing-strength improvements require matches.
 See [the experiment handoff](docs/CKPT34_TACTICAL_SEARCH_HANDOFF.md) for commands.
 
+The current validated search default is **lambda=0.05 with three opponent
+replies**. On checkpoint 34 at budget 2048/depth 8 it scored 0.7527
+(490/149/111) over 750 games against limited-strength SF2200, then 0.6000
+(338/224/188) over 750 games against limited-strength SF2400. Both runs used
+40k Stockfish nodes, fp32, seed 42, alternating colours, and no random opening.
+SF2400 is therefore the default evaluation opponent; it is a benchmark setting,
+not a claim that the model has an absolute 2400 Elo rating.
+
 | Knob | Default | What it controls | How to tune |
 |---|---|---|---|
 | `search_budget` | 256 | Total value evaluations per move — the strength ↔ wall-clock dial (cost ≈ linear) | The biggest lever; raise first. |
 | `halving_rounds` | 0 (auto) | How often budget is reallocated by observed value | Keep auto. A/B against `1` (pure beam) at the same budget to check the feedback loop earns its keep. |
-| `search_refutation_top_r` | 2 | Opponent replies always expanded besides forcing moves | Raise to 3 if `--debug-trace-games` shows arms scored well whose refutation was never evaluated; costs queue slots everywhere, so pay with budget. |
+| `search_refutation_top_r` | 3 | Opponent replies always expanded besides forcing moves | Three is the measured winner for checkpoint 34 at budget 2048/depth 8; lowering it saves queue slots but weakens defensive breadth. |
 | `search_expand_top` | 3 | Our-side branching per node | Lower = deeper/narrower; sweep only after budget and rounds settle. |
 | `search_max_depth` | 4 | Max plies below each candidate | Keep it **even** — an odd horizon ends on our own move and grades unanswered threats optimistically. 6 needs a bigger budget to be meaningful. |
 | `search_top_m` | 16 | Root candidates entering the bandit | Rarely binding (forcing moves added regardless); raising dilutes early-round per-arm budget. |
@@ -174,8 +182,8 @@ python scripts/eval_vs_stockfish.py \
 python scripts/eval_vs_stockfish.py \
   --checkpoint artifacts/checkpoints/best_hr10_*.pt \
   --model-move-policy value_search_halving \
-  --search-budget 1024 --search-max-depth 6 \
-  --stockfish-limit-strength --stockfish-elo 2000 --games 100
+  --search-budget 2048 --search-max-depth 8 \
+  --stockfish-limit-strength --stockfish-elo 2400 --games 100
 
 # Ladder across several Stockfish levels
 python scripts/eval_vs_stockfish.py \
@@ -188,7 +196,16 @@ Wrappers: `POLICIES="value_search_halving" ELO=1800 TAG=mytag ./eval_best_checkp
 
 ## Results vs Stockfish
 
-Protocol: 100 games per configuration, seed 42, colors alternating, Stockfish at 0.05s/move with `UCI_Elo` per rung. Score = (wins + 0.5 × draws) / games; ±~0.05 SE at 100 games. "Net α" = the distilled value net blended at that α (**historical**: this feature was later removed as dead code, see Current limitations — rows referencing it are not reproducible against current code); model v3 = 512d × 6L (~10M), v4 = 768d × 8L (~27M, `value_loss_weight` 1.0). Full per-run diaries, color splits, and period interpretations: `docs/superpowers/notes/2026-07-06-eval-log-archive.md`.
+Historical rows use 100 games per configuration, seed 42, alternating colours,
+and Stockfish at 0.05s/move with `UCI_Elo` per rung. The two checkpoint-34
+rows use the newer 750-game, 40k-node protocol documented above. Score =
+(wins + 0.5 × draws) / games; ±~0.05 SE at 100 games. "Net α" = the
+distilled value net blended at that α (**historical**: this feature was later
+removed as dead code, see Current limitations — rows referencing it are not
+reproducible against current code); model v3 = 512d × 6L (~10M), v4 = 768d
+× 8L (~27M, `value_loss_weight` 1.0). Full per-run diaries, color splits,
+and period interpretations:
+`docs/superpowers/notes/2026-07-06-eval-log-archive.md`.
 
 | Opponent | Move selection | Model | W / D / L | Score |
 |---|---|---|---|---|
@@ -212,6 +229,8 @@ Protocol: 100 games per configuration, seed 42, colors alternating, Stockfish at
 | SF2200 | halving 2048/d8 + net α=0.15 | v4 e14 | 38 / 27 / 35 | 0.515 |
 | SF2200 | halving 2048/d8 | v4 e23 (Elo-weighted value loss) | 44 / 31 / 25 | **0.595** |
 | SF2200 | halving 2048/d8 + net α=0.15 | v4 e23 (Elo-weighted value loss) | 46 / 20 / 34 | 0.560 |
+| SF2200 | halving 2048/d8, λ=0.05, replies=3 | v4 e34 | 490 / 149 / 111 @ 750 | **0.7527** |
+| SF2400 | halving 2048/d8, λ=0.05, replies=3 | v4 e34 | 338 / 224 / 188 @ 750 | **0.6000** |
 
 How the components came to be, in order:
 

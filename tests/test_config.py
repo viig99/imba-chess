@@ -124,14 +124,38 @@ save_games_dir = "artifacts/eval/custom_games"
 
 def test_eval_vs_stockfish_search_knob_defaults():
     config = EvalVsStockfishConfig()
+    assert config.ladder_elos == "2400"
+    assert config.include_full_strength_segment is False
+    assert config.model_move_policy == "value_search_halving"
+    assert config.value_rerank_lambda == 0.05
     assert config.search_budget == 256
     assert config.search_top_m == 16
     assert config.halving_rounds == 0
-    assert config.search_refutation_top_r == 2
+    assert config.search_refutation_top_r == 3
     assert config.search_expand_top == 3
     assert config.search_max_depth == 4
     assert config.search_tactical_coverage is False
     assert config.search_quiescence_plies == 0
+
+
+@pytest.mark.parametrize(
+    "filename",
+    (
+        "imba_chess.toml",
+        "imba_chess_v3.toml",
+        "imba_chess_v4.toml",
+        "imba_chess_sf_finetune_low_lr.toml",
+    ),
+)
+def test_maintained_configs_share_validated_eval_defaults(filename):
+    config = load_repo_config(
+        Path(__file__).resolve().parent.parent / "config" / filename
+    ).eval_vs_stockfish
+    assert config.ladder_elos == "2400"
+    assert config.include_full_strength_segment is False
+    assert config.model_move_policy == "value_search_halving"
+    assert config.value_rerank_lambda == 0.05
+    assert config.search_refutation_top_r == 3
 
 
 def test_load_repo_config_unknown_section_raises(tmp_path):
@@ -167,7 +191,7 @@ def test_v4_config_geometry_and_size():
     assert config.model.enable_value_head is True
     assert config.model.value_head_blocks == 2
     assert config.model.value_head_width == 512
-    # Eval must stay on the ckpt23 anchor ruler.
+    # Eval must stay on the current ckpt34/SF2400 anchor ruler.
     assert config.eval_vs_stockfish.search_budget == 2048
     assert config.eval_vs_stockfish.search_max_depth == 8
     assert config.eval_vs_stockfish.stockfish_nodes == 40000

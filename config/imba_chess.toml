@@ -106,9 +106,9 @@ stockfish_limit_strength = false
 # stockfish_nodes = 1000
 # stockfish_depth = 10
 # Optional ladder mode.
-ladder_elos = "2200"
+ladder_elos = "2400"
 ladder_games_per_segment = 100
-# include_full_strength_segment = true
+include_full_strength_segment = false
 device = "auto"
 dtype = "float32"     # adopted 2026-07-19: batched evals make fp32 nearly free; removes bf16 near-tie noise
 compile = true
@@ -121,7 +121,7 @@ value_rerank_lambda = 0.05
 search_budget = 256
 search_top_m = 16
 halving_rounds = 0
-search_refutation_top_r = 2
+search_refutation_top_r = 3
 search_expand_top = 3
 search_max_depth = 4
 opening_random_plies = 0  # adopted 2026-07-19: random first ply was a -0.045 handicap; keep >=1 for full-strength (deterministic) SF segments
