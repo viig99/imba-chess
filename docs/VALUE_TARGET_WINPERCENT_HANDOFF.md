@@ -87,14 +87,15 @@ than Black at that setting: always pair openings with colour reversal.
   Training keeps the full stream: every game supervises policy and moves-left,
   while only evaluated plies supervise value.
 - Games longer than `max_seq_len` are rejected, not truncated.
-- **The centipawn scale is not uniform across the corpus.** Lichess evals are
-  produced by whatever Stockfish version fishnet ran at analysis time. Since
-  Stockfish 15.1 (Dec 2022) the reported cp is normalised so that +100 means
-  roughly a 50% win probability in engine self-play; before that +100 meant
-  roughly a pawn. Games from 2021 to 2022 sit on the old scale. Every fixed
-  function, and the corpus calibration too, averages over this. Lichess
-  itself applies one function uniformly, so this recipe is no worse than
-  Lichess's own accuracy numbers.
+- **The centipawn scale may not be uniform across the corpus.** Stockfish 15.1
+  (Dec 2022) changed the reported cp convention so that +100 means roughly a
+  50% win probability in engine self-play; before that +100 meant roughly a
+  pawn. The export records neither the engine version nor the analysis time,
+  and game date is not analysis date, so rows cannot be reliably assigned to
+  an evaluation era. Every fixed function, and the corpus calibration too,
+  averages over any such mixture. This recipe uses Lichess's mapping
+  consistently, but any evaluation-scale mixture remains an unquantified
+  source of target noise.
 
 ### 2.5 How search consumes the value head
 
@@ -188,7 +189,8 @@ rejected because it models **engine self-play at long time control**: at full
 material an equal position is 98.7% draw and +200 is 99.3% won (table above).
 That saturates WL by ±150 cp and tells the head that the whole band humans
 actually play in is a draw. It is also only meaningful for normalised-scale
-evals (Stockfish ≥ 15.1), which excludes the 2021 to 2022 part of the corpus.
+evals (Stockfish ≥ 15.1), while the export lacks the engine metadata needed
+to identify reliably which rows use that scale.
 
 **The corpus calibration** (arm A) is the thing being replaced: it needs an
 extraction script, a fitting script, a parquet, a JSON with 48 bins plus a

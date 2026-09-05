@@ -117,19 +117,22 @@ only **86.7%**, and **mate-scored positions convert 85.1%**. The game outcome
 is a very noisy function of true position quality at 2000--2400 Elo. That noise
 is what the current value target is made of.
 
-### Engine-era question: settled, no restriction needed
+### Game-date comparison: supports retaining the full window
 
-Compared 2021 H1 vs 2024 H1 (spanning roughly SF13 → SF16):
+Compared games played in 2021 H1 vs 2024 H1. These are game-date cohorts,
+not verified engine-version cohorts: the export records neither the engine
+version nor the analysis time, and older games may have been analyzed later.
 
 ```
 P(win) at matched cp buckets differ by <= 0.03, most within 0.01
-CE(era-calibrated eval || outcome):   2021 = 0.8391    2024 = 0.8395
+CE(cohort-calibrated eval || outcome):   2021 = 0.8391    2024 = 0.8395
 ```
 
-A 0.0004 nat difference. The limiting factor is the humans, not the engine --
-both eras' evals are far past what 2000--2400 players can exploit. **Use the
-full window; a single global cp→WDL calibration is fine.** (Annotation rate
-does rise over time: 12.9% in 2021 H1 → 15.4% in 2024 H1.)
+A 0.0004 nat difference supports retaining the full game-date window for
+this calibration experiment. It does not establish that engine-version
+differences are negligible or that the centipawn scale is uniform. Those
+questions remain unresolved without analysis provenance. Annotation rates
+also differ by game-date cohort: 12.9% in 2021 H1 → 15.4% in 2024 H1.
 
 ---
 
@@ -204,8 +207,8 @@ Under `artifacts/corpus/`:
 | `val_evals.parquet`, `val_eval_targets.parquet` | 463,257 held-out eval targets |
 | `cp_to_wdl_600k.json` | the fitted calibration |
 
-Scripts: `materialize_corpus.py` (`--split`), `filter_annotated_corpus.py`,
-`extract_lichess_evals.py`, `calibrate_evals_to_wdl.py`,
+Historical scripts used for this experiment included `materialize_corpus.py`
+(`--split`), `extract_lichess_evals.py`, `calibrate_evals_to_wdl.py`,
 `value_head_vs_stockfish.py`.
 
 ---
