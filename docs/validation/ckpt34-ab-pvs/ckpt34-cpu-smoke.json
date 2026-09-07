@@ -1,0 +1,206 @@
+{
+  "kind": "CPU checkpoint compatibility smoke; not campaign conditions",
+  "compiled": false,
+  "rows": [
+    {
+      "policy": "value_search_alphabeta",
+      "cache": "off",
+      "lmr": false,
+      "move": "e2e4",
+      "report": {
+        "chosen_index": 11,
+        "score": 0.0406569242477417,
+        "completed_depth": 1,
+        "attempted_depth": 2,
+        "pv": [
+          "e2e4"
+        ],
+        "stop_reason": "evaluation_budget",
+        "stats": {
+          "new_neural_evaluations": 32,
+          "raw_eval_cache_hits": 3,
+          "recursive_visits": 36,
+          "alpha_beta_cutoffs": 0,
+          "inference_requests": 32,
+          "fallback_count": 0,
+          "board_hash_repeats": 0,
+          "pvs_scout_calls": 0,
+          "pvs_full_window_researches": 0,
+          "score_cache_probes": 0,
+          "score_cache_hits": 0,
+          "score_cache_cutoffs": 0,
+          "lmr_attempts": 0,
+          "lmr_full_depth_verifications": 0,
+          "selective_results": 0,
+          "visits_depth_1": 2,
+          "visits_depth_0": 33,
+          "visits_depth_2": 1,
+          "max_completed_depth": 1,
+          "max_attempted_depth": 2,
+          "move_selection_seconds": 0.20299186604097486
+        },
+        "selective": false
+      }
+    },
+    {
+      "policy": "value_search_pvs",
+      "cache": "off",
+      "lmr": false,
+      "move": "e2e4",
+      "report": {
+        "chosen_index": 11,
+        "score": 0.0406569242477417,
+        "completed_depth": 1,
+        "attempted_depth": 2,
+        "pv": [
+          "e2e4"
+        ],
+        "stop_reason": "evaluation_budget",
+        "stats": {
+          "new_neural_evaluations": 32,
+          "raw_eval_cache_hits": 5,
+          "recursive_visits": 38,
+          "alpha_beta_cutoffs": 0,
+          "inference_requests": 32,
+          "fallback_count": 0,
+          "board_hash_repeats": 0,
+          "pvs_scout_calls": 31,
+          "pvs_full_window_researches": 2,
+          "score_cache_probes": 0,
+          "score_cache_hits": 0,
+          "score_cache_cutoffs": 0,
+          "lmr_attempts": 0,
+          "lmr_full_depth_verifications": 0,
+          "selective_results": 0,
+          "visits_depth_1": 2,
+          "visits_depth_0": 35,
+          "visits_depth_2": 1,
+          "max_completed_depth": 1,
+          "max_attempted_depth": 2,
+          "move_selection_seconds": 0.20315715507604182
+        },
+        "selective": false
+      }
+    },
+    {
+      "policy": "value_search_pvs",
+      "cache": "context",
+      "lmr": false,
+      "move": "e2e4",
+      "report": {
+        "chosen_index": 11,
+        "score": 0.0406569242477417,
+        "completed_depth": 1,
+        "attempted_depth": 2,
+        "pv": [
+          "e2e4"
+        ],
+        "stop_reason": "evaluation_budget",
+        "stats": {
+          "new_neural_evaluations": 32,
+          "raw_eval_cache_hits": 5,
+          "recursive_visits": 38,
+          "alpha_beta_cutoffs": 0,
+          "inference_requests": 32,
+          "fallback_count": 0,
+          "board_hash_repeats": 0,
+          "pvs_scout_calls": 31,
+          "pvs_full_window_researches": 2,
+          "score_cache_probes": 38,
+          "score_cache_hits": 0,
+          "score_cache_cutoffs": 0,
+          "lmr_attempts": 0,
+          "lmr_full_depth_verifications": 0,
+          "selective_results": 0,
+          "visits_depth_1": 2,
+          "visits_depth_0": 35,
+          "visits_depth_2": 1,
+          "max_completed_depth": 1,
+          "max_attempted_depth": 2,
+          "move_selection_seconds": 0.20405110495630652
+        },
+        "selective": false
+      }
+    },
+    {
+      "policy": "value_search_pvs",
+      "cache": "off",
+      "lmr": true,
+      "move": "e2e4",
+      "report": {
+        "chosen_index": 11,
+        "score": 0.0406569242477417,
+        "completed_depth": 1,
+        "attempted_depth": 2,
+        "pv": [
+          "e2e4"
+        ],
+        "stop_reason": "evaluation_budget",
+        "stats": {
+          "new_neural_evaluations": 32,
+          "raw_eval_cache_hits": 5,
+          "recursive_visits": 38,
+          "alpha_beta_cutoffs": 0,
+          "inference_requests": 32,
+          "fallback_count": 0,
+          "board_hash_repeats": 0,
+          "pvs_scout_calls": 31,
+          "pvs_full_window_researches": 2,
+          "score_cache_probes": 0,
+          "score_cache_hits": 0,
+          "score_cache_cutoffs": 0,
+          "lmr_attempts": 0,
+          "lmr_full_depth_verifications": 0,
+          "selective_results": 0,
+          "visits_depth_1": 2,
+          "visits_depth_0": 35,
+          "visits_depth_2": 1,
+          "max_completed_depth": 1,
+          "max_attempted_depth": 2,
+          "move_selection_seconds": 0.2013750650221482
+        },
+        "selective": false
+      }
+    },
+    {
+      "policy": "value_search_pvs",
+      "cache": "context",
+      "lmr": true,
+      "move": "e2e4",
+      "report": {
+        "chosen_index": 11,
+        "score": 0.0406569242477417,
+        "completed_depth": 1,
+        "attempted_depth": 2,
+        "pv": [
+          "e2e4"
+        ],
+        "stop_reason": "evaluation_budget",
+        "stats": {
+          "new_neural_evaluations": 32,
+          "raw_eval_cache_hits": 5,
+          "recursive_visits": 38,
+          "alpha_beta_cutoffs": 0,
+          "inference_requests": 32,
+          "fallback_count": 0,
+          "board_hash_repeats": 0,
+          "pvs_scout_calls": 31,
+          "pvs_full_window_researches": 2,
+          "score_cache_probes": 38,
+          "score_cache_hits": 0,
+          "score_cache_cutoffs": 0,
+          "lmr_attempts": 0,
+          "lmr_full_depth_verifications": 0,
+          "selective_results": 0,
+          "visits_depth_1": 2,
+          "visits_depth_0": 35,
+          "visits_depth_2": 1,
+          "max_completed_depth": 1,
+          "max_attempted_depth": 2,
+          "move_selection_seconds": 0.20100425696000457
+        },
+        "selective": false
+      }
+    }
+  ]
+}

@@ -429,6 +429,9 @@ class _EvalSummaryFragment:
     turns_with_no_vocab_legal_move: int = 0
     search_stats: dict[str, int] = field(default_factory=dict)
     model_selection_seconds: float = 0.0
+    game_records: list[dict] = field(default_factory=list)
+    search_reports: list[dict] = field(default_factory=list)
+    inference_stats: dict[str, float | int] = field(default_factory=dict)
 
 
 def _update_summary_fragment(
@@ -549,7 +552,7 @@ def _select_model_move(
     policy: str,
     value_rerank_top_k: int,
     value_rerank_lambda: float,
-    halving_config: "search.HalvingConfig | None",
+    halving_config: "search.HalvingConfig | alphabeta.AlphaBetaConfig | None",
 ) -> tuple[chess.Move, dict]:
     """Torch-free, protocol-driven twin of `scripts/eval_vs_stockfish.py`'s
     `_select_model_move`: the model forward becomes one `RootEvalRequest`/
@@ -711,7 +714,7 @@ def _play_one_game(
     policy: str,
     value_rerank_top_k: int,
     value_rerank_lambda: float,
-    halving_config: "search.HalvingConfig | None",
+    halving_config: "search.HalvingConfig | alphabeta.AlphaBetaConfig | None",
     opening_random_plies: int,
     max_plies: int,
     rng: random.Random,
@@ -766,6 +769,8 @@ def _play_one_game(
             summary.model_turns += 1
             summary.model_selection_seconds += perf_counter() - selection_start
             search.merge_search_stats(summary.search_stats, debug_info.get("search_stats", {}))
+            if "search_report" in debug_info:
+                summary.search_reports.append(dict(game_idx=game_idx, ply=plies, **debug_info["search_report"]))
             summary.legal_moves_total += int(debug_info["total_legal_moves"])
             summary.legal_moves_mapped_total += int(debug_info["mapped_legal_moves"])
             if int(debug_info["mapped_legal_moves"]) == 0:
@@ -785,6 +790,8 @@ def _play_one_game(
     _update_summary_fragment(
         summary, result=result, model_color=model_color, completed=completed, plies=plies
     )
+    summary.game_records.append(dict(game_idx=game_idx, result=result, completed=completed,
+                                     model_color="white" if model_color else "black", plies=plies))
     return summary
 
 

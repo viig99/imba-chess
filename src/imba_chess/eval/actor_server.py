@@ -547,6 +547,8 @@ class ActorInferenceServer:
         _t2 = time.perf_counter()
         self.stats["root_build_s"] += _t1 - _t0
         self.stats["root_gpu_s"] += _t2 - _t1
+        batch_key = f"root_batch_size_{len(requests)}"
+        self.stats[batch_key] = self.stats.get(batch_key, 0) + 1
         self.stats["root_calls"] += 1
         self.stats["root_reqs"] += len(requests)
         output = _ensure_value_logits_placeholder(output)
@@ -805,6 +807,8 @@ class ActorInferenceServer:
         _t2 = time.perf_counter()
         self.stats["wave_build_s"] += _t1 - _t0
         self.stats["wave_gpu_s"] += _t2 - _t1
+        batch_key = f"wave_batch_size_{sum(len(r.rows) for r in requests)}"
+        self.stats[batch_key] = self.stats.get(batch_key, 0) + 1
         self.stats["wave_calls"] += 1
         self.stats["wave_reqs"] += len(requests)
         self.stats["wave_rows"] += sum(len(r.rows) for r in requests)

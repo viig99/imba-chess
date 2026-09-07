@@ -82,6 +82,9 @@ class EvalSummary:
     turns_with_no_vocab_legal_move: int = 0
     search_stats: dict[str, int] = field(default_factory=dict)
     model_selection_seconds: float = 0.0
+    game_records: list[dict[str, Any]] = field(default_factory=list)
+    search_reports: list[dict[str, Any]] = field(default_factory=list)
+    inference_stats: dict[str, float | int] = field(default_factory=dict)
 
     @property
     def avg_plies(self) -> float:
@@ -197,7 +200,8 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--halving-rounds", type=int, default=None)
     parser.add_argument("--search-refutation-top-r", type=int, default=None)
     parser.add_argument("--search-expand-top", type=int, default=None)
-    parser.add_argument("--search-max-depth", type=int, default=None)
+    parser.add_argument("--search-max-depth", type=int, default=None,
+                        help="Halving: plies below a candidate; alpha-beta/PVS: root-relative plies (1..128).")
     parser.add_argument(
         "--search-tactical-coverage", action=argparse.BooleanOptionalAction, default=None,
         help="Include forcing moves on both sides and all legal check evasions in halving search.",
@@ -319,7 +323,7 @@ def _select_model_move(
     value_rerank_top_k: int,
     value_rerank_lambda: float,
     debug_topk: int = 0,
-    halving_config: HalvingConfig | None = None,
+    halving_config: HalvingConfig | alphabeta.AlphaBetaConfig | None = None,
 ) -> tuple[chess.Move, dict[str, Any]]:
     output = _forward_model(
         model=model,
@@ -480,7 +484,7 @@ def _select_model_move_stepwise(
     value_rerank_top_k: int,
     value_rerank_lambda: float,
     debug_topk: int = 0,
-    halving_config: HalvingConfig | None = None,
+    halving_config: HalvingConfig | alphabeta.AlphaBetaConfig | None = None,
 ) -> Generator[WorkRequest, Any, tuple[chess.Move, dict[str, Any]]]:
     """Scheduler-driven twin of `_select_model_move`: yields
     `WorkRequest("root_eval", batch)` for the root forward instead of
@@ -716,6 +720,9 @@ def _summary_to_payload(
         "average_full_moves_per_game": summary.avg_full_moves,
         "model_turns": summary.model_turns,
         "search_stats": dict(summary.search_stats),
+        "game_records": summary.game_records,
+        "search_reports": summary.search_reports,
+        "inference_stats": summary.inference_stats,
         "model_selection_seconds": summary.model_selection_seconds,
         "mean_model_selection_seconds": (
             summary.model_selection_seconds / summary.model_turns if summary.model_turns else 0.0
@@ -755,8 +762,8 @@ def _summary_to_payload(
             "seed": int(seed),
             "max_plies": int(max_plies),
             "model_move_policy": model_move_policy,
-            "value_rerank_top_k": int(value_rerank_top_k),
-            "value_rerank_lambda": float(value_rerank_lambda),
+            "value_rerank_top_k": ("not applicable" if model_move_policy in alphabeta.POLICIES else int(value_rerank_top_k)),
+            "value_rerank_lambda": ("not applicable" if model_move_policy in alphabeta.POLICIES else float(value_rerank_lambda)),
             "opening_random_plies": int(opening_random_plies),
             "search": search_knobs,
         },
@@ -936,7 +943,7 @@ def _play_game(
     debug_topk: int,
     stockfish_label: str,
     save_games_dir: Path | None,
-    halving_config: "HalvingConfig | None" = None,
+    halving_config: "HalvingConfig | alphabeta.AlphaBetaConfig | None" = None,
 ) -> Generator[WorkRequest, Any, EvalSummary]:
     """One game's coroutine core: the `BatchScheduler` game-factory contract.
 
@@ -1014,6 +1021,8 @@ def _play_game(
             summary.model_turns += 1
             summary.model_selection_seconds += time.perf_counter() - selection_start
             search.merge_search_stats(summary.search_stats, debug_info.get("search_stats", {}))
+            if "search_report" in debug_info:
+                summary.search_reports.append(dict(game_idx=game_idx, ply=plies, **debug_info["search_report"]))
             summary.legal_moves_total += int(debug_info["total_legal_moves"])
             summary.legal_moves_mapped_total += int(
                 debug_info["mapped_legal_moves"]
@@ -1100,6 +1109,8 @@ def _play_game(
         completed=completed,
         plies=plies,
     )
+    summary.game_records.append(dict(game_idx=game_idx, result=result, completed=completed,
+                                     model_color="white" if model_color else "black", plies=plies))
     return summary
 
 
@@ -1269,7 +1280,7 @@ def _build_worker_config(
     model_move_policy: str,
     value_rerank_top_k: int,
     value_rerank_lambda: float,
-    halving_config: "HalvingConfig | None",
+    halving_config: "HalvingConfig | alphabeta.AlphaBetaConfig | None",
     vocab_path: Path,
     vocab_include_unk: bool,
     board_state_config: dict[str, Any],
@@ -1566,7 +1577,7 @@ def _run_segment_actor_mode(
     vocab_path: Path,
     vocab_include_unk: bool,
     board_state_config: dict[str, Any],
-    halving_config: "HalvingConfig | None" = None,
+    halving_config: "HalvingConfig | alphabeta.AlphaBetaConfig | None" = None,
     fake_engine_factory: Callable[[], Any] | None = None,
 ) -> EvalSummary:
     """Run one segment's `games` games at `concurrent_games > 1` via actor
@@ -1685,7 +1696,23 @@ def _run_segment_actor_mode(
             conn.close()
 
     _join_and_verify_workers(processes)
+    summary.inference_stats.update(server.stats)
     return summary
+
+
+def _record_inference(executor, stats, kind):
+    """Count actual calls and merged rows where the existing executor runs."""
+    def measured(payloads):
+        rows = len(payloads) if kind == "root" else sum(len(batch) for _, batch in payloads)
+        started = time.perf_counter()
+        result = executor(payloads)
+        search.merge_search_stats(stats, {
+            f"{kind}_calls": 1, f"{kind}_requests": len(payloads),
+            f"{kind}_rows": rows, f"{kind}_batch_size_{rows}": 1,
+            f"{kind}_seconds": time.perf_counter() - started,
+        })
+        return result
+    return measured
 
 
 def _run_segment(
@@ -1711,7 +1738,7 @@ def _run_segment(
     stockfish_label: str,
     save_games_dir: Path | None,
     concurrent_games: int,
-    halving_config: "HalvingConfig | None" = None,
+    halving_config: "HalvingConfig | alphabeta.AlphaBetaConfig | None" = None,
 ) -> EvalSummary:
     """Run one segment's `games` games through `BatchScheduler`, for any
     `concurrent_games >= 1`.
@@ -1835,12 +1862,12 @@ def _run_segment(
             scheduler = BatchScheduler(
                 game_factory=_game_factory(),
                 executors={
-                    "root_eval": _make_root_eval_executor(
+                    "root_eval": _record_inference(_make_root_eval_executor(
                         model=model, device=device, dtype=dtype, stats=None
-                    ),
-                    "decode_wave": _make_decode_wave_executor(
+                    ), summary.inference_stats, "root"),
+                    "decode_wave": _record_inference(_make_decode_wave_executor(
                         model=model, device=device, dtype=dtype, stats=None
-                    ),
+                    ), summary.inference_stats, "decode"),
                     "sf_move": make_sf_move_executor(pool_threads=concurrent_games),
                 },
                 concurrent_games=concurrent_games,
@@ -1889,6 +1916,9 @@ def _accumulate_summary(target: EvalSummary, fragment: EvalSummary) -> None:
     target.turns_with_no_vocab_legal_move += fragment.turns_with_no_vocab_legal_move
     target.model_selection_seconds += fragment.model_selection_seconds
     search.merge_search_stats(target.search_stats, fragment.search_stats)
+    target.game_records.extend(fragment.game_records)
+    target.search_reports.extend(fragment.search_reports)
+    search.merge_search_stats(target.inference_stats, fragment.inference_stats)
 
 
 def _merge_summaries(summaries: list[EvalSummary]) -> EvalSummary:

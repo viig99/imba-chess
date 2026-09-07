@@ -339,3 +339,26 @@ def test_lmr_budget_and_legal_completed_pv(cache):
 def test_lmr_requires_pvs():
     with pytest.raises(ValueError, match='LMR requires PVS'):
         AlphaBetaConfig(lmr=True)
+
+
+@pytest.mark.parametrize('policy', ['value_search_alphabeta','value_search_pvs'])
+def test_shallow_favorite_refuted_only_after_completed_iteration(policy):
+    def value(path, board):
+        favorite = path[0] == 'a2a1'
+        return (-.9 if favorite else -.5) if len(path) == 1 else (-.8 if favorite else .5)
+    shallow, ev = run(Evaluator(value), max_depth=1, budget=10000, policy=policy)
+    assert shallow.pv[0] == 'a2a1'
+    interrupted, _ = run(Evaluator(value), max_depth=2, budget=len(ev.seen), policy=policy)
+    assert interrupted.completed_depth == 1 and interrupted.pv == shallow.pv
+    deep, _ = run(Evaluator(value), max_depth=2, budget=10000, policy=policy)
+    assert deep.completed_depth == 2 and deep.pv[0] != 'a2a1'
+
+
+def test_mate_scores_prefer_shorter_wins_and_later_losses():
+    from imba_chess.eval.alphabeta import _Search
+    ctx = _Search(Evaluator().extend, AlphaBetaConfig())
+    board = cozy_bridge.board_to_cozy(chess.Board(FEN))
+    short = ctx.node(board, [], None, 2, -1).terminal
+    long = ctx.node(board, [], None, 4, -1).terminal
+    assert -short > -long > 1
+    assert long > short and long < -1

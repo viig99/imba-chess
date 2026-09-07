@@ -262,6 +262,8 @@ def search_stepwise(*, extend, root_handle, board: chess.Board,
     report = SearchReport(None, terminal, 0, 0, [], 'terminal_position', ctx.stats)
     if terminal is not None:
         report.score = root.terminal
+        ctx.stats.update(max_completed_depth=0, max_attempted_depth=0,
+                         move_selection_seconds=time.perf_counter() - started)
         return report
     # Root KV/policy were already prefetched by the existing adapter.
     root.evaluation = PositionEval(0.0,
@@ -280,6 +282,7 @@ def search_stepwise(*, extend, root_handle, board: chess.Board,
             report.chosen_index, report.score = index, -child.terminal
             report.completed_depth = report.attempted_depth = 1
             report.pv = [legal_moves[index].uci()]
+            report.stop_reason = "terminal_position"
             break
     else:
         depths = range(1, config.max_depth + 1) if config.iterative_deepening else [config.max_depth]
