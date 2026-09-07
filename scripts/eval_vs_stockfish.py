@@ -46,6 +46,7 @@ from imba_chess.eval.position_evaluator import (
     _value_scalar_from_logits,
     load_hstu_checkpoint,
 )
+from imba_chess.eval import alphabeta
 from imba_chess.eval.search import (
     EvalRequest,
     HalvingConfig,
@@ -172,7 +173,7 @@ def _parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--model-move-policy",
-        choices=["greedy", "value_rerank", "value_search_d2", "value_search_halving"],
+        choices=["greedy", "value_rerank", "value_search_d2", "value_search_halving", *alphabeta.POLICIES],
         default=None,
         help="Model move selection on legal moves.",
     )
@@ -188,6 +189,7 @@ def _parse_args() -> argparse.Namespace:
         default=None,
         help="Weight for value_rerank score adjustment.",
     )
+    parser.add_argument("--search-iterative-deepening", action=argparse.BooleanOptionalAction, default=None)
     parser.add_argument("--search-budget", type=int, default=None)
     parser.add_argument("--search-top-m", type=int, default=None)
     parser.add_argument("--halving-rounds", type=int, default=None)
@@ -376,6 +378,17 @@ def _select_model_move(
             top_k=value_rerank_top_k,
             lam=value_rerank_lambda,
         )
+    elif policy in alphabeta.POLICIES:
+        if output.get("value_logits") is None:
+            raise RuntimeError(f"{policy} requires a checkpoint with value head enabled")
+        if not isinstance(halving_config, alphabeta.AlphaBetaConfig):
+            raise ValueError(f"{policy} requires AlphaBetaConfig")
+        report = alphabeta.select_value_search(
+            evaluator=evaluator, root_handle=None, board=board,
+            legal_moves=legal_moves_with_ids, legal_log_priors=legal_log_priors,
+            config=halving_config,
+        )
+        chosen_index = report.chosen_index
     elif policy == "value_search_halving":
         if output.get("value_logits") is None:
             raise RuntimeError(
@@ -411,6 +424,8 @@ def _select_model_move(
         debug["search_budget"] = int(halving_config.budget)
         debug["value_search_halving_candidates"] = halving_rows
         debug["search_stats"] = search.summarize_search_rows(halving_rows)
+    if policy in alphabeta.POLICIES:
+        debug.update(report.debug())
     if debug_topk > 0:
         k = min(int(debug_topk), mapped_legal)
         top_values, top_indices = torch.topk(legal_logits, k=k, largest=True)
@@ -543,6 +558,17 @@ def _select_model_move_stepwise(
             ),
             evaluator,
         )
+    elif policy in alphabeta.POLICIES:
+        if output.get("value_logits") is None:
+            raise RuntimeError(f"{policy} requires a checkpoint with value head enabled")
+        if not isinstance(halving_config, alphabeta.AlphaBetaConfig):
+            raise ValueError(f"{policy} requires AlphaBetaConfig")
+        report = yield from _drive_stepwise_as_decode_waves(alphabeta.search_stepwise(
+            extend=evaluator.extend, root_handle=None, board=board,
+            legal_moves=legal_moves_with_ids, legal_log_priors=legal_log_priors,
+            config=halving_config,
+        ), evaluator)
+        chosen_index = report.chosen_index
     elif policy == "value_search_halving":
         if output.get("value_logits") is None:
             raise RuntimeError(
@@ -581,6 +607,8 @@ def _select_model_move_stepwise(
         debug["search_budget"] = int(halving_config.budget)
         debug["value_search_halving_candidates"] = halving_rows
         debug["search_stats"] = search.summarize_search_rows(halving_rows)
+    if policy in alphabeta.POLICIES:
+        debug.update(report.debug())
     if debug_topk > 0:
         k = min(int(debug_topk), mapped_legal)
         top_values, top_indices = torch.topk(legal_logits, k=k, largest=True)
@@ -1598,7 +1626,7 @@ def _run_segment_actor_mode(
         # response's value_stm is then a documented 0.0 placeholder --
         # see ActorInferenceServer.__init__/_ensure_value_logits_placeholder).
         require_value_head=model_move_policy
-        in {"value_rerank", "value_search_d2", "value_search_halving"},
+        in {"value_rerank", "value_search_d2", "value_search_halving", *alphabeta.POLICIES},
     )
     game_indices_by_worker = _assign_games_round_robin(games, concurrent_games)
     engine_config = _worker_engine_config(
@@ -1945,6 +1973,10 @@ def main() -> None:
         if args.value_rerank_lambda is None
         else args.value_rerank_lambda
     )
+    args.search_iterative_deepening = (
+        eval_cfg.search_iterative_deepening if args.search_iterative_deepening is None
+        else args.search_iterative_deepening
+    )
     args.search_budget = int(
         eval_cfg.search_budget if args.search_budget is None else args.search_budget
     )
@@ -2032,6 +2064,7 @@ def main() -> None:
         "value_rerank",
         "value_search_d2",
         "value_search_halving",
+        *alphabeta.POLICIES,
     }:
         raise ValueError(
             "--model-move-policy must be one of: greedy, value_rerank, "
@@ -2047,6 +2080,8 @@ def main() -> None:
         raise ValueError("--search-refutation-top-r must be >= 1")
     if args.search_expand_top < 1:
         raise ValueError("--search-expand-top must be >= 1")
+    if args.model_move_policy in alphabeta.POLICIES and args.search_max_depth > 128:
+        raise ValueError("alpha-beta/PVS depth must be in [1, 128]")
     if args.search_max_depth < 1:
         raise ValueError("--search-max-depth must be >= 1")
     if args.search_quiescence_plies < 0:
@@ -2081,7 +2116,7 @@ def main() -> None:
         compile_model=bool(args.compile),
         require_value_head=(
             str(args.model_move_policy)
-            in {"value_rerank", "value_search_d2", "value_search_halving"}
+            in {"value_rerank", "value_search_d2", "value_search_halving", *alphabeta.POLICIES}
         ),
     )
     engine_limit = _build_engine_limit(args)
@@ -2145,6 +2180,12 @@ def main() -> None:
             tactical_coverage=bool(args.search_tactical_coverage),
             quiescence_plies=int(args.search_quiescence_plies),
         )
+        if args.model_move_policy in alphabeta.POLICIES:
+            halving_config = alphabeta.AlphaBetaConfig(
+                budget=args.search_budget, max_depth=args.search_max_depth,
+                iterative_deepening=args.search_iterative_deepening,
+                policy=args.model_move_policy,
+            )
         if actor_mode:
             segment_summary = _run_segment_actor_mode(
                 stockfish_path=args.stockfish_path,
@@ -2212,11 +2253,12 @@ def main() -> None:
             opening_random_plies=int(args.opening_random_plies),
             search_knobs={
                 "search_budget": int(args.search_budget),
-                "search_top_m": int(args.search_top_m),
-                "halving_rounds": int(args.halving_rounds),
-                "search_refutation_top_r": int(args.search_refutation_top_r),
-                "search_expand_top": int(args.search_expand_top),
+                "search_top_m": ("not applicable" if args.model_move_policy in alphabeta.POLICIES else int(args.search_top_m)),
+                "halving_rounds": ("not applicable" if args.model_move_policy in alphabeta.POLICIES else int(args.halving_rounds)),
+                "search_refutation_top_r": ("not applicable" if args.model_move_policy in alphabeta.POLICIES else int(args.search_refutation_top_r)),
+                "search_expand_top": ("not applicable" if args.model_move_policy in alphabeta.POLICIES else int(args.search_expand_top)),
                 "search_max_depth": int(args.search_max_depth),
+                "search_iterative_deepening": args.search_iterative_deepening,
                 "search_tactical_coverage": bool(args.search_tactical_coverage),
                 "search_quiescence_plies": int(args.search_quiescence_plies),
             },
@@ -2262,11 +2304,12 @@ def main() -> None:
         opening_random_plies=int(args.opening_random_plies),
         search_knobs={
             "search_budget": int(args.search_budget),
-            "search_top_m": int(args.search_top_m),
-            "halving_rounds": int(args.halving_rounds),
-            "search_refutation_top_r": int(args.search_refutation_top_r),
-            "search_expand_top": int(args.search_expand_top),
+            "search_top_m": ("not applicable" if args.model_move_policy in alphabeta.POLICIES else int(args.search_top_m)),
+            "halving_rounds": ("not applicable" if args.model_move_policy in alphabeta.POLICIES else int(args.halving_rounds)),
+            "search_refutation_top_r": ("not applicable" if args.model_move_policy in alphabeta.POLICIES else int(args.search_refutation_top_r)),
+            "search_expand_top": ("not applicable" if args.model_move_policy in alphabeta.POLICIES else int(args.search_expand_top)),
             "search_max_depth": int(args.search_max_depth),
+                "search_iterative_deepening": args.search_iterative_deepening,
             "search_tactical_coverage": bool(args.search_tactical_coverage),
             "search_quiescence_plies": int(args.search_quiescence_plies),
         },

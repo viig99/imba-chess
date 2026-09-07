@@ -42,7 +42,7 @@ from imba_chess.data.board_state import BoardStateEncoder
 from imba_chess.data.event_builder import BOS_TOKEN_ID, EVENT_TOKEN_ID, TARGET_IGNORE_INDEX
 from imba_chess.data.models import BoardTokenConfig
 from imba_chess.data.move_vocab import MoveVocab, load_or_create_static_move_vocab
-from imba_chess.eval import cozy_bridge, search
+from imba_chess.eval import alphabeta, cozy_bridge, search
 from imba_chess.eval.actor_protocol import (
     GameDone,
     RootEvalRequest,
@@ -637,7 +637,7 @@ def _select_model_move(
 
     if policy == "greedy":
         chosen_index = search.select_greedy(legal_log_priors)
-    elif policy in ("value_rerank", "value_search_d2", "value_search_halving"):
+    elif policy in ("value_rerank", "value_search_d2", "value_search_halving", *alphabeta.POLICIES):
         evaluator = _WaveEvaluator(
             conn=conn,
             worker_id=worker_id,
@@ -665,6 +665,15 @@ def _select_model_move(
                 top_k=value_rerank_top_k,
                 lam=value_rerank_lambda,
             )
+        elif policy in alphabeta.POLICIES:
+            if not isinstance(halving_config, alphabeta.AlphaBetaConfig):
+                raise ValueError(f"{policy} requires AlphaBetaConfig")
+            report = alphabeta.select_value_search(
+                evaluator=evaluator, root_handle=None, board=board,
+                legal_moves=legal_moves, legal_log_priors=legal_log_priors,
+                config=halving_config,
+            )
+            chosen_index = report.chosen_index
         else:
             if halving_config is None:
                 raise ValueError("policy=value_search_halving requires halving_config")
@@ -685,6 +694,8 @@ def _select_model_move(
     }
     if policy == "value_search_halving":
         debug_info["search_stats"] = search.summarize_search_rows(_rows)
+    if policy in alphabeta.POLICIES:
+        debug_info.update(report.debug())
     return legal_moves[chosen_index], debug_info
 
 
@@ -872,7 +883,7 @@ def run_eval_worker(conn, worker_config: dict) -> None:
     value_rerank_lambda = float(worker_config.get("value_rerank_lambda", 0.0))
     halving_config_dict = worker_config.get("halving_config")
     halving_config = (
-        search.HalvingConfig(**halving_config_dict) if halving_config_dict is not None else None
+        (alphabeta.AlphaBetaConfig if worker_config["model_move_policy"] in alphabeta.POLICIES else search.HalvingConfig)(**halving_config_dict) if halving_config_dict is not None else None
     )
 
     move_vocab = load_or_create_static_move_vocab(

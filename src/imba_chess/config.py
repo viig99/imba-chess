@@ -155,6 +155,7 @@ class EvalVsStockfishConfig:
     model_move_policy: str = "value_search_halving"
     value_rerank_top_k: int = 8
     value_rerank_lambda: float = 0.05
+    search_iterative_deepening: bool = True
     search_budget: int = 256
     search_top_m: int = 16
     halving_rounds: int = 0
