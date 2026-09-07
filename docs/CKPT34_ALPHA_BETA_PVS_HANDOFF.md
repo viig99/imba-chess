@@ -201,6 +201,12 @@ After restoring CUDA, run in a **new** directory:
 .venv/bin/python scripts/run_ckpt34_ab_pvs_campaign.py --checkpoint artifacts/checkpoints_v4/best_hr10_checkpoint_34_hr10=0.9677.pt --output artifacts/eval/ckpt34-ab-pvs-screen --run
 ```
 
+The prepared local campaign is in
+`artifacts/eval/ckpt34-ab-pvs-final-prepared-20260907`; its manifest and commands
+are also saved under `docs/validation/ckpt34-ab-pvs/prepared-*`. All 12 generated
+commands were checked against the evaluation argument parser. This is a preparation
+record: every match remains `not_run`, with CUDA recorded as the blocking prerequisite.
+
 The wrapper records checkpoint/Stockfish SHA256, source revision, source archive,
 working-tree patch/status, config snapshot/hash, Python/PyTorch/platform/GPU,
 exact commands, per-run logs, JSON results, exit codes, and completion status.
