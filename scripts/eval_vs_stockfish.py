@@ -189,6 +189,7 @@ def _parse_args() -> argparse.Namespace:
         default=None,
         help="Weight for value_rerank score adjustment.",
     )
+    parser.add_argument("--search-score-cache", choices=["off", "context"], default=None)
     parser.add_argument("--search-iterative-deepening", action=argparse.BooleanOptionalAction, default=None)
     parser.add_argument("--search-budget", type=int, default=None)
     parser.add_argument("--search-top-m", type=int, default=None)
@@ -1973,6 +1974,7 @@ def main() -> None:
         if args.value_rerank_lambda is None
         else args.value_rerank_lambda
     )
+    args.search_score_cache = eval_cfg.search_score_cache if args.search_score_cache is None else args.search_score_cache
     args.search_iterative_deepening = (
         eval_cfg.search_iterative_deepening if args.search_iterative_deepening is None
         else args.search_iterative_deepening
@@ -2070,6 +2072,10 @@ def main() -> None:
             "--model-move-policy must be one of: greedy, value_rerank, "
             "value_search_d2, value_search_halving"
         )
+    if args.search_score_cache not in {"off", "context"}:
+        raise ValueError("--search-score-cache must be off or context")
+    if args.search_score_cache != "off" and args.model_move_policy not in alphabeta.POLICIES:
+        raise ValueError("Context score cache requires alpha-beta or PVS")
     if args.search_budget < 1:
         raise ValueError("--search-budget must be >= 1")
     if args.search_top_m < 1:
@@ -2184,7 +2190,7 @@ def main() -> None:
             halving_config = alphabeta.AlphaBetaConfig(
                 budget=args.search_budget, max_depth=args.search_max_depth,
                 iterative_deepening=args.search_iterative_deepening,
-                policy=args.model_move_policy,
+                policy=args.model_move_policy, score_cache=args.search_score_cache,
             )
         if actor_mode:
             segment_summary = _run_segment_actor_mode(
@@ -2259,6 +2265,7 @@ def main() -> None:
                 "search_expand_top": ("not applicable" if args.model_move_policy in alphabeta.POLICIES else int(args.search_expand_top)),
                 "search_max_depth": int(args.search_max_depth),
                 "search_iterative_deepening": args.search_iterative_deepening,
+                "search_score_cache": args.search_score_cache,
                 "search_tactical_coverage": bool(args.search_tactical_coverage),
                 "search_quiescence_plies": int(args.search_quiescence_plies),
             },
@@ -2310,6 +2317,7 @@ def main() -> None:
             "search_expand_top": ("not applicable" if args.model_move_policy in alphabeta.POLICIES else int(args.search_expand_top)),
             "search_max_depth": int(args.search_max_depth),
                 "search_iterative_deepening": args.search_iterative_deepening,
+                "search_score_cache": args.search_score_cache,
             "search_tactical_coverage": bool(args.search_tactical_coverage),
             "search_quiescence_plies": int(args.search_quiescence_plies),
         },

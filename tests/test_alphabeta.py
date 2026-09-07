@@ -23,7 +23,7 @@ class Evaluator:
         rows = []
         for path, board in batch:
             assert path not in self.seen, 'duplicate neural evaluation'
-            assert len(path) == 1 or path[:-1] in self.seen, 'child decoded before parent'
+            assert len(path) <= 1 or path[:-1] in self.seen, 'child decoded before parent'
             self.seen.append(path)
             moves = list(board.generate_moves())
             ucis = [cozy_bridge.cozy_move_to_uci(board, m) for m in moves]
@@ -208,3 +208,75 @@ def test_pvs_budget_boundaries():
             assert report.score == completed[report.completed_depth].score
         else:
             assert report.score is None and not report.pv
+
+
+@pytest.mark.parametrize('policy', ['value_search_alphabeta','value_search_pvs'])
+@pytest.mark.parametrize('depth', range(1,5))
+def test_context_cache_equivalence(policy, depth):
+    ref, _ = run(max_depth=depth, budget=100000, policy=policy)
+    cached, _ = run(max_depth=depth, budget=100000, policy=policy, score_cache='context')
+    assert cached.score == ref.score
+    assert cached.completed_depth == depth
+
+
+def test_cache_bounds_depth_profile_and_eviction():
+    from imba_chess.eval.alphabeta import _ScoreCache, _Entry
+    cache = _ScoreCache(capacity=2)
+    key = (1, 2, ('value_search_pvs',))
+    entry = _Entry(.5, 'lower', 0, ('a2a3',))
+    cache.put(key, entry)
+    assert cache.get((1, 3, key[2])) is None
+    assert cache.get((2, 2, key[2])) is None
+    assert cache.get((1, 2, ('other',))) is None
+    cache.put('second', entry)
+    assert cache.get(key) == entry
+    cache.put('third', entry)
+    assert cache.get('second') is None
+
+
+def test_direct_fail_low_high_and_exact_cache():
+    from imba_chess.eval.alphabeta import _Search
+    from imba_chess.eval.search import _drive
+    import math
+    for alpha, beta, expected in [(-2, 2, 'exact'), (-2, -1.5, 'lower'), (1.5, 2, 'upper')]:
+        evaluator = Evaluator()
+        ctx = _Search(evaluator.extend, AlphaBetaConfig(score_cache='context'))
+        board = chess.Board(FEN)
+        root = ctx.node(cozy_bridge.board_to_cozy(board), [], (), 0, None)
+        # evaluate root outside counted child rows for this internal-window test
+        root.evaluation = evaluator.evaluate([((), root.board)])[0]
+        score, pv = _drive(ctx.visit(root, 2, alpha, beta), evaluator)
+        entry = ctx.cache.get((root.identity, 2, ctx.profile))
+        assert entry.bound == expected
+        before = len(evaluator.seen)
+        assert _drive(ctx.visit(root, 2, alpha, beta), evaluator) == (score, pv)
+        assert ctx.stats['score_cache_cutoffs'] > 0
+        assert len(evaluator.seen) == before
+
+
+def test_same_board_different_paths_never_share_scores():
+    from imba_chess.eval.alphabeta import _Search
+    from imba_chess.eval.search import _drive
+    evaluator = Evaluator()
+    ctx = _Search(evaluator.extend, AlphaBetaConfig(score_cache='context'))
+    board = cozy_bridge.board_to_cozy(chess.Board(FEN))
+    a = ctx.node(board, [], ('path-a',), 1, None)
+    b = ctx.node(board, [], ('path-b',), 1, None)
+    av = _drive(ctx.visit(a, 1, -math.inf, math.inf), evaluator)
+    bv = _drive(ctx.visit(b, 1, -math.inf, math.inf), evaluator)
+    assert a.identity != b.identity
+    assert ctx.stats['board_hash_repeats'] > 0
+    assert ctx.stats['score_cache_hits'] == 0
+    assert av != bv
+
+
+def test_interrupted_root_not_cached():
+    from imba_chess.eval.alphabeta import _Search, _BudgetExhausted
+    from imba_chess.eval.search import _drive
+    evaluator = Evaluator()
+    ctx = _Search(evaluator.extend, AlphaBetaConfig(budget=8, score_cache='context'))
+    root = ctx.node(cozy_bridge.board_to_cozy(chess.Board(FEN)), [], (), 0, None)
+    root.evaluation = evaluator.evaluate([((), root.board)])[0]
+    with pytest.raises(_BudgetExhausted):
+        _drive(ctx.visit(root, 4, -math.inf, math.inf), evaluator)
+    assert ctx.cache.get((root.identity, 4, ctx.profile)) is None

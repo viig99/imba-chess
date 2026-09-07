@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import math
 import time
+from collections import OrderedDict
 from dataclasses import asdict, dataclass, field
 from typing import Any
 
@@ -26,8 +27,11 @@ class AlphaBetaConfig:
     max_depth: int = 9
     iterative_deepening: bool = True
     policy: str = "value_search_alphabeta"
+    score_cache: str = "off"
 
     def __post_init__(self):
+        if self.score_cache not in {"off", "context"}:
+            raise ValueError("score_cache must be off or context")
         if self.budget < 0:
             raise ValueError("search budget must be nonnegative")
         if not 1 <= self.max_depth <= 128:
@@ -86,6 +90,33 @@ def _validate(board, evaluation):
         raise ValueError(f"Non-finite policy at {board.fen()}")
 
 
+@dataclass(frozen=True)
+class _Entry:
+    score: float
+    bound: str
+    best: int | None
+    pv: tuple[str, ...]
+
+
+class _ScoreCache:
+    """Exact continuation identity, exact depth, exact search profile only."""
+    def __init__(self, capacity=65536):
+        self.capacity = capacity
+        self.entries = OrderedDict()
+
+    def get(self, key):
+        entry = self.entries.get(key)
+        if entry is not None:
+            self.entries.move_to_end(key)
+        return entry
+
+    def put(self, key, entry):
+        self.entries[key] = entry
+        self.entries.move_to_end(key)
+        if len(self.entries) > self.capacity:
+            self.entries.popitem(last=False)
+
+
 class _Search:
     def __init__(self, extend, config):
         self.extend = extend
@@ -94,6 +125,9 @@ class _Search:
                           recursive_visits=0, alpha_beta_cutoffs=0,
                           inference_requests=0, fallback_count=0, board_hash_repeats=0,
                           pvs_scout_calls=0, pvs_full_window_researches=0)
+        self.cache = _ScoreCache()
+        self.profile = (config.policy,)
+        self.stats.update(score_cache_probes=0, score_cache_hits=0, score_cache_cutoffs=0)
         self.nodes = []
         self.hashes = set()
         self.pending_best = {}
@@ -140,11 +174,25 @@ class _Search:
         self.stats[key] = self.stats.get(key, 0) + 1
         if node.terminal is not None:
             return node.terminal, []
+        original_alpha, original_beta = alpha, beta
+        cache_key = (node.identity, depth, self.profile)
+        entry = None
+        if self.config.score_cache == "context":
+            self.stats['score_cache_probes'] += 1
+            entry = self.cache.get(cache_key)
+            if entry is not None:
+                self.stats['score_cache_hits'] += 1
+                if (entry.bound == 'exact'
+                    or (entry.bound == 'lower' and entry.score >= beta)
+                    or (entry.bound == 'upper' and entry.score <= alpha)):
+                    self.stats['score_cache_cutoffs'] += 1
+                    return entry.score, list(entry.pv)
         ev = yield from self.evaluate(node)
         if depth == 0:
             return ev.value_stm, []
         order = sorted(range(len(ev.legal_ucis)), key=lambda i: (
-            i != node.best, -ev.legal_log_priors[i], ev.legal_ucis[i]))
+            i != (node.best if node.best is not None else entry.best if entry else None),
+            -ev.legal_log_priors[i], ev.legal_ucis[i]))
         best_score, best_pv, best_index = -math.inf, [], None
         for move_number, index in enumerate(order):
             child = self.child(node, index)
@@ -167,6 +215,10 @@ class _Search:
                 self.stats['alpha_beta_cutoffs'] += 1
                 break
         self.pending_best[node.identity] = best_index
+        if self.config.score_cache == "context":
+            bound = ('upper' if best_score <= original_alpha else
+                     'lower' if best_score >= original_beta else 'exact')
+            self.cache.put(cache_key, _Entry(best_score, bound, best_index, tuple(best_pv)))
         return best_score, best_pv
 
 
