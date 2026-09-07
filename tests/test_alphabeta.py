@@ -245,11 +245,11 @@ def test_direct_fail_low_high_and_exact_cache():
         root = ctx.node(cozy_bridge.board_to_cozy(board), [], (), 0, None)
         # evaluate root outside counted child rows for this internal-window test
         root.evaluation = evaluator.evaluate([((), root.board)])[0]
-        score, pv = _drive(ctx.visit(root, 2, alpha, beta), evaluator)
+        score, pv, selective = _drive(ctx.visit(root, 2, alpha, beta), evaluator)
         entry = ctx.cache.get((root.identity, 2, ctx.profile))
         assert entry.bound == expected
         before = len(evaluator.seen)
-        assert _drive(ctx.visit(root, 2, alpha, beta), evaluator) == (score, pv)
+        assert _drive(ctx.visit(root, 2, alpha, beta), evaluator) == (score, pv, selective)
         assert ctx.stats['score_cache_cutoffs'] > 0
         assert len(evaluator.seen) == before
 
@@ -280,3 +280,62 @@ def test_interrupted_root_not_cached():
     with pytest.raises(_BudgetExhausted):
         _drive(ctx.visit(root, 4, -math.inf, math.inf), evaluator)
     assert ctx.cache.get((root.identity, 4, ctx.profile)) is None
+
+
+def test_lmr_eligibility_exclusions():
+    from imba_chess.eval.alphabeta import _Search
+    ctx = _Search(Evaluator().extend, AlphaBetaConfig(policy='value_search_pvs', lmr=True))
+    evaluator = Evaluator()
+    node = ctx.node(cozy_bridge.board_to_cozy(chess.Board()), [], ('root',), 1, None)
+    node.evaluation = evaluator.evaluate([(node.handle, node.board)])[0]
+    i = node.evaluation.legal_ucis.index('a2a3')
+    assert ctx.lmr_eligible(node, 3, 3, i, False)
+    assert not ctx.lmr_eligible(node, 2, 3, i, False)
+    assert not ctx.lmr_eligible(node, 3, 2, i, False)
+    assert not ctx.lmr_eligible(node, 3, 3, i, True)
+    node.ply = 0
+    assert not ctx.lmr_eligible(node, 3, 3, i, False)
+    for fen in ['7k/P7/8/8/8/8/8/K7 w - - 0 1',
+                '7k/8/8/8/8/8/r7/K7 w - - 0 1',
+                '7k/8/8/8/8/8/pR6/K7 w - - 0 1']:
+        node = ctx.node(cozy_bridge.board_to_cozy(chess.Board(fen)), [], (fen,), 1, None)
+        node.evaluation = evaluator.evaluate([(node.handle, node.board)])[0]
+        for i, move in enumerate(node.evaluation.legal_moves):
+            if node.board.checkers() or move.promotion or cozy_bridge.is_capture_cozy(node.board, move) or cozy_bridge.gives_check(node.board, move):
+                assert not ctx.lmr_eligible(node, 3, 3, i, False)
+
+
+def test_lmr_selective_entries_never_cut_off():
+    from imba_chess.eval.alphabeta import _Search, _Entry
+    from imba_chess.eval.search import _drive
+    ev = Evaluator(lambda *_: 0.0)
+    ctx = _Search(ev.extend, AlphaBetaConfig(policy='value_search_pvs', lmr=True, score_cache='context'))
+    node = ctx.node(cozy_bridge.board_to_cozy(chess.Board(FEN)), [], ('root',), 1, None)
+    result = _drive(ctx.visit(node, 3, 0.1, math.nextafter(.1, math.inf), False), ev)
+    assert result[2] and ctx.stats['lmr_attempts'] > 0
+    key = (node.identity, 3, ctx.profile+(False,))
+    assert ctx.cache.get(key).bound == 'selective'
+    # Even a fabricated huge selective score may only guide move ordering.
+    ctx.cache.put(key, _Entry(9999, 'selective', 0, ()))
+    repeated = _drive(ctx.visit(node, 3, .1, math.nextafter(.1, math.inf), False), ev)
+    assert repeated[0] == result[0] and repeated[2]
+
+
+def test_lmr_mandatory_verification():
+    report, _ = run(max_depth=5, budget=100000, policy='value_search_pvs', lmr=True)
+    assert report.stats['lmr_attempts'] > 0
+    assert report.stats['lmr_full_depth_verifications'] > 0
+    assert report.stats['selective_results'] > 0
+
+
+@pytest.mark.parametrize('cache', ['off', 'context'])
+def test_lmr_budget_and_legal_completed_pv(cache):
+    report, ev = run(max_depth=5, budget=2048, policy='value_search_pvs', lmr=True, score_cache=cache)
+    assert len(ev.seen) <= 2048
+    assert report.completed_depth >= 1
+    assert report.pv
+
+
+def test_lmr_requires_pvs():
+    with pytest.raises(ValueError, match='LMR requires PVS'):
+        AlphaBetaConfig(lmr=True)

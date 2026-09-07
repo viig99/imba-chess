@@ -28,8 +28,11 @@ class AlphaBetaConfig:
     iterative_deepening: bool = True
     policy: str = "value_search_alphabeta"
     score_cache: str = "off"
+    lmr: bool = False
 
     def __post_init__(self):
+        if self.lmr and self.policy != "value_search_pvs":
+            raise ValueError("LMR requires PVS")
         if self.score_cache not in {"off", "context"}:
             raise ValueError("score_cache must be off or context")
         if self.budget < 0:
@@ -49,6 +52,7 @@ class SearchReport:
     pv: list[str]
     stop_reason: str
     stats: dict[str, int | float]
+    selective: bool = False
 
     def debug(self):
         return {"search_report": asdict(self), "search_stats": self.stats}
@@ -126,8 +130,9 @@ class _Search:
                           inference_requests=0, fallback_count=0, board_hash_repeats=0,
                           pvs_scout_calls=0, pvs_full_window_researches=0)
         self.cache = _ScoreCache()
-        self.profile = (config.policy,)
+        self.profile = (config.policy, config.lmr)
         self.stats.update(score_cache_probes=0, score_cache_hits=0, score_cache_cutoffs=0)
+        self.stats.update(lmr_attempts=0, lmr_full_depth_verifications=0, selective_results=0)
         self.nodes = []
         self.hashes = set()
         self.pending_best = {}
@@ -168,14 +173,23 @@ class _Search:
         node.evaluation = rows[0]
         return rows[0]
 
-    def visit(self, node, depth, alpha, beta):
+    def lmr_eligible(self, node, depth, move_number, index, pv_node):
+        move = node.evaluation.legal_moves[index]
+        return (self.config.lmr and not pv_node and node.ply > 0
+                and not node.board.checkers() and depth >= 3 and move_number >= 3
+                and move.promotion is None
+                and not cozy_bridge.is_capture_cozy(node.board, move)
+                and not cozy_bridge.gives_check(node.board, move))
+
+    def visit(self, node, depth, alpha, beta, pv_node=True):
         self.stats['recursive_visits'] += 1
         key = f'visits_depth_{depth}'
         self.stats[key] = self.stats.get(key, 0) + 1
         if node.terminal is not None:
-            return node.terminal, []
+            return node.terminal, [], False
         original_alpha, original_beta = alpha, beta
-        cache_key = (node.identity, depth, self.profile)
+        profile = self.profile + ((pv_node,) if self.config.lmr else ())
+        cache_key = (node.identity, depth, profile)
         entry = None
         if self.config.score_cache == "context":
             self.stats['score_cache_probes'] += 1
@@ -186,28 +200,41 @@ class _Search:
                     or (entry.bound == 'lower' and entry.score >= beta)
                     or (entry.bound == 'upper' and entry.score <= alpha)):
                     self.stats['score_cache_cutoffs'] += 1
-                    return entry.score, list(entry.pv)
+                    return entry.score, list(entry.pv), False
         ev = yield from self.evaluate(node)
         if depth == 0:
-            return ev.value_stm, []
+            return ev.value_stm, [], False
         order = sorted(range(len(ev.legal_ucis)), key=lambda i: (
             i != (node.best if node.best is not None else entry.best if entry else None),
             -ev.legal_log_priors[i], ev.legal_ucis[i]))
         best_score, best_pv, best_index = -math.inf, [], None
+        selective = False
         for move_number, index in enumerate(order):
             child = self.child(node, index)
             if self.config.policy == "value_search_pvs" and move_number > 0:
                 self.stats['pvs_scout_calls'] += 1
-                value, pv = yield from self.visit(
-                    child, depth - 1, -math.nextafter(alpha, math.inf), -alpha)
+                reduced = self.lmr_eligible(node, depth, move_number, index, pv_node)
+                if reduced:
+                    self.stats['lmr_attempts'] += 1
+                value, pv, child_selective = yield from self.visit(
+                    child, depth - 2 if reduced else depth - 1,
+                    -math.nextafter(alpha, math.inf), -alpha, False)
                 score = -value
+                if reduced and score > alpha:
+                    self.stats['lmr_full_depth_verifications'] += 1
+                    value, pv, child_selective = yield from self.visit(
+                        child, depth - 1, -math.nextafter(alpha, math.inf), -alpha, False)
+                    score = -value
+                elif reduced:
+                    child_selective = True
                 if alpha < score < beta:
                     self.stats['pvs_full_window_researches'] += 1
-                    value, pv = yield from self.visit(child, depth - 1, -beta, -alpha)
+                    value, pv, child_selective = yield from self.visit(child, depth - 1, -beta, -alpha, pv_node)
                     score = -value
             else:
-                value, pv = yield from self.visit(child, depth - 1, -beta, -alpha)
+                value, pv, child_selective = yield from self.visit(child, depth - 1, -beta, -alpha, pv_node)
                 score = -value
+            selective = selective or child_selective
             if score > best_score:
                 best_score, best_pv, best_index = score, [ev.legal_ucis[index]] + pv, index
             alpha = max(alpha, score)
@@ -215,11 +242,13 @@ class _Search:
                 self.stats['alpha_beta_cutoffs'] += 1
                 break
         self.pending_best[node.identity] = best_index
+        if selective:
+            self.stats["selective_results"] += 1
         if self.config.score_cache == "context":
             bound = ('upper' if best_score <= original_alpha else
                      'lower' if best_score >= original_beta else 'exact')
-            self.cache.put(cache_key, _Entry(best_score, bound, best_index, tuple(best_pv)))
-        return best_score, best_pv
+            self.cache.put(cache_key, _Entry(best_score, "selective" if selective else bound, best_index, tuple(best_pv)))
+        return best_score, best_pv, selective
 
 
 def search_stepwise(*, extend, root_handle, board: chess.Board,
@@ -258,12 +287,13 @@ def search_stepwise(*, extend, root_handle, board: chess.Board,
             report.attempted_depth = depth
             ctx.pending_best.clear()
             try:
-                score, pv = yield from ctx.visit(root, depth, -math.inf, math.inf)
+                score, pv, selective = yield from ctx.visit(root, depth, -math.inf, math.inf)
             except _BudgetExhausted:
                 report.stop_reason = 'evaluation_budget' if report.completed_depth else 'no_completed_iteration_fallback'
                 ctx.stats['fallback_count'] = int(not report.completed_depth)
                 break
             report.score, report.pv, report.completed_depth = score, pv, depth
+            report.selective = selective
             report.chosen_index = root.evaluation.legal_ucis.index(pv[0])
             for identity, best in ctx.pending_best.items():
                 ctx.nodes[identity].best = best

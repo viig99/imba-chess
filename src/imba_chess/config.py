@@ -157,6 +157,7 @@ class EvalVsStockfishConfig:
     value_rerank_lambda: float = 0.05
     search_iterative_deepening: bool = True
     search_score_cache: str = "off"
+    search_lmr: bool = False
     search_budget: int = 256
     search_top_m: int = 16
     halving_rounds: int = 0
