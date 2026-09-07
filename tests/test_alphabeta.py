@@ -171,3 +171,40 @@ def test_draw_claim_and_repetition():
     assert report.score == 0 and not ev.seen
     report, ev = run(board=chess.Board('8/7k/7p/8/8/P7/K7/8 w - - 99 60'))
     assert report.score == 0 and not ev.seen
+
+
+@pytest.mark.parametrize('depth', range(1,5))
+@pytest.mark.parametrize('ordering', ['good','poor','tied'])
+def test_pvs_agrees_with_alphabeta(depth, ordering):
+    ab, _ = run(Evaluator(ordering=ordering), max_depth=depth, budget=100000)
+    pvs, _ = run(Evaluator(ordering=ordering), max_depth=depth, budget=100000, policy='value_search_pvs')
+    assert (ab.score, ab.completed_depth) == (pvs.score, pvs.completed_depth)
+    assert pvs.stats['pvs_scout_calls'] > 0
+
+
+@pytest.mark.parametrize('value', [0.0, -0.5, math.nextafter(0.0, math.inf), math.nextafter(-0.5, math.inf)])
+def test_float_scouts(value):
+    # Two adjacent representable scores must not be rounded to an integer window.
+    fn = lambda path, board: value if path[-1] == 'a2a1' else math.nextafter(value, -math.inf)
+    ab, _ = run(Evaluator(fn), max_depth=3, budget=100000)
+    pvs, _ = run(Evaluator(fn), max_depth=3, budget=100000, policy='value_search_pvs')
+    assert ab.score == pvs.score
+
+
+def test_pvs_research_reuses_evaluations():
+    report, evaluator = run(max_depth=4, budget=100000, policy='value_search_pvs')
+    assert report.stats['pvs_full_window_researches'] > 0
+    assert report.stats['raw_eval_cache_hits'] > 0
+    assert report.stats['new_neural_evaluations'] == len(evaluator.seen)
+
+
+def test_pvs_budget_boundaries():
+    full, ev = run(max_depth=3, budget=100000, policy='value_search_pvs')
+    completed = {d: run(max_depth=d, budget=100000, policy='value_search_pvs')[0] for d in range(1,4)}
+    for budget in range(len(ev.seen)+1):
+        report, evaluator = run(max_depth=3, budget=budget, policy='value_search_pvs')
+        assert len(evaluator.seen) <= budget
+        if report.completed_depth:
+            assert report.score == completed[report.completed_depth].score
+        else:
+            assert report.score is None and not report.pv

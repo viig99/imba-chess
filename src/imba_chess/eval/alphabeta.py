@@ -16,7 +16,7 @@ import imba_chess_native as cc
 from imba_chess.eval import cozy_bridge
 from imba_chess.eval.search import EvalRequest, PositionEval, _drive, _root_hash_seed
 
-POLICIES = {"value_search_alphabeta"}
+POLICIES = {"value_search_alphabeta", "value_search_pvs"}
 MATE = 10000.0
 
 
@@ -92,7 +92,8 @@ class _Search:
         self.config = config
         self.stats = dict(new_neural_evaluations=0, raw_eval_cache_hits=0,
                           recursive_visits=0, alpha_beta_cutoffs=0,
-                          inference_requests=0, fallback_count=0, board_hash_repeats=0)
+                          inference_requests=0, fallback_count=0, board_hash_repeats=0,
+                          pvs_scout_calls=0, pvs_full_window_researches=0)
         self.nodes = []
         self.hashes = set()
         self.pending_best = {}
@@ -145,10 +146,20 @@ class _Search:
         order = sorted(range(len(ev.legal_ucis)), key=lambda i: (
             i != node.best, -ev.legal_log_priors[i], ev.legal_ucis[i]))
         best_score, best_pv, best_index = -math.inf, [], None
-        for index in order:
+        for move_number, index in enumerate(order):
             child = self.child(node, index)
-            value, pv = yield from self.visit(child, depth - 1, -beta, -alpha)
-            score = -value
+            if self.config.policy == "value_search_pvs" and move_number > 0:
+                self.stats['pvs_scout_calls'] += 1
+                value, pv = yield from self.visit(
+                    child, depth - 1, -math.nextafter(alpha, math.inf), -alpha)
+                score = -value
+                if alpha < score < beta:
+                    self.stats['pvs_full_window_researches'] += 1
+                    value, pv = yield from self.visit(child, depth - 1, -beta, -alpha)
+                    score = -value
+            else:
+                value, pv = yield from self.visit(child, depth - 1, -beta, -alpha)
+                score = -value
             if score > best_score:
                 best_score, best_pv, best_index = score, [ev.legal_ucis[index]] + pv, index
             alpha = max(alpha, score)
