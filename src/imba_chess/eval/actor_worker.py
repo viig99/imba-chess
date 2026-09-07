@@ -28,6 +28,7 @@ merely by running those packages' `__init__`.)
 from __future__ import annotations
 
 import itertools
+import math
 import random
 import signal
 from dataclasses import asdict, dataclass, field
@@ -629,13 +630,15 @@ def _select_model_move(
         )
     history.server_prefix_len = new_server_prefix_len
 
+    if policy in alphabeta.POLICIES and not math.isfinite(response.value_stm):
+        raise ValueError(f"Non-finite root value at {board.fen()}")
     total_legal_moves = len(list(board.legal_moves))
     legal_log_priors = _log_softmax_f32(list(response.legal_logits))
     mapped_legal_moves = len(legal_moves)
     if mapped_legal_moves == 0:
         raise RuntimeError(
             f"actor worker {worker_id}: no legal moves mapped to vocab ids for "
-            f"current board (turn={turn_id}, total_legal={total_legal_moves})."
+            f"current board {board.fen()} (turn={turn_id}, total_legal={total_legal_moves})."
         )
 
     if policy == "greedy":

@@ -309,7 +309,7 @@ def _project_legal_logits(
     if not legal_move_ids:
         raise RuntimeError(
             "No legal moves mapped to vocab ids for current board "
-            f"(total legal={total_legal})."
+            f"{board.fen()} (total legal={total_legal})."
         )
     # Canonical order: sort by UCI string so python-chess and cozy movegen
     # (Stage 3) produce identical move lists. Gumbel draws and prior-tie

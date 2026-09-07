@@ -14,7 +14,8 @@ training code, or rollout policy selectors were changed by this work.
 
 Gate logs are in [validation/ckpt34-ab-pvs](validation/ckpt34-ab-pvs).
 Final validation recorded 1,001 passing regression tests, 21 integration tests,
-68 core tests, and 108 core/shared-adapter regression tests (these sets overlap).
+68 core tests, 108 core/shared-adapter regression tests, and 80 final
+root-output/integration regression tests (these sets overlap).
 Later integration/diagnostic tests exercise all variants together. These are CPU
 correctness gates, **not chess-strength screens**. Screens have not run: `nvidia-smi` cannot communicate with the driver and
 PyTorch reports `cuda_available=False`. The exact ckpt34 was found in

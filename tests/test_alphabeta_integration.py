@@ -128,3 +128,17 @@ def test_real_actor_server_cleanup_and_reports(policy):
     assert summary.inference_stats['wave_rows'] == summary.search_stats['new_neural_evaluations']
     assert any(k.startswith('wave_batch_size_') for k in summary.inference_stats)
     assert multiprocessing.active_children() == []
+
+
+@pytest.mark.parametrize('policy', sorted(POLICIES))
+def test_nonfinite_root_value_is_rejected(monkeypatch, policy):
+    module = _load_eval_script_module()
+    vocab = MoveVocab.build_static()
+    monkeypatch.setattr(module, '_forward_model', lambda **kw: dict(
+        logits=torch.zeros(1, len(vocab)), value_logits=torch.full((1, 3), float('nan')),
+        kv_caches=[]))
+    with pytest.raises(ValueError, match='Non-finite root value'):
+        module._select_model_move(model=None, batch={'total_tokens': 1}, board=chess.Board(),
+            move_vocab=vocab, board_state_encoder=BoardStateEncoder(), device=torch.device('cpu'),
+            dtype=torch.float32, policy=policy, value_rerank_top_k=1, value_rerank_lambda=.05,
+            halving_config=AlphaBetaConfig(policy=policy))

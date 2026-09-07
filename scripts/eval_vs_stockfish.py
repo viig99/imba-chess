@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import multiprocessing
 import os
 import random
@@ -387,6 +388,8 @@ def _select_model_move(
     elif policy in alphabeta.POLICIES:
         if output.get("value_logits") is None:
             raise RuntimeError(f"{policy} requires a checkpoint with value head enabled")
+        if not math.isfinite(_value_scalar_from_logits(output["value_logits"][-1])):
+            raise ValueError(f"Non-finite root value at {board.fen()}")
         if not isinstance(halving_config, alphabeta.AlphaBetaConfig):
             raise ValueError(f"{policy} requires AlphaBetaConfig")
         report = alphabeta.select_value_search(
@@ -567,6 +570,8 @@ def _select_model_move_stepwise(
     elif policy in alphabeta.POLICIES:
         if output.get("value_logits") is None:
             raise RuntimeError(f"{policy} requires a checkpoint with value head enabled")
+        if not math.isfinite(_value_scalar_from_logits(output["value_logits"][-1])):
+            raise ValueError(f"Non-finite root value at {board.fen()}")
         if not isinstance(halving_config, alphabeta.AlphaBetaConfig):
             raise ValueError(f"{policy} requires AlphaBetaConfig")
         report = yield from _drive_stepwise_as_decode_waves(alphabeta.search_stepwise(
