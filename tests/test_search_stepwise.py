@@ -98,7 +98,7 @@ def test_budget_starvation_falls_back_to_highest_prior_arm(monkeypatch, picks):
     `arms` is built from `picks` = `order[:top_m]`. With
     gumbel_root_sampling=False `order` is _prior_order, so arms[0] genuinely
     is the highest-prior candidate. With gumbel_root_sampling=True (the
-    DEFAULT in scripts/generate_search_rollouts.py) `order` is a Gumbel-Top-k
+    former offline sampling setting) `order` is a Gumbel-Top-k
     permutation, so arms[0] is an arbitrary draw and the fallback silently
     returned a random move while claiming to return the best-prior one.
 

@@ -46,7 +46,7 @@ from imba_chess.data.move_vocab import load_or_create_static_move_vocab
 from imba_chess.eval.position_evaluator import _SequenceHistory, load_hstu_checkpoint
 from imba_chess.eval.search import HalvingConfig
 
-DEFAULT_CALIBRATION_CONFIG_PATH = Path("config/imba_chess_exit_full.toml")
+DEFAULT_CALIBRATION_CONFIG_PATH = Path("config/imba_chess_v4.toml")
 
 
 def _load_eval_vs_stockfish_module():

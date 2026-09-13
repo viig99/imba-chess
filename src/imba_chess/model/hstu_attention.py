@@ -539,7 +539,7 @@ class SequentialTransductionUnitJagged(torch.nn.Module):
         device->host sync G*num_layers times per decode step. The caller
         already has these lengths as Python ints before any tensor is built
         (see _DecodeRequest.prefix_len / _merge_decode_requests in
-        scripts/generate_search_rollouts.py), so no tensor round-trip -- and
+        imba_chess.eval.merged_executors), so no tensor round-trip -- and
         no sync -- is needed to get them here. group_index: [B] row -> game
         index g. suffix_k/v/positions/mask are unchanged from
         forward_decode -- already per-row.

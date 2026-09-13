@@ -1,10 +1,24 @@
 # Maintainability review — 2026-09-13
 
-Reviewed after implementation commit `d35a7096b278df88da58a30d82709a656ff346d4` was pushed to `origin/main`. This review proposes decisions; it removes no additional code, configs or historical evidence.
+Reviewed after implementation commit `d35a7096b278df88da58a30d82709a656ff346d4` was pushed to `origin/main`. The initial review proposed decisions. The approved cleanup is recorded below; the remaining evaluator refactor is deferred.
 
 The strongest next cleanup is the stale experiment tooling and old implementation plans. Most large runtime modules still serve either current self-play, supervised training, or the established halving/Stockfish comparison. Removing them based only on size would remove useful capabilities.
 
 Method: tracked-file inventory, source/CLI inspection, import and symbol references across `src`, `scripts`, `tests`, config existence checks, and comparison with documented current workflows. I did not run old launchers: several can start/stop jobs or write experiments. “No current consumer” refers to checked-in code; external scripts and manual use may exist. Counts include comments and blank lines and describe scope, not promised deletions.
+
+## Approved cleanup and restart preparation — 2026-09-13
+
+Removed the 13 stale launchers/probes, the permanently retired offline halving generator/schema/exports and direct tests, and its `label_gate_diff.py` companion. Preserved the shared executor's device-placement regression independently. Retired 24 old implementation plans/specs to immutable Git links in [the experiment history](EXPERIMENT_HISTORY.md); shortened README, roadmap and readiness to current behavior and linked the full measurement chronology. The standalone LR-result summarizer and useful native microbenchmarks remain.
+
+**Stockfish evaluation and model-pair matches are both retained.** `match_two_checkpoints.py` is model A versus B, not Stockfish. Comparison of executable ASTs before/after cleanup confirms both that script and `eval_vs_stockfish.py` changed only comments/docstrings. Potential refactoring targets are the duplicated synchronous/stepwise legal-prior setup, policy dispatch/value-head guards and debug formatting. Keep their different execution/worker cleanup paths and validate shared behavior separately; this refactor is deferred until after the overnight run.
+
+All eight config files remain byte-identical. [The config guide](CONFIG_GUIDE.md) distinguishes current recipes from checkpoint/resume compatibility. Fixed the calibration utility's missing default config to v4 and the corpus-materialization example. A logged `--concurrent-games` override lets the old pilot resume with 24 collection slots without bypassing config/learning-state validation; optimizer, replay, actor and seed identity are retained. The supervisor forwards and records that override. Existing evaluation concurrency is unchanged.
+
+Validation: **2,267 default CPU tests passed**, with 17 extended cases deselected, in **20.84 seconds**. This includes real Stockfish actor lifecycle checks (with test engines), collection resume across differing slot counts, morning handoff/resume and the retained device-placement regression. Current documentation links resolve and all eight config hashes match. No decoder arithmetic was modified in this cleanup.
+
+**3070 Ti training probe:** actual saved replay, actor-000002 weights in disposable models, four Torch threads, FP32, 8,192 requested exposures per trial. At 1,024 tokens, all three trials completed 8,669 supervised positions / 15 optimizer steps in 15.88 / 10.47 / 9.12 seconds, peak allocated VRAM 2.725 GB. The 2,048-token trial failed in backward with CUDA OOM (5.70 GiB allocated, a further 1.01 GiB allocation requested, 357 MiB free). The 4,096-token trial was not run after this limit. Retain 1,024 for tonight; larger context batches in the current unfused training-attention path are not equivalent to larger inference batches. The compiled inference decoder does not compile the training backward pass. Logs/commands/summary are under `artifacts/self_play_validation/nightly_tuning_2026-09-13/`.
+
+The existing 4,096-fresh-position phase threshold now gives much more frequent actor refresh in wall-clock time than the original slow collector; the matched compiled reference rate implies roughly 5.5 minutes for that many eligible positions before whole-game overshoot and evaluation overhead. This is an indicative reference rate, not an overnight forecast. Keep LR 1e-5 and reuse=2 as controlled starting settings; throughput measurements do not prove them optimal for learning. With unchanged learning batches/exposure budget, faster collection increases updates per hour without reducing updates per sampled trajectory.
 
 ## Inventory
 

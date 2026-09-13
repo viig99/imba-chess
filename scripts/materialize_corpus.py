@@ -15,7 +15,7 @@ diff, not assumed.
 
 Run:
   .venv/bin/python scripts/materialize_corpus.py \
-    --config config/imba_chess_exit_seeded_rollout.toml \
+    --config config/imba_chess_v4.toml \
     --output artifacts/corpus/seed42_train.parquet --max-rows 50000
 """
 

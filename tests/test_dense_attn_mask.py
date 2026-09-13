@@ -210,7 +210,7 @@ def test_dense_mask_survives_torch_compile_across_shapes():
     torch.compile(dynamic=True), Inductor fails to lower flex's sdpa_mask0 /
     sdpa_score0 subgraphs once a second distinct shape appears
     (InductorError: LoweringException), which is why
-    generate_search_rollouts.py hardcodes compile_model=False. SDPA is a
+    the retired offline generator disabled compilation. SDPA is a
     plain op with no mask subgraph, so the dense path compiles and
     generalizes -- pinned here because eval_vs_stockfish resolves
     `compile = true` from config and would otherwise regress silently.

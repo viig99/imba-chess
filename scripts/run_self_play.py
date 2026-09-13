@@ -36,6 +36,10 @@ def main():
     parser.add_argument("--device", default="cuda")
     parser.add_argument("--max-iterations", type=int, default=100000)
     parser.add_argument(
+        "--concurrent-games", type=int,
+        help="Collection slots; execution-only override preserves resume config identity",
+    )
+    parser.add_argument(
         "--until",
         type=datetime.fromisoformat,
         help="Absolute deadline with timezone; overrides the configured duration",
@@ -60,6 +64,8 @@ def main():
     args = parser.parse_args()
     if args.decoder_mode == "compiled" and args.device.split(":")[0] != "cuda":
         parser.error("compiled decoding requires --device cuda")
+    if args.concurrent_games is not None and args.concurrent_games < 1:
+        parser.error("--concurrent-games must be positive")
     if args.screen_every < 1:
         parser.error("--screen-every must be positive")
     if args.until is not None and args.until.tzinfo is None:
@@ -187,6 +193,8 @@ def main():
         log(
             dict(
                 event="run_start",
+                concurrent_games=args.concurrent_games or cfg.collection.concurrent_games,
+                inference_options=getattr(runtime, "options", {}),
                 until=args.until.isoformat() if args.until else None,
                 screen_every=args.screen_every,
                 defer_confirmation=args.defer_confirmation,
@@ -245,6 +253,8 @@ def main():
                     skip_ids=store.seen,
                     metrics=metrics,
                     on_game=record_game,
+                    **({"concurrent_games": args.concurrent_games}
+                       if args.concurrent_games is not None else {}),
                 )
                 log(metrics.report())
                 if (

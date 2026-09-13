@@ -1,4 +1,4 @@
-"""Real shutdown behavior plus thin wiring checks for both command entrypoints."""
+"""Real shutdown behavior plus a wiring check for the Stockfish command."""
 
 from __future__ import annotations
 
@@ -80,7 +80,7 @@ def test_scripts_delegate_to_shared_exit_helper(monkeypatch):
     import importlib.util
     import imba_chess.process as process
 
-    for name in ("eval_vs_stockfish", "generate_search_rollouts"):
+    for name in ("eval_vs_stockfish",):
         path = Path(__file__).resolve().parents[1] / "scripts" / f"{name}.py"
         spec = importlib.util.spec_from_file_location(f"exit_wiring_{name}", path)
         module = importlib.util.module_from_spec(spec)

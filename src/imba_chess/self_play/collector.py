@@ -333,7 +333,10 @@ def collect(
     on_game=lambda game: None,
     skip_ids=(),
     metrics=None,
+    concurrent_games=None,
 ):
+    if concurrent_games is not None and concurrent_games < 1:
+        raise ValueError("concurrent_games must be positive")
     metrics = metrics or CollectionMetrics()
     skipped = set(skip_ids)
     active = {}
@@ -403,7 +406,10 @@ def collect(
         BatchScheduler(
             game_factory=iter(factory()),
             executors=runtime.executors,
-            concurrent_games=config.collection.concurrent_games,
+            concurrent_games=(
+                config.collection.concurrent_games
+                if concurrent_games is None else concurrent_games
+            ),
             on_game_done=done,
             on_game_error=lambda gid, exc: None,
             completion_order=True,

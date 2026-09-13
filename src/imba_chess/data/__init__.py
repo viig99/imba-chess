@@ -38,9 +38,6 @@ __all__ = [
     "BoardTokenConfig",
     "BoardState",
     "TorchLichessIterableDataset",
-    "RolloutRow",
-    "load_rollout_lookup",
-    "write_rollout_parquet",
     "winpercent_wdl",
 ]
 
@@ -61,9 +58,6 @@ _SOURCE_MODULE = {
     "MoveVocabConfig": "move_vocab",
     "load_or_create_static_move_vocab": "move_vocab",
     "MaxTokensJaggedBatchDataset": "packing",
-    "RolloutRow": "rollout_store",
-    "load_rollout_lookup": "rollout_store",
-    "write_rollout_parquet": "rollout_store",
     "winpercent_wdl": "stockfish_evals",
     "TorchLichessIterableDataset": "torch_iterable",
     "EventSequence": "types",

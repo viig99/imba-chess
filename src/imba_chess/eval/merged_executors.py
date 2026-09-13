@@ -1,6 +1,6 @@
 """Merged root-eval / decode-wave executors for the cross-game batch scheduler.
 
-scripts/generate_search_rollouts.py's BatchScheduler drives up to G games
+The BatchScheduler drives up to G games
 concurrently; each tick, it hands this module's executors the tick's pending
 per-game GPU work (root forwards, or search decode waves) and expects one
 merged model call back. `_merge_root_batches`/`_split_root_output` ragged-
@@ -38,7 +38,7 @@ from imba_chess.eval.position_evaluator import (
 
 class TimingStatsLike(Protocol):
     """Structural type for the timing-stats accumulator these executors
-    write into -- matches scripts/generate_search_rollouts.py's
+    write into -- matches the calling scheduler's
     `_TimingStats` without importing it (that script imports this module,
     so importing back would cycle); any object with these mutable
     numeric attributes works, including `stats=None` at each call site's

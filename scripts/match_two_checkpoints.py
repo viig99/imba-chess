@@ -69,8 +69,7 @@ def _select_move(
     halving_config: HalvingConfig,
     rng: random.Random,
 ) -> Generator[WorkRequest, Any, str]:
-    """One side's move: mirrors generate_search_rollouts._generate_rollout_row's
-    coroutine core, but returns the chosen UCI instead of building a row.
+    """Search one side's position and return the chosen UCI.
 
     Requests are tagged with `side` so the scheduler merges each model's work
     separately.

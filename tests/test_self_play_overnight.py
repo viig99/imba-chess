@@ -31,6 +31,7 @@ def test_overnight_handoff_and_resume(tmp_path, monkeypatch, incomplete):
         calls.append(argv)
         if "scripts/run_self_play.py" in argv:
             assert "--resume" in argv and "--defer-confirmation" in argv
+            assert argv[argv.index("--concurrent-games") + 1] == "24"
             assert argv[argv.index("--screen-every") + 1] == "3"
             (run / "actor-000001.pt").write_bytes(b"trained")
         else:
@@ -62,6 +63,8 @@ def test_overnight_handoff_and_resume(tmp_path, monkeypatch, incomplete):
             str(output),
             "--until",
             deadline.isoformat(),
+            "--concurrent-games",
+            "24",
             "--stockfish",
             str(stockfish),
         ],

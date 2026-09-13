@@ -108,7 +108,10 @@ def main():
     parser.add_argument("--until", type=datetime.fromisoformat, required=True)
     parser.add_argument("--stockfish", type=Path, default=Path("/usr/bin/stockfish"))
     parser.add_argument("--eval-seconds", type=int, default=7200)
+    parser.add_argument("--concurrent-games", type=int, help="Override collection slots when resuming")
     args = parser.parse_args()
+    if args.concurrent_games is not None and args.concurrent_games < 1:
+        parser.error("--concurrent-games must be positive")
     if args.until.tzinfo is None or args.eval_seconds < 1:
         parser.error("deadline needs a timezone and evaluation budget must be positive")
     identity = dict(
@@ -119,6 +122,8 @@ def main():
         eval_seconds=args.eval_seconds,
         stockfish=file_hash(args.stockfish),
     )
+    if args.concurrent_games is not None:
+        identity["concurrent_games"] = args.concurrent_games
     progress_path = args.output / "progress.json"
     seconds = max(0, args.until.timestamp() - time.time()) + 3 * args.eval_seconds + 300
     with run_lock(args.output / "supervisor"), StopBudget(seconds=seconds) as stop:
@@ -151,6 +156,8 @@ def main():
                 "3",
                 "--defer-confirmation",
             ]
+            if args.concurrent_games is not None:
+                command += ["--concurrent-games", str(args.concurrent_games)]
             # On recovery after the deadline, proceed directly to the published actor.
             if time.time() < args.until.timestamp():
                 progress["training_command"] = command

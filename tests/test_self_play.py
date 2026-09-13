@@ -514,7 +514,7 @@ def test_collection_resume_and_executor_failure(tmp_path):
     assert len(store.game_ids()) == 1
     collect(**common, store=store, skip_ids=store.seen)
     whole = SelfPlayStore(tmp_path / "whole")
-    collect(**common, store=whole)
+    collect(**common, store=whole, concurrent_games=3)
     assert store.game_ids() == whole.game_ids()
     assert [store.read_game(g) for g in store.game_ids()] == [
         whole.read_game(g) for g in whole.game_ids()

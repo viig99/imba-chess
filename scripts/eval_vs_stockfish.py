@@ -436,11 +436,7 @@ def _drive_stepwise_as_decode_waves(
     `search._rerank_stepwise` / `search._d2_stepwise` / `search.
     _halving_stepwise` all share this same `EvalRequest` yield contract (via
     `search._expand_root_candidates_stepwise`), so one driver here handles
-    all three policies. Mirrors `scripts/generate_search_rollouts.py`'s
-    `_generate_rollout_row` driving pattern for `_halving_stepwise`
-    (duplicated rather than imported from there: that script's version is
-    fused with its own `_TimingStats` bookkeeping via `_timed_advance`,
-    which this eval driver has no equivalent of).
+    all three policies. The shared merged executors answer these requests.
     """
     try:
         request = next(gen)
@@ -469,8 +465,7 @@ def _select_model_move_stepwise(
     """Scheduler-driven twin of `_select_model_move`: yields
     `WorkRequest("root_eval", batch)` for the root forward instead of
     calling `_forward_model` synchronously -- the payload is the bare
-    `batch` dict, the same contract `generate_search_rollouts.py`'s
-    `_generate_rollout_row` uses, answered by the shared
+    `batch` dict, answered by the shared
     `_make_root_eval_executor` (which always requests `return_kv=True`,
     unlike `_select_model_move`'s policy-conditional `return_kv=policy !=
     "greedy"` -- a harmless compute-only difference for `greedy`: kv_caches
@@ -1814,13 +1809,8 @@ def _run_segment(
                 progress.set_postfix(_progress_postfix(summary))
 
             def _on_game_error(game_id: str, exc: BaseException) -> None:
-                # Fail-fast policy (Task 3): unlike generate_search_rollouts.
-                # py's on_game_error (logs and skips one bad game out of a
-                # large batch-generation run), eval play has no equivalent
-                # "skip this game" semantics -- a mid-game crash means the
-                # segment's results are no longer trustworthy, so this
-                # re-raises to kill the whole run rather than silently
-                # continuing with a hole in the summary.
+                # A failed game invalidates the evaluation segment; propagate
+                # the error instead of silently skipping a planned result.
                 raise exc
 
             scheduler = BatchScheduler(
