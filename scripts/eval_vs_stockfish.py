@@ -49,9 +49,6 @@ from imba_chess.eval.search import (
     HalvingConfig,
     PositionEval,
     select_greedy,
-    select_value_rerank,
-    select_value_search_d2,
-    select_value_search_halving,
 )
 from tqdm.auto import tqdm
 
@@ -318,111 +315,46 @@ def _select_model_move(
     debug_topk: int = 0,
     halving_config: HalvingConfig | None = None,
 ) -> tuple[chess.Move, dict[str, Any]]:
-    output = _forward_model(
+    """Run the shared selection controller with synchronous inference.
+
+    The scheduler uses the same controller but merges requests across games.
+    Greedy synchronous roots still omit KV caches.
+    """
+    gen = _select_model_move_stepwise(
         model=model,
         batch=batch,
-        device=device,
-        dtype=dtype,
-        return_kv=policy != "greedy",
-    )
-
-    logits = output["logits"][-1]
-    legal_logits, legal_moves_with_ids, total_legal, mapped_legal = _project_legal_logits(
-        logits=logits,
         board=board,
         move_vocab=move_vocab,
+        board_state_encoder=board_state_encoder,
+        device=device,
+        dtype=dtype,
+        policy=policy,
+        value_rerank_top_k=value_rerank_top_k,
+        value_rerank_lambda=value_rerank_lambda,
+        debug_topk=debug_topk,
+        halving_config=halving_config,
     )
-    legal_log_priors = torch.log_softmax(legal_logits.float(), dim=0).tolist()
-    evaluator = None
-    if policy != "greedy":
-        evaluator = CachedPositionEvaluator(
-            model=model,
-            move_vocab=move_vocab,
-            board_state_encoder=board_state_encoder,
-            device=device,
-            dtype=dtype,
-            prefix_kv=output["kv_caches"],
-            prefix_len=int(batch["total_tokens"]),
-        )
-    rerank_rows: list[dict[str, Any]] = []
-    search_rows: list[dict[str, Any]] = []
-    halving_rows: list[dict[str, Any]] = []
-    if policy == "greedy":
-        chosen_index = select_greedy(legal_log_priors)
-    elif policy == "value_rerank":
-        if output.get("value_logits") is None:
-            raise RuntimeError(
-                "model_move_policy=value_rerank requires a checkpoint with value head enabled."
-            )
-        chosen_index, rerank_rows = select_value_rerank(
-            evaluator=evaluator,
-            root_handle=None,
-            board=board,
-            legal_moves=legal_moves_with_ids,
-            legal_log_priors=legal_log_priors,
-            top_k=value_rerank_top_k,
-            lam=value_rerank_lambda,
-        )
-    elif policy == "value_search_d2":
-        if output.get("value_logits") is None:
-            raise RuntimeError(
-                "model_move_policy=value_search_d2 requires a checkpoint with value head enabled."
-            )
-        chosen_index, search_rows = select_value_search_d2(
-            evaluator=evaluator,
-            root_handle=None,
-            board=board,
-            legal_moves=legal_moves_with_ids,
-            legal_log_priors=legal_log_priors,
-            top_k=value_rerank_top_k,
-            lam=value_rerank_lambda,
-        )
-    elif policy == "value_search_halving":
-        if output.get("value_logits") is None:
-            raise RuntimeError(
-                "model_move_policy=value_search_halving requires a checkpoint with value head enabled."
-            )
-        if halving_config is None:
-            raise ValueError("policy=value_search_halving requires halving_config")
-        chosen_index, halving_rows = select_value_search_halving(
-            evaluator=evaluator,
-            root_handle=None,
-            board=board,
-            legal_moves=legal_moves_with_ids,
-            legal_log_priors=legal_log_priors,
-            config=halving_config,
-        )
-    else:
-        raise ValueError(f"Unknown model move policy: {policy}")
-    debug: dict[str, Any] = {
-        "total_legal_moves": total_legal,
-        "mapped_legal_moves": mapped_legal,
-        "coverage": (mapped_legal / total_legal) if total_legal > 0 else float("nan"),
-        "policy": policy,
-    }
-    if policy == "value_rerank":
-        debug["value_rerank_top_k"] = int(min(int(value_rerank_top_k), mapped_legal))
-        debug["value_rerank_lambda"] = float(value_rerank_lambda)
-        debug["value_rerank_candidates"] = rerank_rows
-    if policy == "value_search_d2":
-        debug["value_rerank_top_k"] = int(min(int(value_rerank_top_k), mapped_legal))
-        debug["value_rerank_lambda"] = float(value_rerank_lambda)
-        debug["value_search_d2_candidates"] = search_rows
-    if policy == "value_search_halving":
-        debug["search_budget"] = int(halving_config.budget)
-        debug["value_search_halving_candidates"] = halving_rows
-        debug["search_stats"] = search.summarize_search_rows(halving_rows)
-    if debug_topk > 0:
-        k = min(int(debug_topk), mapped_legal)
-        top_values, top_indices = torch.topk(legal_logits, k=k, largest=True)
-        debug["topk_legal"] = [
-            {
-                "move_uci": legal_moves_with_ids[int(local_idx)].uci(),
-                "logit": float(value.item()),
-            }
-            for value, local_idx in zip(top_values, top_indices)
-        ]
-    return legal_moves_with_ids[chosen_index], debug
+    try:
+        request = next(gen)
+        while True:
+            if request.kind == "root_eval":
+                response = _forward_model(
+                    model=model,
+                    batch=request.payload,
+                    device=device,
+                    dtype=dtype,
+                    return_kv=policy != "greedy",
+                )
+            elif request.kind == "decode_wave":
+                evaluator, wave = request.payload
+                response = evaluator.evaluate(wave)
+            else:
+                raise RuntimeError(f"Unexpected selection request: {request.kind}")
+            request = gen.send(response)
+    except StopIteration as stop:
+        return stop.value
+    finally:
+        gen.close()
 
 
 def _drive_stepwise_as_decode_waves(
@@ -462,23 +394,11 @@ def _select_model_move_stepwise(
     debug_topk: int = 0,
     halving_config: HalvingConfig | None = None,
 ) -> Generator[WorkRequest, Any, tuple[chess.Move, dict[str, Any]]]:
-    """Scheduler-driven twin of `_select_model_move`: yields
-    `WorkRequest("root_eval", batch)` for the root forward instead of
-    calling `_forward_model` synchronously -- the payload is the bare
-    `batch` dict, answered by the shared
-    `_make_root_eval_executor` (which always requests `return_kv=True`,
-    unlike `_select_model_move`'s policy-conditional `return_kv=policy !=
-    "greedy"` -- a harmless compute-only difference for `greedy`: kv_caches
-    get computed but are never consulted, since `greedy` never builds an
-    evaluator or issues a decode wave).
+    """Shared move selection, yielding root and leaf inference requests.
 
-    For any non-greedy policy this then drives that policy's `*_stepwise`
-    generator core via `_drive_stepwise_as_decode_waves`, forwarding every
-    `EvalRequest` as `WorkRequest("decode_wave", ...)`. All three non-greedy
-    policies route through their `*_stepwise` core exactly as
-    `_select_model_move` routes through their synchronous `select_*`
-    wrapper -- same if/elif dispatch, same requires-value-head guards, same
-    debug-dict shape.
+    Direct callers answer requests synchronously; the batch scheduler merges
+    them across games. Legal projection, search dispatch, validation and debug
+    reporting therefore follow one implementation for both execution routes.
     """
     output = yield WorkRequest("root_eval", batch)
 

@@ -738,7 +738,7 @@ def test_select_model_move_stepwise_matches_sync_for_greedy():
         policy="greedy",
         value_rerank_top_k=2,
         value_rerank_lambda=0.2,
-        debug_topk=0,
+        debug_topk=2,
     )
 
     gen = module._select_model_move_stepwise(
@@ -752,12 +752,13 @@ def test_select_model_move_stepwise_matches_sync_for_greedy():
         policy="greedy",
         value_rerank_top_k=2,
         value_rerank_lambda=0.2,
-        debug_topk=0,
+        debug_topk=2,
     )
     move_stepwise, debug_stepwise = _drive_model_move_stepwise(
         gen, model=_DummyNoValueModel(move_vocab), device=torch.device("cpu"), dtype=torch.float32
     )
 
+    assert debug_stepwise == debug_sync
     assert move_stepwise.uci() == move_sync.uci() == "e2e4"
     assert debug_stepwise["policy"] == debug_sync["policy"] == "greedy"
 
@@ -783,7 +784,7 @@ def test_select_model_move_stepwise_matches_sync_for_value_rerank():
         policy="value_rerank",
         value_rerank_top_k=2,
         value_rerank_lambda=0.2,
-        debug_topk=0,
+        debug_topk=2,
     )
 
     model_stepwise = _DummyValueRerankModel(move_vocab)
@@ -798,12 +799,13 @@ def test_select_model_move_stepwise_matches_sync_for_value_rerank():
         policy="value_rerank",
         value_rerank_top_k=2,
         value_rerank_lambda=0.2,
-        debug_topk=0,
+        debug_topk=2,
     )
     move_stepwise, debug_stepwise = _drive_model_move_stepwise(
         gen, model=model_stepwise, device=torch.device("cpu"), dtype=torch.float32
     )
 
+    assert debug_stepwise == debug_sync
     assert move_stepwise.uci() == move_sync.uci() == "d2d4"
     assert model_stepwise.forward_calls == model_sync.forward_calls
     assert len(debug_stepwise["value_rerank_candidates"]) == len(
@@ -832,7 +834,7 @@ def test_select_model_move_stepwise_matches_sync_for_value_search_d2():
         policy="value_search_d2",
         value_rerank_top_k=2,
         value_rerank_lambda=0.2,
-        debug_topk=0,
+        debug_topk=2,
     )
 
     model_stepwise = _DummyValueSearchD2Model(move_vocab)
@@ -847,12 +849,13 @@ def test_select_model_move_stepwise_matches_sync_for_value_search_d2():
         policy="value_search_d2",
         value_rerank_top_k=2,
         value_rerank_lambda=0.2,
-        debug_topk=0,
+        debug_topk=2,
     )
     move_stepwise, debug_stepwise = _drive_model_move_stepwise(
         gen, model=model_stepwise, device=torch.device("cpu"), dtype=torch.float32
     )
 
+    assert debug_stepwise == debug_sync
     assert move_stepwise.uci() == move_sync.uci() == "d2d4"
     assert model_stepwise.forward_calls == model_sync.forward_calls
     assert len(debug_stepwise["value_search_d2_candidates"]) == len(
@@ -884,7 +887,7 @@ def test_select_model_move_stepwise_matches_sync_for_value_search_halving():
         policy="value_search_halving",
         value_rerank_top_k=2,
         value_rerank_lambda=0.05,
-        debug_topk=0,
+        debug_topk=2,
         halving_config=halving_config,
     )
 
@@ -900,13 +903,14 @@ def test_select_model_move_stepwise_matches_sync_for_value_search_halving():
         policy="value_search_halving",
         value_rerank_top_k=2,
         value_rerank_lambda=0.05,
-        debug_topk=0,
+        debug_topk=2,
         halving_config=halving_config,
     )
     move_stepwise, debug_stepwise = _drive_model_move_stepwise(
         gen, model=model_stepwise, device=torch.device("cpu"), dtype=torch.float32
     )
 
+    assert debug_stepwise == debug_sync
     assert move_stepwise.uci() == move_sync.uci() == "d2d4"
     assert model_stepwise.forward_calls == model_sync.forward_calls
     assert {row["move_uci"] for row in debug_stepwise["value_search_halving_candidates"]} == {

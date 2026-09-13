@@ -1,10 +1,14 @@
 # Maintainability review — 2026-09-13
 
-Reviewed after implementation commit `d35a7096b278df88da58a30d82709a656ff346d4` was pushed to `origin/main`. The initial review proposed decisions. The approved cleanup is recorded below; the remaining evaluator refactor is deferred.
+Reviewed after implementation commit `d35a7096b278df88da58a30d82709a656ff346d4` was pushed to `origin/main`. The initial review proposed decisions. The approved cleanup is recorded below; the first evaluator consolidation is now complete; broader actor/reporting work remains deferred.
 
 The strongest next cleanup is the stale experiment tooling and old implementation plans. Most large runtime modules still serve either current self-play, supervised training, or the established halving/Stockfish comparison. Removing them based only on size would remove useful capabilities.
 
 Method: tracked-file inventory, source/CLI inspection, import and symbol references across `src`, `scripts`, `tests`, config existence checks, and comparison with documented current workflows. I did not run old launchers: several can start/stop jobs or write experiments. “No current consumer” refers to checked-in code; external scripts and manual use may exist. Counts include comments and blank lines and describe scope, not promised deletions.
+
+## Stockfish controller consolidation — September 13
+
+Completed the first behavior-preserving reduction: the synchronous adapter drives the existing stepwise move-selection controller, eliminating its duplicate legal projection, search dispatch, validation and debug formatting. The evaluator is 80 lines shorter. Both inference execution routes and the multiprocess actor route remain available; search algorithms, CLI/config values and historical Stockfish protocol are retained. Existing parity checks now include full debug output, and an independent comparison against pre-refactor source matched all four policies and inference counts. Full default CPU suite: 2,267 passed / 17 deselected. See the readiness report for artifacts and real CUDA/Stockfish smoke checks. Further actor/IPC/reporting consolidation is intentionally outside this small change.
 
 ## Approved cleanup and restart preparation — 2026-09-13
 
