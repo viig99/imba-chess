@@ -170,9 +170,16 @@ def test_sparse_loss_by_hand_and_finite_gradients():
     loss = self_play_loss(dict(logits=logits, value_logits=value), batch)
     assert loss["policy_loss"].item() == pytest.approx(math.log(2) / 2)
     assert loss["value_loss"].item() == pytest.approx(math.log(3))
+    assert loss["model_policy_entropy"].item() == pytest.approx(math.log(2) / 2)
+    assert loss["policy_entropy"].item() == pytest.approx(
+        -(0.25 * math.log(0.25) + 0.75 * math.log(0.75)) / 2
+    )
     loss["loss"].backward()
     assert torch.isfinite(logits.grad).all() and torch.isfinite(value.grad).all()
     assert logits.grad[:, 0].tolist() == [0, 0]
+    torch.testing.assert_close(
+        logits.grad, torch.tensor([[0.0, 0.125, -0.125], [0.0, 0.0, 0.0]])
+    )
 
 
 def tiny_model():

@@ -66,6 +66,32 @@ Nightly screens use 100 games from 50 held-out prefix pairs. Promote best only a
 
 Monitor completed eligible positions/hour, unfinished reasons, policy CE/entropy/KL, outcome CE/Brier, predicted/observed draw rates, gradient norms, replay age/reuse and matched strength. Runtime gains and lower training losses do not establish chess improvement. Current run state/logs are under `artifacts/self_play/`; do not infer completion from a stopped terminal alone.
 
+## Regression diagnosis — September 13
+
+The original waiting morning supervisor was cancelled and replaced with a bounded diagnosis queue. Checkpoints 0/14/15, optimizer/sampler state, every retained replay shard, configurations and original screens/logs were copied and SHA256-indexed before experiments. Artifacts and exact executable commands: `artifacts/self_play_diagnosis/2026-09-13/` (`snapshot-manifest.json`, `campaign.py`, `progress.json`, `summary.json`). The original production run remains halted.
+
+Fresh Gumbel screens used the same 50 monitoring source games for both candidates, excluding all source games appearing in earlier saved evaluation identities. All 100 games completed per candidate. Actor14 scored **46%, paired 95% CI 37–54.5%** versus ckpt34; actor15 scored **37.5%, CI 30–45%**, corroborating the earlier regression signal on different openings. Actor15 minus actor14 was -8.5 points, paired CI -21.5 to +5 points: the last phase alone is not proven to account for the decline.
+
+Independent reconstruction passed for **665 retained games / 57,304 positions**, including python-chess legality, termination before every supervised move, final results, side-to-move WDL, prefix masking, previous-move alignment and the actual 513-token context limit. All 57,304 saved search policies exactly matched an independent completed-Q/softmax reconstruction; simulation, candidate and depth bounds passed. Older evicted trajectories are outside this audit. Replaying the final 20 optimizer updates from the preserved step-305 state produced actor15's step-325 weights **bit-for-bit**, matching exposures (195,583), queue and sampler RNG. No production weights/replay were changed by this check.
+
+Fixed monitoring set: 64 trajectories / 5,178 positions. Outcomes describe the recorded continuations, not optimal-play values. Metrics are position-weighted:
+
+| Metric | ckpt34 | Actor14 | Actor15 |
+|---|---:|---:|---:|
+| Search-policy CE | 1.6741 | 1.6475 | 1.6487 |
+| Outcome WDL CE | 3.8931 | 1.3623 | 1.2450 |
+| WDL Brier (lower better) | .4746 | .5428 | .5160 |
+| WDL accuracy | 67.61% | 61.22% | 62.42% |
+| Predicted draw probability | ~0% | 15.82% | 14.15% |
+| Actual draw-position fraction | 17.46% | 17.46% | 17.46% |
+| Model policy entropy | 1.4769 | 1.6177 | 1.6247 |
+
+Actor15's Brier increase has a source-game bootstrap interval spanning zero; do not call it conclusively worse calibration. Its accuracy difference was -5.20 points (exploratory paired interval -10.05 to -.20). Training loss improvement does not establish playing-strength improvement. Two fixed gradient probes found actor15 shared-backbone value/policy gradient-norm ratios around 5 on a decisive trajectory and 11 on a draw. This motivates testing value-loss weighting; it does not establish the regression's cause.
+
+The next queued controlled experiment forks the identical final-phase weights, optimizer and sampler/replay, changing only value weight 1.0 → 0.1. It is a diagnostic counterfactual, not an automatic production restart or a strength claim. Matched 100-game halving/SF2400 screens (budget 2048, roots 16, refutations 4, own expansions 3, depth 8) are running before that experiment; final results remain pending.
+
+Telemetry now includes `model_policy_entropy` computed without gradients. The historical `policy_entropy` remains the search-target entropy for compatibility. Existing hand-calculated loss coverage checks both distributions, padded legality and exact policy gradients.
+
 ## Laptop learning settings checked before restart
 
 A disposable actor-000002/replay training sweep measured 1,024-token batches at 8,669 supervised positions / 15 steps per trial in 15.88 / 10.47 / 9.12 seconds, peak allocated VRAM 2.725 GB. At 2,048 tokens the current training backward path ran out of CUDA memory; 4,096 was not attempted. Retain 1,024 for the resumed run. Full inference-decoder compilation is separate from training attention/backward. Keep 4,096 fresh positions per phase, reuse=2, LR=1e-5 and the existing optimizer/sampler state. These are measured hardware-compatible starting settings, not proven optimal learning hyperparameters. Artifacts: `artifacts/self_play_validation/nightly_tuning_2026-09-13/`.

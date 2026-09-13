@@ -18,7 +18,11 @@ def self_play_loss(output, batch, *, value_weight=1.0):
     value_log_probs = F.log_softmax(value_logits, -1)
     value_loss = -(wdl * value_log_probs).sum(-1).mean()
     probs = value_log_probs.exp()
+    # Keep the historical target entropy key; model entropy measures the
+    # student's distribution and can move in a different direction.
     entropy = -(target * target.clamp_min(1e-38).log()).sum(-1).mean()
+    with torch.no_grad():
+        model_entropy = -(log_probs.exp() * log_probs).sum(-1).mean()
     actor_kl = {}
     if "actor_log_priors" in batch:
         available = batch["actor_prior_available"].to(logits.device)
@@ -34,6 +38,7 @@ def self_play_loss(output, batch, *, value_weight=1.0):
         policy_loss=policy_loss,
         value_loss=value_loss,
         policy_entropy=entropy,
+        model_policy_entropy=model_entropy,
         policy_target_kl=policy_loss - entropy,
         **actor_kl,
         brier=(probs - wdl).square().sum(-1).mean(),
