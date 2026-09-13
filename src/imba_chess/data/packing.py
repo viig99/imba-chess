@@ -16,6 +16,7 @@ def iter_max_tokens_batches(
     events: Iterable[EventSequence],
     *,
     max_tokens_per_batch: int,
+    collator=collate_jagged_batch,
 ) -> Iterator[JaggedBatch]:
     if max_tokens_per_batch < 1:
         raise ValueError("max_tokens_per_batch must be >= 1")
@@ -28,14 +29,14 @@ def iter_max_tokens_batches(
 
         if seq_len > max_tokens_per_batch:
             if current_batch:
-                yield collate_jagged_batch(current_batch)
+                yield collator(current_batch)
                 current_batch = []
                 current_tokens = 0
-            yield collate_jagged_batch([sample])
+            yield collator([sample])
             continue
 
         if current_batch and (current_tokens + seq_len) > max_tokens_per_batch:
-            yield collate_jagged_batch(current_batch)
+            yield collator(current_batch)
             current_batch = [sample]
             current_tokens = seq_len
         else:
@@ -43,7 +44,7 @@ def iter_max_tokens_batches(
             current_tokens += seq_len
 
     if current_batch:
-        yield collate_jagged_batch(current_batch)
+        yield collator(current_batch)
 
 
 class MaxTokensJaggedBatchDataset(IterableDataset):

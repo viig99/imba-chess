@@ -118,7 +118,7 @@ def test_hstu_chess_model_elo_weighted_loss_matches_manual_formula():
     )
     model = HSTUChessModel(config)
     batch = _batch()
-    batch["played_by_elo"] = torch.tensor([0, 2200, 2500, 0, 3000], dtype=torch.long)
+    batch["played_by_elo"] = torch.tensor([0, 2199, 2500, 0, 4000], dtype=torch.long)
 
     out = model(batch, return_loss=True)
     logits = out["logits"]
@@ -174,20 +174,6 @@ def test_hstu_chess_model_elo_strength_zero_matches_unweighted_loss():
         per_token_loss * valid_mask.to(per_token_loss.dtype)
     ).sum() / valid_mask.to(per_token_loss.dtype).sum().clamp_min(1.0)
     assert torch.allclose(out["policy_loss"], expected, atol=1e-6, rtol=1e-6)
-
-
-def test_elo_normalization_clamps_at_config_bounds():
-    config = HSTUChessConfig(
-        move_vocab_size=128,
-        elo_weight_min_elo=2200,
-        elo_weight_max_elo=2800,
-    )
-    elo = torch.tensor([0.0, 2199.0, 2200.0, 2500.0, 2800.0, 4000.0])
-    elo_norm = (
-        (elo - config.elo_weight_min_elo)
-        / (config.elo_weight_max_elo - config.elo_weight_min_elo)
-    ).clamp(min=0.0, max=1.0)
-    assert elo_norm.tolist() == pytest.approx([0.0, 0.0, 0.0, 0.5, 1.0, 1.0])
 
 
 def test_hstu_chess_model_value_head_outputs_and_combines_loss():

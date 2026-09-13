@@ -410,9 +410,14 @@ class _KVArena:
         Returns the per-layer `[(k, v), ...]` list `forward_decode_grouped`
         expects, each `[B, H, S, d]` -- ONE indexed gather plus one permute
         for the whole wave, not a per-node `torch.cat` chain."""
-        gathered_k = self.k[:, :, idx, :].permute(0, 2, 1, 3, 4)  # [L, B, H, S, d]
-        gathered_v = self.v[:, :, idx, :].permute(0, 2, 1, 3, 4)
+        gathered_k, gathered_v = self.gather_suffix_layers(idx)
         return list(zip(gathered_k.unbind(0), gathered_v.unbind(0)))
+
+    def gather_suffix_layers(self, idx):
+        return (
+            self.k[:, :, idx, :].permute(0, 2, 1, 3, 4),
+            self.v[:, :, idx, :].permute(0, 2, 1, 3, 4),
+        )  # [L, B, H, S, d]
 
 
 def _padded_chain_indices(
@@ -468,12 +473,60 @@ class _DecodeRequest:
     nodes: list[_CachedNode]
     boards: list[cc.Board]
     new_token_batch: dict[str, Any]
-    positions: torch.Tensor
+    positions: torch.Tensor | list[int]
     suffix_kv: list[tuple[torch.Tensor, torch.Tensor]] | None
     suffix_positions: torch.Tensor | None
     suffix_mask: torch.Tensor | None
     prefix_kv: Any
     prefix_len: int
+    suffix_layers: tuple[torch.Tensor, torch.Tensor] | None = None
+
+
+def _project_decode_results(per_node, out):
+    # One device->host transfer per wave instead of two syncs per node.
+    # `logits` deliberately stays on the device: only the ~31 legal
+    # entries per row are ever read, and _batched_legal_log_priors gathers
+    # them there so the crossing carries [B, width], not [B, vocab].
+    # value_logits is [B, 3] -- already negligible.
+    logits = out["logits"].float()
+    value_logits = out["value_logits"].float().cpu()
+
+    # Every remaining tensor op is one call for the whole wave. At budget
+    # 2048 a wave carries ~1,321 nodes, and the old shape ran a softmax, a
+    # torch.tensor, an index_select and a log_softmax per node over
+    # ~31-element rows, where dispatch dominated the arithmetic.
+    values = _batched_value_scalars(value_logits)
+
+    id_lists = [ids for ids, _, _, _, _ in per_node]
+    prior_rows: list[list[float]] = [[] for _ in id_lists]
+    if all(id_lists):
+        prior_rows = _batched_legal_log_priors(logits, id_lists)
+    else:
+        # A node whose legal moves map to nothing in the vocab yields an
+        # empty PositionEval, matching the old RuntimeError branch. Gather
+        # only the rows that have moves so the batch stays rectangular.
+        keep = [row for row, ids in enumerate(id_lists) if ids]
+        if keep:
+            sub = _batched_legal_log_priors(
+                logits.index_select(
+                    0, torch.tensor(keep, device=logits.device, dtype=torch.long)
+                ),
+                [id_lists[row] for row in keep],
+            )
+            for row, priors in zip(keep, sub):
+                prior_rows[row] = priors
+
+    return [
+        PositionEval(
+            value_stm=values[row],
+            legal_moves=moves,
+            legal_ucis=ucis,
+            legal_log_priors=prior_rows[row],
+            legal_forcing=forcing,
+            legal_ids=ids,
+        )
+        for row, (ids, moves, ucis, forcing, _total) in enumerate(per_node)
+    ]
 
 
 class CachedPositionEvaluator:
@@ -520,7 +573,9 @@ class CachedPositionEvaluator:
             move_vocab_id = int(self._move_vocab.encode(move_uci))
         return _CachedNode(parent, move_vocab_id, depth)
 
-    def build_decode_request(self, batch) -> _DecodeRequest:
+    def build_decode_request(
+        self, batch, *, defer_tensors=False, stack_suffix=False
+    ) -> _DecodeRequest:
         """All CPU pre-work for one wave: encode boards, token tensors,
         suffix gather, positions -- everything before the model call.
 
@@ -540,34 +595,24 @@ class CachedPositionEvaluator:
         wave_size = len(batch)
 
         new_token_batch = {
-            "piece_ids": torch.tensor(
-                [state.piece_ids for state in states], dtype=torch.long
-            ),
-            "seq_token_id": torch.full((wave_size,), EVENT_TOKEN_ID, dtype=torch.long),
-            "turn_id": torch.tensor(
-                [state.turn_id for state in states], dtype=torch.long
-            ),
-            "castle_id": torch.tensor(
-                [state.castle_id for state in states], dtype=torch.long
-            ),
-            "ep_file_id": torch.tensor(
-                [state.ep_file_id for state in states], dtype=torch.long
-            ),
-            "halfmove_bucket_id": torch.tensor(
-                [state.halfmove_bucket_id for state in states], dtype=torch.long
-            ),
-            "fullmove_bucket_id": torch.tensor(
-                [state.fullmove_bucket_id for state in states], dtype=torch.long
-            ),
-            "prev_move_id": torch.tensor(
-                [node.move_id for node in nodes], dtype=torch.long
-            ),
+            "piece_ids": [state.piece_ids for state in states],
+            "seq_token_id": [EVENT_TOKEN_ID] * wave_size,
+            "turn_id": [state.turn_id for state in states],
+            "castle_id": [state.castle_id for state in states],
+            "ep_file_id": [state.ep_file_id for state in states],
+            "halfmove_bucket_id": [state.halfmove_bucket_id for state in states],
+            "fullmove_bucket_id": [state.fullmove_bucket_id for state in states],
+            "prev_move_id": [node.move_id for node in nodes],
         }
-        positions = torch.tensor(
-            [self._prefix_len + node.depth for node in nodes], dtype=torch.long
-        )
+        positions = [self._prefix_len + node.depth for node in nodes]
+        if not defer_tensors:
+            new_token_batch = {
+                key: torch.tensor(value, dtype=torch.long)
+                for key, value in new_token_batch.items()
+            }
+            positions = torch.tensor(positions, dtype=torch.long)
         max_suffix = max(node.depth for node in nodes)
-        suffix_kv = suffix_positions = suffix_mask = None
+        suffix_kv = suffix_positions = suffix_mask = suffix_layers = None
         if max_suffix > 0:
             if self._arena is None:
                 raise RuntimeError("Missing KV arena for non-root decode wave")
@@ -582,7 +627,13 @@ class CachedPositionEvaluator:
                     )
                 parent_chains.append(node.parent.arena_chain)
             idx, suffix_mask = _padded_chain_indices(parent_chains, device=self._device)
-            suffix_kv = self._arena.gather_suffix(idx)
+            if stack_suffix:
+                suffix_layers = self._arena.gather_suffix_layers(idx)
+                suffix_kv = list(
+                    zip(suffix_layers[0].unbind(0), suffix_layers[1].unbind(0))
+                )
+            else:
+                suffix_kv = self._arena.gather_suffix(idx)
             suffix_positions = (
                 (torch.arange(max_suffix, device=self._device) + self._prefix_len)
                 .unsqueeze(0)
@@ -599,7 +650,17 @@ class CachedPositionEvaluator:
             suffix_mask=suffix_mask,
             prefix_kv=self._prefix_kv,
             prefix_len=self._prefix_len,
+            suffix_layers=suffix_layers,
         )
+
+    def _append_decode_rows(self, request, k_rows, v_rows):
+        self._arena = _get_or_create_arena(self._arena, k_rows, v_rows)
+        assigned_rows = self._arena.append(k_rows, v_rows)
+        for node, own_row in zip(request.nodes, assigned_rows):
+            parent_chain = [] if node.parent is None else node.parent.arena_chain
+            if parent_chain is None:
+                raise RuntimeError("Cannot store a child before evaluating its parent")
+            node.arena_chain = parent_chain + [own_row]
 
     def consume_decode_result(
         self, request: _DecodeRequest, out: dict[str, torch.Tensor]
@@ -614,13 +675,7 @@ class CachedPositionEvaluator:
         v_stack = torch.stack([v for _, v in out["kv"]], dim=0)
         k_rows = k_stack.squeeze(3).permute(0, 2, 1, 3)  # [L, H, B, d]
         v_rows = v_stack.squeeze(3).permute(0, 2, 1, 3)
-        self._arena = _get_or_create_arena(self._arena, k_rows, v_rows)
-        assigned_rows = self._arena.append(k_rows, v_rows)
-        for node, own_row in zip(request.nodes, assigned_rows):
-            parent_chain = [] if node.parent is None else node.parent.arena_chain
-            if parent_chain is None:
-                raise RuntimeError("Cannot store a child before evaluating its parent")
-            node.arena_chain = parent_chain + [own_row]
+        self._append_decode_rows(request, k_rows, v_rows)
 
         # Arena operations only queue CUDA work. Move generation and vocab
         # mapping overlap the first device-to-host synchronization.
@@ -629,50 +684,7 @@ class CachedPositionEvaluator:
             for cozy_board in request.boards
         ]
 
-        # One device->host transfer per wave instead of two syncs per node.
-        # `logits` deliberately stays on the device: only the ~31 legal
-        # entries per row are ever read, and _batched_legal_log_priors gathers
-        # them there so the crossing carries [B, width], not [B, vocab].
-        # value_logits is [B, 3] -- already negligible.
-        logits = out["logits"].float()
-        value_logits = out["value_logits"].float().cpu()
-
-        # Every remaining tensor op is one call for the whole wave. At budget
-        # 2048 a wave carries ~1,321 nodes, and the old shape ran a softmax, a
-        # torch.tensor, an index_select and a log_softmax per node over
-        # ~31-element rows, where dispatch dominated the arithmetic.
-        values = _batched_value_scalars(value_logits)
-
-        id_lists = [ids for ids, _, _, _, _ in per_node]
-        prior_rows: list[list[float]] = [[] for _ in id_lists]
-        if all(id_lists):
-            prior_rows = _batched_legal_log_priors(logits, id_lists)
-        else:
-            # A node whose legal moves map to nothing in the vocab yields an
-            # empty PositionEval, matching the old RuntimeError branch. Gather
-            # only the rows that have moves so the batch stays rectangular.
-            keep = [row for row, ids in enumerate(id_lists) if ids]
-            if keep:
-                sub = _batched_legal_log_priors(
-                    logits.index_select(
-                        0, torch.tensor(keep, device=logits.device, dtype=torch.long)
-                    ),
-                    [id_lists[row] for row in keep],
-                )
-                for row, priors in zip(keep, sub):
-                    prior_rows[row] = priors
-
-        return [
-            PositionEval(
-                value_stm=values[row],
-                legal_moves=moves,
-                legal_ucis=ucis,
-                legal_log_priors=prior_rows[row],
-                legal_forcing=forcing,
-                legal_ids=ids,
-            )
-            for row, (ids, moves, ucis, forcing, _total) in enumerate(per_node)
-        ]
+        return _project_decode_results(per_node, out)
 
     def evaluate(self, batch):
         if not batch:
@@ -688,3 +700,34 @@ class CachedPositionEvaluator:
                 suffix_mask=request.suffix_mask,
             )
         return self.consume_decode_result(request, out)
+
+
+def consume_batched_decode_results(payloads, requests, out):
+    """Append independent game caches, then read back/project one merged wave."""
+    k_rows = (
+        torch.stack([k for k, _ in out["kv"]], dim=0).squeeze(3).permute(0, 2, 1, 3)
+    )
+    v_rows = (
+        torch.stack([v for _, v in out["kv"]], dim=0).squeeze(3).permute(0, 2, 1, 3)
+    )
+    per_node = []
+    offset = 0
+    for (evaluator, _), request in zip(payloads, requests):
+        end = offset + len(request.nodes)
+        evaluator._append_decode_rows(
+            request, k_rows[:, :, offset:end], v_rows[:, :, offset:end]
+        )
+        per_node.extend(
+            cozy_bridge.project_legal_moves(board, evaluator._move_vocab)
+            for board in request.boards
+        )
+        offset = end
+    if offset != out["logits"].shape[0]:
+        raise ValueError("merged decode output row count mismatch")
+    flat = _project_decode_results(per_node, out)
+    results, offset = [], 0
+    for request in requests:
+        end = offset + len(request.nodes)
+        results.append(flat[offset:end])
+        offset = end
+    return results

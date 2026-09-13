@@ -21,6 +21,7 @@ so any caller can plug in its own accumulator (or none, via `stats=None`).
 from __future__ import annotations
 
 import time
+import weakref
 from dataclasses import dataclass
 from typing import Any, Protocol
 
@@ -123,8 +124,32 @@ def _split_root_output(
     return results
 
 
-def _make_root_eval_executor(*, model, device, dtype, stats: "TimingStatsLike | None"):
+def _make_root_eval_executor(
+    *,
+    model,
+    device,
+    dtype,
+    stats: "TimingStatsLike | None",
+    max_tokens: int | None = None,
+):
     def executor(payloads: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        if max_tokens is not None:
+            if max_tokens < 1 or any(
+                int(p["total_tokens"]) > max_tokens for p in payloads
+            ):
+                raise ValueError("root exceeds executor token limit")
+            groups, group, count = [], [], 0
+            for payload in payloads:
+                size = int(payload["total_tokens"])
+                if group and count + size > max_tokens:
+                    groups.append(group)
+                    group, count = [], 0
+                group.append(payload)
+                count += size
+            if group:
+                groups.append(group)
+            if len(groups) > 1:
+                return [result for group in groups for result in executor(group)]
         merged = _merge_root_batches(payloads)
         t0 = time.perf_counter()
         output = _forward_model(
@@ -151,7 +176,63 @@ class _MergedDecodeRequest:
     suffix_mask: torch.Tensor | None
 
 
-def _merge_decode_requests(requests: list[Any]) -> _MergedDecodeRequest:
+def _pack_prefixes(requests, reserve_tokens=0):
+    """Pack roots, optionally reserving SDPA branch/leaf space in the same storage."""
+    num_layers = len(requests[0].prefix_kv)
+    max_prefix = max(req.prefix_len for req in requests)
+    prefix_kv_grouped: list[tuple[torch.Tensor, torch.Tensor]] = []
+    for layer in range(num_layers):
+        if reserve_tokens:
+            ref_k, ref_v = requests[0].prefix_kv[layer]
+            total = max_prefix + reserve_tokens
+            packed_k = ref_k.new_zeros(
+                (len(requests), ref_k.size(0), total, ref_k.size(-1))
+            )
+            packed_v = ref_v.new_zeros(
+                (len(requests), ref_v.size(0), total, ref_v.size(-1))
+            )
+            for game, req in enumerate(requests):
+                k, v = req.prefix_kv[layer]
+                packed_k[game, :, : req.prefix_len].copy_(k)
+                packed_v[game, :, : req.prefix_len].copy_(v)
+            prefix_kv_grouped.append((packed_k, packed_v))
+            continue
+        ks, vs = [], []
+        for req in requests:
+            k, v = req.prefix_kv[layer]
+            pad = max_prefix + reserve_tokens - k.size(1)
+            ks.append(F.pad(k, (0, 0, 0, pad)) if pad else k)
+            vs.append(F.pad(v, (0, 0, 0, pad)) if pad else v)
+        prefix_kv_grouped.append((torch.stack(ks, dim=0), torch.stack(vs, dim=0)))
+
+    return prefix_kv_grouped
+
+
+def _pack_suffix_layers(requests, max_suffix):
+    """Pad/catenate whole-layer stacks, avoiding one padding launch per layer."""
+    ks, vs = [], []
+    for req in requests:
+        if req.suffix_kv is None:
+            k, v = req.prefix_kv[0]
+            shape = (len(req.prefix_kv), len(req.nodes), k.size(0), max_suffix)
+            ks.append(k.new_zeros((*shape, k.size(-1))))
+            vs.append(v.new_zeros((*shape, v.size(-1))))
+        else:
+            layers = getattr(req, "suffix_layers", None)
+            if layers is None:
+                layers = tuple(
+                    torch.stack([kv[i] for kv in req.suffix_kv]) for i in range(2)
+                )
+            k, v = layers
+            pad = max_suffix - k.size(-2)
+            ks.append(F.pad(k, (0, 0, 0, pad)) if pad else k)
+            vs.append(F.pad(v, (0, 0, 0, pad)) if pad else v)
+    return list(zip(torch.cat(ks, dim=1).unbind(0), torch.cat(vs, dim=1).unbind(0)))
+
+
+def _merge_decode_requests(
+    requests: list[Any], *, prefix_kv_grouped=None, batch_suffix=False
+) -> _MergedDecodeRequest:
     """Build forward_decode_grouped's inputs from G games' _DecodeRequest.
 
     prefix_kv_grouped pads every game's [H, T_g, d] prefix to [G, H, maxP, d]
@@ -178,30 +259,36 @@ def _merge_decode_requests(requests: list[Any]) -> _MergedDecodeRequest:
     # still want it -- forward_decode_grouped(group_sizes=...) does not read
     # it, which is what removes its per-wave syncs.
     group_sizes = [len(req.nodes) for req in requests]
-    group_index = torch.cat(
-        [
-            torch.full((n,), g, dtype=torch.long)
-            for g, n in enumerate(group_sizes)
-        ]
+    group_index = (
+        torch.arange(len(group_sizes), dtype=torch.long)
+        if all(n == 1 for n in group_sizes)
+        else torch.cat(
+            [torch.full((n,), g, dtype=torch.long) for g, n in enumerate(group_sizes)]
+        )
     )
-    new_token_batch = {
-        key: torch.cat([req.new_token_batch[key] for req in requests], dim=0)
-        for key in requests[0].new_token_batch
-    }
-    positions = torch.cat([req.positions for req in requests])
+    deferred = not isinstance(requests[0].positions, torch.Tensor)
+    if deferred:
+        new_token_batch = {
+            key: torch.tensor(
+                [row for req in requests for row in req.new_token_batch[key]],
+                dtype=torch.long,
+            )
+            for key in requests[0].new_token_batch
+        }
+        positions = torch.tensor(
+            [pos for req in requests for pos in req.positions], dtype=torch.long
+        )
+    else:
+        new_token_batch = {
+            key: torch.cat([req.new_token_batch[key] for req in requests], dim=0)
+            for key in requests[0].new_token_batch
+        }
+        positions = torch.cat([req.positions for req in requests])
     prefix_lens_list = [req.prefix_len for req in requests]
     prefix_lens = torch.tensor(prefix_lens_list, dtype=torch.long)
 
-    max_prefix = max(req.prefix_len for req in requests)
-    prefix_kv_grouped: list[tuple[torch.Tensor, torch.Tensor]] = []
-    for layer in range(num_layers):
-        ks, vs = [], []
-        for req in requests:
-            k, v = req.prefix_kv[layer]
-            pad = max_prefix - k.size(1)
-            ks.append(F.pad(k, (0, 0, 0, pad)) if pad else k)
-            vs.append(F.pad(v, (0, 0, 0, pad)) if pad else v)
-        prefix_kv_grouped.append((torch.stack(ks, dim=0), torch.stack(vs, dim=0)))
+    if prefix_kv_grouped is None:
+        prefix_kv_grouped = _pack_prefixes(requests)
 
     max_suffix = max(
         (req.suffix_kv[0][0].size(2) if req.suffix_kv is not None else 0)
@@ -231,7 +318,7 @@ def _merge_decode_requests(requests: list[Any]) -> _MergedDecodeRequest:
                 # from ref_k correctly; only the two device-less
                 # torch.zeros(...) calls below needed the explicit device=.
                 request_device = req.prefix_kv[0][0].device
-                for layer in range(num_layers):
+                for layer in range(0 if batch_suffix else num_layers):
                     ref_k, ref_v = req.prefix_kv[layer]
                     suffix_k_rows[layer].append(
                         ref_k.new_zeros(
@@ -246,7 +333,7 @@ def _merge_decode_requests(requests: list[Any]) -> _MergedDecodeRequest:
                 suffix_positions_rows.append(
                     torch.zeros(
                         (wave_size, max_suffix),
-                        dtype=req.positions.dtype,
+                        dtype=getattr(req.positions, "dtype", torch.long),
                         device=request_device,
                     )
                 )
@@ -258,7 +345,7 @@ def _merge_decode_requests(requests: list[Any]) -> _MergedDecodeRequest:
             else:
                 s_g = req.suffix_kv[0][0].size(2)
                 pad = max_suffix - s_g
-                for layer in range(num_layers):
+                for layer in range(0 if batch_suffix else num_layers):
                     k, v = req.suffix_kv[layer]
                     suffix_k_rows[layer].append(F.pad(k, (0, 0, 0, pad)) if pad else k)
                     suffix_v_rows[layer].append(F.pad(v, (0, 0, 0, pad)) if pad else v)
@@ -272,13 +359,17 @@ def _merge_decode_requests(requests: list[Any]) -> _MergedDecodeRequest:
                     if pad
                     else req.suffix_mask
                 )
-        suffix_kv = [
-            (
-                torch.cat(suffix_k_rows[layer], dim=0),
-                torch.cat(suffix_v_rows[layer], dim=0),
-            )
-            for layer in range(num_layers)
-        ]
+        suffix_kv = (
+            _pack_suffix_layers(requests, max_suffix)
+            if batch_suffix
+            else [
+                (
+                    torch.cat(suffix_k_rows[layer], dim=0),
+                    torch.cat(suffix_v_rows[layer], dim=0),
+                )
+                for layer in range(num_layers)
+            ]
+        )
         suffix_positions = torch.cat(suffix_positions_rows, dim=0)
         suffix_mask = torch.cat(suffix_mask_rows, dim=0)
 
@@ -320,12 +411,40 @@ def _split_decode_output(
 
 
 def _make_decode_wave_executor(
-    *, model, device, dtype, stats: "TimingStatsLike | None"
+    *,
+    model,
+    device,
+    dtype,
+    stats: "TimingStatsLike | None",
+    one_query_per_game: bool = False,
+    cache_prefixes: bool = False,
+    batch_projection: bool = False,
+    batch_inputs: bool = False,
+    batch_suffix: bool = False,
+    decoder_mode: str = "current",
 ):
+    if decoder_mode not in ("current", "tensor", "compiled", "sdpa", "compiled-sdpa"):
+        raise ValueError("unknown decoder mode")
+    from imba_chess.model.tensor_decoder import DecoderRunner
+
+    runner = DecoderRunner(model, decoder_mode) if decoder_mode != "current" else None
+    cached_owners = ()
+    cached_prefixes = None
+    cached_workspace = None
+
+    def clear_cache():
+        nonlocal cached_owners, cached_prefixes, cached_workspace
+        cached_owners, cached_prefixes = (), None
+        cached_workspace = None
+        if runner is not None:
+            runner.clear()
+
     def executor(
         payloads: list[tuple[CachedPositionEvaluator, list]],
     ) -> list[list[search.PositionEval]]:
-        if len(payloads) == 1:
+        nonlocal cached_owners, cached_prefixes, cached_workspace
+        if len(payloads) == 1 and runner is None:
+            clear_cache()
             # Single game in this tick's decode_wave batch: the existing
             # single-prefix evaluate() path, byte-identical to the
             # pre-scheduler code (this is the only path exercised when
@@ -345,35 +464,70 @@ def _make_decode_wave_executor(
         # which is pure Python move generation and vocab projection.
         prep0 = time.perf_counter()
         requests = [
-            evaluator.build_decode_request(batch) for evaluator, batch in payloads
+            evaluator.build_decode_request(
+                batch, defer_tensors=batch_inputs, stack_suffix=batch_suffix
+            )
+            if batch_inputs or batch_suffix
+            else evaluator.build_decode_request(batch)
+            for evaluator, batch in payloads
         ]
-        merged = _merge_decode_requests(requests)
+        suffix_options = {"batch_suffix": True} if batch_suffix else {}
+        if cache_prefixes:
+            owners = tuple(weakref.ref(evaluator) for evaluator, _ in payloads)
+            if owners != cached_owners:
+                if runner is not None and runner.sdpa:
+                    reserve = runner.suffix_capacity + 1
+                    cached_workspace = _pack_prefixes(requests, reserve_tokens=reserve)
+                    # Views, not another packed-prefix allocation/copy. The
+                    # final reserve slots belong only to the mutable branch.
+                    cached_prefixes = [
+                        (k[:, :, :-reserve], v[:, :, :-reserve])
+                        for k, v in cached_workspace
+                    ]
+                else:
+                    cached_prefixes = _pack_prefixes(requests)
+                cached_owners = owners
+            merged = _merge_decode_requests(
+                requests, prefix_kv_grouped=cached_prefixes, **suffix_options
+            )
+        else:
+            merged = _merge_decode_requests(requests, **suffix_options)
         prep = time.perf_counter() - prep0
 
         t0 = time.perf_counter()
         with torch.inference_mode(), _autocast_context(device, dtype):
-            out = model.forward_decode_grouped(
-                new_token_batch=merged.new_token_batch,
-                positions=merged.positions,
-                group_index=merged.group_index,
-                prefix_kv_grouped=merged.prefix_kv_grouped,
-                prefix_lens=merged.prefix_lens,
-                prefix_lens_list=merged.prefix_lens_list,
-                suffix_kv=merged.suffix_kv,
-                suffix_positions=merged.suffix_positions,
-                suffix_mask=merged.suffix_mask,
-                group_sizes=merged.group_sizes,
+            out = (
+                runner(merged, workspace=cached_workspace)
+                if runner is not None
+                else model.forward_decode_grouped(
+                    new_token_batch=merged.new_token_batch,
+                    positions=merged.positions,
+                    group_index=merged.group_index,
+                    prefix_kv_grouped=merged.prefix_kv_grouped,
+                    prefix_lens=merged.prefix_lens,
+                    prefix_lens_list=merged.prefix_lens_list,
+                    suffix_kv=merged.suffix_kv,
+                    suffix_positions=merged.suffix_positions,
+                    suffix_mask=merged.suffix_mask,
+                    group_sizes=merged.group_sizes,
+                    **({"one_query_per_game": True} if one_query_per_game else {}),
+                )
             )
         gpu_elapsed = time.perf_counter() - t0
 
         # Legal-move projection back into PositionEvals -- also previously
         # untimed, and the single largest Python self-time in the profile.
         post0 = time.perf_counter()
-        split_outs = _split_decode_output(out, [len(req.nodes) for req in requests])
-        results = [
-            evaluator.consume_decode_result(req, out_g)
-            for (evaluator, _), req, out_g in zip(payloads, requests, split_outs)
-        ]
+        if batch_projection:
+            from .position_evaluator import consume_batched_decode_results
+
+            results = consume_batched_decode_results(payloads, requests, out)
+        else:
+            split_outs = _split_decode_output(out, [len(req.nodes) for req in requests])
+            results = [
+                evaluator.consume_decode_result(req, out_g)
+                for (evaluator, _), req, out_g in zip(payloads, requests, split_outs)
+            ]
         post = time.perf_counter() - post0
 
         if stats is not None:
@@ -384,4 +538,5 @@ def _make_decode_wave_executor(
             stats.search_eval_items += sum(len(req.nodes) for req in requests)
         return results
 
+    executor.clear_cache = clear_cache
     return executor

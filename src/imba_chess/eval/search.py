@@ -104,10 +104,10 @@ def _drive(gen: Generator[EvalRequest, list[PositionEval], Any], evaluator: Posi
 
 @dataclass(frozen=True)
 class HalvingConfig:
-    budget: int = 256
+    budget: int = 2048
     top_m: int = 16
     rounds: int = 0  # 0 = auto ceil(log2(num_arms))
-    refutation_top_r: int = 2
+    refutation_top_r: int = 4
     expand_top: int = 3
     max_depth: int = 4
     lam: float = 0.05
@@ -835,6 +835,15 @@ def _halving_stepwise(
         )
         if terminal_root is not None and terminal_root >= 1.0:
             # Immediate win (checkmate delivered): no other move can score higher.
+            terminal_arm = _Arm(
+                idx,
+                move,
+                float(legal_log_priors[idx]),
+                None,
+                terminal_root,
+                root_coverage_added=idx not in legacy_picks,
+                root_check_evasion=root_in_check,
+            )
             return idx, [
                 {
                     "move_uci": move.uci(),
@@ -844,9 +853,7 @@ def _halving_stepwise(
                     "backed_value": 1.0,
                     "search_score": 1.0,
                     "eliminated_round": None,
-                    "search_stats": _arm_search_stats(
-                        _Arm(idx, move, float(legal_log_priors[idx]), None, terminal_root), config
-                    ),
+                    "search_stats": _arm_search_stats(terminal_arm, config),
                 }
             ]
         arm = _Arm(

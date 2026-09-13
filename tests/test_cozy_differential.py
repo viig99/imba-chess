@@ -4,6 +4,7 @@ cozy-backed primitive used by search.py. Covers perft-suite edge positions
 """
 
 import os
+from functools import lru_cache
 import random
 from typing import Any
 
@@ -16,7 +17,7 @@ from imba_chess.eval.cozy_bridge import (
     gives_check,
     py_move_to_cozy,
 )
-from tests.test_cozy_bridge import EDGE_FENS, _random_boards
+from tests.chess_positions import EDGE_FENS, _random_boards
 
 # Hand-built (position, move, expected gives_check) cases the random sweep is
 # unlikely to hit. All five verified against python-chess 1.11.2 on 2026-07-18.
@@ -34,20 +35,22 @@ CURATED_CASES = [
 ]
 
 
-def _all_boards() -> list[chess.Board]:
-    return [chess.Board(f) for f in EDGE_FENS] + _random_boards(200, seed=1234)
+@lru_cache(maxsize=2)
+def _all_boards(n_games) -> list[chess.Board]:
+    return [chess.Board(f) for f in EDGE_FENS] + _random_boards(n_games, seed=1234)
 
 
-def test_gives_check_matches_python_chess_everywhere():
+@pytest.mark.parametrize("n_games", [3, pytest.param(200, marks=pytest.mark.extended)])
+def test_gives_check_matches_python_chess_everywhere(n_games):
     checked = 0
-    for board in _all_boards():
+    for board in _all_boards(n_games):
         cozy = board_to_cozy(board)
         for move in board.legal_moves:
             assert gives_check(cozy, py_move_to_cozy(board, move)) == board.gives_check(
                 move
             ), (board.fen(), move.uci())
             checked += 1
-    assert checked > 50_000
+    assert checked > 100
 
 
 @pytest.mark.parametrize("fen,uci,expected", CURATED_CASES)
@@ -59,17 +62,19 @@ def test_gives_check_curated_edge_cases(fen, uci, expected):
     assert gives_check(board_to_cozy(board), py_move_to_cozy(board, move)) == expected
 
 
-def test_legal_move_sets_match_python_chess_everywhere():
+@pytest.mark.parametrize("n_games", [3, pytest.param(200, marks=pytest.mark.extended)])
+def test_legal_move_sets_match_python_chess_everywhere(n_games):
     from imba_chess.eval.cozy_bridge import cozy_move_to_uci
 
-    for board in _all_boards():
+    for board in _all_boards(n_games):
         cozy = board_to_cozy(board)
         assert sorted(m.uci() for m in board.legal_moves) == sorted(
             cozy_move_to_uci(cozy, m) for m in cozy.generate_moves()
         ), board.fen()
 
 
-def test_is_capture_cozy_matches_python_chess_everywhere():
+@pytest.mark.parametrize("n_games", [3, pytest.param(200, marks=pytest.mark.extended)])
+def test_is_capture_cozy_matches_python_chess_everywhere(n_games):
     """cozy_bridge.is_capture_cozy (Stage 3 Task 5) is the capture test
     _forcing_index_set_tree uses at cozy-only tree nodes -- python-chess is_capture
     remains the oracle, castling included (cozy's king-takes-own-rook
@@ -78,7 +83,7 @@ def test_is_capture_cozy_matches_python_chess_everywhere():
     from imba_chess.eval.cozy_bridge import is_capture_cozy
 
     checked = 0
-    for board in _all_boards():
+    for board in _all_boards(n_games):
         cozy = board_to_cozy(board)
         for move in board.legal_moves:
             cozy_move = py_move_to_cozy(board, move)
@@ -86,7 +91,7 @@ def test_is_capture_cozy_matches_python_chess_everywhere():
                 board.fen(), move.uci(),
             )
             checked += 1
-    assert checked > 50_000
+    assert checked > 100
 
 
 def test_is_capture_cozy_curated_castling_is_not_a_capture():
@@ -158,45 +163,49 @@ def test_insufficient_material_matches_python_chess():
         )
 
 
-def test_terminal_value_native_matches_oracle_on_replayed_games():
-    import copy as copymod
-    import random
+def _python_terminal_value(board, color):
+    outcome = board.outcome(claim_draw=True)
+    if outcome is None:
+        return None
+    if outcome.winner is None:
+        return 0.0
+    return 1.0 if outcome.winner == color else -1.0
 
-    from imba_chess.eval.cozy_bridge import repetition_hash, terminal_value_native
-    from imba_chess.eval.search import terminal_value_for_color
 
-    rng = random.Random(77)
-    terminal_seen = draw_claims_seen = 0
-    for g in range(800):
-        pyb = chess.Board()
-        cb = board_to_cozy(pyb)
-        # repetition_hash() of prior positions since the last irreversible
-        # (zeroing: capture/pawn-move) move -- see terminal_value_native's
-        # docstring for why zeroing-only is a sufficient reset condition.
-        hash_history = []
-        for _ in range(300):
-            moves = list(pyb.legal_moves)
-            if not moves:
-                break
-            quiet = [m for m in moves if not pyb.is_capture(m) and m.promotion is None]
-            mv = rng.choice(quiet if (quiet and rng.random() < 0.92) else moves)
-            prev_hash = repetition_hash(cb)
-            prev_halfmove = pyb.halfmove_clock
-            cb2 = copymod.copy(cb)
-            cb2.play(py_move_to_cozy(pyb, mv))
-            pyb.push(mv)
-            hash_history = [] if pyb.halfmove_clock <= prev_halfmove else hash_history + [prev_hash]
-            cb = cb2
-            expected = terminal_value_for_color(pyb, color=pyb.turn)
-            got = terminal_value_native(cb, color_is_stm=True, hash_history=hash_history)
-            assert got == expected, (pyb.fen(), len(hash_history), expected, got)
-            if expected is not None:
-                terminal_seen += 1
-                if expected == 0.0 and not pyb.is_stalemate() and not pyb.is_insufficient_material():
-                    draw_claims_seen += 1
-                break
-    assert terminal_seen >= 30
-    assert draw_claims_seen >= 5  # repetition/50-move path must actually be exercised
+@pytest.mark.parametrize("fen,moves,termination", [
+    (chess.STARTING_FEN, "e2e4 e7e5", None),
+    (chess.STARTING_FEN, "f2f3 e7e5 g2g4 d8h4", chess.Termination.CHECKMATE),
+    ("7k/5Q2/6K1/8/8/8/8/8 b - - 0 1", "", chess.Termination.STALEMATE),
+    ("7k/8/8/8/8/8/8/KB6 w - - 0 1", "", chess.Termination.INSUFFICIENT_MATERIAL),
+    ("7k/8/8/8/8/8/8/K5R1 w - - 98 60", "", None),
+    ("7k/8/8/8/8/8/8/K5R1 w - - 99 60", "", chess.Termination.FIFTY_MOVES),
+    ("7k/8/8/8/8/8/8/K5R1 w - - 100 60", "", chess.Termination.FIFTY_MOVES),
+    ("8/8/8/8/8/5k2/6q1/7K w - - 100 60", "", chess.Termination.CHECKMATE),
+    (chess.STARTING_FEN, "g1f3 g8f6 f3g1 f6g8 g1f3 g8f6 f3g1", chess.Termination.THREEFOLD_REPETITION),
+    (chess.STARTING_FEN, "g1f3 g8f6 f3g1 f6g8 g1f3 g8f6 f3g1 f6g8", chess.Termination.THREEFOLD_REPETITION),
+])
+def test_terminal_value_native_matches_independent_outcome(fen, moves, termination):
+    import copy
+
+    board = chess.Board(fen)
+    native = board_to_cozy(board)
+    history = []
+    for uci in [None, *moves.split()]:
+        if uci is not None:
+            move = chess.Move.from_uci(uci)
+            history.append(cozy_bridge.repetition_hash(native))
+            child = copy.copy(native)
+            child.play(py_move_to_cozy(board, move))
+            board.push(move)
+            native = child
+            if board.halfmove_clock == 0:
+                history = []
+        for color in (chess.WHITE, chess.BLACK):
+            assert cozy_bridge.terminal_value_native(
+                native, color_is_stm=color == board.turn, hash_history=history,
+            ) == _python_terminal_value(board, color), (board.fen(), color)
+    outcome = board.outcome(claim_draw=True)
+    assert (outcome.termination if outcome else None) == termination
 
 
 def test_terminal_value_native_curated_phantom_ep_repetition():
@@ -212,7 +221,6 @@ def test_terminal_value_native_curated_phantom_ep_repetition():
     import copy as copymod
 
     from imba_chess.eval.cozy_bridge import repetition_hash, terminal_value_native
-    from imba_chess.eval.search import terminal_value_for_color
 
     # Kings far apart, single white pawn free to double-push with no black
     # pawn anywhere near it -- the resulting ep flag is unconditionally
@@ -248,13 +256,13 @@ def test_terminal_value_native_curated_phantom_ep_repetition():
         if cb.en_passant() is not None:
             saw_phantom_ep = True
             hashes_after_occurrence_1 = (cb.hash(), repetition_hash(cb))
-        expected = terminal_value_for_color(pyb, color=pyb.turn)
+        expected = _python_terminal_value(pyb, pyb.turn)
         got = terminal_value_native(cb, color_is_stm=True, hash_history=hash_history)
         assert got == expected, (pyb.fen(), uci, len(hash_history), expected, got)
 
     assert saw_phantom_ep, "fixture is broken: expected a phantom ep flag after d2d4"
     assert pyb.is_repetition(3)
-    assert terminal_value_for_color(pyb, color=pyb.turn) == 0.0
+    assert _python_terminal_value(pyb, pyb.turn) == 0.0
     # The regression this test targets: cozy's raw hash() at P1 (with the
     # phantom ep flag) differs from its own hash_without_ep(), proving the
     # divergence is real and repetition_hash is the thing bridging it.

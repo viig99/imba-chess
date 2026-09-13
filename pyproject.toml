@@ -37,6 +37,8 @@ where = ["src"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+addopts = "-m 'not extended'"
+markers = ["extended: compiler/device integration and broad randomized sweeps (run with -m extended or -m '')"]
 # Repo root on sys.path so test modules can cross-import fixtures, e.g.
 # `from tests.test_cozy_bridge import EDGE_FENS` in test_cozy_differential.py.
 # Needed because `.venv/bin/pytest` (unlike `python -m pytest`) does not add

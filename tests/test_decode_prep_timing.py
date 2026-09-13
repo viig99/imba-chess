@@ -116,9 +116,9 @@ def test_multi_game_path_accounts_for_prep_and_consume(monkeypatch):
 
     assert [len(o) for o in out] == [3, 2]
     assert all(ev.built == 1 and ev.consumed == 1 for ev, _ in payloads)
-    assert stats.decode_prep > 0.0 and stats.decode_project > 0.0, (
-        "build_decode_request/_merge/consume time was not accounted for"
-    )
+    assert (
+        stats.decode_prep > 0.0 and stats.decode_project > 0.0
+    ), "build_decode_request/_merge/consume time was not accounted for"
     assert stats.search_eval_items == 5
 
 
@@ -147,4 +147,56 @@ def test_stats_none_is_still_supported(monkeypatch):
     executor = _make_decode_wave_executor(
         model=model, device=torch.device("cpu"), dtype=torch.float32, stats=None
     )
-    assert [len(o) for o in executor([(_FakeEvaluator(2), [1, 2]), (_FakeEvaluator(1), [3])])] == [2, 1]
+    assert [
+        len(o)
+        for o in executor([(_FakeEvaluator(2), [1, 2]), (_FakeEvaluator(1), [3])])
+    ] == [2, 1]
+
+
+def test_prefix_cache_tracks_order_and_does_not_retain_evaluators(monkeypatch):
+    import gc
+    import weakref
+    import imba_chess.eval.merged_executors as me
+
+    model = _install_fakes(monkeypatch, None)
+    original_merge = me._merge_decode_requests
+    packed = []
+    seen = []
+
+    def pack(requests):
+        token = object()
+        packed.append(token)
+        return token
+
+    def merge(requests, *, prefix_kv_grouped):
+        seen.append(prefix_kv_grouped)
+        return original_merge(requests)
+
+    monkeypatch.setattr(me, "_pack_prefixes", pack)
+    monkeypatch.setattr(me, "_merge_decode_requests", merge)
+    executor = me._make_decode_wave_executor(
+        model=model,
+        device=torch.device("cpu"),
+        dtype=torch.float32,
+        stats=None,
+        cache_prefixes=True,
+    )
+    a, b = _FakeEvaluator(1), _FakeEvaluator(1)
+    executor([(a, [0]), (b, [0])])
+    executor([(a, [1]), (b, [1])])
+    assert len(packed) == 1 and seen[0] is seen[1]
+    executor([(b, [0]), (a, [0])])
+    assert len(packed) == 2
+    c = _FakeEvaluator(1)
+    executor([(b, [0]), (c, [0])])
+    assert len(packed) == 3
+    ref = weakref.ref(c)
+    del c
+    gc.collect()
+    assert ref() is None  # Holding packed prefix tensors must not retain whole trees.
+    executor.clear_cache()
+    executor([(a, [0]), (b, [0])])
+    assert len(packed) == 4
+    executor([(a, [0])])  # Tail fallback also releases the packed batch.
+    executor([(a, [0]), (b, [0])])
+    assert len(packed) == 5

@@ -46,7 +46,11 @@ class BatchScheduler:
         concurrent_games: int,
         on_game_done: Callable[[str, list[Any] | None], None],
         on_game_error: Callable[[str, BaseException], None],
+        completion_order: bool = False,
     ) -> None:
+        if concurrent_games < 1:
+            raise ValueError("concurrent_games must be positive")
+        self._completion_order = completion_order
         self._game_factory = game_factory
         self._executors = executors
         self._concurrent_games = concurrent_games
@@ -61,6 +65,13 @@ class BatchScheduler:
 
     def run(self) -> None:
         slots: dict[int, _Slot] = {}
+        try:
+            self._run(slots)
+        finally:
+            for slot in slots.values():
+                slot.gen.close()
+
+    def _run(self, slots: dict[int, _Slot]) -> None:
         self._fill_slots(slots)
         while True:
             # Phase 1: advance every slot lacking a pending request. A game
@@ -141,6 +152,9 @@ class BatchScheduler:
         self, slot_id: int, slots: dict[int, _Slot], rows: list[Any] | None
     ) -> None:
         slot = slots.pop(slot_id)
+        if self._completion_order:
+            self._on_game_done(slot.game_id, rows)
+            return
         self._held_back[slot.stream_idx] = (slot.game_id, rows)
         self._emit_ready()
 

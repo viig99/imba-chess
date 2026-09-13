@@ -28,7 +28,6 @@ merely by running those packages' `__init__`.)
 from __future__ import annotations
 
 import itertools
-import math
 import random
 import signal
 from dataclasses import asdict, dataclass, field
@@ -43,7 +42,7 @@ from imba_chess.data.board_state import BoardStateEncoder
 from imba_chess.data.event_builder import BOS_TOKEN_ID, EVENT_TOKEN_ID, TARGET_IGNORE_INDEX
 from imba_chess.data.models import BoardTokenConfig
 from imba_chess.data.move_vocab import MoveVocab, load_or_create_static_move_vocab
-from imba_chess.eval import alphabeta, cozy_bridge, search
+from imba_chess.eval import cozy_bridge, search
 from imba_chess.eval.actor_protocol import (
     GameDone,
     RootEvalRequest,
@@ -431,7 +430,6 @@ class _EvalSummaryFragment:
     search_stats: dict[str, int] = field(default_factory=dict)
     model_selection_seconds: float = 0.0
     game_records: list[dict] = field(default_factory=list)
-    search_reports: list[dict] = field(default_factory=list)
     inference_stats: dict[str, float | int] = field(default_factory=dict)
 
 
@@ -553,7 +551,7 @@ def _select_model_move(
     policy: str,
     value_rerank_top_k: int,
     value_rerank_lambda: float,
-    halving_config: "search.HalvingConfig | alphabeta.AlphaBetaConfig | None",
+    halving_config: "search.HalvingConfig | None",
 ) -> tuple[chess.Move, dict]:
     """Torch-free, protocol-driven twin of `scripts/eval_vs_stockfish.py`'s
     `_select_model_move`: the model forward becomes one `RootEvalRequest`/
@@ -630,8 +628,6 @@ def _select_model_move(
         )
     history.server_prefix_len = new_server_prefix_len
 
-    if policy in alphabeta.POLICIES and not math.isfinite(response.value_stm):
-        raise ValueError(f"Non-finite root value at {board.fen()}")
     total_legal_moves = len(list(board.legal_moves))
     legal_log_priors = _log_softmax_f32(list(response.legal_logits))
     mapped_legal_moves = len(legal_moves)
@@ -643,7 +639,7 @@ def _select_model_move(
 
     if policy == "greedy":
         chosen_index = search.select_greedy(legal_log_priors)
-    elif policy in ("value_rerank", "value_search_d2", "value_search_halving", *alphabeta.POLICIES):
+    elif policy in ("value_rerank", "value_search_d2", "value_search_halving"):
         evaluator = _WaveEvaluator(
             conn=conn,
             worker_id=worker_id,
@@ -671,15 +667,6 @@ def _select_model_move(
                 top_k=value_rerank_top_k,
                 lam=value_rerank_lambda,
             )
-        elif policy in alphabeta.POLICIES:
-            if not isinstance(halving_config, alphabeta.AlphaBetaConfig):
-                raise ValueError(f"{policy} requires AlphaBetaConfig")
-            report = alphabeta.select_value_search(
-                evaluator=evaluator, root_handle=None, board=board,
-                legal_moves=legal_moves, legal_log_priors=legal_log_priors,
-                config=halving_config,
-            )
-            chosen_index = report.chosen_index
         else:
             if halving_config is None:
                 raise ValueError("policy=value_search_halving requires halving_config")
@@ -700,8 +687,6 @@ def _select_model_move(
     }
     if policy == "value_search_halving":
         debug_info["search_stats"] = search.summarize_search_rows(_rows)
-    if policy in alphabeta.POLICIES:
-        debug_info.update(report.debug())
     return legal_moves[chosen_index], debug_info
 
 
@@ -717,7 +702,7 @@ def _play_one_game(
     policy: str,
     value_rerank_top_k: int,
     value_rerank_lambda: float,
-    halving_config: "search.HalvingConfig | alphabeta.AlphaBetaConfig | None",
+    halving_config: "search.HalvingConfig | None",
     opening_random_plies: int,
     max_plies: int,
     rng: random.Random,
@@ -772,8 +757,6 @@ def _play_one_game(
             summary.model_turns += 1
             summary.model_selection_seconds += perf_counter() - selection_start
             search.merge_search_stats(summary.search_stats, debug_info.get("search_stats", {}))
-            if "search_report" in debug_info:
-                summary.search_reports.append(dict(game_idx=game_idx, ply=plies, **debug_info["search_report"]))
             summary.legal_moves_total += int(debug_info["total_legal_moves"])
             summary.legal_moves_mapped_total += int(debug_info["mapped_legal_moves"])
             if int(debug_info["mapped_legal_moves"]) == 0:
@@ -893,7 +876,7 @@ def run_eval_worker(conn, worker_config: dict) -> None:
     value_rerank_lambda = float(worker_config.get("value_rerank_lambda", 0.0))
     halving_config_dict = worker_config.get("halving_config")
     halving_config = (
-        (alphabeta.AlphaBetaConfig if worker_config["model_move_policy"] in alphabeta.POLICIES else search.HalvingConfig)(**halving_config_dict) if halving_config_dict is not None else None
+        search.HalvingConfig(**halving_config_dict) if halving_config_dict is not None else None
     )
 
     move_vocab = load_or_create_static_move_vocab(

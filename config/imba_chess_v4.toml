@@ -23,8 +23,8 @@
 # Sized for a 32GB card (5090). [eval_vs_stockfish] is held in lockstep with
 # imba_chess.toml / the ckpt23 anchor protocol so v4 numbers land on the SAME
 # ruler: SF2400, 40000 nodes, budget 2048 / depth 8, fp32, no random opening.
-# The current anchor is ckpt34 with lambda=0.05 / 3 opponent replies:
-# 0.6000 (338/224/188 over 750 games).
+# The current anchor is ckpt34 with lambda=0.05 / 4 opponent replies:
+# 0.6593 (383/223/144 over 750 games; seed 1042).
 
 [dataset]
 min_avg_elo = 2000
@@ -163,7 +163,7 @@ value_rerank_lambda = 0.05
 search_budget = 2048
 search_top_m = 16
 halving_rounds = 0
-search_refutation_top_r = 3
+search_refutation_top_r = 4
 search_expand_top = 3
 search_max_depth = 8
 opening_random_plies = 0

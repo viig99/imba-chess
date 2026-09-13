@@ -41,6 +41,10 @@ class GroupedDecodeCache:
     prefix_rel: list[torch.Tensor]
     suffix_rel: list[torch.Tensor | None]
     suffix_fill_mask: list[torch.Tensor | None]
+    batched_prefix_rel: torch.Tensor | None = None
+    batched_prefix_fill: torch.Tensor | None = None
+    batched_suffix_rel: torch.Tensor | None = None
+    batched_suffix_fill: torch.Tensor | None = None
 
 
 def build_grouped_decode_cache(
@@ -104,6 +108,94 @@ def build_grouped_decode_cache(
     )
 
 
+def build_one_query_decode_cache(
+    *,
+    row_idx_per_group,
+    prefix_lens_list,
+    q_positions,
+    suffix_positions,
+    suffix_mask,
+    max_seq_len,
+    max_prefix,
+    prefix_lens=None,
+):
+    """Batched position indices/masks shared by every attention layer in a wave."""
+    if any(length < 0 or length > max_prefix for length in prefix_lens_list):
+        raise ValueError("prefix length exceeds padded cache")
+    device = q_positions.device
+    if prefix_lens is None:
+        prefix_lens = torch.tensor(prefix_lens_list, device=device)
+    positions = torch.arange(max_prefix, device=device)
+    q = q_positions.reshape(-1, 1)
+    rel = (positions[None, :] - q + max_seq_len - 1).clamp(0, 2 * max_seq_len - 2)
+    fill = (positions[None, :] >= prefix_lens[:, None])[:, None, None, :]
+    has_suffix = suffix_positions is not None and suffix_positions.size(-1) > 0
+    return GroupedDecodeCache(
+        row_idx=row_idx_per_group,
+        prefix_rel=[],
+        suffix_rel=[],
+        suffix_fill_mask=[],
+        batched_prefix_rel=rel,
+        batched_prefix_fill=fill,
+        batched_suffix_rel=(suffix_positions - q + max_seq_len - 1).clamp(
+            0, 2 * max_seq_len - 2
+        )
+        if has_suffix
+        else None,
+        batched_suffix_fill=~suffix_mask[:, None, None, :] if has_suffix else None,
+    )
+
+
+def _batch_bias(ps_w, rel):
+    return ps_w[:, rel].permute(1, 0, 2).unsqueeze(2)
+
+
+def _one_query_attention(
+    q_heads,
+    prefix_k,
+    prefix_v,
+    k_new,
+    v_new,
+    suffix_k,
+    suffix_v,
+    decode_cache,
+    ps_w,
+    self_bias,
+    scale,
+):
+    bias_dtype = q_heads.dtype
+    has_suffix = suffix_k is not None and suffix_k.size(2) > 0
+    max_p = prefix_k.size(2)
+    scores = torch.matmul(q_heads, prefix_k.to(q_heads.dtype).transpose(-2, -1)) * scale
+    scores = scores + _batch_bias(ps_w, decode_cache.batched_prefix_rel).to(bias_dtype)
+    scores = scores.masked_fill(decode_cache.batched_prefix_fill, -torch.inf)
+    parts = [scores]
+    if has_suffix:
+        suffix_scores = (
+            torch.matmul(q_heads, suffix_k.to(q_heads.dtype).transpose(-2, -1)) * scale
+        )
+        suffix_scores = suffix_scores + _batch_bias(
+            ps_w, decode_cache.batched_suffix_rel
+        ).to(bias_dtype)
+        parts.append(
+            suffix_scores.masked_fill(decode_cache.batched_suffix_fill, -torch.inf)
+        )
+    parts.append((q_heads * k_new).sum(-1, keepdim=True) * scale + self_bias)
+    weights = torch.softmax(torch.cat(parts, -1).float(), -1).to(q_heads.dtype)
+    attn_output = torch.matmul(weights[..., :max_p], prefix_v.to(weights.dtype))
+    offset = max_p
+    if has_suffix:
+        size = suffix_k.size(2)
+        attn_output = attn_output + torch.matmul(
+            weights[..., offset : offset + size], suffix_v.to(weights.dtype)
+        )
+        offset += size
+    attn_output = attn_output + weights[..., offset:] * v_new
+    return attn_output
+
+
+
+
 class SequentialTransductionUnitJagged(torch.nn.Module):
     def __init__(
         self,
@@ -143,9 +235,7 @@ class SequentialTransductionUnitJagged(torch.nn.Module):
         # Per-head relative position bias (T5-style): heads can learn distinct
         # distance priors (e.g. previous-move vs long-range opening context).
         self._ps_w = torch.nn.Parameter(
-            torch.empty(num_heads, 2 * self._max_seq_len - 1).normal_(
-                mean=0, std=0.02
-            ),
+            torch.empty(num_heads, 2 * self._max_seq_len - 1).normal_(mean=0, std=0.02),
         )
 
     def _norm_input(self, x: torch.Tensor) -> torch.Tensor:
@@ -333,9 +423,12 @@ class SequentialTransductionUnitJagged(torch.nn.Module):
 
         Returns (x_out [B, D], k_new [B, H, 1, d_qk], v_new [B, H, 1, d_v]).
         """
-        assert (suffix_k is None) == (suffix_v is None) == (
-            suffix_positions is None
-        ) == (suffix_mask is None), "suffix tensors must be provided together"
+        assert (
+            (suffix_k is None)
+            == (suffix_v is None)
+            == (suffix_positions is None)
+            == (suffix_mask is None)
+        ), "suffix tensors must be provided together"
         batch_size = x_new.size(0)
         x = x_new.unsqueeze(1)  # [B, 1, D]
         normed_x = self._norm_input(x)
@@ -433,6 +526,7 @@ class SequentialTransductionUnitJagged(torch.nn.Module):
         suffix_positions: torch.Tensor | None = None,
         suffix_mask: torch.Tensor | None = None,
         decode_cache: GroupedDecodeCache | None = None,
+        one_query_per_game: bool = False,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """Decode one new token per batch row against per-game grouped
         prefix K/V (cross-game merged wave).
@@ -465,9 +559,12 @@ class SequentialTransductionUnitJagged(torch.nn.Module):
         -- k_new/v_new for the FULL batch, in original row order (they only
         depend on each row's own token, not on its group's prefix).
         """
-        assert (suffix_k is None) == (suffix_v is None) == (
-            suffix_positions is None
-        ) == (suffix_mask is None), "suffix tensors must be provided together"
+        assert (
+            (suffix_k is None)
+            == (suffix_v is None)
+            == (suffix_positions is None)
+            == (suffix_mask is None)
+        ), "suffix tensors must be provided together"
         batch_size = x_new.size(0)
         x = x_new.unsqueeze(1)  # [B, 1, D]
         normed_x = self._norm_input(x)
@@ -494,8 +591,12 @@ class SequentialTransductionUnitJagged(torch.nn.Module):
         has_suffix = suffix_k is not None and suffix_k.size(2) > 0
 
         attn_output = torch.empty(
-            batch_size, self._num_heads, 1, self._linear_dim,
-            dtype=q_heads.dtype, device=device,
+            batch_size,
+            self._num_heads,
+            1,
+            self._linear_dim,
+            dtype=q_heads.dtype,
+            device=device,
         )
 
         num_groups = prefix_k.size(0)
@@ -505,7 +606,19 @@ class SequentialTransductionUnitJagged(torch.nn.Module):
                 f"(== prefix_k.size(0) == {num_groups}), got "
                 f"{len(row_idx_per_group)}"
             )
-        if decode_cache is None:
+        if one_query_per_game and (
+            decode_cache is None or decode_cache.batched_prefix_rel is None
+        ):
+            decode_cache = build_one_query_decode_cache(
+                row_idx_per_group=row_idx_per_group,
+                prefix_lens_list=prefix_lens_list,
+                q_positions=q_positions,
+                suffix_positions=suffix_positions,
+                suffix_mask=suffix_mask,
+                max_seq_len=self._max_seq_len,
+                max_prefix=prefix_k.size(2),
+            )
+        elif decode_cache is None:
             # Standalone call (tests, or any caller that has not been taught
             # about the wave cache): build it here so there is exactly one
             # implementation of this arithmetic. The model's own decode loop
@@ -526,89 +639,111 @@ class SequentialTransductionUnitJagged(torch.nn.Module):
             )
         # Group-invariant (it indexes _ps_w at a fixed offset), so it was the
         # same tensor G times per layer.
-        self_bias = self._ps_w[:, self._max_seq_len - 1].view(1, -1, 1, 1).to(
-            bias_dtype
+        self_bias = (
+            self._ps_w[:, self._max_seq_len - 1].view(1, -1, 1, 1).to(bias_dtype)
         )
-        for g in range(num_groups):
-            # Precomputed by the caller once per wave. These depend only on
-            # group_index, which is fixed across layers, so deriving them here
-            # ran `nonzero` num_layers times over for every group -- and
-            # `nonzero` has a data-dependent output shape, so each one was also
-            # a device->host sync.
-            row_idx = decode_cache.row_idx[g]
-            if row_idx.numel() == 0:
-                continue
-            actual_len = prefix_lens_list[g]
-            max_p = prefix_k.size(2)
-            if not 0 <= actual_len <= max_p:
-                raise ValueError(
-                    f"prefix_lens[{g}]={actual_len} out of range for padded "
-                    f"prefix length {max_p}"
-                )
-
-            q_g = q_heads.index_select(0, row_idx)
-            # Real (unpadded) prefix slice for this game only -- a view, not
-            # a per-row copy: identical shape/semantics to forward_decode's
-            # prefix_k [H, T, d].
-            prefix_k_g = prefix_k[g, :, :actual_len, :]
-            prefix_v_g = prefix_v[g, :, :actual_len, :]
-
-            prefix_scores = (
-                torch.einsum("bhqd,htd->bhqt", q_g, prefix_k_g.to(q_g.dtype)) * scale
+        if one_query_per_game:
+            # Experimental: the caller promises one row per group, in group order.
+            # Padding is masked before float32 softmax; no [B,H,P,D] gather.
+            if batch_size != num_groups or any(
+                len(rows) != 1 for rows in row_idx_per_group
+            ):
+                raise ValueError("one-query path requires one row per game")
+            attn_output = _one_query_attention(
+                q_heads,
+                prefix_k,
+                prefix_v,
+                k_new,
+                v_new,
+                suffix_k,
+                suffix_v,
+                decode_cache,
+                self._ps_w,
+                self_bias,
+                scale,
             )
-            prefix_scores = prefix_scores + self._bias_from_rel(
-                decode_cache.prefix_rel[g]
-            ).to(bias_dtype)
-
-            score_parts = [prefix_scores]
-            if has_suffix:
-                suffix_k_g = suffix_k.index_select(0, row_idx)
-                suffix_v_g = suffix_v.index_select(0, row_idx)
-                suffix_rel_g = decode_cache.suffix_rel[g]
-                suffix_fill_g = decode_cache.suffix_fill_mask[g]
-                if suffix_rel_g is None or suffix_fill_g is None:
+        else:
+            for g in range(num_groups):
+                # Precomputed by the caller once per wave. These depend only on
+                # group_index, which is fixed across layers, so deriving them here
+                # ran `nonzero` num_layers times over for every group -- and
+                # `nonzero` has a data-dependent output shape, so each one was also
+                # a device->host sync.
+                row_idx = decode_cache.row_idx[g]
+                if row_idx.numel() == 0:
+                    continue
+                actual_len = prefix_lens_list[g]
+                max_p = prefix_k.size(2)
+                if not 0 <= actual_len <= max_p:
                     raise ValueError(
-                        "decode_cache has no suffix entries but the wave has "
-                        "suffix tokens -- it was built for a different wave"
+                        f"prefix_lens[{g}]={actual_len} out of range for padded "
+                        f"prefix length {max_p}"
                     )
-                suffix_scores = (
-                    torch.einsum(
-                        "bhqd,bhsd->bhqs", q_g, suffix_k_g.to(q_g.dtype)
-                    )
+
+                q_g = q_heads.index_select(0, row_idx)
+                # Real (unpadded) prefix slice for this game only -- a view, not
+                # a per-row copy: identical shape/semantics to forward_decode's
+                # prefix_k [H, T, d].
+                prefix_k_g = prefix_k[g, :, :actual_len, :]
+                prefix_v_g = prefix_v[g, :, :actual_len, :]
+
+                prefix_scores = (
+                    torch.einsum("bhqd,htd->bhqt", q_g, prefix_k_g.to(q_g.dtype))
                     * scale
                 )
-                suffix_scores = suffix_scores + self._bias_from_rel(
-                    suffix_rel_g
+                prefix_scores = prefix_scores + self._bias_from_rel(
+                    decode_cache.prefix_rel[g]
                 ).to(bias_dtype)
-                suffix_scores = suffix_scores.masked_fill(
-                    suffix_fill_g, float("-inf")
+
+                score_parts = [prefix_scores]
+                if has_suffix:
+                    suffix_k_g = suffix_k.index_select(0, row_idx)
+                    suffix_v_g = suffix_v.index_select(0, row_idx)
+                    suffix_rel_g = decode_cache.suffix_rel[g]
+                    suffix_fill_g = decode_cache.suffix_fill_mask[g]
+                    if suffix_rel_g is None or suffix_fill_g is None:
+                        raise ValueError(
+                            "decode_cache has no suffix entries but the wave has "
+                            "suffix tokens -- it was built for a different wave"
+                        )
+                    suffix_scores = (
+                        torch.einsum("bhqd,bhsd->bhqs", q_g, suffix_k_g.to(q_g.dtype))
+                        * scale
+                    )
+                    suffix_scores = suffix_scores + self._bias_from_rel(
+                        suffix_rel_g
+                    ).to(bias_dtype)
+                    suffix_scores = suffix_scores.masked_fill(
+                        suffix_fill_g, float("-inf")
+                    )
+                    score_parts.append(suffix_scores)
+
+                k_new_g = k_new.index_select(0, row_idx)
+                v_new_g = v_new.index_select(0, row_idx)
+                self_scores = (q_g * k_new_g).sum(dim=-1, keepdim=True) * scale
+                self_scores = self_scores + self_bias
+                score_parts.append(self_scores)
+
+                scores = torch.cat(score_parts, dim=-1)  # [Bg, H, 1, T_g + s + 1]
+                weights = torch.softmax(scores.float(), dim=-1).to(q_g.dtype)
+
+                out_g = torch.einsum(
+                    "bhqt,htd->bhqd",
+                    weights[..., :actual_len],
+                    prefix_v_g.to(weights.dtype),
                 )
-                score_parts.append(suffix_scores)
+                offset = actual_len
+                if has_suffix:
+                    suffix_len = suffix_k_g.size(2)
+                    out_g = out_g + torch.einsum(
+                        "bhqs,bhsd->bhqd",
+                        weights[..., offset : offset + suffix_len],
+                        suffix_v_g.to(weights.dtype),
+                    )
+                    offset += suffix_len
+                out_g = out_g + weights[..., offset:] * v_new_g
 
-            k_new_g = k_new.index_select(0, row_idx)
-            v_new_g = v_new.index_select(0, row_idx)
-            self_scores = (q_g * k_new_g).sum(dim=-1, keepdim=True) * scale
-            self_scores = self_scores + self_bias
-            score_parts.append(self_scores)
-
-            scores = torch.cat(score_parts, dim=-1)  # [Bg, H, 1, T_g + s + 1]
-            weights = torch.softmax(scores.float(), dim=-1).to(q_g.dtype)
-
-            out_g = torch.einsum(
-                "bhqt,htd->bhqd", weights[..., :actual_len], prefix_v_g.to(weights.dtype)
-            )
-            offset = actual_len
-            if has_suffix:
-                suffix_len = suffix_k_g.size(2)
-                out_g = out_g + torch.einsum(
-                    "bhqs,bhsd->bhqd",
-                    weights[..., offset : offset + suffix_len],
-                    suffix_v_g.to(weights.dtype),
-                )
-                offset += suffix_len
-            out_g = out_g + weights[..., offset:] * v_new_g
-
-            attn_output.index_copy_(0, row_idx, out_g)
+                attn_output.index_copy_(0, row_idx, out_g)
 
         attn_output = self._norm_attn_output(
             attn_output.permute(0, 2, 1, 3).reshape(

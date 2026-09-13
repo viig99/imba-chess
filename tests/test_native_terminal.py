@@ -19,7 +19,7 @@ import imba_chess_native as native_cc
 import pytest
 
 from imba_chess.eval import cozy_bridge
-from tests.test_cozy_bridge import EDGE_FENS, _random_boards
+from tests.chess_positions import EDGE_FENS, native_positions
 
 # Positions where the interesting branches actually fire.
 TERMINAL_FENS = [
@@ -38,11 +38,7 @@ TERMINAL_FENS = [
 ]
 
 
-_RANDOM = _random_boards(120, seed=4242)
-_POSITIONS = (
-    [chess.Board(fen) for fen in EDGE_FENS + TERMINAL_FENS]
-    + _RANDOM[:: max(1, len(_RANDOM) // 120)][:120]
-)
+_POSITIONS = [chess.Board(fen) for fen in EDGE_FENS + TERMINAL_FENS] + native_positions("terminal")
 
 
 def _cozy_push(cozy_board, cozy_move, hash_history):

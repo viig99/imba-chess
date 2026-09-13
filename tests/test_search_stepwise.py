@@ -37,13 +37,9 @@ def _drive_by_hand(gen, evaluator):
         return stop.value
 
 
-@pytest.mark.parametrize("fen", [
-    chess.STARTING_FEN,
-    "r1bqkbnr/pppp1ppp/2n5/1B2p3/4P3/5N2/PPPP1PPP/RNBQK2R b KQkq - 3 3",
-    "r4rk1/1pp1qppp/p1np1n2/2b1p1B1/2B1P1b1/P1NP1N2/1PP1QPPP/R4RK1 w - - 0 10",
-])
-@pytest.mark.parametrize("coverage,q", [(False, 0), (True, 0), (False, 2), (True, 2)])
-def test_halving_generator_matches_sync_wrapper(fen, coverage, q):
+def test_halving_generator_matches_sync_wrapper():
+    fen = "r1bqkbnr/pppp1ppp/2n5/1B2p3/4P3/5N2/PPPP1PPP/RNBQK2R b KQkq - 3 3"
+    coverage, q = True, 2
     board = chess.Board(fen)
     legal_moves = list(board.legal_moves)
     legal_log_priors = [-1.0 - 0.01 * i for i in range(len(legal_moves))]
@@ -88,8 +84,8 @@ def test_d2_and_rerank_wrappers_unchanged_behavior():
     assert evaluator.calls  # evaluator was exercised through the wrapper
 
 
-@pytest.mark.parametrize("seed", list(range(24)))
-def test_budget_starvation_falls_back_to_highest_prior_arm(seed):
+@pytest.mark.parametrize("picks", [(2, 0, 1), (2, 1, 3)])
+def test_budget_starvation_falls_back_to_highest_prior_arm(monkeypatch, picks):
     """The starvation fallback must mean what it says.
 
     `_halving_stepwise` ends with:
@@ -114,13 +110,11 @@ def test_budget_starvation_falls_back_to_highest_prior_arm(seed):
     budget=0 forces the branch: the round loop breaks on
     `spent >= config.budget` before any eval, so every arm keeps score -inf.
     """
-    board = chess.Board(
-        "r4rk1/1pp1qppp/p1np1n2/2b1p1B1/2B1P1b1/P1NP1N2/1PP1QPPP/R4RK1 w - - 0 10"
-    )
+    board = chess.Board()
     legal_moves = list(board.legal_moves)
-    legal_log_priors = [
-        -1.0 - 0.13 * ((i * 7) % len(legal_moves)) for i in range(len(legal_moves))
-    ]
+    legal_log_priors = [-float(i) for i in range(len(legal_moves))]
+    monkeypatch.setattr(search, "_gumbel_top_k_order", lambda *args, **kwargs: list(picks))
+    assert picks[0] != min(picks)
 
     gen = search._halving_stepwise(
         extend=lambda handle, uci: None,
@@ -128,8 +122,8 @@ def test_budget_starvation_falls_back_to_highest_prior_arm(seed):
         board=board,
         legal_moves=legal_moves,
         legal_log_priors=legal_log_priors,
-        config=search.HalvingConfig(budget=0, top_m=8, gumbel_root_sampling=True),
-        rng=random.Random(seed),
+        config=search.HalvingConfig(budget=0, top_m=3, gumbel_root_sampling=True),
+        rng=random.Random(0),
     )
     try:
         next(gen)

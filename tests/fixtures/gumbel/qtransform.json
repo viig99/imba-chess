@@ -1,0 +1,94 @@
+{
+  "revision": "88f92056a420c2673bed282f5a0c00211f126e78",
+  "generator": "Pinned upstream qtransforms.py function bodies executed with NumPy float32 and NumPy softmax; no production imports.",
+  "cases": [
+    {
+      "value": 0.2,
+      "priors": [
+        0,
+        0,
+        0
+      ],
+      "visits": [
+        2,
+        0,
+        1
+      ],
+      "qvalues": [
+        1,
+        0,
+        -1
+      ],
+      "expected": [
+        5.2,
+        2.730000001937151,
+        0.0
+      ]
+    },
+    {
+      "value": 0.8,
+      "priors": [
+        0,
+        0
+      ],
+      "visits": [
+        0,
+        0
+      ],
+      "qvalues": [
+        0,
+        0
+      ],
+      "expected": [
+        0.0,
+        0.0
+      ]
+    },
+    {
+      "value": 0.4,
+      "priors": [
+        0,
+        -10000
+      ],
+      "visits": [
+        0,
+        2
+      ],
+      "qvalues": [
+        0,
+        -0.7
+      ],
+      "expected": [
+        5.2,
+        0.0
+      ]
+    },
+    {
+      "value": -0.8,
+      "priors": [
+        2,
+        -3,
+        1,
+        0
+      ],
+      "visits": [
+        8,
+        2,
+        0,
+        1
+      ],
+      "qvalues": [
+        0.2,
+        0.5,
+        0,
+        -0.8
+      ],
+      "expected": [
+        4.461538487108502,
+        5.800000000000001,
+        3.612348987621995,
+        0.0
+      ]
+    }
+  ]
+}

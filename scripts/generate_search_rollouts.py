@@ -20,9 +20,7 @@ import argparse
 import json
 import os
 import random
-import sys
 import time
-import traceback
 from pathlib import Path
 from typing import Any, Generator, Iterator
 
@@ -765,65 +763,9 @@ def main() -> None:
 
 
 def _main_with_hard_exit_on_crash() -> None:
-    """Entry-point wrapper: guarantees the process actually terminates on
-    every outcome -- success, unhandled exception, or Ctrl-C -- instead of
-    hanging.
+    from imba_chess.process import main_with_hard_exit
 
-    Observed in practice on a real GPU run: a crash inside scheduler.run()
-    printed its traceback but the process then sat futex-parked forever at
-    0% GPU instead of exiting -- a non-daemon background thread was still
-    alive, and CPython's normal interpreter shutdown (Py_FinalizeEx) blocks
-    joining every non-daemon thread before the process can actually
-    terminate. The most likely culprit here is PyTorch Inductor's
-    AsyncCompile background ThreadPoolExecutor, implicitly spun up by
-    create_batch_block_mask's module-level `torch.compile(...)` (see
-    src/imba_chess/model/hstu_model.py): CPython's own
-    concurrent.futures.thread module registers an atexit hook
-    (_python_exit) that explicitly joins every one of that pool's worker
-    threads, and that join can hang forever if a compile job is in flight or
-    a worker is otherwise blocked. Rather than depend on correctly
-    identifying (and safely daemonizing) every such dependency-owned thread,
-    force-terminate unconditionally: print the traceback, flush output, then
-    bypass the normal thread-joining shutdown path entirely via os._exit.
-    This matters for remote multi-shard operation, where a hung-but-not-dead
-    process silently occupies a shard slot forever instead of failing
-    visibly.
-
-    (Since 2026-08-20 this script's root evals go through
-    create_batch_dense_mask, so create_batch_block_mask -- and the
-    AsyncCompile pool it spins up on first call -- is no longer reached from
-    here. That removes the specific culprit named above, not the class of
-    problem, so the unconditional hard exit stays.)
-
-    Referencing the module-level `main` by bare name (not capturing it as a
-    default argument) is deliberate: tests monkeypatch `module.main` and
-    call this function directly to drive the crash/hard-exit path in a
-    subprocess without needing a real GPU or checkpoint.
-    """
-    try:
-        main()
-    except SystemExit:
-        # argparse's own --help/usage-error exits (and any explicit
-        # sys.exit() elsewhere) already carry the right code -- pass through
-        # unchanged rather than clobbering it via the hard-exit path below.
-        raise
-    except BaseException:
-        traceback.print_exc()
-        sys.stdout.flush()
-        sys.stderr.flush()
-        os._exit(1)
-    # Success takes the same escape. A finished run has already written every
-    # output and printed its summary, so nothing is lost by skipping CPython's
-    # ordinary shutdown -- and staying in it risks the same indefinite park,
-    # observed on a real 20-game rollout that completed, wrote its parquet and
-    # sidecar, then held 4 GB of GPU for 11 minutes until killed. A faulthandler
-    # dump of that shutdown showed a native thread calling PyGILState_Release
-    # against a non-current thread state while the runtime was finalizing, so
-    # the failure is not one identifiable joinable thread to daemonize; the
-    # same unconditional exit that covers the crash path covers this one.
-    sys.stdout.flush()
-    sys.stderr.flush()
-    os._exit(0)
+    main_with_hard_exit(main)
 
 
 if __name__ == "__main__":

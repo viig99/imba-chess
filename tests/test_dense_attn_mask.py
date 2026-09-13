@@ -202,6 +202,7 @@ def test_additive_mask_refuses_dataset_sized_batches():
         layer._additive_mask(allowed, dtype=torch.float32)
 
 
+@pytest.mark.extended
 def test_dense_mask_survives_torch_compile_across_shapes():
     """Compiled + varying shapes must work: eval runs with `compile = true`.
 

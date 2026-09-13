@@ -20,7 +20,7 @@ import pytest
 
 from imba_chess.data.move_vocab import MoveVocab, MoveVocabConfig
 from imba_chess.eval import cozy_bridge
-from tests.test_cozy_bridge import EDGE_FENS, _random_boards
+from tests.chess_positions import EDGE_FENS, native_positions
 
 
 def _python_forcing(py_board: chess.Board, ucis: list[str]) -> list[bool]:
@@ -101,11 +101,7 @@ _RESTRICTED_VOCAB = MoveVocab.build(
     _RESTRICTED_UCIS, config=MoveVocabConfig(include_unk=False)
 )
 
-_PROJECTOR_RANDOM_BOARDS = _random_boards(200, seed=911)
-_PROJECTOR_RANDOM_POSITIONS = _PROJECTOR_RANDOM_BOARDS[
-    :: max(1, len(_PROJECTOR_RANDOM_BOARDS) // 200)
-][:200]
-_POSITIONS = [chess.Board(fen) for fen in EDGE_FENS] + _PROJECTOR_RANDOM_POSITIONS
+_POSITIONS = [chess.Board(fen) for fen in EDGE_FENS] + native_positions("projection")
 
 
 def _native_board(board: chess.Board):

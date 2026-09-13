@@ -71,10 +71,10 @@ def test_auto_rounds():
 
 def test_halving_config_defaults_match_spec():
     config = HalvingConfig()
-    assert config.budget == 256
+    assert config.budget == 2048
     assert config.top_m == 16
     assert config.rounds == 0
-    assert config.refutation_top_r == 2
+    assert config.refutation_top_r == 4
     assert config.expand_top == 3
     assert config.max_depth == 4
     assert config.lam == 0.05

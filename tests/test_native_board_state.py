@@ -16,7 +16,7 @@ import imba_chess_native as native_cc
 import pytest
 
 from imba_chess.data.board_state import BoardStateEncoder, BoardTokenConfig
-from tests.test_cozy_bridge import EDGE_FENS, _random_boards
+from tests.chess_positions import EDGE_FENS, native_positions
 
 EP_MODES = {"fen": 0, "legal": 1, "xfen": 2}
 
@@ -31,11 +31,7 @@ EXTRA_FENS = [
     "8/8/8/8/8/6k1/8/6K1 w - - 0 1",              # clocks at zero
 ]
 
-_RANDOM = _random_boards(150, seed=31337)
-_POSITIONS = (
-    [chess.Board(fen) for fen in EDGE_FENS + EXTRA_FENS]
-    + _RANDOM[:: max(1, len(_RANDOM) // 150)][:150]
-)
+_POSITIONS = [chess.Board(fen) for fen in EDGE_FENS + EXTRA_FENS] + native_positions("board_state")
 
 
 def _native(board: chess.Board):

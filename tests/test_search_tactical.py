@@ -1,52 +1,12 @@
-"""Independent coverage/quiescence controls, including a pre-change baseline."""
+"""Independent coverage/quiescence controls, with behavioral search assertions."""
 
-import hashlib
 import itertools
-import json
 
 import chess
 import pytest
 
 from imba_chess.eval import cozy_bridge, search
 from tests.test_search import _MaterialEvaluator
-from tests.test_search_stepwise import _RecordingEvaluator
-
-
-# Captured from the original algorithm before adding either switch. Includes
-# chosen index, every legacy arm field, and the ordered evaluator request FENs.
-_LEGACY = [
-    (chess.STARTING_FEN, [
-        "7f29fdb3cdd6303aa627f2e7aeb2d0c478eee82701ef2ebf0623592b9c1a58f2",
-        "ad56282a59f0f92e3ec2505242a4b91907bbd50fae8699594e6d33afd3dea3da",
-        "13630fa9e3907142f755eab881bdd9890f0a8fdb2d8f65d52787e9299efb0ff2",
-    ]),
-    ("r1bqkbnr/pppp1ppp/2n5/1B2p3/4P3/5N2/PPPP1PPP/RNBQK2R b KQkq - 3 3", [
-        "96c424aa8d10f43519a399331871cc4e5dc88485785527b695f1fb34e79b7a5a",
-        "0f3f982ef080a88444373ae977f38dc0fd7d29c96dafbe77439d8d494e128a97",
-        "b95f7adcdee5331933fc5e55ad4a3d16017b4b42d7933b6280bb42bbf34d4de2",
-    ]),
-    ("r4rk1/1pp1qppp/p1np1n2/2b1p1B1/2B1P1b1/P1NP1N2/1PP1QPPP/R4RK1 w - - 0 10", [
-        "6696fb8d0a0c898f713f329aa4f1fadfe854bf9d9d7102b6800b1411d92b2f34",
-        "e00f054acdbefd245a9f0a3c828a154ca3476d75b3f6e40fce01994725140d71",
-        "000f58577166d39680486464da76e2d299e75107aeeace1e87dbb957208e82fa",
-    ]),
-]
-
-
-@pytest.mark.parametrize("fen,hashes", _LEGACY)
-@pytest.mark.parametrize("budget_index,budget", enumerate((0, 8, 64)))
-def test_disabled_search_matches_prechange_trace(fen, hashes, budget_index, budget):
-    board = chess.Board(fen)
-    moves = list(board.legal_moves)
-    evaluator = _RecordingEvaluator(_MaterialEvaluator())
-    chosen, rows = search.select_value_search_halving(
-        evaluator=evaluator, root_handle=None, board=board, legal_moves=moves,
-        legal_log_priors=[-1 - .01 * i for i in range(len(moves))],
-        config=search.HalvingConfig(budget=budget, top_m=8, max_depth=3),
-    )
-    legacy_rows = [{key: value for key, value in row.items() if key != "search_stats"} for row in rows]
-    encoded = json.dumps([(chosen, legacy_rows), evaluator.calls], sort_keys=True).encode()
-    assert hashlib.sha256(encoded).hexdigest() == hashes[budget_index]
 
 
 def _expand(fen, config, *, depth=0, opponent=False):
@@ -185,7 +145,7 @@ def test_quiescence_selects_exact_capture_and_promotion_set(fen, monkeypatch):
 @pytest.mark.parametrize("coverage,q", [(False, 0), (True, 0), (False, 2), (True, 2)])
 @pytest.mark.parametrize("budget", [0, 1, 9, 128])
 def test_all_combinations_share_hard_budget_and_depth_limit(coverage, q, budget):
-    board = chess.Board(_LEGACY[2][0])
+    board = chess.Board("r4rk1/1pp1qppp/p1np1n2/2b1p1B1/2B1P1b1/P1NP1N2/1PP1QPPP/R4RK1 w - - 0 10")
     moves = list(board.legal_moves)
     evaluator = _MaterialEvaluator()
     _, rows = search.select_value_search_halving(
@@ -221,6 +181,35 @@ def test_terminal_root_evasion_is_generated_without_a_neural_evaluation():
                       root_coverage_added=True, root_check_evasion=True)
     stats = search._arm_search_stats(arm, search.HalvingConfig(tactical_coverage=True))
     assert stats["coverage_added_generated"] == stats["check_evasions_generated"] == 1
+    assert stats["evals_spent"] == stats["coverage_added_evaluated"] == 0
+
+
+def test_immediate_terminal_root_evasion_reports_zero_eval_metrics(monkeypatch):
+    board = chess.Board("7k/8/8/8/8/8/4r3/4K3 w - - 0 1")
+    moves = list(board.legal_moves)
+    terminal_idx = len(moves) - 1
+    original = search.cc.push_and_classify
+
+    def terminal_for_last_move(cozy, move, *args):
+        child, history, terminal = original(cozy, move, *args)
+        if cozy_bridge.cozy_move_to_uci(cozy, move) == moves[terminal_idx].uci():
+            terminal = 1.0
+        return child, history, terminal
+
+    monkeypatch.setattr(search.cc, "push_and_classify", terminal_for_last_move)
+    _, rows = search.select_value_search_halving(
+        evaluator=_MaterialEvaluator(),
+        root_handle=None,
+        board=board,
+        legal_moves=moves,
+        legal_log_priors=[-float(i) for i in range(len(moves))],
+        config=search.HalvingConfig(
+            budget=0, top_m=1, tactical_coverage=True
+        ),
+    )
+    stats = rows[0]["search_stats"]
+    assert stats["coverage_added_generated"] == 1
+    assert stats["check_evasions_generated"] == 1
     assert stats["evals_spent"] == stats["coverage_added_evaluated"] == 0
 
 

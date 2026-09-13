@@ -150,8 +150,14 @@ evaluations), and model-selection timing including inference/actor waiting.
 These are experimental controls; playing-strength improvements require matches.
 See [the experiment handoff](docs/CKPT34_TACTICAL_SEARCH_HANDOFF.md) for commands.
 
-The current validated search default is **lambda=0.05 with three opponent
-replies**. On checkpoint 34 at budget 2048/depth 8 it scored 0.7527
+The current validated search default is **lambda=0.05, four opponent replies,
+and budget 2048**. Checkpoint 34 scored 0.6593 (383/223/144)
+over 750 SF2400 games at seed 1042, depth 8, with quiescence and tactical
+coverage off. Replies=3 at budget 4096 scored 0.6613 over 750 games;
+four replies at 2048 offers similar observed strength at half the budget.
+This does not establish a strength difference between those two settings.
+
+The previous default used lambda=0.05 and three opponent replies. On checkpoint 34 at budget 2048/depth 8 it scored 0.7527
 (490/149/111) over 750 games against limited-strength SF2200, then 0.6000
 (338/224/188) over 750 games against limited-strength SF2400. Both runs used
 40k Stockfish nodes, fp32, seed 42, alternating colours, and no random opening.
@@ -160,9 +166,9 @@ not a claim that the model has an absolute 2400 Elo rating.
 
 | Knob | Default | What it controls | How to tune |
 |---|---|---|---|
-| `search_budget` | 256 | Total value evaluations per move — the strength ↔ wall-clock dial (cost ≈ linear) | The biggest lever; raise first. |
+| `search_budget` | 2048 | Total value evaluations per move — the strength ↔ wall-clock dial (cost ≈ linear) | The biggest lever; raise first. |
 | `halving_rounds` | 0 (auto) | How often budget is reallocated by observed value | Keep auto. A/B against `1` (pure beam) at the same budget to check the feedback loop earns its keep. |
-| `search_refutation_top_r` | 3 | Opponent replies always expanded besides forcing moves | Three is the measured winner for checkpoint 34 at budget 2048/depth 8; lowering it saves queue slots but weakens defensive breadth. |
+| `search_refutation_top_r` | 4 | Opponent replies always expanded besides forcing moves | Four is the adopted checkpoint-34 setting at budget 2048/depth 8. |
 | `search_expand_top` | 3 | Our-side branching per node | Lower = deeper/narrower; sweep only after budget and rounds settle. |
 | `search_max_depth` | 4 | Max plies below each candidate | Keep it **even** — an odd horizon ends on our own move and grades unanswered threats optimistically. 6 needs a bigger budget to be meaningful. |
 | `search_top_m` | 16 | Root candidates entering the bandit | Rarely binding (forcing moves added regardless); raising dilutes early-round per-arm budget. |
@@ -197,7 +203,7 @@ Wrappers: `POLICIES="value_search_halving" ELO=1800 TAG=mytag ./eval_best_checkp
 ## Results vs Stockfish
 
 Historical rows use 100 games per configuration, seed 42, alternating colours,
-and Stockfish at 0.05s/move with `UCI_Elo` per rung. The two checkpoint-34
+and Stockfish at 0.05s/move with `UCI_Elo` per rung. The checkpoint-34
 rows use the newer 750-game, 40k-node protocol documented above. Score =
 (wins + 0.5 × draws) / games; ±~0.05 SE at 100 games. "Net α" = the
 distilled value net blended at that α (**historical**: this feature was later
@@ -231,6 +237,8 @@ and period interpretations:
 | SF2200 | halving 2048/d8 + net α=0.15 | v4 e23 (Elo-weighted value loss) | 46 / 20 / 34 | 0.560 |
 | SF2200 | halving 2048/d8, λ=0.05, replies=3 | v4 e34 | 490 / 149 / 111 @ 750 | **0.7527** |
 | SF2400 | halving 2048/d8, λ=0.05, replies=3 | v4 e34 | 338 / 224 / 188 @ 750 | **0.6000** |
+| SF2400 | halving 4096/d8, λ=0.05, replies=3 (seed 1042) | v4 e34 | 405 / 182 / 163 @ 750 | 0.6613 |
+| SF2400 | halving 2048/d8, λ=0.05, replies=4 (seed 1042, adopted) | v4 e34 | 383 / 223 / 144 @ 750 | **0.6593** |
 
 How the components came to be, in order:
 
@@ -305,3 +313,40 @@ uv run --python .venv/bin/python --with pytest pytest -q
 - `docs/STOCKFISH_SUPERVISION_HANDOFF.md` (**historical**) for the superseded corpus-calibration and search-distillation experiments.
 - `docs/loss_audit_2026-09.md` for the 2026-09 audit of the training losses and how `config/imba_chess_sf_finetune_low_lr.toml` was derived from it.
 - `STOCKFISH_EVAL_PLAN.md` (**historical**, 2026-02) for the original head-to-head evaluation plan, superseded by `EVAL_SPEC.md` and the nodes-calibrated protocol.
+
+**Stage-2 Gumbel self-play prototype.** Offline human-prefix collection, immutable
+replay, soft-policy/outcome training, explicit initialization/resume, component
+benchmarks, and a bounded collect/train/evaluate runner are available. Start with
+[the consolidated readiness report](docs/SELF_PLAY_READINESS_REVIEW_2026-09-11.md)
+for verified CPU/CUDA results, measured collection throughput, exact commands,
+and the remaining learning gates. CUDA self-play uses the compiled full neural
+FP32 decoder by default; `--decoder-mode current` selects the eager fallback.
+CPU correctness probes use eager decoding automatically.
+`config/self_play_laptop_fast.toml` uses 24 concurrent games on the RTX 3070 Ti
+Laptop GPU. Existing run configs are preserved for resume; remote settings are
+in `config/self_play_5090.toml`. External nightly scheduling remains disabled.
+
+On the laptop, matched 32-game trials measured 23% higher collection throughput
+with whole-decoder compilation than eager. Generation, the iteration runner and
+evaluation select it automatically on CUDA. This FP32
+path supports search depth up to 32 and incurs compilation on first use.
+Benchmark/profiler modes `sdpa` and `compiled-sdpa` retain the shared K/V workspace
+experiment: SDPA did not provide a reliable additional throughput gain.
+See the readiness report for timings, numerical differences and validation.
+
+**Tests.** `.venv/bin/python -m pytest -q` runs the fast default suite, including
+losses, replay/resume, chess rules and eager decoder equivalence. Compiler/device
+integration and broad random sweeps are marked `extended`:
+
+```bash
+# Extended checks only (CUDA cases run when a GPU is available).
+.venv/bin/python -m pytest -q -m extended
+# All checks, overriding the default marker filter.
+.venv/bin/python -m pytest -q -m ''
+# Independent native binding suite.
+.venv/bin/python -m pytest -q native/imba_chess_native/tests
+```
+
+Run the extended suite on decoder, attention or native chess changes. The default
+CPU suite passed 2,280 cases in 20.35 seconds on the laptop after the
+[test-maintenance cleanup](docs/TEST_MAINTENANCE_AUDIT_2026-09-12.md).

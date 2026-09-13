@@ -22,6 +22,7 @@ Run:
 from __future__ import annotations
 
 import argparse
+from dataclasses import asdict
 import os
 import sys
 import time
@@ -120,7 +121,7 @@ def main() -> None:
             buf.append(dict(row))
             if len(buf) >= args.chunk_rows:
                 _flush()
-            if written >= args.max_rows:
+            if written + len(buf) >= args.max_rows:
                 break
         _flush()
     finally:
@@ -130,6 +131,9 @@ def main() -> None:
     if written == 0:
         raise RuntimeError("no rows written -- refusing to leave an empty corpus")
     tmp.replace(args.output)
+    from imba_chess.data.self_play_store import atomic_json
+    atomic_json(args.output.with_suffix(args.output.suffix + ".provenance.json"),
+                dict(split=args.split, dataset=asdict(cfg), config=str(args.config), rows=written))
     size_mb = args.output.stat().st_size / 1e6
     print(
         f"\nwrote {written:,} rows to {args.output} ({size_mb:.1f} MB) "

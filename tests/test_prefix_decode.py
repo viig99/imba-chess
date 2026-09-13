@@ -4,6 +4,7 @@ import pytest
 
 torch = pytest.importorskip("torch")
 
+from imba_chess.eval.position_evaluator import _value_scalar_from_logits
 from imba_chess.model import create_batch_dense_mask
 from imba_chess.model.hstu_attention import SequentialTransductionUnitJagged
 from imba_chess.model.position_embedding import PositionEmbedding
@@ -368,7 +369,7 @@ class _FullForwardReferenceEvaluator:
             with torch.no_grad():
                 out = self._model(full_batch, return_loss=False)
             logits = out["logits"][-1]
-            value_stm = self._module._value_scalar_from_logits(
+            value_stm = _value_scalar_from_logits(
                 out["value_logits"][-1]
             )
             try:

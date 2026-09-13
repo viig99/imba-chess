@@ -3,12 +3,10 @@ from __future__ import annotations
 
 import argparse
 import json
-import math
 import multiprocessing
 import os
 import random
 import sys
-import traceback
 import time
 from dataclasses import asdict, dataclass, field
 from multiprocessing import connection as mp_connection
@@ -44,10 +42,8 @@ from imba_chess.eval.position_evaluator import (
     _SequenceHistory,
     _forward_model,
     _project_legal_logits,
-    _value_scalar_from_logits,
     load_hstu_checkpoint,
 )
-from imba_chess.eval import alphabeta
 from imba_chess.eval.search import (
     EvalRequest,
     HalvingConfig,
@@ -84,7 +80,6 @@ class EvalSummary:
     search_stats: dict[str, int] = field(default_factory=dict)
     model_selection_seconds: float = 0.0
     game_records: list[dict[str, Any]] = field(default_factory=list)
-    search_reports: list[dict[str, Any]] = field(default_factory=list)
     inference_stats: dict[str, float | int] = field(default_factory=dict)
 
     @property
@@ -177,7 +172,7 @@ def _parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--model-move-policy",
-        choices=["greedy", "value_rerank", "value_search_d2", "value_search_halving", *alphabeta.POLICIES],
+        choices=["greedy", "value_rerank", "value_search_d2", "value_search_halving"],
         default=None,
         help="Model move selection on legal moves.",
     )
@@ -193,16 +188,13 @@ def _parse_args() -> argparse.Namespace:
         default=None,
         help="Weight for value_rerank score adjustment.",
     )
-    parser.add_argument("--search-lmr", action=argparse.BooleanOptionalAction, default=None)
-    parser.add_argument("--search-score-cache", choices=["off", "context"], default=None)
-    parser.add_argument("--search-iterative-deepening", action=argparse.BooleanOptionalAction, default=None)
     parser.add_argument("--search-budget", type=int, default=None)
     parser.add_argument("--search-top-m", type=int, default=None)
     parser.add_argument("--halving-rounds", type=int, default=None)
     parser.add_argument("--search-refutation-top-r", type=int, default=None)
     parser.add_argument("--search-expand-top", type=int, default=None)
     parser.add_argument("--search-max-depth", type=int, default=None,
-                        help="Halving: plies below a candidate; alpha-beta/PVS: root-relative plies (1..128).")
+                        help="Halving search depth, counting plies below a candidate root move.")
     parser.add_argument(
         "--search-tactical-coverage", action=argparse.BooleanOptionalAction, default=None,
         help="Include forcing moves on both sides and all legal check evasions in halving search.",
@@ -324,7 +316,7 @@ def _select_model_move(
     value_rerank_top_k: int,
     value_rerank_lambda: float,
     debug_topk: int = 0,
-    halving_config: HalvingConfig | alphabeta.AlphaBetaConfig | None = None,
+    halving_config: HalvingConfig | None = None,
 ) -> tuple[chess.Move, dict[str, Any]]:
     output = _forward_model(
         model=model,
@@ -385,19 +377,6 @@ def _select_model_move(
             top_k=value_rerank_top_k,
             lam=value_rerank_lambda,
         )
-    elif policy in alphabeta.POLICIES:
-        if output.get("value_logits") is None:
-            raise RuntimeError(f"{policy} requires a checkpoint with value head enabled")
-        if not math.isfinite(_value_scalar_from_logits(output["value_logits"][-1])):
-            raise ValueError(f"Non-finite root value at {board.fen()}")
-        if not isinstance(halving_config, alphabeta.AlphaBetaConfig):
-            raise ValueError(f"{policy} requires AlphaBetaConfig")
-        report = alphabeta.select_value_search(
-            evaluator=evaluator, root_handle=None, board=board,
-            legal_moves=legal_moves_with_ids, legal_log_priors=legal_log_priors,
-            config=halving_config,
-        )
-        chosen_index = report.chosen_index
     elif policy == "value_search_halving":
         if output.get("value_logits") is None:
             raise RuntimeError(
@@ -433,8 +412,6 @@ def _select_model_move(
         debug["search_budget"] = int(halving_config.budget)
         debug["value_search_halving_candidates"] = halving_rows
         debug["search_stats"] = search.summarize_search_rows(halving_rows)
-    if policy in alphabeta.POLICIES:
-        debug.update(report.debug())
     if debug_topk > 0:
         k = min(int(debug_topk), mapped_legal)
         top_values, top_indices = torch.topk(legal_logits, k=k, largest=True)
@@ -487,7 +464,7 @@ def _select_model_move_stepwise(
     value_rerank_top_k: int,
     value_rerank_lambda: float,
     debug_topk: int = 0,
-    halving_config: HalvingConfig | alphabeta.AlphaBetaConfig | None = None,
+    halving_config: HalvingConfig | None = None,
 ) -> Generator[WorkRequest, Any, tuple[chess.Move, dict[str, Any]]]:
     """Scheduler-driven twin of `_select_model_move`: yields
     `WorkRequest("root_eval", batch)` for the root forward instead of
@@ -567,19 +544,6 @@ def _select_model_move_stepwise(
             ),
             evaluator,
         )
-    elif policy in alphabeta.POLICIES:
-        if output.get("value_logits") is None:
-            raise RuntimeError(f"{policy} requires a checkpoint with value head enabled")
-        if not math.isfinite(_value_scalar_from_logits(output["value_logits"][-1])):
-            raise ValueError(f"Non-finite root value at {board.fen()}")
-        if not isinstance(halving_config, alphabeta.AlphaBetaConfig):
-            raise ValueError(f"{policy} requires AlphaBetaConfig")
-        report = yield from _drive_stepwise_as_decode_waves(alphabeta.search_stepwise(
-            extend=evaluator.extend, root_handle=None, board=board,
-            legal_moves=legal_moves_with_ids, legal_log_priors=legal_log_priors,
-            config=halving_config,
-        ), evaluator)
-        chosen_index = report.chosen_index
     elif policy == "value_search_halving":
         if output.get("value_logits") is None:
             raise RuntimeError(
@@ -618,8 +582,6 @@ def _select_model_move_stepwise(
         debug["search_budget"] = int(halving_config.budget)
         debug["value_search_halving_candidates"] = halving_rows
         debug["search_stats"] = search.summarize_search_rows(halving_rows)
-    if policy in alphabeta.POLICIES:
-        debug.update(report.debug())
     if debug_topk > 0:
         k = min(int(debug_topk), mapped_legal)
         top_values, top_indices = torch.topk(legal_logits, k=k, largest=True)
@@ -726,7 +688,6 @@ def _summary_to_payload(
         "model_turns": summary.model_turns,
         "search_stats": dict(summary.search_stats),
         "game_records": summary.game_records,
-        "search_reports": summary.search_reports,
         "inference_stats": summary.inference_stats,
         "model_selection_seconds": summary.model_selection_seconds,
         "mean_model_selection_seconds": (
@@ -767,8 +728,8 @@ def _summary_to_payload(
             "seed": int(seed),
             "max_plies": int(max_plies),
             "model_move_policy": model_move_policy,
-            "value_rerank_top_k": ("not applicable" if model_move_policy in alphabeta.POLICIES else int(value_rerank_top_k)),
-            "value_rerank_lambda": ("not applicable" if model_move_policy in alphabeta.POLICIES else float(value_rerank_lambda)),
+            "value_rerank_top_k": int(value_rerank_top_k),
+            "value_rerank_lambda": float(value_rerank_lambda),
             "opening_random_plies": int(opening_random_plies),
             "search": search_knobs,
         },
@@ -948,7 +909,7 @@ def _play_game(
     debug_topk: int,
     stockfish_label: str,
     save_games_dir: Path | None,
-    halving_config: "HalvingConfig | alphabeta.AlphaBetaConfig | None" = None,
+    halving_config: "HalvingConfig | None" = None,
 ) -> Generator[WorkRequest, Any, EvalSummary]:
     """One game's coroutine core: the `BatchScheduler` game-factory contract.
 
@@ -1026,8 +987,6 @@ def _play_game(
             summary.model_turns += 1
             summary.model_selection_seconds += time.perf_counter() - selection_start
             search.merge_search_stats(summary.search_stats, debug_info.get("search_stats", {}))
-            if "search_report" in debug_info:
-                summary.search_reports.append(dict(game_idx=game_idx, ply=plies, **debug_info["search_report"]))
             summary.legal_moves_total += int(debug_info["total_legal_moves"])
             summary.legal_moves_mapped_total += int(
                 debug_info["mapped_legal_moves"]
@@ -1285,7 +1244,7 @@ def _build_worker_config(
     model_move_policy: str,
     value_rerank_top_k: int,
     value_rerank_lambda: float,
-    halving_config: "HalvingConfig | alphabeta.AlphaBetaConfig | None",
+    halving_config: "HalvingConfig | None",
     vocab_path: Path,
     vocab_include_unk: bool,
     board_state_config: dict[str, Any],
@@ -1582,7 +1541,7 @@ def _run_segment_actor_mode(
     vocab_path: Path,
     vocab_include_unk: bool,
     board_state_config: dict[str, Any],
-    halving_config: "HalvingConfig | alphabeta.AlphaBetaConfig | None" = None,
+    halving_config: "HalvingConfig | None" = None,
     fake_engine_factory: Callable[[], Any] | None = None,
 ) -> EvalSummary:
     """Run one segment's `games` games at `concurrent_games > 1` via actor
@@ -1644,7 +1603,7 @@ def _run_segment_actor_mode(
         # response's value_stm is then a documented 0.0 placeholder --
         # see ActorInferenceServer.__init__/_ensure_value_logits_placeholder).
         require_value_head=model_move_policy
-        in {"value_rerank", "value_search_d2", "value_search_halving", *alphabeta.POLICIES},
+        in {"value_rerank", "value_search_d2", "value_search_halving"},
     )
     game_indices_by_worker = _assign_games_round_robin(games, concurrent_games)
     engine_config = _worker_engine_config(
@@ -1743,7 +1702,7 @@ def _run_segment(
     stockfish_label: str,
     save_games_dir: Path | None,
     concurrent_games: int,
-    halving_config: "HalvingConfig | alphabeta.AlphaBetaConfig | None" = None,
+    halving_config: "HalvingConfig | None" = None,
 ) -> EvalSummary:
     """Run one segment's `games` games through `BatchScheduler`, for any
     `concurrent_games >= 1`.
@@ -1922,7 +1881,6 @@ def _accumulate_summary(target: EvalSummary, fragment: EvalSummary) -> None:
     target.model_selection_seconds += fragment.model_selection_seconds
     search.merge_search_stats(target.search_stats, fragment.search_stats)
     target.game_records.extend(fragment.game_records)
-    target.search_reports.extend(fragment.search_reports)
     search.merge_search_stats(target.inference_stats, fragment.inference_stats)
 
 
@@ -2009,12 +1967,6 @@ def main() -> None:
         eval_cfg.value_rerank_lambda
         if args.value_rerank_lambda is None
         else args.value_rerank_lambda
-    )
-    args.search_lmr = eval_cfg.search_lmr if args.search_lmr is None else args.search_lmr
-    args.search_score_cache = eval_cfg.search_score_cache if args.search_score_cache is None else args.search_score_cache
-    args.search_iterative_deepening = (
-        eval_cfg.search_iterative_deepening if args.search_iterative_deepening is None
-        else args.search_iterative_deepening
     )
     args.search_budget = int(
         eval_cfg.search_budget if args.search_budget is None else args.search_budget
@@ -2103,18 +2055,11 @@ def main() -> None:
         "value_rerank",
         "value_search_d2",
         "value_search_halving",
-        *alphabeta.POLICIES,
     }:
         raise ValueError(
             "--model-move-policy must be one of: greedy, value_rerank, "
             "value_search_d2, value_search_halving"
         )
-    if args.search_lmr and args.model_move_policy != "value_search_pvs":
-        raise ValueError("--search-lmr requires PVS")
-    if args.search_score_cache not in {"off", "context"}:
-        raise ValueError("--search-score-cache must be off or context")
-    if args.search_score_cache != "off" and args.model_move_policy not in alphabeta.POLICIES:
-        raise ValueError("Context score cache requires alpha-beta or PVS")
     if args.search_budget < 1:
         raise ValueError("--search-budget must be >= 1")
     if args.search_top_m < 1:
@@ -2125,8 +2070,6 @@ def main() -> None:
         raise ValueError("--search-refutation-top-r must be >= 1")
     if args.search_expand_top < 1:
         raise ValueError("--search-expand-top must be >= 1")
-    if args.model_move_policy in alphabeta.POLICIES and args.search_max_depth > 128:
-        raise ValueError("alpha-beta/PVS depth must be in [1, 128]")
     if args.search_max_depth < 1:
         raise ValueError("--search-max-depth must be >= 1")
     if args.search_quiescence_plies < 0:
@@ -2161,7 +2104,7 @@ def main() -> None:
         compile_model=bool(args.compile),
         require_value_head=(
             str(args.model_move_policy)
-            in {"value_rerank", "value_search_d2", "value_search_halving", *alphabeta.POLICIES}
+            in {"value_rerank", "value_search_d2", "value_search_halving"}
         ),
     )
     engine_limit = _build_engine_limit(args)
@@ -2225,12 +2168,6 @@ def main() -> None:
             tactical_coverage=bool(args.search_tactical_coverage),
             quiescence_plies=int(args.search_quiescence_plies),
         )
-        if args.model_move_policy in alphabeta.POLICIES:
-            halving_config = alphabeta.AlphaBetaConfig(
-                budget=args.search_budget, max_depth=args.search_max_depth,
-                iterative_deepening=args.search_iterative_deepening,
-                policy=args.model_move_policy, score_cache=args.search_score_cache, lmr=args.search_lmr,
-            )
         if actor_mode:
             segment_summary = _run_segment_actor_mode(
                 stockfish_path=args.stockfish_path,
@@ -2298,14 +2235,11 @@ def main() -> None:
             opening_random_plies=int(args.opening_random_plies),
             search_knobs={
                 "search_budget": int(args.search_budget),
-                "search_top_m": ("not applicable" if args.model_move_policy in alphabeta.POLICIES else int(args.search_top_m)),
-                "halving_rounds": ("not applicable" if args.model_move_policy in alphabeta.POLICIES else int(args.halving_rounds)),
-                "search_refutation_top_r": ("not applicable" if args.model_move_policy in alphabeta.POLICIES else int(args.search_refutation_top_r)),
-                "search_expand_top": ("not applicable" if args.model_move_policy in alphabeta.POLICIES else int(args.search_expand_top)),
+                "search_top_m": int(args.search_top_m),
+                "halving_rounds": int(args.halving_rounds),
+                "search_refutation_top_r": int(args.search_refutation_top_r),
+                "search_expand_top": int(args.search_expand_top),
                 "search_max_depth": int(args.search_max_depth),
-                "search_iterative_deepening": args.search_iterative_deepening,
-                "search_score_cache": args.search_score_cache,
-                "search_lmr": args.search_lmr,
                 "search_tactical_coverage": bool(args.search_tactical_coverage),
                 "search_quiescence_plies": int(args.search_quiescence_plies),
             },
@@ -2351,14 +2285,11 @@ def main() -> None:
         opening_random_plies=int(args.opening_random_plies),
         search_knobs={
             "search_budget": int(args.search_budget),
-            "search_top_m": ("not applicable" if args.model_move_policy in alphabeta.POLICIES else int(args.search_top_m)),
-            "halving_rounds": ("not applicable" if args.model_move_policy in alphabeta.POLICIES else int(args.halving_rounds)),
-            "search_refutation_top_r": ("not applicable" if args.model_move_policy in alphabeta.POLICIES else int(args.search_refutation_top_r)),
-            "search_expand_top": ("not applicable" if args.model_move_policy in alphabeta.POLICIES else int(args.search_expand_top)),
+            "search_top_m": int(args.search_top_m),
+            "halving_rounds": int(args.halving_rounds),
+            "search_refutation_top_r": int(args.search_refutation_top_r),
+            "search_expand_top": int(args.search_expand_top),
             "search_max_depth": int(args.search_max_depth),
-                "search_iterative_deepening": args.search_iterative_deepening,
-                "search_score_cache": args.search_score_cache,
-                "search_lmr": args.search_lmr,
             "search_tactical_coverage": bool(args.search_tactical_coverage),
             "search_quiescence_plies": int(args.search_quiescence_plies),
         },
@@ -2382,48 +2313,9 @@ def main() -> None:
 
 
 def _main_with_hard_exit_on_crash() -> None:
-    """Entry-point wrapper: guarantees the process actually terminates on
-    every outcome -- success, unhandled exception, or Ctrl-C -- instead of
-    hanging.
+    from imba_chess.process import main_with_hard_exit
 
-    Duplicated from `scripts/generate_search_rollouts.py`'s wrapper of the
-    same name rather than factored into a shared helper (Task 3's brief:
-    extract only if trivial, otherwise duplicate the ~15 lines with a
-    comment -- a shared helper would need to import a script-independent
-    "hard exit" module, which is more indirection than the ~15 duplicated
-    lines below are worth) -- see that copy's docstring for the full
-    root-cause writeup (PyTorch Inductor's AsyncCompile background
-    ThreadPoolExecutor + CPython's non-daemon-thread-joining shutdown path).
-    The same fail-fast policy applies here: any exception that reaches
-    `_run_segment` -- whether via `BatchScheduler`'s `on_game_error`
-    re-raising a game-coroutine exception, or an executor-phase exception
-    (e.g. Stockfish crashing inside `sf_move`) propagating directly out of
-    `BatchScheduler.run()` without ever reaching `on_game_error` (see
-    `_release_engine_on_finish`'s docstring) -- kills the whole run; this
-    wrapper is what turns that into an actual process exit instead of a
-    hang.
-    """
-    try:
-        main()
-    except SystemExit:
-        raise
-    except BaseException:
-        traceback.print_exc()
-        sys.stdout.flush()
-        sys.stderr.flush()
-        os._exit(1)
-    # Success takes the same escape. A finished run has already written every
-    # output and printed its summary, so nothing is lost by skipping CPython's
-    # ordinary shutdown -- and staying in it risks the same indefinite park,
-    # observed on a real 20-game rollout that completed, wrote its parquet and
-    # sidecar, then held 4 GB of GPU for 11 minutes until killed. A faulthandler
-    # dump of that shutdown showed a native thread calling PyGILState_Release
-    # against a non-current thread state while the runtime was finalizing, so
-    # the failure is not one identifiable joinable thread to daemonize; the
-    # same unconditional exit that covers the crash path covers this one.
-    sys.stdout.flush()
-    sys.stderr.flush()
-    os._exit(0)
+    main_with_hard_exit(main)
 
 
 if __name__ == "__main__":

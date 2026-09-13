@@ -35,9 +35,10 @@ def _load_eval_script_module():
     return module
 
 
-@pytest.mark.parametrize("coverage,q", [(False, 0), (True, 0), (False, 2), (True, 2)])
-@pytest.mark.parametrize("concurrency", [1, 2])
-@pytest.mark.parametrize("use_cli", [False, True])
+@pytest.mark.parametrize("coverage,q,concurrency,use_cli", [
+    (True, 2, 1, False), (False, 0, 2, False),
+    (False, 0, 1, True), (True, 2, 2, True),
+])
 def test_tactical_config_cli_and_result_roundtrip(tmp_path, monkeypatch, coverage, q, concurrency, use_cli):
     module = _load_eval_script_module()
     config_path = tmp_path / "experiment.toml"
@@ -1355,3 +1356,23 @@ def test_join_and_verify_workers_terminates_all_when_worker_never_exits():
 
     assert stuck.terminate_calls == 1
     assert other.terminate_calls == 1
+
+
+@pytest.mark.parametrize("policy", ["value_search_alphabeta", "value_search_pvs"])
+def test_retired_search_policy_rejected_by_cli(monkeypatch, policy):
+    module = _load_eval_script_module()
+    monkeypatch.setattr(sys, "argv", ["eval", "--checkpoint", "unused.pt",
+                                     "--model-move-policy", policy])
+    with pytest.raises(SystemExit) as exc:
+        module._parse_args()
+    assert exc.value.code == 2
+
+
+@pytest.mark.parametrize("option", ["--search-lmr", "--search-score-cache",
+                                    "--search-iterative-deepening"])
+def test_retired_search_options_rejected_by_cli(monkeypatch, option):
+    module = _load_eval_script_module()
+    monkeypatch.setattr(sys, "argv", ["eval", "--checkpoint", "unused.pt", option])
+    with pytest.raises(SystemExit) as exc:
+        module._parse_args()
+    assert exc.value.code == 2

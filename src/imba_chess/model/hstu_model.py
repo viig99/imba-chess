@@ -12,6 +12,7 @@ from torch.nn.attention.flex_attention import BlockMask, create_block_mask
 from .hstu_attention import (
     SequentialTransductionUnitJagged,
     build_grouped_decode_cache,
+    build_one_query_decode_cache,
 )
 from .position_embedding import PositionEmbedding
 
@@ -648,6 +649,7 @@ class HSTUChessModel(nn.Module):
         suffix_positions: torch.Tensor | None = None,
         suffix_mask: torch.Tensor | None = None,
         group_sizes: list[int] | None = None,
+        one_query_per_game: bool = False,
     ) -> dict[str, Any]:
         """Decode one new token per batch row against per-game grouped
         prefix K/V caches (cross-game merged wave).
@@ -705,9 +707,7 @@ class HSTUChessModel(nn.Module):
         # and silently carry uninitialized memory into logits/value_logits.
         # Validated here once, at the model boundary, rather than per-layer.
         if int(group_index.numel()) != batch_size:
-            raise ValueError(
-                "group_index must have shape [B] matching new_token_batch"
-            )
+            raise ValueError("group_index must have shape [B] matching new_token_batch")
         if group_sizes is not None:
             # Contiguous-groups fast path. The caller asserts that row i
             # belongs to the unique group g with
@@ -749,7 +749,10 @@ class HSTUChessModel(nn.Module):
         # wave ran 64 `nonzero` calls where 8 suffice -- and since nonzero's
         # output shape is data-dependent, each was a device->host sync too. It
         # measured as the largest single torch op in a rollout profile.
-        if group_sizes is not None:
+        use_one_query = one_query_per_game and group_sizes == [1] * num_groups
+        if use_one_query:
+            row_idx_per_group = list(torch.arange(num_groups, device=device).split(1))
+        elif group_sizes is not None:
             # ...and when the caller names the group boundaries, the G
             # surviving `nonzero` syncs go away too: each group's rows are
             # the contiguous span [offset, offset + n).
@@ -777,13 +780,24 @@ class HSTUChessModel(nn.Module):
                 "layers must share a single _max_seq_len for the per-wave "
                 f"decode cache; got {sorted(max_seq_lens)}"
             )
-        decode_cache = build_grouped_decode_cache(
+        cache_builder = (
+            build_one_query_decode_cache
+            if use_one_query
+            else build_grouped_decode_cache
+        )
+        extra = (
+            dict(max_prefix=prefix_kv_grouped[0][0].size(2), prefix_lens=prefix_lens)
+            if use_one_query
+            else {}
+        )
+        decode_cache = cache_builder(
             row_idx_per_group=row_idx_per_group,
             prefix_lens_list=prefix_lens_list,
             q_positions=positions,
             suffix_positions=suffix_positions,
             suffix_mask=suffix_mask,
             max_seq_len=next(iter(max_seq_lens)),
+            **extra,
         )
 
         for layer_idx, layer in enumerate(self.layers):
@@ -805,6 +819,7 @@ class HSTUChessModel(nn.Module):
                 suffix_positions=suffix_positions,
                 suffix_mask=suffix_mask,
                 decode_cache=decode_cache,
+                one_query_per_game=use_one_query,
             )
             new_kv.append((k_new, v_new))
 

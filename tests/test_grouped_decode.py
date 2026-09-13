@@ -134,7 +134,8 @@ def _assemble_batch_suffix(model, rows, s_max, num_layers):
     return suffix_kv, suffix_positions, suffix_mask
 
 
-def test_forward_decode_grouped_matches_per_game_forward_decode():
+@pytest.mark.parametrize("one_query", [False, True])
+def test_forward_decode_grouped_matches_per_game_forward_decode(one_query):
     """G=3, different prefix lengths (padding exercised on prefix_kv_grouped),
     one row at depth 0, one row at depth >= 2 (suffix len 2), one at depth 1.
     """
@@ -206,6 +207,8 @@ def test_forward_decode_grouped_matches_per_game_forward_decode():
             prefix_kv_grouped=prefix_kv_grouped,
             prefix_lens=prefix_lens,
             prefix_lens_list=prefix_lens.tolist(),
+            group_sizes=[1, 1, 1],
+            one_query_per_game=one_query,
             suffix_kv=suffix_kv,
             suffix_positions=suffix_positions,
             suffix_mask=suffix_mask,
@@ -231,7 +234,6 @@ def test_forward_decode_grouped_matches_per_game_forward_decode():
 def test_forward_decode_grouped_g1_matches_plain_forward_decode():
     """Degenerate case: G=1 grouped call must equal plain forward_decode."""
     model = _tiny_model()
-    num_layers = len(model.layers)
     T, depth = 7, 2
     ids = _random_token_ids(T + depth + 1, seed=42)
     prefix_kv = _prefill(model, ids, T)

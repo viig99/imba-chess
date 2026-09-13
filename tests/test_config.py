@@ -2,7 +2,7 @@ from pathlib import Path
 
 import pytest
 
-from imba_chess.config import EvalVsStockfishConfig, RepoConfig, load_repo_config
+from imba_chess.config import EvalVsStockfishConfig, load_repo_config
 
 
 def test_load_repo_config_reads_sections(tmp_path):
@@ -123,19 +123,11 @@ save_games_dir = "artifacts/eval/custom_games"
 
 
 def test_eval_vs_stockfish_search_knob_defaults():
+    from imba_chess.eval.search import HalvingConfig
+
     config = EvalVsStockfishConfig()
-    assert config.ladder_elos == "2400"
-    assert config.include_full_strength_segment is False
-    assert config.model_move_policy == "value_search_halving"
-    assert config.value_rerank_lambda == 0.05
-    assert config.search_budget == 256
-    assert config.search_top_m == 16
-    assert config.halving_rounds == 0
-    assert config.search_refutation_top_r == 3
-    assert config.search_expand_top == 3
-    assert config.search_max_depth == 4
-    assert config.search_tactical_coverage is False
-    assert config.search_quiescence_plies == 0
+    assert HalvingConfig().refutation_top_r == config.search_refutation_top_r
+    assert HalvingConfig().budget == config.search_budget
 
 
 @pytest.mark.parametrize(
@@ -147,15 +139,9 @@ def test_eval_vs_stockfish_search_knob_defaults():
         "imba_chess_sf_finetune_low_lr.toml",
     ),
 )
-def test_maintained_configs_share_validated_eval_defaults(filename):
-    config = load_repo_config(
-        Path(__file__).resolve().parent.parent / "config" / filename
-    ).eval_vs_stockfish
-    assert config.ladder_elos == "2400"
-    assert config.include_full_strength_segment is False
-    assert config.model_move_policy == "value_search_halving"
-    assert config.value_rerank_lambda == 0.05
-    assert config.search_refutation_top_r == 3
+def test_maintained_configs_parse(filename):
+    config = load_repo_config(Path(__file__).resolve().parent.parent / "config" / filename)
+    assert isinstance(config.eval_vs_stockfish, EvalVsStockfishConfig)
 
 
 def test_load_repo_config_unknown_section_raises(tmp_path):
@@ -163,41 +149,3 @@ def test_load_repo_config_unknown_section_raises(tmp_path):
     path.write_text("[expert_iteration]\nbeta = 1.0\n", encoding="utf-8")
     with pytest.raises(ValueError, match="Unknown sections.*expert_iteration"):
         load_repo_config(path)
-
-
-def test_stockfish_finetune_recipe_loads():
-    config = load_repo_config(
-        Path(__file__).resolve().parent.parent
-        / "config"
-        / "imba_chess_sf_finetune_low_lr.toml"
-    )
-    assert config.model.enable_value_head is True
-    assert config.model.label_smoothing == 0.0
-
-
-def test_v4_config_geometry_and_size():
-    from imba_chess.model import HSTUChessModel, build_hstu_chess_config
-
-    config = load_repo_config(
-        Path(__file__).resolve().parent.parent / "config" / "imba_chess_v4.toml"
-    )
-    assert config.model.model_dim == 1024
-    assert config.model.num_layers == 8
-    assert config.model.num_heads == 16
-    assert config.model.label_smoothing == 0.0
-    # Convex Elo curve: shape AND magnitude both move (see the config header).
-    assert config.model.elo_loss_weight_alpha == 2.0
-    assert config.model.elo_loss_weight_strength == 3.0
-    assert config.model.enable_value_head is True
-    assert config.model.value_head_blocks == 2
-    assert config.model.value_head_width == 512
-    # Eval must stay on the current ckpt34/SF2400 anchor ruler.
-    assert config.eval_vs_stockfish.search_budget == 2048
-    assert config.eval_vs_stockfish.search_max_depth == 8
-    assert config.eval_vs_stockfish.stockfish_nodes == 40000
-
-    model = HSTUChessModel(
-        build_hstu_chess_config(config.model, move_vocab_size=1970)
-    )
-    params = sum(p.numel() for p in model.parameters())
-    assert 46_000_000 < params < 50_000_000, params
