@@ -73,6 +73,17 @@ before and afterward. All full passes held the warmed graph count at two, cleare
 caches, and retained exactly 201,884,160 allocated bytes after collection. Production
 checkpoints and replay were not modified.
 
+## Follow-up concurrency comparison
+
+A subsequent matched 100-game comparison measured **67,451 moves/hour at 12**,
+**80,478 at 24**, and **88,608 at 48**. Thus the earlier slow 48 result below did not
+repeat: the fresh 48 case had identical work/targets but much lower elapsed time.
+The supplemental final 24 repeat was interrupted and excluded after the user
+reported a slowdown. These are exploratory single measurements, not robust speedup
+estimates; no default was changed. See the
+[concurrency report](SELF_PLAY_CONCURRENCY_2026-09-16.md) for rates, latency, memory,
+batching/copy costs, the interrupted-run caveat, and the fixed-buffer discussion.
+
 ## Requested 48-concurrency exploration
 
 The direct-only collector completed a warmed **100-game** measurement at **48
