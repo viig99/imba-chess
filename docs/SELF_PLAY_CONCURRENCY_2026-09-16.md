@@ -106,6 +106,10 @@ a fixed-stride cache experiment was introduced during this concurrency compariso
 
 ## Evidence and reproduction
 
+The subsequent [48-concurrency bottleneck profile](SELF_PLAY_48_BOTTLENECKS_2026-09-16.md)
+measures padding and separates owner reordering from width-induced history copies.
+It is a diagnostic workload, not another concurrency throughput comparison.
+
 Artifacts are under
 `artifacts/self_play_validation/concurrency_12_24_48_2026-09-16/`:
 `commands.json`, per-process metadata/source hashes, full games/targets/latencies,
