@@ -1,5 +1,13 @@
 # Remaining self-play bottlenecks at concurrency 48
 
+Follow-up: the [bounded graph experiment](CUDA_GRAPH_EXPERIMENT_2026-09-16.md)
+passed correctness but failed the matched throughput gate: 0.63% lower throughput
+and 2.03% higher p95 latency. It was rejected and its experimental maintained code
+removed. Stable placement plus selective gather subsequently passed three pairs
+with a 19.61% median throughput gain; see
+[the combined report](SELF_PLAY_COMBINED_CACHE_2026-09-16.md). Earlier attribution
+follows. GNOME remains running as the user's normal operating environment.
+
 The direct history cache remains the only maintained workspace implementation.
 This investigation changes no runtime code or production concurrency setting.
 It uses 48 as the next optimization baseline, following the

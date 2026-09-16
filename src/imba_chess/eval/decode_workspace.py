@@ -72,6 +72,23 @@ class DecodeWorkspace:
         self.device_fields = None
         self.prefix_inputs = self.feature_inputs = None
         self.prefix_inference = None
+        self.branch_gather_width = None
+
+    def placement_order(self, payloads):
+        """Keep live owners in their active rows; callers restore result order."""
+        count = len(payloads)
+        by_owner = {id(owner): index for index, (owner, _) in enumerate(payloads)}
+        order = [None] * count
+        used = set()
+        for row, entry in enumerate(self.row_owners[:count]):
+            owner = None if entry is None else entry[0]()
+            if owner is not None:
+                index = by_owner.get(id(owner))
+                if index is not None and index not in used:
+                    order[row] = index
+                    used.add(index)
+        remaining = iter(i for i in range(count) if i not in used)
+        return [next(remaining) if i is None else i for i in order]
 
     def _grow_arena(self, reference):
         old = self.row_capacity
@@ -210,6 +227,7 @@ class DecodeWorkspace:
                 )
                 for pair in ref
             ]
+            self.branch_gather_width = None
             # The reference packs prefixes outside inference_mode. Preserve
             # that dispatch metadata too: inference tensors can select a
             # numerically different compiled graph after a weight update.
@@ -316,18 +334,41 @@ class DecodeWorkspace:
         return args, (requests, chains, slots_rows, per_node, width)
 
     def _gather_ancestors(self, g):
-        indices = self.device_fields[3]
+        # Read staged CPU depths without a device synchronization. Keep the full
+        # independent, contiguous decoder buffers: only the gather work shrinks.
+        width = int(self._fields(self.numpy, g)[2][2].max())
+        buffers = [buffer for pair in self.branch for buffer in pair]
+        if self.branch_gather_width is None:
+            torch._foreach_zero_(buffers)
+            self.counters["branch_zeroed_bytes"] += sum(
+                t.numel() * t.element_size() for t in buffers
+            )
+            self.branch_gather_width = 0
+        if width < self.branch_gather_width:
+            # Include inactive rows so later batch growth cannot expose stale K/V.
+            padding = [t[:, :, width : self.branch_gather_width] for t in buffers]
+            torch._foreach_zero_(padding)
+            self.counters["branch_zeroed_bytes"] += sum(
+                t.numel() * t.element_size() for t in padding
+            )
+        self.branch_gather_width = width
+        indices = self.device_fields[3][:, :width]
         suffix = []
         for layer, pair in enumerate(self.branch):
             targets = []
             for arena, buffer in zip(self.arena, pair):
                 target = buffer[:g]
-                source = arena[layer].permute(1, 0, 2)[None].expand(g, -1, -1, -1)
-                gather_indices = indices[:, None, :, None].expand_as(target)
-                torch.gather(source, 2, gather_indices, out=target)
-                self.counters["gather_bytes"] += target.numel() * target.element_size()
+                if width:
+                    source = arena[layer].permute(1, 0, 2)[None].expand(g, -1, -1, -1)
+                    selected = target[:, :, :width]
+                    gather_indices = indices[:, None, :, None].expand_as(selected)
+                    torch.gather(source, 2, gather_indices, out=selected)
+                    self.counters["gather_bytes"] += (
+                        selected.numel() * selected.element_size()
+                    )
                 targets.append(target)
             suffix.append(tuple(targets))
+        self.counters[f"branch_gather_width_{width}_batches"] += 1
         return suffix
 
     def _prepare_attention(self, p, positions, lengths, depths):

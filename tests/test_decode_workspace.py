@@ -483,3 +483,74 @@ def test_mutable_external_tensor_replacement_is_fingerprinted():
         torch.testing.assert_close(t[0], expected, atol=0, rtol=0)
     assert ws.counters["fallback_validation_calls"] == 2
     assert ws.counters["history_dirty_rows"] == 2
+
+
+@pytest.mark.parametrize(
+    "device,mode",
+    [("cpu", "tensor"), pytest.param("cuda", "compiled", marks=pytest.mark.extended)],
+)
+def test_stable_placement_and_selective_gather(device, mode, monkeypatch):
+    """Compare reordered execution to the independent legacy decoder path."""
+    if device == "cuda" and not torch.cuda.is_available():
+        pytest.skip("CUDA unavailable")
+    from imba_chess.eval.merged_executors import _make_decode_wave_executor
+
+    torch.set_num_threads(4)
+    torch.manual_seed(789)
+    model = _tiny_model(len(VOCAB)).to(device).eval()
+    kwargs = dict(
+        model=model,
+        device=torch.device(device),
+        dtype=torch.float32,
+        stats=None,
+        one_query_per_game=True,
+        decoder_mode=mode,
+        cache_prefixes=True,
+        batch_projection=True,
+        batch_inputs=True,
+        batch_suffix=True,
+    )
+    reference = _make_decode_wave_executor(**kwargs, reuse_decode_buffers=False)
+    candidate = _make_decode_wave_executor(**kwargs, reuse_decode_buffers=True)
+    ws = candidate.workspace
+    gather = ws._gather_ancestors
+
+    def checked_gather(g):
+        result = gather(g)
+        for layer, pair in enumerate(result):
+            for arena, target in zip(ws.arena, pair):
+                source = arena[layer].permute(1, 0, 2)[None].expand(g, -1, -1, -1)
+                indices = ws.device_fields[3][:, None, :, None].expand_as(target)
+                torch.testing.assert_close(
+                    target, torch.gather(source, 2, indices), atol=0, rtol=0
+                )
+                assert target.is_contiguous() and target.size(2) == 32
+        return result
+
+    monkeypatch.setattr(ws, "_gather_ancestors", checked_gather)
+    a = [evaluator(model, n, immutable=True) for n in (0, 7, 19)]
+    b = [evaluator(model, e._prefix_len, e._prefix_kv, immutable=True) for e in a]
+    pa, pb = [None] * 3, [None] * 3
+    with torch.inference_mode():
+        for step in range(40):
+            order = [0, 1, 2] if step % 2 == 0 else [2, 0, 1]
+            if step == 34:
+                order = [2, 0]
+            elif step == 36:
+                order = [0]
+            if step == 37:
+                a[1] = evaluator(model, 2, immutable=True)
+                b[1] = evaluator(model, 2, a[1]._prefix_kv, immutable=True)
+            aa = [payload(a[i], pa[i] if i == 0 and step < 33 else None) for i in order]
+            bb = [payload(b[i], pb[i] if i == 0 and step < 33 else None) for i in order]
+            copied = ws.counters["history_copied_bytes"]
+            compare_results(reference(aa), candidate(bb))
+            if 0 < step < 33:
+                assert ws.counters["history_copied_bytes"] == copied
+            for i, x, y in zip(order, aa, bb):
+                pa[i], pb[i] = x[1][0][0], y[1][0][0]
+        assert ws.counters["branch_gather_width_0_batches"] > 0
+        assert ws.counters["branch_gather_width_32_batches"] > 0
+        reference.clear_cache()
+        candidate.clear_cache()
+        assert not ws.slots and ws.arena is None and ws.branch_gather_width is None

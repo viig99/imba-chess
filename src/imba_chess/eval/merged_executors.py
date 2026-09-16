@@ -463,13 +463,17 @@ def _make_decode_wave_executor(
             try:
                 with torch.inference_mode(), _autocast_context(device, dtype):
                     start = time.perf_counter()
+                    order = reusable.placement_order(payloads)
                     args, state = reusable.prepare(
-                        payloads, prefix_inference=prefix_inference
+                        [payloads[i] for i in order], prefix_inference=prefix_inference
                     )
                     prepared = time.perf_counter()
                     out = runner.decode(*args)
                     decoded = time.perf_counter()
                     results = reusable.consume(state, out)
+                    restored = [None] * len(results)
+                    for index, result in zip(order, results):
+                        restored[index] = result
             except BaseException:
                 clear_cache()
                 raise
@@ -479,7 +483,7 @@ def _make_decode_wave_executor(
                 stats.decode_project += time.perf_counter() - decoded
                 stats.search_eval_calls += 1
                 stats.search_eval_items += len(payloads)
-            return results
+            return restored
         if len(payloads) == 1 and runner is None:
             clear_cache()
             # Single game in this tick's decode_wave batch: the existing
