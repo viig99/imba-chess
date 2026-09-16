@@ -39,6 +39,9 @@ class InferenceRuntime:
         batch_projection=False,
         batch_inputs=False,
         batch_suffix=False,
+        reuse_decode_buffers=False,
+        history_cache_mode="current",
+        native_gumbel=False,
     ):
         self.model, self.move_vocab, self.encoder, self.device = (
             model,
@@ -46,6 +49,7 @@ class InferenceRuntime:
             encoder,
             device,
         )
+        self.native_gumbel = native_gumbel
         self.options = dict(
             one_query_per_game=one_query_per_game,
             cache_prefixes=cache_prefixes,
@@ -53,6 +57,9 @@ class InferenceRuntime:
             batch_inputs=batch_inputs,
             batch_suffix=batch_suffix,
             decoder_mode=decoder_mode,
+            reuse_decode_buffers=reuse_decode_buffers,
+            history_cache_mode=history_cache_mode,
+            native_gumbel=native_gumbel,
             dtype="float32",
         )
         self.waves = dict(root_eval=Counter(), decode_wave=Counter())
@@ -78,6 +85,8 @@ class InferenceRuntime:
                 batch_projection=batch_projection,
                 batch_inputs=batch_inputs,
                 batch_suffix=batch_suffix,
+                reuse_decode_buffers=reuse_decode_buffers,
+                history_cache_mode=history_cache_mode,
             ),
         ).items():
             self.executors[kind] = self._identified(kind, executor)
@@ -135,6 +144,7 @@ class InferenceRuntime:
             dtype=torch.float32,
             prefix_kv=output["kv_caches"],
             prefix_len=batch["total_tokens"],
+            immutable_prefix=True,
         )
         gen = gumbel_stepwise(
             board=board,
@@ -143,6 +153,7 @@ class InferenceRuntime:
             rng=rng,
             root_eval=root,
             root_wdl=wdl,
+            native_selection=self.native_gumbel,
             should_stop=should_stop,
         )
         del output, batch, native
@@ -408,7 +419,8 @@ def collect(
             executors=runtime.executors,
             concurrent_games=(
                 config.collection.concurrent_games
-                if concurrent_games is None else concurrent_games
+                if concurrent_games is None
+                else concurrent_games
             ),
             on_game_done=done,
             on_game_error=lambda gid, exc: None,

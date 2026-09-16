@@ -10,6 +10,7 @@ pub mod castle_rights;
 pub mod chess_move;
 pub mod enums;
 pub mod functions;
+pub mod gumbel;
 pub mod move_projector;
 pub mod piece_moves;
 pub mod terminal;
@@ -24,6 +25,7 @@ fn imba_chess_native(m: &Bound<'_, PyModule>) -> PyResult<()> {
     board::register(m)?;
     board_builder::register(m)?;
     functions::register(m)?;
+    gumbel::register(m)?;
     move_projector::register(m)?;
     terminal::register(m)?;
     board_state::register(m)?;

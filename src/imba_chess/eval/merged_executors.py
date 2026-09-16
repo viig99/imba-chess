@@ -422,12 +422,26 @@ def _make_decode_wave_executor(
     batch_inputs: bool = False,
     batch_suffix: bool = False,
     decoder_mode: str = "current",
+    reuse_decode_buffers: bool = False,
+    history_cache_mode: str = "current",
 ):
+    if history_cache_mode not in ("current", "revision", "direct"):
+        raise ValueError("unknown or unvalidated history cache mode")
     if decoder_mode not in ("current", "tensor", "compiled", "sdpa", "compiled-sdpa"):
         raise ValueError("unknown decoder mode")
     from imba_chess.model.tensor_decoder import DecoderRunner
 
     runner = DecoderRunner(model, decoder_mode) if decoder_mode != "current" else None
+    if reuse_decode_buffers:
+        if runner is None or not one_query_per_game:
+            raise ValueError(
+                "reusable decode buffers require a tensor decoder and one query per game"
+            )
+        from .decode_workspace import DecodeWorkspace
+
+        reusable = DecodeWorkspace(runner, history_cache_mode=history_cache_mode)
+    else:
+        reusable = None
     cached_owners = ()
     cached_prefixes = None
     cached_workspace = None
@@ -438,11 +452,37 @@ def _make_decode_wave_executor(
         cached_workspace = None
         if runner is not None:
             runner.clear()
+        if reusable is not None:
+            reusable.clear()
 
     def executor(
         payloads: list[tuple[CachedPositionEvaluator, list]],
     ) -> list[list[search.PositionEval]]:
         nonlocal cached_owners, cached_prefixes, cached_workspace
+        if reusable is not None:
+            if model.training:
+                raise ValueError("tensor decoder is inference-only")
+            prefix_inference = torch.is_inference_mode_enabled()
+            try:
+                with torch.inference_mode(), _autocast_context(device, dtype):
+                    start = time.perf_counter()
+                    args, state = reusable.prepare(
+                        payloads, prefix_inference=prefix_inference
+                    )
+                    prepared = time.perf_counter()
+                    out = runner.decode(*args)
+                    decoded = time.perf_counter()
+                    results = reusable.consume(state, out)
+            except BaseException:
+                clear_cache()
+                raise
+            if stats is not None:
+                stats.decode_prep += prepared - start
+                stats.search_gpu += decoded - prepared
+                stats.decode_project += time.perf_counter() - decoded
+                stats.search_eval_calls += 1
+                stats.search_eval_items += len(payloads)
+            return results
         if len(payloads) == 1 and runner is None:
             clear_cache()
             # Single game in this tick's decode_wave batch: the existing
@@ -539,4 +579,5 @@ def _make_decode_wave_executor(
         return results
 
     executor.clear_cache = clear_cache
+    executor.workspace = reusable
     return executor

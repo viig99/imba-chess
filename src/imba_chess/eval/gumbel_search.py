@@ -169,6 +169,7 @@ def gumbel_stepwise(
     noise=None,
     root_eval: PositionEval | None = None,
     root_wdl=None,
+    native_selection=False,
     should_stop: Callable[[], bool] = lambda: False,
 ):
     """Yield at most one new neural leaf per simulation; retain history per path.
@@ -198,6 +199,20 @@ def gumbel_stepwise(
     evaluations, terminal_hits, cutoffs, deepest = 1, 0, 0, 0
 
     def root_action(visit):
+        if native_selection:
+            return cc.gumbel_root_action(
+                root.value,
+                priors,
+                root.visits,
+                root.qs(),
+                root.prior_probs,
+                config.maxvisit_init,
+                config.value_scale,
+                config.epsilon,
+                noise,
+                visit,
+                max_prior,
+            )
         q = completed_q(
             root.value, priors, root.visits, root.qs(), config, root.prior_probs
         )
@@ -245,6 +260,18 @@ def gumbel_stepwise(
                 cutoffs += 1
                 leaf = node
                 break
+            if native_selection:
+                action = cc.gumbel_interior_action(
+                    node.value,
+                    node.evaluation.legal_log_priors,
+                    node.visits,
+                    node.qs(),
+                    node.prior_probs,
+                    config.maxvisit_init,
+                    config.value_scale,
+                    config.epsilon,
+                )
+                continue
             action = interior_action(
                 node.value,
                 node.evaluation.legal_log_priors,

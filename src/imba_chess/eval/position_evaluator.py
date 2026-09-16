@@ -447,9 +447,12 @@ def _get_or_create_arena(
 class _CachedNode:
     """Search-node handle with its append-only K/V arena ancestor chain."""
 
-    __slots__ = ("parent", "move_id", "depth", "arena_chain")
+    __slots__ = ("parent", "move_id", "depth", "arena_chain", "history_token")
 
-    def __init__(self, parent: "_CachedNode | None", move_id: int, depth: int) -> None:
+    def __init__(
+        self, parent: "_CachedNode | None", move_id: int, depth: int, history_token=None
+    ) -> None:
+        self.history_token = history_token
         self.parent = parent
         self.move_id = move_id
         self.depth = depth
@@ -548,15 +551,60 @@ class CachedPositionEvaluator:
         dtype: torch.dtype,
         prefix_kv,
         prefix_len: int,
+        immutable_prefix: bool = False,
     ) -> None:
         self._model = model
         self._move_vocab = move_vocab
         self._board_state_encoder = board_state_encoder
         self._device = device
         self._dtype = dtype
-        self._prefix_kv = prefix_kv
-        self._prefix_len = int(prefix_len)
+        self.history_revision = 0
+        self._immutable_prefix = bool(immutable_prefix)
+        self.replace_history(prefix_kv, prefix_len)
+
+    @property
+    def immutable_prefix(self):
+        return self._immutable_prefix
+
+    def replace_history(self, prefix_kv, prefix_len):
+        """Replace a root history and invalidate every previously issued handle.
+
+        Immutable callers promise not to mutate tensors (including through aliases)
+        during this revision. New model weights require a newly evaluated history.
+        Untrusted callers retain tensor fingerprint validation in the workspace.
+        """
+        if int(prefix_len) < 0:
+            raise ValueError("negative history length")
+        self.__prefix_kv = (
+            tuple(tuple(pair) for pair in prefix_kv)
+            if self.immutable_prefix
+            else prefix_kv
+        )
+        self.__prefix_len = int(prefix_len)
+        self.history_revision += 1
+        self._history_token = object()
         self._arena: _KVArena | None = None
+
+    @property
+    def _prefix_kv(self):
+        return self.__prefix_kv
+
+    @_prefix_kv.setter
+    def _prefix_kv(self, value):
+        self.replace_history(value, self.__prefix_len)
+
+    @property
+    def _prefix_len(self):
+        return self.__prefix_len
+
+    @_prefix_len.setter
+    def _prefix_len(self, value):
+        self.replace_history(self.__prefix_kv, value)
+
+    def _validate_handles(self, nodes):
+        for node in nodes:
+            if node.history_token is not self._history_token:
+                raise RuntimeError("stale or foreign history handle")
 
     def extend(self, handle, move_uci: str, move_vocab_id: int | None = None):
         """Create an opaque child handle backed by the shared K/V arena.
@@ -568,13 +616,15 @@ class CachedPositionEvaluator:
         the string there.
         """
         parent = handle if isinstance(handle, _CachedNode) else None
+        if parent is not None:
+            self._validate_handles((parent,))
         depth = parent.depth + 1 if parent is not None else 0
         if move_vocab_id is None:
             move_vocab_id = int(self._move_vocab.encode(move_uci))
-        return _CachedNode(parent, move_vocab_id, depth)
+        return _CachedNode(parent, move_vocab_id, depth, self._history_token)
 
     def build_decode_request(
-        self, batch, *, defer_tensors=False, stack_suffix=False
+        self, batch, *, defer_tensors=False, stack_suffix=False, defer_suffix=False
     ) -> _DecodeRequest:
         """All CPU pre-work for one wave: encode boards, token tensors,
         suffix gather, positions -- everything before the model call.
@@ -588,6 +638,7 @@ class CachedPositionEvaluator:
         only yields a non-empty batch).
         """
         nodes: list[_CachedNode] = [handle for handle, _ in batch]
+        self._validate_handles(nodes)
         boards = [cozy_board for _, cozy_board in batch]
         states = [
             self._board_state_encoder.encode_cozy(cozy_board) for cozy_board in boards
@@ -613,7 +664,7 @@ class CachedPositionEvaluator:
             positions = torch.tensor(positions, dtype=torch.long)
         max_suffix = max(node.depth for node in nodes)
         suffix_kv = suffix_positions = suffix_mask = suffix_layers = None
-        if max_suffix > 0:
+        if max_suffix > 0 and not defer_suffix:
             if self._arena is None:
                 raise RuntimeError("Missing KV arena for non-root decode wave")
             parent_chains: list[list[int]] = []
@@ -654,6 +705,7 @@ class CachedPositionEvaluator:
         )
 
     def _append_decode_rows(self, request, k_rows, v_rows):
+        self._validate_handles(request.nodes)
         self._arena = _get_or_create_arena(self._arena, k_rows, v_rows)
         assigned_rows = self._arena.append(k_rows, v_rows)
         for node, own_row in zip(request.nodes, assigned_rows):
