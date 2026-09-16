@@ -1,4 +1,4 @@
-"""History-cache ablations against the optimized native CUDA collector."""
+"""Profile the optimized CUDA collector; compare revisions using saved artifacts."""
 
 import argparse
 import cProfile
@@ -9,8 +9,6 @@ import json
 from pathlib import Path
 import pstats
 import random
-import statistics
-import subprocess
 import math
 import time
 from types import SimpleNamespace
@@ -25,75 +23,6 @@ from imba_chess.self_play.collector import CollectionMetrics, collect
 from imba_chess.self_play.config import load_config
 from imba_chess.self_play.runtime import load_runtime, StopBudget, run_lock
 from imba_chess.self_play.seeds import load_seeds, file_hash
-
-
-def thermal_snapshot():
-    fields = (
-        subprocess.check_output(
-            [
-                "nvidia-smi",
-                "--id=0",
-                "--query-gpu=temperature.gpu,clocks.current.sm,power.draw,clocks_event_reasons.sw_thermal_slowdown,clocks_event_reasons.hw_thermal_slowdown",
-                "--format=csv,noheader,nounits",
-            ],
-            text=True,
-        )
-        .strip()
-        .split(", ")
-    )
-    cpu = []
-    for directory in Path("/sys/class/hwmon").glob("hwmon*"):
-        name = directory / "name"
-        if name.exists() and name.read_text().strip() in (
-            "coretemp",
-            "k10temp",
-            "zenpower",
-        ):
-            sensor = directory / "temp1_input"
-            if sensor.exists():
-                cpu.append(int(sensor.read_text()) / 1000)
-    return dict(
-        timestamp=time.time(),
-        gpu_celsius=float(fields[0]),
-        sm_mhz=float(fields[1]),
-        power_watts=float(fields[2]),
-        sw_thermal_slowdown=fields[3],
-        hw_thermal_slowdown=fields[4],
-        cpu_celsius=max(cpu) if cpu else None,
-    )
-
-
-def thermal_ready(snapshot):
-    return (
-        snapshot["gpu_celsius"] <= 60
-        and snapshot["cpu_celsius"] is not None
-        and snapshot["cpu_celsius"] <= 70
-        and snapshot["sw_thermal_slowdown"] == "Not Active"
-        and snapshot["hw_thermal_slowdown"] == "Not Active"
-    )
-
-
-def cool_before_measurement(directory, status):
-    """Keep compiled graphs warm; cool hardware outside the timed collection.
-
-    No power, clock, fan or thread settings are changed. Save every sample and
-    require a minute of rest plus three ready samples before starting a pass.
-    """
-    started = time.monotonic()
-    samples, consecutive = [], 0
-    while True:
-        sample = thermal_snapshot()
-        samples.append(sample)
-        consecutive = consecutive + 1 if thermal_ready(sample) else 0
-        elapsed = time.monotonic() - started
-        if len(samples) % 6 == 1:
-            status("thermal_cooldown", pass_name=directory.name, thermal=sample)
-        atomic_json(directory / "cooldown.json", samples)
-        if elapsed >= 60 and consecutive >= 3:
-            return sample
-        if elapsed >= 300:
-            raise RuntimeError("Hardware did not reach the common thermal baseline")
-        time.sleep(5)
 
 
 def target_digest(targets):
@@ -173,50 +102,12 @@ def compare_workload_targets(references, game_count, targets):
             expected[row["id"]] = row
 
 
-def promotion_report(
-    reports, games, pairs, reference="reference", candidate="candidate"
-):
-    paired = [
-        (reports[f"pair_{i}_{reference}"], reports[f"pair_{i}_{candidate}"])
-        for i in range(pairs)
-    ]
-    gains = [
-        b["usable_positions_per_hour"] / a["usable_positions_per_hour"] - 1
-        for a, b in paired
-    ]
-    latency = [b["move_latency_p95"] / a["move_latency_p95"] - 1 for a, b in paired]
-    checks = dict(
-        workload=games >= 128 and pairs >= 3,
-        median_throughput=statistics.median(gains) >= 0.05,
-        every_pair=all(x > 0 for x in gains),
-        p95_latency=statistics.median(latency) <= 0.05,
-        memory=all(b["peak_allocated_bytes"] < 6 * 1024**3 for _, b in paired),
-        warmed_graphs=all(
-            r["compiler_before"].get("stats", {}).get("unique_graphs", 0)
-            == r["compiler_after"].get("stats", {}).get("unique_graphs", 0)
-            for pair in paired
-            for r in pair
-        ),
-        allocated_retention=max(
-            r["allocated_after_collection"] for pair in paired for r in pair
-        )
-        - min(r["allocated_after_collection"] for pair in paired for r in pair)
-        <= 1024**2,
-        cache_cleanup=all(
-            r["cache_empty_after_collection"] for pair in paired for r in pair
-        ),
+def main(*, diagnostics=True):
+    parser = argparse.ArgumentParser(
+        description=__doc__
+        if diagnostics
+        else "Benchmark complete self-play games with the optimized CUDA collector."
     )
-    return dict(
-        checks=checks,
-        passes=all(checks.values()),
-        throughput_gains=gains,
-        p95_latency_changes=latency,
-        median_throughput_gain=statistics.median(gains),
-    )
-
-
-def main():
-    parser = argparse.ArgumentParser(description=__doc__)
     for key in ("config", "checkpoint", "seeds", "output"):
         parser.add_argument("--" + key, type=Path, required=True)
     parser.add_argument(
@@ -225,75 +116,23 @@ def main():
         help="Compare all passes with a saved targets.json correctness reference",
     )
     parser.add_argument(
-        "--resume",
-        action="store_true",
-        help="Reuse completed measured passes after verifying source and workload identity; repeat warmups",
-    )
-    parser.add_argument(
-        "--thermal-cooldown",
-        action="store_true",
-        help="Cool before each measured pass; archive temperature/clock state outside timing",
-    )
-    parser.add_argument("--study", choices=["history", "legacy"], default="history")
-    parser.add_argument(
-        "--cold-only",
-        action="store_true",
-        help="One cold complete-game pass; run each variant in a fresh process",
-    )
-    parser.add_argument(
         "--reference-games",
         type=Path,
         help="Compare complete trajectories with a separate cold process",
     )
     parser.add_argument("--games", type=int, default=32)
     parser.add_argument("--warmup-games", type=int, default=32)
-    parser.add_argument(
-        "--include-native",
-        action="store_true",
-        help="Include native selectors as a third paired variant",
-    )
     parser.add_argument("--concurrency", type=int, default=24)
     parser.add_argument(
-        "--variant",
-        choices=["current", "revision", "direct", "reference", "candidate", "native"],
-        default="current",
-    )
-    parser.add_argument(
-        "--pairs",
-        type=int,
-        default=0,
-        help="Alternating warmed reference/candidate pairs; use 3 with --games 128 for promotion",
-    )
-    parser.add_argument(
-        "--skip-profile",
-        action="store_true",
-        help="Only run unprofiled collector measurements",
+        "--runs", type=int, default=1, help="Repeated warmed complete-game measurements"
     )
     args = parser.parse_args()
-    if min(args.games, args.warmup_games, args.concurrency) < 1 or args.pairs < 0:
-        parser.error("games/concurrency must be positive and pairs nonnegative")
-    if args.study == "history" and (
-        args.include_native or args.variant not in ("current", "revision", "direct")
-    ):
-        parser.error(
-            "history study uses current/revision/direct with native selection throughout"
-        )
-    if args.study == "legacy" and args.variant not in (
-        "reference",
-        "candidate",
-        "native",
-    ):
-        parser.error("legacy study requires a legacy --variant")
-    if args.cold_only and (args.pairs or args.resume or not args.skip_profile):
-        parser.error("cold-only requires --skip-profile and no pairs/resume")
-    if args.study == "history":
-        from torch._inductor import config as inductor_config
+    if min(args.games, args.warmup_games, args.concurrency, args.runs) < 1:
+        parser.error("games/concurrency/runs must be positive")
+    from torch._inductor import config as inductor_config
 
-        # Compile each process from its own initial workload while preserving
-        # reference kernel tuning choices. A cached dynamic graph first compiled
-        # at another batch size can have different reduction arithmetic. This
-        # affects startup only; warmed calls still reuse their compiled graph.
-        inductor_config.fx_graph_cache = False
+    # Fresh graph compilation, but persisted kernel tuning for reproducible arithmetic.
+    inductor_config.fx_graph_cache = False
     torch.set_num_threads(4)
     torch.backends.cuda.matmul.allow_tf32 = False
     torch.backends.cudnn.allow_tf32 = False
@@ -309,30 +148,6 @@ def main():
     seeds = load_seeds(args.seeds)
     actor = file_hash(args.checkpoint)
     with run_lock(args.output):
-        previous_metadata = None
-        if args.resume:
-            previous_metadata = json.loads((args.output / "metadata.json").read_text())
-            assert previous_metadata["checkpoint_sha256"] == actor
-            assert (
-                previous_metadata.get("thermal_cooldown", False)
-                == args.thermal_cooldown
-            )
-            assert previous_metadata["harness_sha256"] == file_hash(Path(__file__))
-            assert previous_metadata["seed_manifest_sha256"] == file_hash(args.seeds)
-            assert previous_metadata["config"] == asdict(cfg)
-            assert previous_metadata["games"] == args.games
-            assert previous_metadata["concurrency"] == args.concurrency
-            assert previous_metadata.get("study", "legacy") == args.study
-            assert previous_metadata.get("include_native", False) == args.include_native
-            for field in ("source_hashes", "native_source_hashes"):
-                assert all(
-                    file_hash(Path(name)) == digest
-                    for name, digest in previous_metadata[field].items()
-                ), field
-            atomic_json(
-                args.output / f"metadata.before-resume-{int(time.time())}.json",
-                previous_metadata,
-            )
 
         def status(phase, **extra):
             row = dict(phase=phase, timestamp=time.time(), **extra)
@@ -359,43 +174,23 @@ def main():
             stats=stats,
             max_tokens=cfg.collection.root_batch_tokens,
         )
-        modes = (
-            ("current", "revision", "direct")
-            if args.study == "history"
-            else ("reference", "candidate", "native")
+        leaf = merged_executors._make_decode_wave_executor(
+            model=runtime.model,
+            device=runtime.device,
+            dtype=torch.float32,
+            stats=stats,
+            one_query_per_game=True,
+            cache_prefixes=True,
+            decoder_mode="compiled",
+            batch_projection=True,
+            batch_inputs=True,
+            batch_suffix=True,
+            reuse_decode_buffers=True,
         )
-        leaves = {
-            variant: merged_executors._make_decode_wave_executor(
-                model=runtime.model,
-                device=runtime.device,
-                dtype=torch.float32,
-                stats=stats,
-                one_query_per_game=True,
-                cache_prefixes=True,
-                decoder_mode="compiled",
-                batch_projection=True,
-                batch_inputs=True,
-                batch_suffix=True,
-                reuse_decode_buffers=variant != "reference",
-                history_cache_mode=variant if args.study == "history" else "current",
-            )
-            for variant in modes
+        runtime.executors = {
+            k: runtime._identified(k, v)
+            for k, v in [("root_eval", root), ("decode_wave", leaf)]
         }
-
-        def select(variant):
-            runtime.clear_caches()
-            runtime.options["reuse_decode_buffers"] = variant != "reference"
-            runtime.options["history_cache_mode"] = (
-                variant if args.study == "history" else "current"
-            )
-            runtime.native_gumbel = args.study == "history" or variant == "native"
-            runtime.options["native_gumbel"] = runtime.native_gumbel
-            runtime.executors = {
-                k: runtime._identified(k, v)
-                for k, v in [("root_eval", root), ("decode_wave", leaves[variant])]
-            }
-
-        select(args.variant)
         atomic_json(
             args.output / "metadata.json",
             dict(
@@ -405,16 +200,13 @@ def main():
                 seed_manifest_sha256=file_hash(args.seeds),
                 games=args.games,
                 concurrency=args.concurrency,
-                pairs=args.pairs,
+                runs=args.runs,
                 warmup_games=args.warmup_games,
-                include_native=args.include_native,
-                study=args.study,
-                cold_only=args.cold_only,
-                thermal_cooldown=args.thermal_cooldown,
-                cold_graph_compile=args.study == "history",
+                diagnostics=diagnostics,
+                cold_graph_compile=True,
                 persistent_kernel_tuning=True,
                 harness_sha256=file_hash(Path(__file__)),
-                variant=args.variant,
+                history_implementation="direct",
                 runtime=runtime.options,
                 torch=torch.__version__,
                 gpu=torch.cuda.get_device_name(),
@@ -447,7 +239,7 @@ def main():
 
             return {k: dict(v) for k, v in c.items()}
 
-        signatures, reports = {}, {}
+        signatures = {}
         reference_targets = {}
         if args.reference_targets:
             saved_targets = json.loads(args.reference_targets.read_text())
@@ -463,67 +255,17 @@ def main():
             else None
         )
         game_counts = {}
-        variants = (
-            (
-                ("reference", "candidate", "native")
-                if args.include_native
-                else ("reference", "candidate")
-            )
-            if args.pairs
-            else (args.variant,)
+        passes = ["warmup"]
+        passes.extend(
+            ["baseline"] if args.runs == 1 else [f"run_{i}" for i in range(args.runs)]
         )
-        if args.study == "history":
-            # Revision-only is an attribution ablation; gate the combined stage.
-            variants = ("current", "direct") if args.pairs else (args.variant,)
-        passes = [] if args.cold_only else [(f"warmup_{v}", v) for v in variants]
-        if args.pairs:
-            for i in range(args.pairs):
-                order = variants if i % 2 == 0 else variants[::-1]
-                passes.extend((f"pair_{i}_{v}", v) for v in order)
-        else:
-            passes.append(("baseline", args.variant))
-        if not args.skip_profile:
-            passes.append(("cprofile", args.variant))
-        for label, variant in passes:
-            pass_games = (
-                args.warmup_games if label.startswith("warmup_") else args.games
-            )
+        if diagnostics:
+            passes.append("cprofile")
+        workspace = leaf.workspace
+        for label in passes:
+            pass_games = args.warmup_games if label == "warmup" else args.games
             game_counts[label] = pass_games
-            directory = args.output / label
-            if (
-                args.resume
-                and label.startswith("pair_")
-                and all(
-                    (directory / name).exists()
-                    for name in ("metrics.json", "targets.json", "games.json")
-                )
-            ):
-                report = json.loads((directory / "metrics.json").read_text())
-                assert (
-                    report["completed_games"] == pass_games
-                    and report["variant"] == variant
-                )
-                assert not report["profiled"]
-                targets = json.loads((directory / "targets.json").read_text())
-                compare_workload_targets(reference_targets, pass_games, targets)
-                reports[label] = report
-                signatures[label] = report["game_signature"]
-                assert (
-                    len(
-                        {
-                            v
-                            for k, v in signatures.items()
-                            if game_counts[k] == pass_games
-                        }
-                    )
-                    == 1
-                )
-                status(label + "_reused", seconds=report["seconds"])
-                continue
-            select(variant)
-            workspace = leaves[variant].workspace
-            if workspace is not None:
-                workspace.counters.clear()
+            workspace.counters.clear()
             status(label)
             directory = args.output / label
             store = SelfPlayStore(directory / "replay", **asdict(cfg.replay))
@@ -547,13 +289,8 @@ def main():
                         label, games_completed=len(games), games_requested=pass_games
                     )
 
-            thermal_before = None
-            if args.thermal_cooldown and not label.startswith("warmup_"):
-                thermal_before = cool_before_measurement(directory, status)
-                status(label)
             metrics = CollectionMetrics()
-            if args.study == "history":
-                metrics.latencies = []  # Archive every move in the bounded workload.
+            metrics.latencies = []  # Archive every move in the bounded workload.
             start = time.perf_counter()
             if profile:
                 profile.enable()
@@ -575,7 +312,6 @@ def main():
             if profile:
                 profile.disable()
             elapsed = time.perf_counter() - start
-            thermal_after = thermal_snapshot() if args.thermal_cooldown else None
             assert len(games) == pass_games and all(
                 g["status"] == "completed" for g in games
             )
@@ -597,9 +333,7 @@ def main():
                 directory / "latencies.json",
                 dict(
                     seconds=list(metrics.latencies),
-                    scope="all moves"
-                    if args.study == "history"
-                    else "last up to 4096 moves",
+                    scope="all moves",
                 ),
             )
             report = metrics.report()
@@ -608,15 +342,12 @@ def main():
                 usable_positions_per_hour=3600
                 * report.get("usable_positions", 0)
                 / elapsed,
-                variant=variant,
+                history_implementation="direct",
                 target_sha256=bitwise,
-                thermal_before=thermal_before,
-                thermal_after=thermal_after,
                 bitwise_targets_equal=bitwise == expected_bitwise,
                 single_game_tail=runtime.waves["decode_wave"].get(1, 0) > 0,
-                transfers=dict(workspace.counters) if workspace else {},
-                cache_empty_after_collection=workspace is None
-                or (
+                transfers=dict(workspace.counters),
+                cache_empty_after_collection=(
                     not workspace.slots
                     and workspace.arena is None
                     and workspace.host is None
@@ -630,12 +361,12 @@ def main():
                 waves={k: dict(v) for k, v in runtime.waves.items()},
                 inference_rows=dict(runtime.inference_rows),
                 peak_allocated_bytes=torch.cuda.max_memory_allocated(),
+                peak_reserved_bytes=torch.cuda.max_memory_reserved(),
                 compiler_before=before,
                 compiler_after=counters(),
                 game_signature=digest,
                 profiled=profile is not None,
             )
-            reports[label] = report
             atomic_json(directory / "metrics.json", report)
             atomic_json(directory / "games.json", games)
             if profile:
@@ -716,33 +447,10 @@ def main():
                 seconds=elapsed,
                 positions=report["searched_positions"],
             )
-        # Per-game targets and same-size signatures were checked after every pass.
-        if args.pairs:
-            atomic_json(
-                args.output / "promotion.json",
-                dict(
-                    cache=promotion_report(reports, args.games, args.pairs),
-                    native=promotion_report(
-                        reports, args.games, args.pairs, "candidate", "native"
-                    ),
-                )
-                if args.study == "legacy" and args.include_native
-                else (
-                    dict(
-                        direct=promotion_report(
-                            reports, args.games, args.pairs, "current", "direct"
-                        ),
-                        promoted=False,
-                        note="Throughput gates only; separate cold-process and updated-weight checks are required before promotion.",
-                    )
-                    if args.study == "history"
-                    else promotion_report(reports, args.games, args.pairs)
-                ),
-            )
-        if args.skip_profile:
+        if not diagnostics:
             status("complete", signatures_match=True, targets_match=True)
             return
-        select(args.variant)
+        runtime.clear_caches()
         # Fixed representative prefix lengths for a short, fully warmed CUDA trace.
         ordered = sorted(seeds, key=lambda s: (len(s.prefix_moves), s.seed_id))
         selected = [
@@ -799,22 +507,16 @@ def main():
 
             return call
 
-        workspace = leaves[args.variant].workspace
-        if workspace is not None:
-            for method, label in (
-                ("_history_stamp", "history_validation"),
-                ("_slot", "history_slot_refresh"),
-                ("_refresh_direct", "history_direct_refresh"),
-                ("_refresh_compact_row", "history_compact_refresh"),
-                ("_refresh_current_prefix", "history_decoder_refresh"),
-                ("_gather_ancestors", "preparation_ancestor_gather"),
-                ("_prepare_attention", "preparation_masks_positions"),
-                ("consume", "result_processing"),
-            ):
-                setattr(workspace, method, traced(label, getattr(workspace, method)))
-            workspace.runner.decode = traced(
-                "decoder_execution", workspace.runner.decode
-            )
+        for method, label in (
+            ("_history_stamp", "history_validation"),
+            ("_slot", "history_slot_refresh"),
+            ("_refresh_direct", "history_direct_refresh"),
+            ("_gather_ancestors", "preparation_ancestor_gather"),
+            ("_prepare_attention", "preparation_masks_positions"),
+            ("consume", "result_processing"),
+        ):
+            setattr(workspace, method, traced(label, getattr(workspace, method)))
+        workspace.runner.decode = traced("decoder_execution", workspace.runner.decode)
         status("cuda_trace")
         with torch.profiler.profile(
             activities=[

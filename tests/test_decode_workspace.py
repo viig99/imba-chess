@@ -69,8 +69,7 @@ def compare_results(a, b):
 @pytest.mark.parametrize(
     "mode", ["tensor", pytest.param("compiled", marks=pytest.mark.extended)]
 )
-@pytest.mark.parametrize("cache_mode", ["current", "revision", "direct"])
-def test_workspace_mixed_depth_owner_changes_and_kv_lifetime(device, mode, cache_mode):
+def test_workspace_mixed_depth_owner_changes_and_kv_lifetime(device, mode):
     if device == "cuda" and not torch.cuda.is_available():
         pytest.skip("CUDA unavailable")
     if device == "cpu" and mode == "compiled":
@@ -82,7 +81,7 @@ def test_workspace_mixed_depth_owner_changes_and_kv_lifetime(device, mode, cache
     torch.manual_seed(789)
     model = _tiny_model(len(VOCAB)).to(device).eval()
     reference = DecoderRunner(model, mode)
-    ws = DecodeWorkspace(DecoderRunner(model, mode), history_cache_mode=cache_mode)
+    ws = DecodeWorkspace(DecoderRunner(model, mode))
     a = [evaluator(model, n) for n in (0, 7, 19)]
     b = [evaluator(model, e._prefix_len, e._prefix_kv, immutable=True) for e in a]
     pa, pb = [None] * 3, [None] * 3
@@ -182,11 +181,10 @@ def test_workspace_mixed_depth_owner_changes_and_kv_lifetime(device, mode, cache
         torch.compiler.reset()
 
 
-@pytest.mark.parametrize("cache_mode", ["current", "revision", "direct"])
-def test_arena_growth_slot_reclamation_and_empty_projection(monkeypatch, cache_mode):
+def test_arena_growth_slot_reclamation_and_empty_projection(monkeypatch):
     torch.set_num_threads(4)
     model = _tiny_model(len(VOCAB)).eval()
-    ws = DecodeWorkspace(DecoderRunner(model, "tensor"), history_cache_mode=cache_mode)
+    ws = DecodeWorkspace(DecoderRunner(model, "tensor"))
     owner = evaluator(model, 3)
     original_projection = cozy_bridge.project_legal_moves
     monkeypatch.setattr(
@@ -218,8 +216,7 @@ def test_arena_growth_slot_reclamation_and_empty_projection(monkeypatch, cache_m
         ws.clear()
 
 
-@pytest.mark.parametrize("cache_mode", ["current", "revision", "direct"])
-def test_scratch_collect_update_collect_and_cancellation(tmp_path, cache_mode):
+def test_scratch_collect_update_collect_and_cancellation(tmp_path):
     from dataclasses import replace
     from imba_chess.data.self_play_store import SelfPlayStore
     from imba_chess.self_play.collector import InferenceRuntime, collect
@@ -251,7 +248,6 @@ def test_scratch_collect_update_collect_and_cancellation(tmp_path, cache_mode):
             batch_inputs=True,
             batch_suffix=True,
             reuse_decode_buffers=reuse,
-            history_cache_mode=cache_mode,
             native_gumbel=True,
         )
         for reuse in (False, True)
@@ -317,10 +313,9 @@ def test_scratch_collect_update_collect_and_cancellation(tmp_path, cache_mode):
     assert any(g["status"] == "unfinished" and not g["targets"] for g in interrupted)
 
 
-@pytest.mark.parametrize("cache_mode", ["current", "revision", "direct"])
-def test_history_refresh_and_padding_shrink_without_owner_change(cache_mode):
+def test_history_refresh_and_padding_shrink_without_owner_change():
     model = _tiny_model(len(VOCAB)).eval()
-    ws = DecodeWorkspace(DecoderRunner(model, "tensor"), history_cache_mode=cache_mode)
+    ws = DecodeWorkspace(DecoderRunner(model, "tensor"))
     owner = evaluator(model, 9)
     other = evaluator(model, 13)
     with torch.inference_mode():
@@ -364,12 +359,11 @@ def test_profile_compares_targets_only_within_identical_collection_sizes():
         compare_workload_targets(references, 2, warmup + measured[1:])
 
 
-@pytest.mark.parametrize("cache_mode", ["revision", "direct"])
-def test_immutable_revision_and_stale_handles(cache_mode, monkeypatch):
+def test_immutable_revision_and_stale_handles(monkeypatch):
     model = _tiny_model(len(VOCAB)).eval()
     owner = evaluator(model, 3, immutable=True)
     other = evaluator(model, 3, immutable=True)
-    ws = DecodeWorkspace(DecoderRunner(model, "tensor"), history_cache_mode=cache_mode)
+    ws = DecodeWorkspace(DecoderRunner(model, "tensor"))
 
     def no_fingerprint(request):
         raise AssertionError("immutable cache fingerprinted")
@@ -403,7 +397,7 @@ def test_immutable_revision_and_stale_handles(cache_mode, monkeypatch):
 @pytest.mark.parametrize("immutable", [False, True])
 def test_direct_dirty_rows_batch_resize_and_width_changes(immutable):
     model = _tiny_model(len(VOCAB)).eval()
-    ws = DecodeWorkspace(DecoderRunner(model, "tensor"), history_cache_mode="direct")
+    ws = DecodeWorkspace(DecoderRunner(model, "tensor"))
     owners = [evaluator(model, n, immutable=immutable) for n in (7, 0, 3, 7, 7)]
 
     def prepare(order, dirty):
@@ -425,7 +419,6 @@ def test_direct_dirty_rows_batch_resize_and_width_changes(immutable):
                 "history_zero_submissions",
             ):
                 assert ws.counters[key] == before[key]
-        assert ws.prefix is None and all(not slot.history for slot in ws.slots.values())
 
     prepare([0, 1, 2], 3)
     prepare([0, 1, 2], 0)
@@ -462,7 +455,6 @@ def test_workspace_executor_error_cleans_buffers(monkeypatch):
         one_query_per_game=True,
         decoder_mode="tensor",
         reuse_decode_buffers=True,
-        history_cache_mode="direct",
     )
 
     def fail(*args):
@@ -476,13 +468,12 @@ def test_workspace_executor_error_cleans_buffers(monkeypatch):
     assert not executor.workspace.slots
 
 
-@pytest.mark.parametrize("cache_mode", ["current", "revision", "direct"])
-def test_mutable_external_tensor_replacement_is_fingerprinted(cache_mode):
+def test_mutable_external_tensor_replacement_is_fingerprinted():
     model = _tiny_model(len(VOCAB)).eval()
     original = evaluator(model, 3)
     prefix = list(original._prefix_kv)
     owner = evaluator(model, 3, prefix)
-    ws = DecodeWorkspace(DecoderRunner(model, "tensor"), history_cache_mode=cache_mode)
+    ws = DecodeWorkspace(DecoderRunner(model, "tensor"))
     with torch.inference_mode():
         ws.prepare([payload(owner)])
     prefix[0] = tuple(t + 4 for t in prefix[0])

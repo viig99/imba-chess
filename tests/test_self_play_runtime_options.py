@@ -38,9 +38,6 @@ def test_runtime_resolves_decoder_options_without_changing_checkpoint(
     assert actual.decoder_mode == (mode or ("compiled" if expected else "current"))
     assert actual.reuse_decode_buffers is (expected and mode != "current")
     assert actual.native_gumbel is actual.reuse_decode_buffers
-    assert actual.history_cache_mode == (
-        "direct" if actual.reuse_decode_buffers else "current"
-    )
 
 
 @pytest.mark.parametrize(
@@ -74,16 +71,3 @@ def test_runtime_retains_reference_switches_and_ablation_options(
     actual, _ = runtime.load_runtime(SelfPlayConfig(), "unused.pt", "cuda", **overrides)
     assert actual.reuse_decode_buffers is reuse
     assert actual.native_gumbel is native
-    assert actual.history_cache_mode == ("direct" if reuse else "current")
-
-
-@pytest.mark.parametrize("mode", ["current", "revision", "direct"])
-def test_runtime_preserves_explicit_history_cache_mode(monkeypatch, mode):
-    model = SimpleNamespace(config=SimpleNamespace(max_position_embeddings=513))
-    monkeypatch.setattr(runtime.torch.cuda, "is_available", lambda: True)
-    monkeypatch.setattr(runtime, "load_hstu_checkpoint", lambda **kw: (model, None))
-    monkeypatch.setattr(runtime, "InferenceRuntime", lambda **kw: SimpleNamespace(**kw))
-    actual, _ = runtime.load_runtime(
-        SelfPlayConfig(), "unused.pt", "cuda", history_cache_mode=mode
-    )
-    assert actual.history_cache_mode == mode

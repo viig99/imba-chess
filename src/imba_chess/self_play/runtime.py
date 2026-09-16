@@ -30,7 +30,6 @@ def load_runtime(
     batch_inputs=None,
     batch_suffix=None,
     reuse_decode_buffers=None,
-    history_cache_mode=None,
     native_gumbel=None,
 ):
     device = torch.device(device)
@@ -62,15 +61,6 @@ def load_runtime(
         )
     if native_gumbel is None:
         native_gumbel = enabled and reuse_decode_buffers
-    if history_cache_mode is None:
-        history_cache_mode = (
-            "direct"
-            if enabled
-            and reuse_decode_buffers
-            and decoder_mode in ("tensor", "compiled")
-            and all(options.values())
-            else "current"
-        )
     repo = load_repo_config(Path(config.base_config))
     vocab = MoveVocab.load(repo.vocab.path)
     encoder = BoardStateEncoder(repo.board_state)
@@ -92,7 +82,6 @@ def load_runtime(
         root_batch_tokens=config.collection.root_batch_tokens,
         decoder_mode=decoder_mode,
         reuse_decode_buffers=reuse_decode_buffers,
-        history_cache_mode=history_cache_mode,
         native_gumbel=native_gumbel,
         **options,
     )

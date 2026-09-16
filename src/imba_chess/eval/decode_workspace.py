@@ -20,7 +20,6 @@ class _Slot:
     owner: weakref.ReferenceType
     rows: list[int] = field(default_factory=list)
     free: list[int] = field(default_factory=list)
-    history: tuple = ()
     stamp: tuple = ()
 
 
@@ -47,10 +46,7 @@ def _stamp(request):
 class DecodeWorkspace:
     capacity = 32
 
-    def __init__(self, runner, *, history_cache_mode="current"):
-        if history_cache_mode not in ("current", "revision", "direct"):
-            raise ValueError("unknown or unvalidated history cache mode")
-        self.history_cache_mode = history_cache_mode
+    def __init__(self, runner):
         if runner.sdpa:
             raise ValueError(
                 "reusable decode buffers require the custom attention decoder"
@@ -68,7 +64,7 @@ class DecodeWorkspace:
         self.slots = {}
         self.free_rows = []
         self.arena = None
-        self.host = self.metadata = self.prefix = self.branch = None
+        self.host = self.metadata = self.branch = None
         self.row_owners = []
         self.batch_capacity = self.prefix_capacity = self.legal_capacity = 0
         self.row_capacity = 0
@@ -96,7 +92,7 @@ class DecodeWorkspace:
         self.counters["arena_growths"] += 1
 
     def _history_stamp(self, evaluator, request):
-        if self.history_cache_mode != "current" and evaluator.immutable_prefix:
+        if evaluator.immutable_prefix:
             self.counters["fast_validation_calls"] += 1
             return (evaluator.history_revision, request.prefix_len)
         self.counters["fallback_validation_calls"] += 1
@@ -139,30 +135,6 @@ class DecodeWorkspace:
             t.numel() * t.element_size() for t in padding
         )
 
-    def _refresh_compact_row(self, compact, history, row, length):
-        for target, source in zip(compact or (), history):
-            target[:, row].zero_()
-            target[:, row, :, :length].copy_(source)
-            copied = source.numel() * source.element_size()
-            self.counters["compact_copy_bytes"] += copied
-            self.counters["history_copied_bytes"] += copied
-            self.counters["history_zeroed_bytes"] += (
-                target[:, row].numel() * target.element_size()
-            )
-            self.counters["history_copy_submissions"] += 1
-            self.counters["history_zero_submissions"] += 1
-
-    def _refresh_current_prefix(self, prefix, compact):
-        targets = [t for pair in prefix for t in pair]
-        sources = [
-            compact[kind][layer] for layer in range(len(prefix)) for kind in range(2)
-        ]
-        torch._foreach_copy_(targets, sources)
-        self.counters["history_copy_submissions"] += 1
-        copied = sum(t.numel() * t.element_size() for t in targets)
-        self.counters["decoder_prefix_copy_bytes"] += copied
-        self.counters["history_copied_bytes"] += copied
-
     def _slot(self, evaluator, request):
         key = id(evaluator)
         slot = self.slots.get(key)
@@ -174,17 +146,8 @@ class DecodeWorkspace:
             slot = self.slots[key] = _Slot(weakref.ref(evaluator))
         stamp = self._history_stamp(evaluator, request)
         if stamp != slot.stamp:
-            if self.history_cache_mode != "direct":
-                slot.history = tuple(
-                    torch.stack([pair[i] for pair in request.prefix_kv])
-                    for i in range(2)
-                )
             slot.stamp = stamp
             self.counters["history_refreshes"] += 1
-            copied = sum(t.numel() * t.element_size() for t in slot.history)
-            self.counters["history_copy_bytes"] += copied
-            self.counters["history_copied_bytes"] += copied
-            self.counters["history_copy_submissions"] += len(slot.history)
         if not slot.free:
             if not self.free_rows:
                 self._grow_arena(request.prefix_kv)
@@ -236,22 +199,6 @@ class DecodeWorkspace:
             self.batch_capacity = max(self.batch_capacity, _capacity(g))
             self.prefix_capacity = max(self.prefix_capacity, _capacity(p))
             ref = requests[0].prefix_kv
-            self.prefix = (
-                None
-                if self.history_cache_mode == "direct"
-                else tuple(
-                    t.new_zeros(
-                        (
-                            len(ref),
-                            self.batch_capacity,
-                            t.size(0),
-                            self.prefix_capacity,
-                            t.size(-1),
-                        )
-                    )
-                    for t in ref[0]
-                )
-            )
             # Match the reference's independent input storages. Shared layer
             # views can select numerically different cold-compiled graphs.
             self.branch = [
@@ -313,16 +260,6 @@ class DecodeWorkspace:
         self.counters["history_full_refreshes"] += int(full_refresh)
         # Logical rows are contiguous just like the compiled reference. Capacity
         # padding lives after the used range, outside each layer's active view.
-        compact = (
-            None
-            if self.history_cache_mode == "direct"
-            else tuple(
-                t.flatten(1)[:, : g * t.size(2) * p * t.size(4)].view(
-                    t.size(0), g, t.size(2), p, t.size(4)
-                )
-                for t in self.prefix
-            )
-        )
         keys = tuple(k for k in requests[0].new_token_batch if k != "piece_ids")
         dirty = []
         for row, (req, chain, (slot, dest), legal) in enumerate(
@@ -337,13 +274,7 @@ class DecodeWorkspace:
             owner = (slot.owner, slot.stamp)
             if self.row_owners[row] != owner:
                 dirty.append(row)
-                if compact is not None:
-                    self._refresh_compact_row(
-                        compact, slot.history, row, req.prefix_len
-                    )
                 self.row_owners[row] = owner
-                if compact is not None:
-                    self.counters["compact_row_refreshes"] += 1
         metadata = self.metadata[:count]
         metadata.copy_(self.host[:count], non_blocking=True)
         self.device_fields = self._fields(metadata, g)
@@ -352,11 +283,8 @@ class DecodeWorkspace:
         suffix = self._gather_ancestors(g)
         prefix = self._prefix_views(requests[0].prefix_kv, g, p)
         self.counters["history_dirty_rows"] += len(dirty)
-        if self.history_cache_mode == "direct":
-            if dirty:
-                self._refresh_direct(prefix, requests, dirty)
-        elif dirty:
-            self._refresh_current_prefix(prefix, compact)
+        if dirty:
+            self._refresh_direct(prefix, requests, dirty)
         feature_targets = [t[:g] for t in self.feature_inputs]
         feature_sources = [
             self.device_fields[0],

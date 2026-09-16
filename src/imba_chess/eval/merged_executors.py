@@ -423,10 +423,7 @@ def _make_decode_wave_executor(
     batch_suffix: bool = False,
     decoder_mode: str = "current",
     reuse_decode_buffers: bool = False,
-    history_cache_mode: str = "current",
 ):
-    if history_cache_mode not in ("current", "revision", "direct"):
-        raise ValueError("unknown or unvalidated history cache mode")
     if decoder_mode not in ("current", "tensor", "compiled", "sdpa", "compiled-sdpa"):
         raise ValueError("unknown decoder mode")
     from imba_chess.model.tensor_decoder import DecoderRunner
@@ -439,7 +436,7 @@ def _make_decode_wave_executor(
             )
         from .decode_workspace import DecodeWorkspace
 
-        reusable = DecodeWorkspace(runner, history_cache_mode=history_cache_mode)
+        reusable = DecodeWorkspace(runner)
     else:
         reusable = None
     cached_owners = ()

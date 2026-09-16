@@ -1,5 +1,11 @@
 # History-cache preparation: CUDA validation
 
+> Historical promotion evidence: commit `5a23adf` contains the three-mode
+> implementation and exact ablation harness used below. The subsequent simplicity
+> cleanup retains direct caching only and removes `history_cache_mode`; use Git
+> history to reproduce old variants. Current tooling profiles one implementation
+> against saved artifacts. See the [session report](SELF_PLAY_SESSION_REPORT_2026-09-16.md).
+
 The combined `direct` mode **passed all promotion gates** and is now the default
 for the compatible optimized CUDA runtime. Explicit `history_cache_mode="current"`
 retains the prior optimized path; CPU and legacy behavior are unchanged. The reference for this stage is reusable decoder buffers plus native

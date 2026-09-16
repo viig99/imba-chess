@@ -40,7 +40,6 @@ class InferenceRuntime:
         batch_inputs=False,
         batch_suffix=False,
         reuse_decode_buffers=False,
-        history_cache_mode="current",
         native_gumbel=False,
     ):
         self.model, self.move_vocab, self.encoder, self.device = (
@@ -58,7 +57,6 @@ class InferenceRuntime:
             batch_suffix=batch_suffix,
             decoder_mode=decoder_mode,
             reuse_decode_buffers=reuse_decode_buffers,
-            history_cache_mode=history_cache_mode,
             native_gumbel=native_gumbel,
             dtype="float32",
         )
@@ -86,7 +84,6 @@ class InferenceRuntime:
                 batch_inputs=batch_inputs,
                 batch_suffix=batch_suffix,
                 reuse_decode_buffers=reuse_decode_buffers,
-                history_cache_mode=history_cache_mode,
             ),
         ).items():
             self.executors[kind] = self._identified(kind, executor)

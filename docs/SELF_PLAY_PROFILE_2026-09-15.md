@@ -1,5 +1,9 @@
 # Gumbel-128 self-play profile — September 15, 2026
 
+> Historical report. The later direct-only cleanup retires the current/revision
+> history-cache choices and legacy profiler variants. Commit `5a23adf` preserves
+> the implementations and harness for reproducing these measurements.
+
 The validated CUDA default now uses reusable leaf buffers and fused native
 Gumbel selectors. Across three alternating 128-game comparisons, median collector
 throughput improved **58.3%** over the existing compiled path, with matching game

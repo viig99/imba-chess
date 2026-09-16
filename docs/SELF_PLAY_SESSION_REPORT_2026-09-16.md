@@ -21,9 +21,9 @@ and native-Gumbel collector, not from the original preparation path.
   profiling, short CUDA traces, and scratch collect/update/collect checks. Artifacts
   include complete games, targets, latency distributions, memory, compilation,
   copy counters, and source/config/checkpoint hashes.
-- The production CUDA default selects `direct` only on the compatible optimized
-  path. Explicit `current` remains the validated rollback; CPU and legacy behavior
-  are preserved.
+- The reusable decoder workspace now has a single history implementation: direct.
+  The current/revision alternatives and their runtime switch have been removed.
+  CPU compatibility and mutable-history safety checks are preserved.
 
 ## Measured results and practical impact
 
@@ -41,11 +41,8 @@ an absolute rate above the previously observed 95,000 moves/hour: the current
 reference also ran slower in this session. The paired comparison is the evidence
 for improvement. These rates exclude optimizer updates and strength screens.
 
-The lower memory use makes 32 concurrent games a reasonable next benchmark, then
-48 if useful. Higher concurrency is not yet validated or enabled and may increase
-CPU/launch work. Keeping rollback and attribution modes does not execute them or
-allocate their history buffers alongside direct; the small mode checks are already
-included in the measurements. Deleting supported modes has no demonstrated speedup.
+The history-mode cleanup is for simplicity; no additional speedup is attributed
+to removing the alternate implementations.
 
 Each pass played the same 128 games, searched 10,358 positions, and generated 9,782
 usable training positions. Direct therefore produces more fresh training data per
@@ -76,37 +73,100 @@ before and afterward. All full passes held the warmed graph count at two, cleare
 caches, and retained exactly 201,884,160 allocated bytes after collection. Production
 checkpoints and replay were not modified.
 
-## Cleanup audit and commit boundary
+## Requested 48-concurrency exploration
 
-The audit covered the history workspace, runtime options, native selection, and
-profiling harness. It removed the redundant `refresh_prefix` boolean, whose state
-was identical to whether the dirty-row list was nonempty. The focused post-cleanup suite passed 120 tests. An isolated checkout containing
-only the selected commit files then passed 138 tests, including self-play tests
-(15 extended cases deselected). Lint and staged whitespace checks passed.
-No unused collector feature flag was found: the alternatives have active callers or validation uses.
+The direct-only collector completed a warmed **100-game** measurement at **48
+concurrent games**. Actor111, FP32, 128 simulations, top-m 16, depth 32, four CPU
+threads, and seed manifest remained fixed. The 48-game warmup is excluded below.
 
-| Retained path | Why it remains |
-| --- | --- |
-| `history_cache_mode="current"` | Explicit validated rollback and performance reference |
-| `history_cache_mode="revision"` | Reproduces the required validation-only attribution ablation |
-| `reuse_decode_buffers=False` | CPU/legacy compatibility and prior collector reference |
-| Python Gumbel selection | Exact native-versus-Python oracle and explicit fallback |
-| Legacy profiler study | Reproduces the preceding reusable-buffer/native promotion evidence |
-| Mutable-history fingerprinting | Detects external replacement and ordinary in-place tensor changes |
+| Measure | Result |
+| --- | ---: |
+| Timed collection | 486.648 seconds |
+| Completed games | 100 |
+| Played/searched moves | 7,849 |
+| Usable training positions | 7,436 |
+| Completed games/hour | **739.8** |
+| Played/search moves/hour | **57,936.6** |
+| Usable positions/hour | **55,008.1** |
+| p95 move latency | 5.332 seconds |
+| Peak allocated CUDA memory | **3.87 GiB** |
+| Peak reserved CUDA memory | **4.96 GiB** |
 
-These paths are not removed merely because the optimized CUDA default bypasses
-them. Broader retirement would change supported behavior or evidence reproduction
-and should be a separate agreed change with appropriate revalidation. No fused
-preparation implementation was added: the full-profile upper bound was 8.03%,
-below the 10% trigger.
+More VRAM was used, but this exploration did not outperform the earlier 24-slot
+results. Keep the production default at **24**. This single 100-game run and the
+prior repeated 128-game runs are not a matched concurrency experiment; no precise
+causal regression percentage is claimed. Preparation occupied 154.37 seconds of
+host scopes, decoder launch/execution waits 116.87 seconds, and result processing
+73.81 seconds. These include waits and are not exclusive CPU or GPU durations.
+Memory capacity alone does not determine collector throughput.
 
-The commit includes the previously uncommitted reusable-buffer/native-selection
-prerequisites, the new history-cache optimization, their tests, profiling tools,
-and reports. It excludes unrelated training compilation, loss metrics, evaluation
-experiments, observe-only screens, and UI/design files already in the workspace.
+The run exercised a single-game tail, held the warmed compiled-graph count at two,
+and released caches, retaining 201,884,160 allocated bytes afterward. Against the
+same 100 game IDs in the prior 24-slot result, 99 complete trajectory records were
+identical; none of the full per-game target records were bitwise equal. Thus this
+is also not correctness/promotion evidence for changing concurrency. Changing batch
+shapes changes floating-point execution, and the cross-concurrency discrepancy has
+not been isolated further. The direct-only cleanup is independently checked at 24.
+
+Evidence is under
+`artifacts/self_play_validation/direct_only_48x100_2026-09-16/`.
+`run/baseline/` holds metrics, every move latency, games, and targets;
+`cross_concurrency_check.json` records the comparison. `measured_harness.py` preserves
+the exact running script. The process had already started with the former cooldown
+option before that option was removed; it completed unchanged and its pre-timing
+pause is excluded. Future benchmark commands have no thermal wait or telemetry.
+
+## Cleanup and commit boundary
+
+Following promotion, the user chose one maintained history-cache implementation.
+Direct was fastest; current and revision were alternate implementations of the same
+feature. The cleanup removes their stacked/compact buffers, copy helpers, counters,
+mode branches, and `history_cache_mode` plumbing. It also removes a redundant refresh
+boolean. Immutable revision validation and mutable-history fingerprinting both
+remain inside direct, because mutable callers require mutation detection.
+
+The benchmark and profiler use only the production CUDA implementation.
+`scripts/bench_gumbel_pipeline.py` measures throughput; `scripts/profile_gumbel_pipeline.py`
+adds function profiling and a CUDA trace. Both share the same harness. The
+`--skip-profile` and `--thermal-cooldown` flags and automatic cooldown waits are
+removed, along with thermal telemetry. Performance profiling remains available. `--runs` repeats
+warmed measurements, `--concurrency` changes the exploration workload, and saved
+`--reference-targets`/`--reference-games` support comparisons across Git revisions.
+Obsolete in-process variant/pair/resume machinery and its gate-only tests are removed.
+`scripts/validate_history_cache.py` now has one purpose: a scratch collect/update/
+collect comparison of the optimized workspace against the existing compatibility
+decoder. It does not retain either retired history-copy implementation.
+
+Commit `5a23adf` preserves the full promotion implementation and harness. The
+simplification is a separate follow-up commit. Historical report commands and
+current/revision ablations refer to that earlier commit. CPU decoding, the
+non-workspace compatibility decoder, and native/Python selection are separate
+capabilities and are outside this removal of duplicate history-cache implementations.
+
+Post-cleanup verification passed **117 focused tests** in an isolated checkout of
+the selected source (nine extended cases deselected), plus lint and whitespace
+checks. Two complete 32-game CUDA passes at 24 concurrency matched the archived
+game trajectories and **bitwise targets**, exercised single-game tails, and cleared
+caches. These verify unchanged direct behavior independently of the 48-slot
+exploration. The test count decreased because retired modes and their duplicate
+parameterizations were removed; direct-path behavioral coverage remains.
+
 The earlier reusable-buffer/native stage reported a 58.3% median gain against its
 own older baseline; that is prior-stage evidence, not this session's incremental
 gain. The two percentages should not be presented as a measured combined result.
+Unrelated training compilation, loss metrics, evaluation experiments, observe-only
+screens, and UI/design edits remain outside these commits.
+
+Current measurement command (scratch output directory):
+
+```bash
+.venv/bin/python scripts/bench_gumbel_pipeline.py \
+  --config config/self_play_laptop_pilot.toml \
+  --checkpoint artifacts/eval/self_play_actor111_sf2400_2026-09-14/checkpoints/actor111.pt \
+  --seeds artifacts/corpus/v4_self_play_seeds_4096.json \
+  --output artifacts/self_play_validation/direct-exploration \
+  --concurrency 48 --games 100 --warmup-games 48
+```
 
 ## Measurement limits and next step
 
