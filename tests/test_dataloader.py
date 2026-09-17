@@ -49,7 +49,7 @@ def _game(game_id: str, first_move: str, second_move: str):
 
 def test_build_event_dataloader_returns_tensor_dict():
     games = [_game("g1", "e2e4", "e7e5"), _game("g2", "d2d4", "d7d5")]
-    vocab = MoveVocab.build_from_games(games)
+    vocab = MoveVocab.build(play["move_uci"] for game in games for play in game["plays"])
     dataset = DummyLichessDataset(games)
 
     loader = build_event_dataloader(
@@ -92,7 +92,7 @@ def test_build_event_dataloader_packs_by_max_tokens():
         _game("g2", "d2d4", "d7d5"),
         _game("g3", "c2c4", "e7e6"),
     ]
-    vocab = MoveVocab.build_from_games(games)
+    vocab = MoveVocab.build(play["move_uci"] for game in games for play in game["plays"])
     dataset = DummyLichessDataset(games)
 
     loader = build_event_dataloader(
@@ -109,7 +109,7 @@ def test_build_event_dataloader_packs_by_max_tokens():
 
 def test_build_event_dataloader_bos_rows_match_num_games_and_targets():
     games = [_game("g1", "e2e4", "e7e5"), _game("g2", "d2d4", "d7d5")]
-    vocab = MoveVocab.build_from_games(games)
+    vocab = MoveVocab.build(play["move_uci"] for game in games for play in game["plays"])
     dataset = DummyLichessDataset(games)
 
     loader = build_event_dataloader(
@@ -138,7 +138,7 @@ def test_build_event_dataloader_threads_evals_into_value_targets():
     game = _game("g1", "e2e4", "e7e5")
     game["plays"][1]["eval_cp_stm"] = -35.0
     game["plays"][1]["eval_mate_stm"] = None
-    vocab = MoveVocab.build_from_games([game])
+    vocab = MoveVocab.build(play["move_uci"] for play in game["plays"])
 
     loader = build_event_dataloader(
         lichess_dataset=DummyLichessDataset([game]),

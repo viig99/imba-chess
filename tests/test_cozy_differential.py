@@ -4,7 +4,6 @@ cozy-backed primitive used by search.py. Covers perft-suite edge positions
 """
 
 import os
-from functools import lru_cache
 import random
 from typing import Any
 
@@ -17,7 +16,7 @@ from imba_chess.eval.cozy_bridge import (
     gives_check,
     py_move_to_cozy,
 )
-from tests.chess_positions import EDGE_FENS, _random_boards
+from tests.chess_positions import EDGE_FENS, _random_boards, differential_positions
 
 # Hand-built (position, move, expected gives_check) cases the random sweep is
 # unlikely to hit. All five verified against python-chess 1.11.2 on 2026-07-18.
@@ -35,15 +34,10 @@ CURATED_CASES = [
 ]
 
 
-@lru_cache(maxsize=2)
-def _all_boards(n_games) -> list[chess.Board]:
-    return [chess.Board(f) for f in EDGE_FENS] + _random_boards(n_games, seed=1234)
-
-
 @pytest.mark.parametrize("n_games", [3, pytest.param(200, marks=pytest.mark.extended)])
 def test_gives_check_matches_python_chess_everywhere(n_games):
     checked = 0
-    for board in _all_boards(n_games):
+    for board in differential_positions(n_games, seed=1234):
         cozy = board_to_cozy(board)
         for move in board.legal_moves:
             assert gives_check(cozy, py_move_to_cozy(board, move)) == board.gives_check(
@@ -63,17 +57,6 @@ def test_gives_check_curated_edge_cases(fen, uci, expected):
 
 
 @pytest.mark.parametrize("n_games", [3, pytest.param(200, marks=pytest.mark.extended)])
-def test_legal_move_sets_match_python_chess_everywhere(n_games):
-    from imba_chess.eval.cozy_bridge import cozy_move_to_uci
-
-    for board in _all_boards(n_games):
-        cozy = board_to_cozy(board)
-        assert sorted(m.uci() for m in board.legal_moves) == sorted(
-            cozy_move_to_uci(cozy, m) for m in cozy.generate_moves()
-        ), board.fen()
-
-
-@pytest.mark.parametrize("n_games", [3, pytest.param(200, marks=pytest.mark.extended)])
 def test_is_capture_cozy_matches_python_chess_everywhere(n_games):
     """cozy_bridge.is_capture_cozy (Stage 3 Task 5) is the capture test
     _forcing_index_set_tree uses at cozy-only tree nodes -- python-chess is_capture
@@ -83,7 +66,7 @@ def test_is_capture_cozy_matches_python_chess_everywhere(n_games):
     from imba_chess.eval.cozy_bridge import is_capture_cozy
 
     checked = 0
-    for board in _all_boards(n_games):
+    for board in differential_positions(n_games, seed=1234):
         cozy = board_to_cozy(board)
         for move in board.legal_moves:
             cozy_move = py_move_to_cozy(board, move)

@@ -10,7 +10,7 @@ from imba_chess.eval.cozy_bridge import (
     py_move_to_cozy,
 )
 
-from tests.chess_positions import EDGE_FENS, _random_boards
+from tests.chess_positions import EDGE_FENS, _random_boards, differential_positions
 
 
 @pytest.mark.parametrize("fen", EDGE_FENS)
@@ -31,8 +31,12 @@ def test_board_to_cozy_matches_fen_roundtrip_on_random_games():
         )
 
 
-def test_move_translation_roundtrips_all_legal_moves():
-    for board in [chess.Board(f) for f in EDGE_FENS] + _random_boards(20, seed=11):
+@pytest.mark.parametrize(
+    "n_games,seed",
+    [(20, 11), (3, 1234), pytest.param(200, 1234, marks=pytest.mark.extended)],
+)
+def test_move_translation_roundtrips_all_legal_moves(n_games, seed):
+    for board in differential_positions(n_games, seed=seed):
         cozy = board_to_cozy(board)
         # py -> cozy: every python-chess legal move maps to a cozy-legal move
         for move in board.legal_moves:

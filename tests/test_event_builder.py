@@ -38,7 +38,7 @@ def _annotated_game():
 def test_event_builder_builds_bos_plus_plies():
     dataset = LichessDataset(min_avg_elo=2000)
     game = list(dataset.stream_from_rows([_row()]))[0]
-    vocab = MoveVocab.build_from_games([game])
+    vocab = MoveVocab.build(play["move_uci"] for play in game["plays"])
 
     builder = EventBuilder(vocab)
     sample = builder.build_game(game)
@@ -58,7 +58,7 @@ def test_event_builder_builds_bos_plus_plies():
 def test_event_builder_masks_value_target_without_evals():
     dataset = LichessDataset(min_avg_elo=2000)
     game = list(dataset.stream_from_rows([_row()]))[0]
-    vocab = MoveVocab.build_from_games([game])
+    vocab = MoveVocab.build(play["move_uci"] for play in game["plays"])
 
     sample = EventBuilder(vocab).build_game(game)
 
@@ -68,7 +68,7 @@ def test_event_builder_masks_value_target_without_evals():
 
 def test_event_builder_builds_winpercent_value_targets_from_evals():
     game = _annotated_game()
-    vocab = MoveVocab.build_from_games([game])
+    vocab = MoveVocab.build(play["move_uci"] for play in game["plays"])
 
     sample = EventBuilder(vocab).build_game(game)
 
@@ -93,7 +93,7 @@ def test_event_builder_maps_mate_evals_to_ceiling():
     row["movetext"] = "1. e4 { [%eval #5] } 1... e5 { [%eval #-3] } 2. Nf3 Nc6 1-0"
     dataset = LichessDataset(min_avg_elo=2000, parse_stockfish_evals=True)
     game = list(dataset.stream_from_rows([row]))[0]
-    vocab = MoveVocab.build_from_games([game])
+    vocab = MoveVocab.build(play["move_uci"] for play in game["plays"])
 
     sample = EventBuilder(vocab).build_game(game)
 

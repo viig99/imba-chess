@@ -70,4 +70,16 @@ Current usage is in [README](../README.md), [the self-play readiness report](SEL
 - [tests/test_rollout_coroutine.py](https://github.com/viig99/imba-chess/blob/3d2d3d53fefbd4b587a82eb9e35772045d4eea50/tests/test_rollout_coroutine.py).
 - [tests/test_rollout_store.py](https://github.com/viig99/imba-chess/blob/3d2d3d53fefbd4b587a82eb9e35772045d4eea50/tests/test_rollout_store.py).
 
-`lr_probe_summarize.py` remains a standalone reader of prior learning-rate probe results. Native microbenchmarks, the corpus estimator, calibration, both evaluation commands, and all config recipes are retained.
+Useful native microbenchmarks, the corpus estimator, calibration, both evaluation commands, and all config recipes are retained.
+
+## Additional tooling retired — 2026-09-16
+
+The following scripts were removed after review; their last retained versions are linked below. `build_static_move_vocab.py` remains available.
+
+- [scripts/bench_move_id_micro.py](https://github.com/viig99/imba-chess/blob/35502f836577720fa88db110ecca813223d8231b/scripts/bench_move_id_micro.py): target function was removed by native projection.
+- [scripts/bench_wave_suffixes.py](https://github.com/viig99/imba-chess/blob/35502f836577720fa88db110ecca813223d8231b/scripts/bench_wave_suffixes.py): benchmarks the retired suffix-path representation.
+- [sweep.sh](https://github.com/viig99/imba-chess/blob/35502f836577720fa88db110ecca813223d8231b/sweep.sh): fixed-checkpoint depth-two experiment launcher.
+- [eval_best_checkpoint.sh](https://github.com/viig99/imba-chess/blob/35502f836577720fa88db110ecca813223d8231b/eval_best_checkpoint.sh): legacy auto-selection and uncompiled evaluation wrapper.
+- [scripts/lr_probe_summarize.py](https://github.com/viig99/imba-chess/blob/35502f836577720fa88db110ecca813223d8231b/scripts/lr_probe_summarize.py): historical result reader for the retired LR-probe workflow.
+
+Removed the test-only `MoveVocab.build_from_games` API; its callers now build their small vocabularies directly. Consolidated legal-move-set checks into the bidirectional translation test with shared positions, preserving both prior random samples and the extended sweep. Calibration tests retain singleton percentiles, interpolation, invalid inputs, rounding ties and final recommendations while dropping redundant median/identity checks.

@@ -66,19 +66,6 @@ class MoveVocab:
         return cls(token_to_id=token_to_id, config=cfg)
 
     @classmethod
-    def build_from_games(
-        cls,
-        games: Iterable[object],
-        config: Optional[MoveVocabConfig] = None,
-    ) -> "MoveVocab":
-        def iter_moves() -> Iterable[str]:
-            for game in games:
-                for play in game["plays"]:
-                    yield play["move_uci"]
-
-        return cls.build(iter_moves(), config=config)
-
-    @classmethod
     def build_static(cls, config: Optional[MoveVocabConfig] = None) -> "MoveVocab":
         cfg = config or MoveVocabConfig(include_unk=False)
         return cls.build(all_possible_uci_moves(), config=cfg)

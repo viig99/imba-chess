@@ -1,5 +1,6 @@
 """Shared, deterministic chess test inputs; no collected-test imports."""
 
+from functools import lru_cache
 import json
 import random
 from pathlib import Path
@@ -36,3 +37,9 @@ def _random_boards(n_games: int = 50, seed: int = 7) -> list[chess.Board]:
 def native_positions(name):
     data = json.loads((Path(__file__).parent / "fixtures/native_positions.json").read_text())
     return [chess.Board(fen) for fen in data[name]["fens"]]
+
+
+@lru_cache(maxsize=3)
+def differential_positions(n_games: int, seed: int = 1234) -> list[chess.Board]:
+    """Shared read-only positions for conversion and chess-rule checks."""
+    return [chess.Board(fen) for fen in EDGE_FENS] + _random_boards(n_games, seed=seed)
