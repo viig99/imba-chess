@@ -152,7 +152,7 @@ def load_hstu_checkpoint(
     )
     if require_value_head and not checkpoint_has_value_head:
         raise ValueError(
-            "model_move_policy in {value_rerank,value_search_d2} requires a checkpoint with value_head "
+            "search requires a checkpoint with value_head "
             "parameters, but checkpoint contains no 'value_head.*' keys."
         )
 

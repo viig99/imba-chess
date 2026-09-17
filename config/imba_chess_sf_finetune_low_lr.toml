@@ -51,7 +51,7 @@ ignore_index = -100
 relative_attention_bias = "position"
 # No label smoothing in the finetune: 0.05 spread over ~1900 UCI classes
 # forces ~5% mass onto (mostly illegal) moves and distorts the softmax that
-# value_rerank / search read.
+# search reads.
 label_smoothing = 0.0
 elo_weight_min_elo = 2000
 elo_weight_max_elo = 2800
@@ -106,11 +106,8 @@ ladder_elos = "2400"
 ladder_games_per_segment = 200
 include_full_strength_segment = false
 device = "auto"
-dtype = "float32"
-compile = true
 model_move_policy = "value_search_halving"
-value_rerank_top_k = 16
-value_rerank_lambda = 0.05
+search_lambda = 0.05
 search_budget = 2048
 search_top_m = 16
 halving_rounds = 0

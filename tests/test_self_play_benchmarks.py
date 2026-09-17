@@ -5,7 +5,7 @@ import json
 import torch
 
 from imba_chess.self_play.benchmarks import benchmark_component
-from imba_chess.self_play.collector import InferenceRuntime
+from tests.search_references import InferenceRuntime
 from imba_chess.self_play.config import SelfPlayConfig, CollectionConfig
 from imba_chess.self_play.seeds import Seed, source_split
 from imba_chess.data.self_play_store import SelfPlayStore

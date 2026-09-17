@@ -131,7 +131,6 @@ optimizer_triton = true
 optimizer_kahan_sum = true
 compile_model = true
 device = "auto"
-dtype = "bfloat16"
 # Separate from artifacts/checkpoints so the ckpt23/ckpt27 lineage is not
 # overwritten or picked up by train_autorestart.sh.
 checkpoint_dir = "artifacts/checkpoints_v4"
@@ -155,11 +154,8 @@ ladder_elos = "2400"
 ladder_games_per_segment = 750
 include_full_strength_segment = false
 device = "auto"
-dtype = "float32"
-compile = true
 model_move_policy = "value_search_halving"
-value_rerank_top_k = 16
-value_rerank_lambda = 0.05
+search_lambda = 0.05
 search_budget = 2048
 search_top_m = 16
 halving_rounds = 0

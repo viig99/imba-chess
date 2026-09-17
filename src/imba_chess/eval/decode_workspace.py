@@ -17,8 +17,13 @@ from imba_chess.data.event_builder import EVENT_TOKEN_ID
 
 
 FEATURE_KEYS = (
-    "seq_token_id", "turn_id", "castle_id", "ep_file_id",
-    "halfmove_bucket_id", "fullmove_bucket_id", "prev_move_id",
+    "seq_token_id",
+    "turn_id",
+    "castle_id",
+    "ep_file_id",
+    "halfmove_bucket_id",
+    "fullmove_bucket_id",
+    "prev_move_id",
 )
 
 
@@ -35,7 +40,10 @@ def _stage_request(evaluator, batch):
     node, board = batch[0]
     evaluator._validate_handles((node,))
     return _StagedRequest(
-        (node,), (board,), evaluator._prefix_kv, evaluator._prefix_len,
+        (node,),
+        (board,),
+        evaluator._prefix_kv,
+        evaluator._prefix_len,
         evaluator._board_state_encoder.encode_cozy(board),
     )
 
@@ -72,10 +80,6 @@ class DecodeWorkspace:
     capacity = 32
 
     def __init__(self, runner):
-        if runner.sdpa:
-            raise ValueError(
-                "reusable decode buffers require the custom attention decoder"
-            )
         self.runner = runner
         self.device = runner.model.piece_square_embedding.weight.device
         self.counters = Counter()
@@ -209,10 +213,7 @@ class DecodeWorkspace:
             if slot.owner() is None:
                 self.free_rows.extend(slot.rows)
                 del self.slots[key]
-        requests = [
-            _stage_request(e, batch)
-            for e, batch in payloads
-        ]
+        requests = [_stage_request(e, batch) for e, batch in payloads]
         chains = []
         for req in requests:
             node = req.nodes[0]
@@ -311,11 +312,19 @@ class DecodeWorkspace:
             state, node = req.encoded, req.nodes[0]
             host_fields[0][row] = state.piece_ids
             host_fields[1][:, row] = (
-                EVENT_TOKEN_ID, state.turn_id, state.castle_id, state.ep_file_id,
-                state.halfmove_bucket_id, state.fullmove_bucket_id, node.move_id,
+                EVENT_TOKEN_ID,
+                state.turn_id,
+                state.castle_id,
+                state.ep_file_id,
+                state.halfmove_bucket_id,
+                state.fullmove_bucket_id,
+                node.move_id,
             )
             host_fields[2][:, row] = (
-                req.prefix_len + node.depth, req.prefix_len, len(chain), dest,
+                req.prefix_len + node.depth,
+                req.prefix_len,
+                len(chain),
+                dest,
             )
             host_fields[3][row, : len(chain)] = chain
             host_fields[4][row, : len(legal[0])] = legal[0]

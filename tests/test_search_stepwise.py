@@ -7,12 +7,10 @@ the sync wrapper — proving the wrapper/generator refactor changed nothing.
 """
 
 import random
-
 import chess
 import pytest
-
 from imba_chess.eval import search
-from tests.test_search import _ArmValueEvaluator, _MaterialEvaluator
+from tests.test_search import _MaterialEvaluator
 
 
 class _RecordingEvaluator:
@@ -39,49 +37,36 @@ def _drive_by_hand(gen, evaluator):
 
 def test_halving_generator_matches_sync_wrapper():
     fen = "r1bqkbnr/pppp1ppp/2n5/1B2p3/4P3/5N2/PPPP1PPP/RNBQK2R b KQkq - 3 3"
-    coverage, q = True, 2
+    coverage, q = (True, 2)
     board = chess.Board(fen)
     legal_moves = list(board.legal_moves)
     legal_log_priors = [-1.0 - 0.01 * i for i in range(len(legal_moves))]
-    config = search.HalvingConfig(budget=64, top_m=8, max_depth=3,
-                                 tactical_coverage=coverage, quiescence_plies=q)
-
+    config = search.HalvingConfig(
+        budget=64, top_m=8, max_depth=3, tactical_coverage=coverage, quiescence_plies=q
+    )
     sync_eval = _RecordingEvaluator(_MaterialEvaluator())
     sync_result = search.select_value_search_halving(
-        evaluator=sync_eval, root_handle=None, board=board,
-        legal_moves=legal_moves, legal_log_priors=legal_log_priors,
-        config=config, rng=random.Random(7),
+        evaluator=sync_eval,
+        root_handle=None,
+        board=board,
+        legal_moves=legal_moves,
+        legal_log_priors=legal_log_priors,
+        config=config,
+        rng=random.Random(7),
     )
-
     gen_eval = _RecordingEvaluator(_MaterialEvaluator())
     gen = search._halving_stepwise(
-        root_handle=None, board=board, legal_moves=legal_moves,
-        legal_log_priors=legal_log_priors, config=config, rng=random.Random(7),
+        root_handle=None,
+        board=board,
+        legal_moves=legal_moves,
+        legal_log_priors=legal_log_priors,
+        config=config,
+        rng=random.Random(7),
         extend=gen_eval.extend,
     )
     gen_result = _drive_by_hand(gen, gen_eval)
-
     assert gen_result == sync_result
     assert gen_eval.calls == sync_eval.calls
-
-
-def test_d2_and_rerank_wrappers_unchanged_behavior():
-    # _ArmValueEvaluator's value for a position depends only on which root
-    # move started the line (handle[0].uci()), keyed against the dict passed
-    # to its constructor -- so, as in test_search.py's own halving tests, the
-    # legal_moves list must be restricted to exactly the moves in that dict
-    # (a full board.legal_moves() top_k=4 cut would surface unrelated knight/
-    # pawn moves not present in arm_values and KeyError).
-    board = chess.Board()
-    legal_moves = [chess.Move.from_uci("e2e4"), chess.Move.from_uci("d2d4")]
-    priors = [-1.0, -1.0]
-    evaluator = _RecordingEvaluator(_ArmValueEvaluator({"e2e4": 0.6, "d2d4": -0.6}))
-    idx, rows = search.select_value_search_d2(
-        evaluator=evaluator, root_handle=None, board=board,
-        legal_moves=legal_moves, legal_log_priors=priors, top_k=4, lam=0.05,
-    )
-    assert legal_moves[idx].uci() == "e2e4"
-    assert evaluator.calls  # evaluator was exercised through the wrapper
 
 
 @pytest.mark.parametrize("picks", [(2, 0, 1), (2, 1, 3)])
@@ -113,9 +98,10 @@ def test_budget_starvation_falls_back_to_highest_prior_arm(monkeypatch, picks):
     board = chess.Board()
     legal_moves = list(board.legal_moves)
     legal_log_priors = [-float(i) for i in range(len(legal_moves))]
-    monkeypatch.setattr(search, "_gumbel_top_k_order", lambda *args, **kwargs: list(picks))
+    monkeypatch.setattr(
+        search, "_gumbel_top_k_order", lambda *args, **kwargs: list(picks)
+    )
     assert picks[0] != min(picks)
-
     gen = search._halving_stepwise(
         extend=lambda handle, uci: None,
         root_handle=None,
@@ -130,15 +116,14 @@ def test_budget_starvation_falls_back_to_highest_prior_arm(monkeypatch, picks):
         raise AssertionError("budget=0 must not request any evaluation")
     except StopIteration as stop:
         best_local_idx, rows = stop.value
-
-    assert all(row["backed_value"] is None for row in rows), "budget=0 must score nothing"
+    assert all(
+        (row["backed_value"] is None for row in rows)
+    ), "budget=0 must score nothing"
     chosen_prior = legal_log_priors[best_local_idx]
-    best_arm_prior = max(row["policy_log_prob"] for row in rows)
-    assert chosen_prior == best_arm_prior, (
-        f"starvation fallback returned {legal_moves[best_local_idx].uci()} "
-        f"(prior {chosen_prior:.3f}) but the best-prior candidate among the "
-        f"{len(rows)} arms has prior {best_arm_prior:.3f}"
-    )
+    best_arm_prior = max((row["policy_log_prob"] for row in rows))
+    assert (
+        chosen_prior == best_arm_prior
+    ), f"starvation fallback returned {legal_moves[best_local_idx].uci()} (prior {chosen_prior:.3f}) but the best-prior candidate among the {len(rows)} arms has prior {best_arm_prior:.3f}"
 
 
 def test_budget_starvation_is_unchanged_for_deterministic_inference():
@@ -149,7 +134,7 @@ def test_budget_starvation_is_unchanged_for_deterministic_inference():
     )
     legal_moves = list(board.legal_moves)
     legal_log_priors = [
-        -1.0 - 0.13 * ((i * 7) % len(legal_moves)) for i in range(len(legal_moves))
+        -1.0 - 0.13 * (i * 7 % len(legal_moves)) for i in range(len(legal_moves))
     ]
     gen = search._halving_stepwise(
         extend=lambda handle, uci: None,
@@ -164,7 +149,6 @@ def test_budget_starvation_is_unchanged_for_deterministic_inference():
         raise AssertionError("budget=0 must not request any evaluation")
     except StopIteration as stop:
         best_local_idx, _rows = stop.value
-
     assert best_local_idx == max(
         range(len(legal_moves)), key=legal_log_priors.__getitem__
     )

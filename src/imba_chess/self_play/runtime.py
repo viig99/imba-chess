@@ -11,81 +11,21 @@ import time
 import torch
 
 from imba_chess.config import load_repo_config
-from imba_chess.data.board_state import BoardStateEncoder
-from imba_chess.data.move_vocab import MoveVocab
-from imba_chess.eval.position_evaluator import load_hstu_checkpoint
-from .collector import InferenceRuntime
 
 
-def load_runtime(
-    config,
-    checkpoint,
-    device,
-    *,
-    optimized=True,
-    one_query_per_game=None,
-    cache_prefixes=None,
-    decoder_mode=None,
-    batch_projection=None,
-    batch_inputs=None,
-    batch_suffix=None,
-    reuse_decode_buffers=None,
-    native_gumbel=None,
-):
-    device = torch.device(device)
-    if device.type == "cuda" and not torch.cuda.is_available():
-        raise RuntimeError(
-            "CUDA is unavailable; use --device cpu for correctness probes"
-        )
-    # Validated CUDA collector path; CPU and explicit reference mode retain
-    # the original decoder. Individual overrides support controlled ablations.
-    enabled = optimized and device.type == "cuda"
-    if decoder_mode is None:
-        decoder_mode = "compiled" if enabled else "current"
-    if decoder_mode != "current" and config.search.max_depth > 32:
-        raise ValueError("tensor decoder workspace supports search depth <= 32")
-    options = {
-        key: enabled if value is None else value
-        for key, value in dict(
-            one_query_per_game=one_query_per_game,
-            cache_prefixes=cache_prefixes,
-            batch_projection=batch_projection,
-            batch_inputs=batch_inputs,
-            batch_suffix=batch_suffix,
-        ).items()
-    }
-    if reuse_decode_buffers is None:
-        # Keep explicit decoder/packing ablations on their requested path.
-        reuse_decode_buffers = (
-            enabled and decoder_mode in ("tensor", "compiled") and all(options.values())
-        )
-    if native_gumbel is None:
-        native_gumbel = enabled and reuse_decode_buffers
-    repo = load_repo_config(Path(config.base_config))
-    vocab = MoveVocab.load(repo.vocab.path)
-    encoder = BoardStateEncoder(repo.board_state)
+def load_runtime(config, checkpoint, device, *, stats=None):
+    from imba_chess.eval.inference_runtime import load_runtime as load_search_runtime
+
     random.seed(config.run.seed)
     torch.manual_seed(config.run.seed)
-    model, _ = load_hstu_checkpoint(
-        checkpoint_path=Path(checkpoint),
-        repo_config=repo,
-        move_vocab=vocab,
+    return load_search_runtime(
+        repo_config=load_repo_config(Path(config.base_config)),
+        checkpoint=checkpoint,
         device=device,
-        compile_model=False,
-        require_value_head=True,
-    )
-    runtime = InferenceRuntime(
-        model=model,
-        move_vocab=vocab,
-        encoder=encoder,
-        device=device,
+        algorithm="gumbel",
         root_batch_tokens=config.collection.root_batch_tokens,
-        decoder_mode=decoder_mode,
-        reuse_decode_buffers=reuse_decode_buffers,
-        native_gumbel=native_gumbel,
-        **options,
+        stats=stats,
     )
-    return runtime, model.config.max_position_embeddings
 
 
 @contextmanager

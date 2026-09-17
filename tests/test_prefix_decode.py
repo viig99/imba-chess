@@ -1,4 +1,6 @@
 from __future__ import annotations
+from imba_chess.eval.search import HalvingConfig
+from imba_chess.eval import position_evaluator
 
 import pytest
 
@@ -254,9 +256,7 @@ def test_model_decode_mixed_depth_wave():
     tok_b = {key: value[T + 2 : T + 3] for key, value in ids.items()}
 
     seq_a = {key: torch.cat([prefix_ids[key], tok_a[key]]) for key in ids}
-    seq_b = {
-        key: torch.cat([prefix_ids[key], tok_bp[key], tok_b[key]]) for key in ids
-    }
+    seq_b = {key: torch.cat([prefix_ids[key], tok_bp[key], tok_b[key]]) for key in ids}
     with torch.no_grad():
         full_a = model(_full_batch(seq_a), return_loss=False)
         full_b = model(_full_batch(seq_b), return_loss=False)
@@ -303,7 +303,7 @@ from imba_chess.data.board_state import BoardStateEncoder
 from imba_chess.data.move_vocab import MoveVocab, MoveVocabConfig
 from imba_chess.eval import cozy_bridge
 from imba_chess.eval.position_evaluator import _project_legal_logits_cozy
-from imba_chess.eval.search import PositionEval, select_value_search_d2
+from imba_chess.eval.search import PositionEval, select_value_search_halving
 
 
 def _load_eval_script_module():
@@ -339,7 +339,9 @@ class _FullForwardReferenceEvaluator:
         self._move_vocab = move_vocab
         self._encoder = board_state_encoder
         self._played = played  # list[(board_before, move_uci)] real game so far
-        self._root_board = root_board  # py board the extend-chain's handle=None roots at
+        self._root_board = (
+            root_board  # py board the extend-chain's handle=None roots at
+        )
 
     def _fresh_history(self):
         history = self._module._SequenceHistory(
@@ -369,16 +371,18 @@ class _FullForwardReferenceEvaluator:
             with torch.no_grad():
                 out = self._model(full_batch, return_loss=False)
             logits = out["logits"][-1]
-            value_stm = _value_scalar_from_logits(
-                out["value_logits"][-1]
-            )
+            value_stm = _value_scalar_from_logits(out["value_logits"][-1])
             try:
                 # cozy-native projection (Stage 3 Task 4/5 contract:
                 # PositionEval.legal_moves are always cc.Move, tree levels
                 # included -- search.py's tree carries no python-chess board
                 # to fall back on for a legacy-py-Move PositionEval anymore).
-                legal_logits, legal_moves, legal_ucis, _, _ = _project_legal_logits_cozy(
-                    logits=logits, cozy_board=cozy_board, move_vocab=self._move_vocab
+                legal_logits, legal_moves, legal_ucis, _, _ = (
+                    _project_legal_logits_cozy(
+                        logits=logits,
+                        cozy_board=cozy_board,
+                        move_vocab=self._move_vocab,
+                    )
                 )
                 log_priors = torch.log_softmax(legal_logits.float(), dim=0).tolist()
             except RuntimeError:
@@ -423,7 +427,7 @@ def test_cached_evaluator_matches_full_forward_reference():
     with torch.no_grad():
         prefill = model(root_batch, return_loss=False, return_kv=True)
 
-    cached = module.CachedPositionEvaluator(
+    cached = position_evaluator.CachedPositionEvaluator(
         model=model,
         move_vocab=move_vocab,
         board_state_encoder=encoder,
@@ -498,12 +502,12 @@ def test_strategy_picks_identical_move_cached_vs_reference():
     with torch.no_grad():
         prefill = model(root_batch, return_loss=False, return_kv=True)
         root_logits = prefill["logits"][-1]
-    legal_logits, legal_moves, _, _ = module._project_legal_logits(
+    legal_logits, legal_moves, _, _ = position_evaluator._project_legal_logits(
         logits=root_logits, board=board, move_vocab=move_vocab
     )
     log_priors = torch.log_softmax(legal_logits.float(), dim=0).tolist()
 
-    cached = module.CachedPositionEvaluator(
+    cached = position_evaluator.CachedPositionEvaluator(
         model=model,
         move_vocab=move_vocab,
         board_state_encoder=encoder,
@@ -521,23 +525,21 @@ def test_strategy_picks_identical_move_cached_vs_reference():
         root_board=board,
     )
 
-    chosen_cached, _ = select_value_search_d2(
+    chosen_cached, _ = select_value_search_halving(
         evaluator=cached,
         root_handle=None,
         board=board,
         legal_moves=legal_moves,
         legal_log_priors=log_priors,
-        top_k=4,
-        lam=0.05,
+        config=HalvingConfig(budget=32, top_m=4, max_depth=2),
     )
-    chosen_ref, _ = select_value_search_d2(
+    chosen_ref, _ = select_value_search_halving(
         evaluator=reference,
         root_handle=None,
         board=board,
         legal_moves=legal_moves,
         legal_log_priors=log_priors,
-        top_k=4,
-        lam=0.05,
+        config=HalvingConfig(budget=32, top_m=4, max_depth=2),
     )
     assert legal_moves[chosen_cached].uci() == legal_moves[chosen_ref].uci()
 
@@ -624,4 +626,6 @@ def test_project_legal_logits_cozy_raises_when_nothing_maps_to_vocab():
     cozy_board = cozy_bridge.board_to_cozy(board)
     logits = torch.zeros(len(empty_vocab))
     with pytest.raises(RuntimeError):
-        _project_legal_logits_cozy(logits=logits, cozy_board=cozy_board, move_vocab=empty_vocab)
+        _project_legal_logits_cozy(
+            logits=logits, cozy_board=cozy_board, move_vocab=empty_vocab
+        )

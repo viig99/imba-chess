@@ -42,17 +42,27 @@ def test_native_q_matches_python_exactly():
 @pytest.mark.parametrize("budget", [1, 3, 128])
 @pytest.mark.parametrize("fen", [chess.STARTING_FEN, "7k/5Q2/6K1/8/8/8/8/8 w - - 0 1"])
 def test_native_search_keeps_rng_visits_targets_and_counters(fen, budget):
-    results = [
-        select_gumbel(
-            evaluator=FakeEvaluator(0.25),
-            board=chess.Board(fen),
-            config=GumbelConfig(simulations=budget),
-            rng=random.Random(42),
-            native_selection=native,
-        )
-        for native in (False, True)
-    ]
-    assert results[0] == results[1]
+    import json
+    from dataclasses import asdict
+    from pathlib import Path
+
+    fixture = json.loads(
+        (
+            Path(__file__).parent / "fixtures/gumbel/native_search_baseline.json"
+        ).read_text()
+    )
+    expected = next(
+        row["result"]
+        for row in fixture["cases"]
+        if row["fen"] == fen and row["budget"] == budget
+    )
+    result = select_gumbel(
+        evaluator=FakeEvaluator(0.25),
+        board=chess.Board(fen),
+        config=GumbelConfig(simulations=budget),
+        rng=random.Random(42),
+    )
+    assert json.loads(json.dumps(asdict(result))) == expected
 
 
 def test_native_rejects_malformed_inputs_and_ineligible_root():

@@ -52,13 +52,15 @@ Install project dependencies and native bindings with `uv sync --extra dev`. Dat
   --output artifacts/self_play/new-run --device cuda
 ```
 
-CUDA self-play uses whole-neural-decoder compilation by default. `--decoder-mode current` selects the eager fallback; CPU probes select eager automatically. Tensor decoding supports search depth up to 32 and pays compilation cost at first use. Experimental SDPA modes are available in the benchmark/profiler. The [readiness report](docs/SELF_PLAY_READINESS_REVIEW_2026-09-11.md) records measured gains and limitations.
+Search inference uses CUDA FP32 with TF32 disabled. Gumbel uses the compiled decoder and reusable workspace (maximum depth 32); halving uses the grouped cached decoder with its configured depth and quiescence. Runtime choices follow the selected algorithm. Ordinary model-component SDPA remains unchanged. Compilation adds first-use latency. Historical measurements remain in the [readiness report](docs/SELF_PLAY_READINESS_REVIEW_2026-09-11.md).
 
 Use [the config guide](docs/CONFIG_GUIDE.md) before changing an existing run. Older configs are retained for checkpoint compatibility. The 5090 recipe is a pilot configuration, not a measured performance promise.
 
 ## Evaluation and monitoring
 
-`eval_vs_stockfish.py` retains greedy/rerank/depth-two/halving selection, Stockfish nodes/time/strength settings, and serial or multiprocess execution. PGN/HTML game saving is supported on its serial route. `match_two_checkpoints.py` compares two models directly; it does not invoke Stockfish.
+`eval_vs_stockfish.py` and `match_two_checkpoints.py` expose `--model-move-policy value_search_halving` (default) or `--model-move-policy gumbel`. One algorithm applies to the entire match. Halving uses `--search-budget` neural evaluations and `--search-lambda`; Gumbel uses `--gumbel-simulations` and explicitly supplies zero exploration noise for standalone evaluation. These budgets are different units. Both paths use shared inference and scheduling; Stockfish calls remain concurrent. Halving retains its existing game concurrency (6 in the config; recent Stockfish runs use 4). PGN/HTML traces remain supported. `match_two_checkpoints.py` compares models directly without Stockfish.
+
+The old standalone Gumbel evaluation commands are retired. Select Gumbel explicitly on the common commands. Retired policies and inference optimization/dtype/compile switches are rejected; supervised-training controls remain separate.
 
 Stage-2 screens compare matched held-out prefixes with colors swapped. A completed 500-game confirmation with paired 95% confidence above 50% is required for best-checkpoint promotion. Incomplete evaluations do not establish a score. Keep full-strength fixed-node Stockfish results separate from historical Elo-limited SF2400 results.
 
@@ -76,6 +78,8 @@ Track usable completed positions/hour, completion/discard rates, training positi
 The extended suite should run on decoder, attention or native-rule changes. Retained tests cover loss/gradient behavior, replay recovery, worker cleanup, chess edge cases, and full-forward → cached → grouped → optimized decoder parity. See [test maintenance](docs/TEST_MAINTENANCE_AUDIT_2026-09-12.md).
 
 ## Status and retained history
+
+- [Search inference consolidation and validation](docs/search-consolidation-validation.md)
 
 - [Self-play implementation, measurements and remaining gates](docs/SELF_PLAY_READINESS_REVIEW_2026-09-11.md)
 - [Current roadmap](PLAN.md)

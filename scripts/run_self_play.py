@@ -9,9 +9,7 @@ from datetime import datetime
 import json
 from pathlib import Path
 import time
-
 import torch
-
 from imba_chess.data.self_play_store import SelfPlayStore, atomic_json
 from imba_chess.self_play.collector import collect, CollectionMetrics
 from imba_chess.self_play.config import load_config
@@ -36,19 +34,25 @@ def main():
     parser.add_argument("--device", default="cuda")
     parser.add_argument("--max-iterations", type=int, default=100000)
     parser.add_argument(
-        "--checkpoint-seconds", type=int, default=60,
+        "--checkpoint-seconds",
+        type=int,
+        default=60,
         help="Training recovery-save interval; phase boundaries always save",
     )
     parser.add_argument(
-        "--keep-recovery-checkpoints", type=int, default=1,
+        "--keep-recovery-checkpoints",
+        type=int,
+        default=1,
         help="Recent recovery checkpoints to retain in addition to actor and best",
     )
     parser.add_argument(
-        "--screen-seconds", type=int,
+        "--screen-seconds",
+        type=int,
         help="Screen at phase boundaries after this interval instead of every N actors",
     )
     parser.add_argument(
-        "--concurrent-games", type=int,
+        "--concurrent-games",
+        type=int,
         help="Collection slots; execution-only override preserves resume config identity",
     )
     parser.add_argument(
@@ -72,15 +76,7 @@ def main():
         action="store_true",
         help="Research runs: record strength screens without rollback or best promotion",
     )
-    parser.add_argument(
-        "--decoder-mode",
-        choices=["current", "compiled"],
-        default=None,
-        help="Default: compiled on CUDA, current (eager) on CPU",
-    )
     args = parser.parse_args()
-    if args.decoder_mode == "compiled" and args.device.split(":")[0] != "cuda":
-        parser.error("compiled decoding requires --device cuda")
     if args.concurrent_games is not None and args.concurrent_games < 1:
         parser.error("--concurrent-games must be positive")
     if args.screen_every < 1:
@@ -143,16 +139,7 @@ def main():
                 phase="collect",
                 halted=False,
             )
-        runtime, max_positions = load_runtime(
-            cfg,
-            checkpoint,
-            args.device,
-            **(
-                {"decoder_mode": args.decoder_mode}
-                if args.decoder_mode is not None
-                else {}
-            ),
-        )
+        runtime, max_positions = load_runtime(cfg, checkpoint, args.device)
         store = SelfPlayStore(args.output / "replay", **asdict(cfg.replay))
         trainer = Stage2Trainer(
             model=runtime.model,
@@ -183,22 +170,24 @@ def main():
         def publish_checkpoint():
             path = (
                 args.output
-                / f'state-{state["iteration"]:06d}-{state["phase"]}-{trainer.steps:09d}.pt'
+                / f"state-{state['iteration']:06d}-{state['phase']}-{trainer.steps:09d}.pt"
             )
             state["checkpoint"] = str(path)
             trainer.checkpoint(
                 path, progress=dict(state), store=store, config_id=cfg.identifier
             )
             atomic_json(state_path, state)
-            # Publish the replacement before retiring unreferenced checkpoints.
             keep = {
                 str(Path(state[k]).resolve()) for k in ("actor", "best", "checkpoint")
             }
             recovery = sorted(
                 args.output.glob("state-*.pt"),
-                key=lambda p: (p.stat().st_mtime_ns, p.name), reverse=True,
+                key=lambda p: (p.stat().st_mtime_ns, p.name),
+                reverse=True,
             )
-            keep.update(str(p.resolve()) for p in recovery[:args.keep_recovery_checkpoints])
+            keep.update(
+                (str(p.resolve()) for p in recovery[: args.keep_recovery_checkpoints])
+            )
             for old in args.output.glob("*.pt"):
                 if str(old.resolve()) not in keep:
                     old.unlink()
@@ -221,7 +210,8 @@ def main():
         log(
             dict(
                 event="run_start",
-                concurrent_games=args.concurrent_games or cfg.collection.concurrent_games,
+                concurrent_games=args.concurrent_games
+                or cfg.collection.concurrent_games,
                 inference_options=getattr(runtime, "options", {}),
                 until=args.until.isoformat() if args.until else None,
                 screen_every=args.screen_every,
@@ -244,12 +234,11 @@ def main():
             store.collect_garbage(pinned_shards=pinned)
 
         next_screen = time.monotonic() + (args.screen_seconds or 0)
-        while state["iteration"] < args.max_iterations and not budget.stop():
+        while state["iteration"] < args.max_iterations and (not budget.stop()):
             if state["phase"] == "collect":
                 if not budget.launch():
                     break
                 metrics = CollectionMetrics()
-                # Recover published collection work even if its phase checkpoint was lost.
                 for shard in store.manifest["shards"]:
                     if not (store.directory / shard["file"]).exists():
                         continue
@@ -286,8 +275,9 @@ def main():
                     skip_ids=store.seen,
                     metrics=metrics,
                     on_game=record_game,
-                    **({"concurrent_games": args.concurrent_games}
-                       if args.concurrent_games is not None else {}),
+                    **{"concurrent_games": args.concurrent_games}
+                    if args.concurrent_games is not None
+                    else {},
                 )
                 log(metrics.report())
                 if (
@@ -329,7 +319,7 @@ def main():
                     publish_checkpoint()
                     break
                 state["phase"] = "evaluate"
-                actor = args.output / f'actor-{state["iteration"]+1:06d}.pt'
+                actor = args.output / f"actor-{state['iteration'] + 1:06d}.pt"
                 state.update(actor=str(actor), checkpoint=str(actor))
                 trainer.checkpoint(
                     actor, progress=dict(state), store=store, config_id=cfg.identifier
@@ -337,28 +327,23 @@ def main():
                 state["actor_id"] = file_hash(actor)
                 atomic_json(state_path, state)
             if state["phase"] == "evaluate":
-                screen_path = args.output / f'screen-{state["iteration"]:06d}.json'
+                screen_path = args.output / f"screen-{state['iteration']:06d}.json"
                 screen_deferred = (
-                    time.monotonic() < next_screen if args.screen_seconds is not None
+                    time.monotonic() < next_screen
+                    if args.screen_seconds is not None
                     else (state["iteration"] + 1) % args.screen_every != 0
                 )
-                if screen_deferred and not screen_path.exists():
+                if screen_deferred and (not screen_path.exists()):
                     log(
-                        dict(decision="screen_deferred", screen_every=args.screen_every,
-                             screen_seconds=args.screen_seconds)
+                        dict(
+                            decision="screen_deferred",
+                            screen_every=args.screen_every,
+                            screen_seconds=args.screen_seconds,
+                        )
                     )
                     finish_iteration()
                     continue
-                best, _ = load_runtime(
-                    cfg,
-                    Path(state["best"]),
-                    args.device,
-                    **(
-                        {"decoder_mode": args.decoder_mode}
-                        if args.decoder_mode is not None
-                        else {}
-                    ),
-                )
+                best, _ = load_runtime(cfg, Path(state["best"]), args.device)
                 common = dict(
                     candidate=runtime,
                     best=best,
@@ -373,22 +358,20 @@ def main():
                 )
                 try:
                     screen = evaluate_pair_checkpoints(
-                        **common,
-                        output=screen_path,
-                        pairs=cfg.run.screen_pairs,
+                        **common, output=screen_path, pairs=cfg.run.screen_pairs
                     )
                     confirmation = None
                     if (
                         screen
                         and screen["score"] > 0.5
-                        and screen["upper"] >= 0.45
-                        and not args.defer_confirmation
-                        and not args.observe_only_screen
+                        and (screen["upper"] >= 0.45)
+                        and (not args.defer_confirmation)
+                        and (not args.observe_only_screen)
                     ):
                         confirmation = evaluate_pair_checkpoints(
                             **common,
                             output=args.output
-                            / f'confirmation-{state["iteration"]:06d}.json',
+                            / f"confirmation-{state['iteration']:06d}.json",
                             pairs=cfg.run.confirmation_pairs,
                         )
                         if confirmation is None:
@@ -398,7 +381,6 @@ def main():
                     state.update(
                         halted=True, halt_reason="evaluation_protocol", error=str(exc)
                     )
-                    # Keep both candidate and best; a protocol failure is not a strength result.
                     atomic_json(state_path, state)
                     log(dict(error=str(exc), decision="protocol_stop"))
                     del best, common
@@ -407,7 +389,9 @@ def main():
                 if screen is None:
                     break
                 recommended_action = decision(screen, confirmation)
-                action = "observe_only" if args.observe_only_screen else recommended_action
+                action = (
+                    "observe_only" if args.observe_only_screen else recommended_action
+                )
                 log(
                     dict(
                         screen=screen,
@@ -423,7 +407,6 @@ def main():
                     state.update(
                         actor=state["best"], actor_id=state["best_id"], halted=True
                     )
-                    # Preserve the failing checkpoint and evaluation; rollback the published actor.
                     atomic_json(state_path, state)
                     break
                 if action == "promote":
@@ -431,7 +414,7 @@ def main():
                 next_screen = time.monotonic() + (args.screen_seconds or 0)
                 finish_iteration()
         print(
-            f'Stopped at iteration {state["iteration"]}, phase {state["phase"]}; '
+            f"Stopped at iteration {state['iteration']}, phase {state['phase']}; "
             + (
                 "halted: investigate recorded failure"
                 if state.get("halted")

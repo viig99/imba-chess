@@ -10,7 +10,6 @@ import resource
 import statistics
 import subprocess
 import time
-
 import torch
 from imba_chess.data.self_play_store import SelfPlayStore, atomic_json
 from imba_chess.self_play.collector import collect
@@ -59,31 +58,11 @@ def main():
     )
     parser.add_argument("--profile", action="store_true")
     parser.add_argument("--save-search-results", action="store_true")
-    parser.add_argument(
-        "--one-query-per-game",
-        action="store_true",
-        help="Use batched one-query attention (explicit opt-in for benchmark ablations)",
-    )
-    parser.add_argument("--cache-prefixes", action="store_true")
-    parser.add_argument(
-        "--decoder-mode",
-        choices=["current", "tensor", "compiled", "sdpa", "compiled-sdpa"],
-        default="current",
-    )
-    parser.add_argument("--batch-projection", action="store_true")
-    parser.add_argument("--batch-inputs", action="store_true")
-    parser.add_argument("--batch-suffix", action="store_true")
     parser.add_argument("--threads", type=int, default=4)
     args = parser.parse_args()
     if min(args.games, args.threads, args.seconds) <= 0 or args.repeats < 0:
         parser.error(
             "bounds must be positive; repeats may be zero for a first-trial-only run"
-        )
-    if args.decoder_mode != "current" and not (
-        args.one_query_per_game and args.cache_prefixes
-    ):
-        parser.error(
-            "whole-decoder modes require --one-query-per-game and --cache-prefixes"
         )
 
     def save_compiler_counters():
@@ -100,17 +79,7 @@ def main():
     actor_id = file_hash(args.checkpoint)
     with run_lock(args.output):
         start = time.perf_counter()
-        runtime, max_positions = load_runtime(
-            cfg,
-            args.checkpoint,
-            args.device,
-            one_query_per_game=args.one_query_per_game,
-            cache_prefixes=args.cache_prefixes,
-            decoder_mode=args.decoder_mode,
-            batch_projection=args.batch_projection,
-            batch_inputs=args.batch_inputs,
-            batch_suffix=args.batch_suffix,
-        )
+        runtime, max_positions = load_runtime(cfg, args.checkpoint, args.device)
         synchronize(runtime.device)
         load_seconds = time.perf_counter() - start
         metadata = dict(
@@ -136,18 +105,13 @@ def main():
             dtype="float32",
             float32_matmul_precision=torch.get_float32_matmul_precision(),
             allow_tf32=torch.backends.cuda.matmul.allow_tf32,
-            decoder_mode=args.decoder_mode,
             decoder_source_sha256=file_hash(
                 Path("src/imba_chess/model/tensor_decoder.py")
             ),
             executor_source_sha256=file_hash(
                 Path("src/imba_chess/eval/merged_executors.py")
             ),
-            compile=(
-                "whole neural decoder"
-                if args.decoder_mode.startswith("compiled")
-                else False
-            ),
+            compile="whole neural decoder",
             threads=args.threads,
             load_seconds=load_seconds,
             profiled=args.profile,
@@ -296,7 +260,6 @@ def main():
                         previous_rate = median
                     if stop_sweep:
                         break
-
         save_compiler_counters()
 
 

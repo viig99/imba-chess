@@ -150,11 +150,8 @@ class EvalVsStockfishConfig:
     ladder_games_per_segment: Optional[int] = None
     include_full_strength_segment: bool = False
     device: str = "auto"
-    dtype: str = "bfloat16"
-    compile: bool = False
     model_move_policy: str = "value_search_halving"
-    value_rerank_top_k: int = 8
-    value_rerank_lambda: float = 0.05
+    search_lambda: float = 0.05
     search_budget: int = 2048
     search_top_m: int = 16
     halving_rounds: int = 0
@@ -174,6 +171,10 @@ class EvalVsStockfishConfig:
     # tick. 1 (default) is byte-identical in call sequence to the
     # pre-scheduler sequential driver.
     concurrent_games: int = 1
+
+    def __post_init__(self):
+        if self.model_move_policy not in ("gumbel", "value_search_halving"):
+            raise ValueError("model_move_policy must be gumbel or value_search_halving")
 
 
 @dataclass(frozen=True)
@@ -206,9 +207,13 @@ def load_repo_config(path: str | Path | None = None) -> RepoConfig:
 
     return RepoConfig(
         dataset=_read_section(DatasetConfig, payload.get("dataset", {}), "dataset"),
-        board_state=_read_section(BoardStateConfig, payload.get("board_state", {}), "board_state"),
+        board_state=_read_section(
+            BoardStateConfig, payload.get("board_state", {}), "board_state"
+        ),
         vocab=_read_section(VocabConfig, payload.get("vocab", {}), "vocab"),
-        dataloader=_read_section(DataloaderConfig, payload.get("dataloader", {}), "dataloader"),
+        dataloader=_read_section(
+            DataloaderConfig, payload.get("dataloader", {}), "dataloader"
+        ),
         model=_read_section(ModelConfig, payload.get("model", {}), "model"),
         training=_read_section(TrainingConfig, payload.get("training", {}), "training"),
         eval_vs_stockfish=_read_section(

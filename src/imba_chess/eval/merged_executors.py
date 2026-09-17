@@ -176,31 +176,16 @@ class _MergedDecodeRequest:
     suffix_mask: torch.Tensor | None
 
 
-def _pack_prefixes(requests, reserve_tokens=0):
-    """Pack roots, optionally reserving SDPA branch/leaf space in the same storage."""
+def _pack_prefixes(requests):
+    """Pack one immutable history per game, padding unequal lengths."""
     num_layers = len(requests[0].prefix_kv)
     max_prefix = max(req.prefix_len for req in requests)
     prefix_kv_grouped: list[tuple[torch.Tensor, torch.Tensor]] = []
     for layer in range(num_layers):
-        if reserve_tokens:
-            ref_k, ref_v = requests[0].prefix_kv[layer]
-            total = max_prefix + reserve_tokens
-            packed_k = ref_k.new_zeros(
-                (len(requests), ref_k.size(0), total, ref_k.size(-1))
-            )
-            packed_v = ref_v.new_zeros(
-                (len(requests), ref_v.size(0), total, ref_v.size(-1))
-            )
-            for game, req in enumerate(requests):
-                k, v = req.prefix_kv[layer]
-                packed_k[game, :, : req.prefix_len].copy_(k)
-                packed_v[game, :, : req.prefix_len].copy_(v)
-            prefix_kv_grouped.append((packed_k, packed_v))
-            continue
         ks, vs = [], []
         for req in requests:
             k, v = req.prefix_kv[layer]
-            pad = max_prefix + reserve_tokens - k.size(1)
+            pad = max_prefix - k.size(1)
             ks.append(F.pad(k, (0, 0, 0, pad)) if pad else k)
             vs.append(F.pad(v, (0, 0, 0, pad)) if pad else v)
         prefix_kv_grouped.append((torch.stack(ks, dim=0), torch.stack(vs, dim=0)))
@@ -416,37 +401,22 @@ def _make_decode_wave_executor(
     device,
     dtype,
     stats: "TimingStatsLike | None",
-    one_query_per_game: bool = False,
-    cache_prefixes: bool = False,
-    batch_projection: bool = False,
-    batch_inputs: bool = False,
-    batch_suffix: bool = False,
-    decoder_mode: str = "current",
-    reuse_decode_buffers: bool = False,
+    algorithm: str = "value_search_halving",
 ):
-    if decoder_mode not in ("current", "tensor", "compiled", "sdpa", "compiled-sdpa"):
-        raise ValueError("unknown decoder mode")
+    if algorithm not in ("gumbel", "value_search_halving"):
+        raise ValueError("unknown search algorithm")
     from imba_chess.model.tensor_decoder import DecoderRunner
+    from .decode_workspace import DecodeWorkspace
 
-    runner = DecoderRunner(model, decoder_mode) if decoder_mode != "current" else None
-    if reuse_decode_buffers:
-        if runner is None or not one_query_per_game:
-            raise ValueError(
-                "reusable decode buffers require a tensor decoder and one query per game"
-            )
-        from .decode_workspace import DecodeWorkspace
-
-        reusable = DecodeWorkspace(runner)
-    else:
-        reusable = None
+    single = algorithm == "gumbel"
+    runner = DecoderRunner(model) if single else None
+    reusable = DecodeWorkspace(runner) if single else None
     cached_owners = ()
     cached_prefixes = None
-    cached_workspace = None
 
     def clear_cache():
-        nonlocal cached_owners, cached_prefixes, cached_workspace
+        nonlocal cached_owners, cached_prefixes
         cached_owners, cached_prefixes = (), None
-        cached_workspace = None
         if runner is not None:
             runner.clear()
         if reusable is not None:
@@ -455,7 +425,7 @@ def _make_decode_wave_executor(
     def executor(
         payloads: list[tuple[CachedPositionEvaluator, list]],
     ) -> list[list[search.PositionEval]]:
-        nonlocal cached_owners, cached_prefixes, cached_workspace
+        nonlocal cached_owners, cached_prefixes
         if reusable is not None:
             if model.training:
                 raise ValueError("tensor decoder is inference-only")
@@ -484,7 +454,7 @@ def _make_decode_wave_executor(
                 stats.search_eval_calls += 1
                 stats.search_eval_items += len(payloads)
             return restored
-        if len(payloads) == 1 and runner is None:
+        if len(payloads) == 1:
             clear_cache()
             # Single game in this tick's decode_wave batch: the existing
             # single-prefix evaluate() path, byte-identical to the
@@ -505,70 +475,43 @@ def _make_decode_wave_executor(
         # which is pure Python move generation and vocab projection.
         prep0 = time.perf_counter()
         requests = [
-            evaluator.build_decode_request(
-                batch, defer_tensors=batch_inputs, stack_suffix=batch_suffix
-            )
-            if batch_inputs or batch_suffix
-            else evaluator.build_decode_request(batch)
+            evaluator.build_decode_request(batch, defer_tensors=True, stack_suffix=True)
             for evaluator, batch in payloads
         ]
-        suffix_options = {"batch_suffix": True} if batch_suffix else {}
-        if cache_prefixes:
-            owners = tuple(weakref.ref(evaluator) for evaluator, _ in payloads)
-            if owners != cached_owners:
-                if runner is not None and runner.sdpa:
-                    reserve = runner.suffix_capacity + 1
-                    cached_workspace = _pack_prefixes(requests, reserve_tokens=reserve)
-                    # Views, not another packed-prefix allocation/copy. The
-                    # final reserve slots belong only to the mutable branch.
-                    cached_prefixes = [
-                        (k[:, :, :-reserve], v[:, :, :-reserve])
-                        for k, v in cached_workspace
-                    ]
-                else:
-                    cached_prefixes = _pack_prefixes(requests)
-                cached_owners = owners
-            merged = _merge_decode_requests(
-                requests, prefix_kv_grouped=cached_prefixes, **suffix_options
-            )
-        else:
-            merged = _merge_decode_requests(requests, **suffix_options)
+        owners = tuple(
+            (weakref.ref(evaluator), evaluator.history_revision)
+            for evaluator, _ in payloads
+        )
+        if owners != cached_owners:
+            cached_prefixes = _pack_prefixes(requests)
+            cached_owners = owners
+        merged = _merge_decode_requests(
+            requests, prefix_kv_grouped=cached_prefixes, batch_suffix=True
+        )
         prep = time.perf_counter() - prep0
 
         t0 = time.perf_counter()
         with torch.inference_mode(), _autocast_context(device, dtype):
-            out = (
-                runner(merged, workspace=cached_workspace)
-                if runner is not None
-                else model.forward_decode_grouped(
-                    new_token_batch=merged.new_token_batch,
-                    positions=merged.positions,
-                    group_index=merged.group_index,
-                    prefix_kv_grouped=merged.prefix_kv_grouped,
-                    prefix_lens=merged.prefix_lens,
-                    prefix_lens_list=merged.prefix_lens_list,
-                    suffix_kv=merged.suffix_kv,
-                    suffix_positions=merged.suffix_positions,
-                    suffix_mask=merged.suffix_mask,
-                    group_sizes=merged.group_sizes,
-                    **({"one_query_per_game": True} if one_query_per_game else {}),
-                )
+            out = model.forward_decode_grouped(
+                new_token_batch=merged.new_token_batch,
+                positions=merged.positions,
+                group_index=merged.group_index,
+                prefix_kv_grouped=merged.prefix_kv_grouped,
+                prefix_lens=merged.prefix_lens,
+                prefix_lens_list=merged.prefix_lens_list,
+                suffix_kv=merged.suffix_kv,
+                suffix_positions=merged.suffix_positions,
+                suffix_mask=merged.suffix_mask,
+                group_sizes=merged.group_sizes,
             )
         gpu_elapsed = time.perf_counter() - t0
 
         # Legal-move projection back into PositionEvals -- also previously
         # untimed, and the single largest Python self-time in the profile.
         post0 = time.perf_counter()
-        if batch_projection:
-            from .position_evaluator import consume_batched_decode_results
+        from .position_evaluator import consume_batched_decode_results
 
-            results = consume_batched_decode_results(payloads, requests, out)
-        else:
-            split_outs = _split_decode_output(out, [len(req.nodes) for req in requests])
-            results = [
-                evaluator.consume_decode_result(req, out_g)
-                for (evaluator, _), req, out_g in zip(payloads, requests, split_outs)
-            ]
+        results = consume_batched_decode_results(payloads, requests, out)
         post = time.perf_counter() - post0
 
         if stats is not None:

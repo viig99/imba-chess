@@ -1,4 +1,3 @@
-#!/usr/bin/env python3
 """Stockfish node-budget calibration probe.
 
 Replays the model-vs-Stockfish game loop from `scripts/eval_vs_stockfish.py`
@@ -23,8 +22,10 @@ Nodes-source survey (python-chess 1.11.2, see chess/engine.py):
     `engine.analyse` call only in the (unexpected) case a move's play-info
     is missing `nodes`, so the probe stays robust to engines that omit it.
 """
-from __future__ import annotations
 
+from __future__ import annotations
+from imba_chess.eval.inference_runtime import load_runtime
+from imba_chess.eval.gumbel_search import GumbelConfig
 import argparse
 import importlib.util
 import json
@@ -34,16 +35,13 @@ from dataclasses import dataclass, field
 from decimal import Decimal, ROUND_HALF_UP
 from pathlib import Path
 from typing import Any
-
 import chess
 import chess.engine
 import torch
 from tqdm.auto import tqdm
-
 from imba_chess.config import load_repo_config
 from imba_chess.data.board_state import BoardStateEncoder
-from imba_chess.data.move_vocab import load_or_create_static_move_vocab
-from imba_chess.eval.position_evaluator import _SequenceHistory, load_hstu_checkpoint
+from imba_chess.eval.position_evaluator import _SequenceHistory
 from imba_chess.eval.search import HalvingConfig
 
 DEFAULT_CALIBRATION_CONFIG_PATH = Path("config/imba_chess_v4.toml")
@@ -57,7 +55,9 @@ def _load_eval_vs_stockfish_module():
     by tests/test_eval_vs_stockfish.py.
     """
     script_path = Path(__file__).resolve().with_name("eval_vs_stockfish.py")
-    spec = importlib.util.spec_from_file_location("eval_vs_stockfish_script", script_path)
+    spec = importlib.util.spec_from_file_location(
+        "eval_vs_stockfish_script", script_path
+    )
     if spec is None or spec.loader is None:
         raise RuntimeError("Unable to load eval_vs_stockfish.py module")
     module = importlib.util.module_from_spec(spec)
@@ -67,9 +67,6 @@ def _load_eval_vs_stockfish_module():
 
 
 _select_model_move = _load_eval_vs_stockfish_module()._select_model_move
-
-# Which path produced the recorded node counts: "play_info" (the common
-# case) or "analyse_fallback" (used only when play-info lacked "nodes").
 PLAY_INFO_NODES_PATH = "play_info"
 ANALYSE_FALLBACK_NODES_PATH = "analyse_fallback"
 
@@ -88,7 +85,7 @@ def percentile(values: list[float], p: float) -> float:
     """
     if not values:
         raise ValueError("percentile() requires at least one value")
-    if not (0.0 <= p <= 100.0):
+    if not 0.0 <= p <= 100.0:
         raise ValueError(f"p must be in [0, 100], got {p}")
     sorted_values = sorted(values)
     n = len(sorted_values)
@@ -171,27 +168,17 @@ class CalibrationResult:
 
 def _parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description=(
-            "Play the model against time-limited Stockfish and record "
-            "Stockfish's reported node counts per move, to calibrate a "
-            "nodes= budget equivalent to the current time-based settings."
-        )
+        description="Play the model against time-limited Stockfish and record Stockfish's reported node counts per move, to calibrate a nodes= budget equivalent to the current time-based settings."
     )
-    parser.add_argument(
-        "--config", type=Path, default=DEFAULT_CALIBRATION_CONFIG_PATH
-    )
+    parser.add_argument("--config", type=Path, default=DEFAULT_CALIBRATION_CONFIG_PATH)
     parser.add_argument("--checkpoint", type=Path, required=True)
     parser.add_argument("--games", type=int, default=8)
     parser.add_argument("--stockfish-elo", type=int, default=2200)
     parser.add_argument("--output-json", type=Path, required=True)
     parser.add_argument(
-        "--compile",
-        action=argparse.BooleanOptionalAction,
-        default=None,
-        help="Override the config's eval compile setting. Pass --no-compile to "
-        "match production eval runs (the nightly always does: the compiled "
-        "eval decode path has a known pre-existing Inductor crash).",
+        "--model-move-policy", choices=["gumbel", "value_search_halving"], default=None
     )
+    parser.add_argument("--gumbel-simulations", type=int, default=None)
     return parser.parse_args()
 
 
@@ -201,19 +188,8 @@ def _resolve_device(device_arg: str) -> torch.device:
     return torch.device(device_arg)
 
 
-def _resolve_dtype(dtype_arg: str) -> torch.dtype:
-    return {
-        "float32": torch.float32,
-        "bfloat16": torch.bfloat16,
-        "float16": torch.float16,
-    }[dtype_arg]
-
-
 def _stockfish_move_with_nodes(
-    *,
-    engine: chess.engine.SimpleEngine,
-    board: chess.Board,
-    limit: chess.engine.Limit,
+    *, engine: chess.engine.SimpleEngine, board: chess.Board, limit: chess.engine.Limit
 ) -> tuple[chess.Move, int, str]:
     """Play one Stockfish move, returning (move, nodes, source).
 
@@ -231,16 +207,14 @@ def _stockfish_move_with_nodes(
         raise RuntimeError("Stockfish returned no move.")
     nodes = result.info.get("nodes")
     if nodes is not None:
-        return result.move, int(nodes), PLAY_INFO_NODES_PATH
-
+        return (result.move, int(nodes), PLAY_INFO_NODES_PATH)
     info = engine.analyse(board, limit)
     fallback_nodes = info.get("nodes")
     if fallback_nodes is None:
         raise RuntimeError(
-            "Stockfish reported no 'nodes' via play-info or analyse fallback; "
-            "cannot calibrate node budget."
+            "Stockfish reported no 'nodes' via play-info or analyse fallback; cannot calibrate node budget."
         )
-    return result.move, int(fallback_nodes), ANALYSE_FALLBACK_NODES_PATH
+    return (result.move, int(fallback_nodes), ANALYSE_FALLBACK_NODES_PATH)
 
 
 def _run_calibration_games(
@@ -255,10 +229,10 @@ def _run_calibration_games(
     device: torch.device,
     dtype: torch.dtype,
     model_move_policy: str,
-    value_rerank_top_k: int,
-    value_rerank_lambda: float,
+    search_lambda: float,
     opening_random_plies: int,
     halving_config: HalvingConfig | None,
+    runtime,
 ) -> CalibrationResult:
     result = CalibrationResult()
     with tqdm(total=games, desc="calibrate-stockfish-nodes", unit="game") as progress:
@@ -267,9 +241,8 @@ def _run_calibration_games(
             history = _SequenceHistory(
                 move_vocab=move_vocab, board_state_encoder=board_state_encoder
             )
-            model_color = chess.WHITE if (game_idx % 2 == 0) else chess.BLACK
+            model_color = chess.WHITE if game_idx % 2 == 0 else chess.BLACK
             plies = 0
-
             while not board.is_game_over(claim_draw=True):
                 if plies >= max_plies:
                     break
@@ -281,34 +254,19 @@ def _run_calibration_games(
                 elif board.turn == model_color:
                     batch = history.build_batch_for_current_position(board)
                     move, _debug_info = _select_model_move(
-                        model=model,
-                        batch=batch,
-                        board=board,
-                        move_vocab=move_vocab,
-                        board_state_encoder=board_state_encoder,
-                        device=device,
-                        dtype=dtype,
-                        policy=model_move_policy,
-                        value_rerank_top_k=value_rerank_top_k,
-                        value_rerank_lambda=value_rerank_lambda,
-                        halving_config=halving_config,
+                        batch=batch, board=board, runtime=runtime, config=halving_config
                     )
                 else:
                     move, nodes, source = _stockfish_move_with_nodes(
                         engine=engine, board=board, limit=engine_limit
                     )
                     result.nodes.append(nodes)
-                    # Only escalate to the fallback label -- never let a
-                    # later play-info move overwrite evidence that the
-                    # fallback path was needed at least once.
                     if source == ANALYSE_FALLBACK_NODES_PATH:
                         result.nodes_source = source
-
                 history.append_observed_position(board)
                 history.record_played_move(move.uci())
                 board.push(move)
                 plies += 1
-
             result.games_played += 1
             result.total_plies += plies
             progress.update(1)
@@ -322,54 +280,39 @@ def main() -> None:
         raise ValueError("--games must be >= 1")
     if args.stockfish_elo < 100:
         raise ValueError("--stockfish-elo must be >= 100")
-
     repo_config = load_repo_config(args.config)
     eval_cfg = repo_config.eval_vs_stockfish
-
     stockfish_path = Path(eval_cfg.stockfish_path)
     if not stockfish_path.exists():
         raise FileNotFoundError(f"Stockfish binary not found: {stockfish_path}")
-
     random.seed(int(eval_cfg.seed))
     torch.manual_seed(int(eval_cfg.seed))
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(int(eval_cfg.seed))
-
     device = _resolve_device(str(eval_cfg.device))
-    dtype = _resolve_dtype(str(eval_cfg.dtype))
-    if device.type == "cuda" and not torch.cuda.is_available():
+    dtype = torch.float32
+    if device.type == "cuda" and (not torch.cuda.is_available()):
         raise RuntimeError("CUDA device requested but not available.")
-
-    move_vocab = load_or_create_static_move_vocab(
-        path=repo_config.vocab.path, include_unk=repo_config.vocab.include_unk
+    model_move_policy = args.model_move_policy or eval_cfg.model_move_policy
+    if model_move_policy != "gumbel" and args.gumbel_simulations is not None:
+        raise ValueError("--gumbel-simulations applies only to gumbel")
+    args.gumbel_simulations = (
+        128 if args.gumbel_simulations is None else args.gumbel_simulations
     )
-    board_state_encoder = BoardStateEncoder(repo_config.board_state)
-
-    model_move_policy = str(eval_cfg.model_move_policy)
-    model, _compile_enabled = load_hstu_checkpoint(
-        checkpoint_path=args.checkpoint,
+    runtime, _ = load_runtime(
         repo_config=repo_config,
-        move_vocab=move_vocab,
+        checkpoint=args.checkpoint,
         device=device,
-        compile_model=bool(
-            eval_cfg.compile if args.compile is None else args.compile
-        ),
-        require_value_head=model_move_policy
-        in {"value_rerank", "value_search_d2", "value_search_halving"},
+        algorithm=model_move_policy,
     )
-
+    model, move_vocab, board_state_encoder = (
+        runtime.model,
+        runtime.move_vocab,
+        runtime.encoder,
+    )
     if eval_cfg.stockfish_nodes is not None:
-        # Calibration measures nodes-per-move under a WALL-CLOCK budget; it is
-        # meaningless against a config that already node-limits Stockfish (the
-        # config's stockfish_time_sec is then only a non-binding safety
-        # ceiling, e.g. 5.0s -- 100x the intended per-move budget). Fail loud
-        # per repo policy: recalibrate against a frozen time-based config.
         raise ValueError(
-            "Config sets stockfish_nodes="
-            f"{eval_cfg.stockfish_nodes} -- calibration needs a TIME-based "
-            "config (stockfish_nodes unset, stockfish_time_sec = the real "
-            "per-move budget). Point --config at a frozen time-based config "
-            "to recalibrate."
+            f"Config sets stockfish_nodes={eval_cfg.stockfish_nodes} -- calibration needs a TIME-based config (stockfish_nodes unset, stockfish_time_sec = the real per-move budget). Point --config at a frozen time-based config to recalibrate."
         )
     engine_limit = chess.engine.Limit(time=float(eval_cfg.stockfish_time_sec))
     stockfish_options = {
@@ -378,7 +321,6 @@ def main() -> None:
         "UCI_LimitStrength": True,
         "UCI_Elo": int(args.stockfish_elo),
     }
-
     halving_config = HalvingConfig(
         budget=int(eval_cfg.search_budget),
         top_m=int(eval_cfg.search_top_m),
@@ -386,15 +328,17 @@ def main() -> None:
         refutation_top_r=int(eval_cfg.search_refutation_top_r),
         expand_top=int(eval_cfg.search_expand_top),
         max_depth=int(eval_cfg.search_max_depth),
-        lam=float(eval_cfg.value_rerank_lambda),
+        lam=float(eval_cfg.search_lambda),
+        tactical_coverage=eval_cfg.search_tactical_coverage,
+        quiescence_plies=eval_cfg.search_quiescence_plies,
     )
-
     print("Calibrating Stockfish node budget")
     print(f"  games={args.games}, stockfish_elo={args.stockfish_elo}")
     print(f"  limit={engine_limit}, options={stockfish_options}")
+    if model_move_policy == "gumbel":
+        halving_config = GumbelConfig(simulations=args.gumbel_simulations)
     print(f"  model_move_policy={model_move_policy}, device={device}, dtype={dtype}")
-
-    with chess.engine.SimpleEngine.popen_uci(str(stockfish_path)) as engine:
+    with runtime, chess.engine.SimpleEngine.popen_uci(str(stockfish_path)) as engine:
         engine.configure(stockfish_options)
         calibration = _run_calibration_games(
             engine=engine,
@@ -407,18 +351,15 @@ def main() -> None:
             device=device,
             dtype=dtype,
             model_move_policy=model_move_policy,
-            value_rerank_top_k=int(eval_cfg.value_rerank_top_k),
-            value_rerank_lambda=float(eval_cfg.value_rerank_lambda),
+            search_lambda=float(eval_cfg.search_lambda),
             opening_random_plies=int(eval_cfg.opening_random_plies),
             halving_config=halving_config,
+            runtime=runtime,
         )
-
     if not calibration.nodes:
         raise RuntimeError(
-            "No Stockfish moves were recorded (0 engine turns played) -- "
-            "cannot calibrate a node budget."
+            "No Stockfish moves were recorded (0 engine turns played) -- cannot calibrate a node budget."
         )
-
     stats = build_nodes_stats(calibration.nodes)
     payload = {
         **stats,
@@ -433,17 +374,25 @@ def main() -> None:
             "stockfish_limit": str(engine_limit),
             "stockfish_options": stockfish_options,
             "model_move_policy": model_move_policy,
+            "algorithm": model_move_policy,
+            "budget": halving_config.simulations
+            if model_move_policy == "gumbel"
+            else halving_config.budget,
+            "budget_unit": "simulations"
+            if model_move_policy == "gumbel"
+            else "neural_evaluations",
+            "exploration": "zero_noise"
+            if model_move_policy == "gumbel"
+            else "deterministic",
+            "precision": "float32",
+            "tf32": False,
+            "runtime_revision": runtime.options["runtime_revision"],
         },
     }
-
     args.output_json.parent.mkdir(parents=True, exist_ok=True)
     args.output_json.write_text(json.dumps(payload, indent=2), encoding="utf-8")
-
     print(
-        f"[calibrate_stockfish_nodes] count={stats['count']} "
-        f"median={stats['median']:.1f} p25={stats['p25']:.1f} p75={stats['p75']:.1f} "
-        f"recommended_stockfish_nodes={stats['recommended_stockfish_nodes']} "
-        f"(source={calibration.nodes_source}) -> wrote {args.output_json}"
+        f"[calibrate_stockfish_nodes] count={stats['count']} median={stats['median']:.1f} p25={stats['p25']:.1f} p75={stats['p75']:.1f} recommended_stockfish_nodes={stats['recommended_stockfish_nodes']} (source={calibration.nodes_source}) -> wrote {args.output_json}"
     )
 
 

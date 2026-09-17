@@ -14,7 +14,7 @@ from imba_chess.eval.position_evaluator import (
     CachedPositionEvaluator,
     consume_batched_decode_results,
 )
-from imba_chess.model.tensor_decoder import DecoderRunner
+from tests.search_references import DecoderRunner
 from tests.test_prefix_decode import _tiny_model
 from tests.test_self_play import VOCAB, ENCODER
 
@@ -219,7 +219,8 @@ def test_arena_growth_slot_reclamation_and_empty_projection(monkeypatch):
 def test_scratch_collect_update_collect_and_cancellation(tmp_path):
     from dataclasses import replace
     from imba_chess.data.self_play_store import SelfPlayStore
-    from imba_chess.self_play.collector import InferenceRuntime, collect
+    from tests.search_references import InferenceRuntime
+    from imba_chess.self_play.collector import collect
     from imba_chess.self_play.config import SelfPlayConfig
     from imba_chess.self_play.seeds import Seed
     from imba_chess.self_play.trainer import Stage2Trainer
@@ -446,15 +447,14 @@ def test_direct_dirty_rows_batch_resize_and_width_changes(immutable):
 def test_workspace_executor_error_cleans_buffers(monkeypatch):
     from imba_chess.eval.merged_executors import _make_decode_wave_executor
 
+    monkeypatch.setattr("imba_chess.model.tensor_decoder.DecoderRunner", DecoderRunner)
     model = _tiny_model(len(VOCAB)).eval()
     executor = _make_decode_wave_executor(
         model=model,
         device=torch.device("cpu"),
         dtype=torch.float32,
         stats=None,
-        one_query_per_game=True,
-        decoder_mode="tensor",
-        reuse_decode_buffers=True,
+        algorithm="gumbel",
     )
 
     def fail(*args):
@@ -498,20 +498,15 @@ def test_stable_placement_and_selective_gather(device, mode, monkeypatch):
     torch.set_num_threads(4)
     torch.manual_seed(789)
     model = _tiny_model(len(VOCAB)).to(device).eval()
+    if mode == "tensor":
+        monkeypatch.setattr(
+            "imba_chess.model.tensor_decoder.DecoderRunner", DecoderRunner
+        )
     kwargs = dict(
-        model=model,
-        device=torch.device(device),
-        dtype=torch.float32,
-        stats=None,
-        one_query_per_game=True,
-        decoder_mode=mode,
-        cache_prefixes=True,
-        batch_projection=True,
-        batch_inputs=True,
-        batch_suffix=True,
+        model=model, device=torch.device(device), dtype=torch.float32, stats=None
     )
-    reference = _make_decode_wave_executor(**kwargs, reuse_decode_buffers=False)
-    candidate = _make_decode_wave_executor(**kwargs, reuse_decode_buffers=True)
+    reference = _make_decode_wave_executor(**kwargs, algorithm="value_search_halving")
+    candidate = _make_decode_wave_executor(**kwargs, algorithm="gumbel")
     ws = candidate.workspace
     gather = ws._gather_ancestors
 

@@ -24,6 +24,8 @@ yields one merged forward per model per tick with no scheduler changes.
 """
 
 from __future__ import annotations
+from imba_chess.eval.inference_runtime import load_runtime
+from imba_chess.eval.gumbel_search import GumbelConfig
 
 import argparse
 import json
@@ -38,84 +40,33 @@ import torch
 from tqdm.auto import tqdm
 
 from imba_chess.config import DEFAULT_CONFIG_PATH, load_repo_config
-from imba_chess.data.board_state import BoardStateEncoder
 from imba_chess.data.lichess_dataset import LichessDataset
-from imba_chess.data.move_vocab import load_or_create_static_move_vocab
-from imba_chess.eval import search
 from imba_chess.eval.batch_scheduler import BatchScheduler, WorkRequest
-from imba_chess.eval.merged_executors import (
-    _make_decode_wave_executor,
-    _make_root_eval_executor,
-)
 from imba_chess.eval.position_evaluator import (
-    CachedPositionEvaluator,
     _SequenceHistory,
-    _project_legal_logits,
-    load_hstu_checkpoint,
 )
 from imba_chess.eval.search import HalvingConfig
 
 
-def _select_move(
-    *,
-    side: str,
-    board: chess.Board,
-    history: _SequenceHistory,
-    model,
-    move_vocab,
-    board_state_encoder,
-    device,
-    dtype,
-    halving_config: HalvingConfig,
-    rng: random.Random,
-) -> Generator[WorkRequest, Any, str]:
-    """Search one side's position and return the chosen UCI.
-
-    Requests are tagged with `side` so the scheduler merges each model's work
-    separately.
-    """
-    batch = history.build_batch_for_current_position(board)
-    output = yield WorkRequest(f"{side}:root_eval", batch)
-
-    logits = output["logits"][-1]
-    legal_logits, legal_moves, _, mapped_legal = _project_legal_logits(
-        logits=logits, board=board, move_vocab=move_vocab
-    )
-    if mapped_legal == 0:
-        # Fail loudly: a position with no vocabulary-representable legal move
-        # would silently corrupt the match result if adjudicated instead.
-        raise RuntimeError(f"no legal move mapped to vocab at fen={board.fen()}")
-    legal_log_priors = torch.log_softmax(legal_logits.float(), dim=0).tolist()
-
-    evaluator = CachedPositionEvaluator(
-        model=model,
-        move_vocab=move_vocab,
-        board_state_encoder=board_state_encoder,
-        device=device,
-        dtype=dtype,
-        prefix_kv=output["kv_caches"],
-        prefix_len=int(batch["total_tokens"]),
-    )
-
-    gen = search._halving_stepwise(
-        extend=evaluator.extend,
-        root_handle=None,
+def _select_move(*, side, board, history, runtime, config, rng):
+    gen = runtime.search(
         board=board,
-        legal_moves=legal_moves,
-        legal_log_priors=legal_log_priors,
-        config=halving_config,
+        history=history,
+        actor_id=side,
+        game_id=str(id(history)),
+        config=config,
         rng=rng,
+        noise=0.0 if runtime.algorithm == "gumbel" else None,
     )
     try:
-        request = gen.send(None)
+        request = next(gen)
         while True:
-            position_evals = yield WorkRequest(
-                f"{side}:decode_wave", (evaluator, request.batch)
-            )
-            request = gen.send(position_evals)
+            answer = yield WorkRequest(f"{side}:{request.kind}", request.payload)
+            request = gen.send(answer)
     except StopIteration as stop:
-        best_local_idx, _rows = stop.value
-    return legal_moves[best_local_idx].uci()
+        return stop.value.move_uci
+    finally:
+        gen.close()
 
 
 def _play_game(
@@ -154,12 +105,8 @@ def _play_game(
             side=side,
             board=board,
             history=history,
-            model=models[side],
-            move_vocab=move_vocab,
-            board_state_encoder=board_state_encoder,
-            device=device,
-            dtype=dtype,
-            halving_config=halving_config,
+            runtime=models[side],
+            config=halving_config,
             rng=random.Random(f"{seed}:{game_key}:{len(board.move_stack)}"),
         )
         history.append_observed_position(board)
@@ -208,13 +155,23 @@ def _parse_args() -> argparse.Namespace:
     p.add_argument("--checkpoint-b", type=Path, required=True)
     p.add_argument("--label-a", type=str, default="A")
     p.add_argument("--label-b", type=str, default="B")
-    p.add_argument("--games", type=int, default=200, help="total games; rounded down to an even number (paired)")
+    p.add_argument(
+        "--games",
+        type=int,
+        default=200,
+        help="total games; rounded down to an even number (paired)",
+    )
     p.add_argument("--opening-plies", type=int, default=8)
     p.add_argument("--concurrent-games", type=int, default=4)
     p.add_argument("--max-plies", type=int, default=None)
     p.add_argument("--seed", type=int, default=42)
     p.add_argument("--device", type=str, default=None)
-    p.add_argument("--dtype", type=str, default=None)
+    p.add_argument(
+        "--model-move-policy",
+        choices=["gumbel", "value_search_halving"],
+        default="value_search_halving",
+    )
+    p.add_argument("--gumbel-simulations", type=int, default=None)
     p.add_argument("--search-budget", type=int, default=None)
     p.add_argument("--search-max-depth", type=int, default=None)
     p.add_argument("--output-json", type=Path, default=None)
@@ -226,43 +183,58 @@ def main() -> None:
     repo_config = load_repo_config(args.config)
     eval_cfg = repo_config.eval_vs_stockfish
 
+    if args.model_move_policy == "gumbel" and (
+        args.search_budget is not None or args.search_max_depth is not None
+    ):
+        raise ValueError(
+            "--search-budget and --search-max-depth apply only to value_search_halving"
+        )
+    if args.model_move_policy != "gumbel" and args.gumbel_simulations is not None:
+        raise ValueError("--gumbel-simulations applies only to gumbel")
+    args.gumbel_simulations = (
+        128 if args.gumbel_simulations is None else args.gumbel_simulations
+    )
     device_arg = args.device or eval_cfg.device
     if device_arg == "auto":
         device_arg = "cuda" if torch.cuda.is_available() else "cpu"
     device = torch.device(device_arg)
-    dtype = {
-        "float32": torch.float32,
-        "bfloat16": torch.bfloat16,
-        "float16": torch.float16,
-    }[args.dtype or eval_cfg.dtype]
-
-    move_vocab = load_or_create_static_move_vocab(
-        path=repo_config.vocab.path, include_unk=repo_config.vocab.include_unk
-    )
-    board_state_encoder = BoardStateEncoder(repo_config.board_state)
-
-    models: dict[str, Any] = {}
-    for side, ckpt in (("A", args.checkpoint_a), ("B", args.checkpoint_b)):
-        models[side], _ = load_hstu_checkpoint(
-            checkpoint_path=ckpt,
+    dtype = torch.float32
+    models = {}
+    for side, checkpoint in (("A", args.checkpoint_a), ("B", args.checkpoint_b)):
+        models[side], _ = load_runtime(
             repo_config=repo_config,
-            move_vocab=move_vocab,
+            checkpoint=checkpoint,
             device=device,
-            compile_model=False,
-            require_value_head=True,
+            algorithm=args.model_move_policy,
         )
+    move_vocab = models["A"].move_vocab
+    board_state_encoder = models["A"].encoder
 
     halving_config = HalvingConfig(
-        budget=int(args.search_budget if args.search_budget is not None else eval_cfg.search_budget),
+        budget=int(
+            args.search_budget
+            if args.search_budget is not None
+            else eval_cfg.search_budget
+        ),
         top_m=int(eval_cfg.search_top_m),
         rounds=int(eval_cfg.halving_rounds),
         refutation_top_r=int(eval_cfg.search_refutation_top_r),
         expand_top=int(eval_cfg.search_expand_top),
-        max_depth=int(args.search_max_depth if args.search_max_depth is not None else eval_cfg.search_max_depth),
-        lam=float(eval_cfg.value_rerank_lambda),
+        max_depth=int(
+            args.search_max_depth
+            if args.search_max_depth is not None
+            else eval_cfg.search_max_depth
+        ),
+        lam=float(eval_cfg.search_lambda),
         gumbel_root_sampling=False,
+        tactical_coverage=eval_cfg.search_tactical_coverage,
+        quiescence_plies=eval_cfg.search_quiescence_plies,
     )
-    max_plies = int(args.max_plies if args.max_plies is not None else eval_cfg.max_plies)
+    if args.model_move_policy == "gumbel":
+        halving_config = GumbelConfig(simulations=args.gumbel_simulations)
+    max_plies = int(
+        args.max_plies if args.max_plies is not None else eval_cfg.max_plies
+    )
 
     num_pairs = args.games // 2
     dataset_cfg = repo_config.dataset
@@ -281,7 +253,10 @@ def main() -> None:
         train_shuffle_buffer_size=dataset_cfg.train_shuffle_buffer_size,
         board_state_config=repo_config.board_state,
     )
-    print(f"collecting {num_pairs} openings ({args.opening_plies} plies each)...", flush=True)
+    print(
+        f"collecting {num_pairs} openings ({args.opening_plies} plies each)...",
+        flush=True,
+    )
     openings = _opening_iter(
         lichess_dataset, opening_plies=args.opening_plies, num_openings=num_pairs
     )
@@ -291,23 +266,28 @@ def main() -> None:
         for i, opening in enumerate(openings):
             for a_is_white in (True, False):
                 key = f"{i}:{'AW' if a_is_white else 'BW'}"
-                yield key, _play_game(
-                    opening_ucis=opening,
-                    a_is_white=a_is_white,
-                    models=models,
-                    move_vocab=move_vocab,
-                    board_state_encoder=board_state_encoder,
-                    device=device,
-                    dtype=dtype,
-                    halving_config=halving_config,
-                    max_plies=max_plies,
-                    seed=args.seed,
-                    game_key=key,
+                yield (
+                    key,
+                    _play_game(
+                        opening_ucis=opening,
+                        a_is_white=a_is_white,
+                        models=models,
+                        move_vocab=move_vocab,
+                        board_state_encoder=board_state_encoder,
+                        device=device,
+                        dtype=dtype,
+                        halving_config=halving_config,
+                        max_plies=max_plies,
+                        seed=args.seed,
+                        game_key=key,
+                    ),
                 )
 
     results: list[dict[str, Any]] = []
     errors: list[str] = []
-    bar = tqdm(total=len(openings) * 2, unit="game", desc=f"{args.label_a} vs {args.label_b}")
+    bar = tqdm(
+        total=len(openings) * 2, unit="game", desc=f"{args.label_a} vs {args.label_b}"
+    )
 
     def _on_done(game_key: str, value: Any) -> None:
         if value is not None:
@@ -317,28 +297,31 @@ def main() -> None:
         losses = sum(1 for r in results if r["a_score"] == 0.0)
         n = len(results)
         bar.set_postfix_str(
-            f"A: W{wins}/D{draws}/L{losses} score={(wins + 0.5 * draws) / n:.4f}" if n else ""
+            f"A: W{wins}/D{draws}/L{losses} score={(wins + 0.5 * draws) / n:.4f}"
+            if n
+            else ""
         )
         bar.update(1)
 
     def _on_error(game_key: str, exc: BaseException) -> None:
-        errors.append(f"{game_key}: {exc!r}")
-        tqdm.write(f"[error] game {game_key}: {exc!r}")
-        bar.update(1)
+        raise RuntimeError(f"match game {game_key} failed") from exc
 
-    BatchScheduler(
-        game_factory=_game_factory(),
-        executors={
-            "A:root_eval": _make_root_eval_executor(model=models["A"], device=device, dtype=dtype, stats=None),
-            "A:decode_wave": _make_decode_wave_executor(model=models["A"], device=device, dtype=dtype, stats=None),
-            "B:root_eval": _make_root_eval_executor(model=models["B"], device=device, dtype=dtype, stats=None),
-            "B:decode_wave": _make_decode_wave_executor(model=models["B"], device=device, dtype=dtype, stats=None),
-        },
-        concurrent_games=args.concurrent_games,
-        on_game_done=_on_done,
-        on_game_error=_on_error,
-    ).run()
-    bar.close()
+    try:
+        BatchScheduler(
+            game_factory=_game_factory(),
+            executors={
+                f"{side}:{kind}": execute
+                for side, runtime in models.items()
+                for kind, execute in runtime.executors.items()
+            },
+            concurrent_games=args.concurrent_games,
+            on_game_done=_on_done,
+            on_game_error=_on_error,
+        ).run()
+    finally:
+        for runtime in models.values():
+            runtime.clear_caches()
+        bar.close()
 
     n = len(results)
     wins = sum(1 for r in results if r["a_score"] == 1.0)
@@ -362,7 +345,19 @@ def main() -> None:
         "a_score_rate": score,
         "a_score_se": se,
         "adjudicated_draws": sum(1 for r in results if r["adjudicated"]),
-        "search_budget": halving_config.budget,
+        "algorithm": args.model_move_policy,
+        "budget": halving_config.simulations
+        if args.model_move_policy == "gumbel"
+        else halving_config.budget,
+        "exploration": "zero_noise"
+        if args.model_move_policy == "gumbel"
+        else "deterministic",
+        "budget_unit": "simulations"
+        if args.model_move_policy == "gumbel"
+        else "neural_evaluations",
+        "precision": "float32",
+        "tf32": False,
+        "runtime_revision": models["A"].options["runtime_revision"],
         "search_max_depth": halving_config.max_depth,
         "opening_plies": args.opening_plies,
         "games": results,

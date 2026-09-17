@@ -12,12 +12,9 @@ import random
 import math
 import time
 from types import SimpleNamespace
-
 import torch
-
 from imba_chess.data.self_play_store import SelfPlayStore, atomic_json
 from imba_chess.eval.batch_scheduler import BatchScheduler
-from imba_chess.eval import merged_executors
 from imba_chess.self_play.benchmarks import histories
 from imba_chess.self_play.collector import CollectionMetrics, collect
 from imba_chess.self_play.config import load_config
@@ -57,7 +54,7 @@ def preparation_attribution(events):
         if parent is not None and event.device_type == torch.autograd.DeviceType.CPU:
             name = event.name.lower()
             if not any(
-                wait in name for wait in ("synchronize", "waitevent", "streamwait")
+                (wait in name for wait in ("synchronize", "waitevent", "streamwait"))
             ):
                 work += event.self_cpu_time_total
     fraction = work / wall if wall else 0.0
@@ -65,7 +62,7 @@ def preparation_attribution(events):
         exclusive_cpu_launch_us=work,
         profiled_wall_us=wall,
         fraction=fraction,
-        threshold_met=bool(wall and fraction >= 0.10),
+        threshold_met=bool(wall and fraction >= 0.1),
         cache_promotion_required=True,
         note="Attempt fusion only after the cache stage passes all gates.",
     )
@@ -83,15 +80,13 @@ def compare_targets(reference, candidate, path="games"):
             compare_targets(a, b, f"{path}[{i}]")
     elif isinstance(reference, float):
         assert math.isclose(
-            reference, candidate, rel_tol=1e-6, abs_tol=1e-6
+            reference, candidate, rel_tol=1e-06, abs_tol=1e-06
         ), f"{path}: {reference!r} != {candidate!r}"
     else:
         assert reference == candidate, path
 
 
 def compare_workload_targets(references, game_count, targets):
-    # Changing the collection size changes the tail's active batches. Compare
-    # variants only within the same workload, including the warmup workload.
     assert len(targets) == game_count
     assert len({row["id"] for row in targets}) == game_count
     expected = references.setdefault(game_count, {})
@@ -131,7 +126,6 @@ def main(*, diagnostics=True):
         parser.error("games/concurrency/runs must be positive")
     from torch._inductor import config as inductor_config
 
-    # Fresh graph compilation, but persisted kernel tuning for reproducible arithmetic.
     inductor_config.fx_graph_cache = False
     torch.set_num_threads(4)
     torch.backends.cuda.matmul.allow_tf32 = False
@@ -143,7 +137,7 @@ def main(*, diagnostics=True):
     assert (
         cfg.search.simulations == 128
         and cfg.search.top_m == 16
-        and cfg.search.max_depth == 32
+        and (cfg.search.max_depth == 32)
     )
     seeds = load_seeds(args.seeds)
     actor = file_hash(args.checkpoint)
@@ -155,9 +149,6 @@ def main(*, diagnostics=True):
             print(json.dumps(row), flush=True)
 
         status("loading")
-        runtime, limit = load_runtime(
-            cfg, args.checkpoint, "cuda", decoder_mode="compiled"
-        )
         stats = SimpleNamespace(
             root_eval=0.0,
             search_gpu=0.0,
@@ -166,31 +157,7 @@ def main(*, diagnostics=True):
             search_eval_calls=0,
             search_eval_items=0,
         )
-        # Existing executor instrumentation measures host scopes, not GPU kernel time.
-        root = merged_executors._make_root_eval_executor(
-            model=runtime.model,
-            device=runtime.device,
-            dtype=torch.float32,
-            stats=stats,
-            max_tokens=cfg.collection.root_batch_tokens,
-        )
-        leaf = merged_executors._make_decode_wave_executor(
-            model=runtime.model,
-            device=runtime.device,
-            dtype=torch.float32,
-            stats=stats,
-            one_query_per_game=True,
-            cache_prefixes=True,
-            decoder_mode="compiled",
-            batch_projection=True,
-            batch_inputs=True,
-            batch_suffix=True,
-            reuse_decode_buffers=True,
-        )
-        runtime.executors = {
-            k: runtime._identified(k, v)
-            for k, v in [("root_eval", root), ("decode_wave", leaf)]
-        }
+        runtime, limit = load_runtime(cfg, args.checkpoint, "cuda", stats=stats)
         atomic_json(
             args.output / "metadata.json",
             dict(
@@ -261,7 +228,7 @@ def main(*, diagnostics=True):
         )
         if diagnostics:
             passes.append("cprofile")
-        workspace = leaf.workspace
+        workspace = runtime.executors["decode_wave"].workspace
         for label in passes:
             pass_games = args.warmup_games if label == "warmup" else args.games
             game_counts[label] = pass_games
@@ -272,7 +239,7 @@ def main(*, diagnostics=True):
             reset()
             before = counters()
             profile = cProfile.Profile() if label == "cprofile" else None
-            games, targets = [], []
+            games, targets = ([], [])
 
             def done(game):
                 targets.append(dict(id=game["game_id"], targets=game["targets"]))
@@ -290,7 +257,7 @@ def main(*, diagnostics=True):
                     )
 
             metrics = CollectionMetrics()
-            metrics.latencies = []  # Archive every move in the bounded workload.
+            metrics.latencies = []
             start = time.perf_counter()
             if profile:
                 profile.enable()
@@ -313,7 +280,7 @@ def main(*, diagnostics=True):
                 profile.disable()
             elapsed = time.perf_counter() - start
             assert len(games) == pass_games and all(
-                g["status"] == "completed" for g in games
+                (g["status"] == "completed" for g in games)
             )
             digest = hashlib.sha256(
                 json.dumps(
@@ -331,10 +298,7 @@ def main(*, diagnostics=True):
             expected_bitwise = bitwise_references.setdefault(pass_games, bitwise)
             atomic_json(
                 directory / "latencies.json",
-                dict(
-                    seconds=list(metrics.latencies),
-                    scope="all moves",
-                ),
+                dict(seconds=list(metrics.latencies), scope="all moves"),
             )
             report = metrics.report()
             report.update(
@@ -347,11 +311,9 @@ def main(*, diagnostics=True):
                 bitwise_targets_equal=bitwise == expected_bitwise,
                 single_game_tail=runtime.waves["decode_wave"].get(1, 0) > 0,
                 transfers=dict(workspace.counters),
-                cache_empty_after_collection=(
-                    not workspace.slots
-                    and workspace.arena is None
-                    and workspace.host is None
-                ),
+                cache_empty_after_collection=not workspace.slots
+                and workspace.arena is None
+                and (workspace.host is None),
                 allocated_after_collection=torch.cuda.memory_allocated(),
             )
             report.update(
@@ -389,10 +351,13 @@ def main(*, diagnostics=True):
                     sorted(rows, key=lambda r: -r["self_seconds"]),
                 )
                 preparation_seconds = sum(
-                    row["cumulative_seconds"]
-                    for row in rows
-                    if row["file"].endswith("/decode_workspace.py")
-                    and row["function"] in ("_gather_ancestors", "_prepare_attention")
+                    (
+                        row["cumulative_seconds"]
+                        for row in rows
+                        if row["file"].endswith("/decode_workspace.py")
+                        and row["function"]
+                        in ("_gather_ancestors", "_prepare_attention")
+                    )
                 )
                 atomic_json(
                     directory / "preparation_attribution.json",
@@ -400,19 +365,23 @@ def main(*, diagnostics=True):
                         host_submission_seconds=preparation_seconds,
                         profiled_wall_seconds=elapsed,
                         fraction=preparation_seconds / elapsed,
-                        threshold_met=preparation_seconds / elapsed >= 0.10,
+                        threshold_met=preparation_seconds / elapsed >= 0.1,
                         note="Host submission upper bound; use the CUDA trace to exclude runtime waits before deciding on fusion.",
                     ),
                 )
                 search_seconds = sum(
-                    row["self_seconds"]
-                    for row in rows
-                    if row["file"].endswith("/gumbel_search.py")
+                    (
+                        row["self_seconds"]
+                        for row in rows
+                        if row["file"].endswith("/gumbel_search.py")
+                    )
                 )
                 atomic_json(
                     directory / "preparation_calls.json",
                     {
-                        name: sum(r["calls"] for r in rows if pattern in r["function"])
+                        name: sum(
+                            (r["calls"] for r in rows if pattern in r["function"])
+                        )
                         for name, pattern in {
                             "torch_tensor": "<built-in method torch.tensor>",
                             "padding": "<built-in method torch._C._nn.pad>",
@@ -429,7 +398,7 @@ def main(*, diagnostics=True):
                         exclusive_python_search_seconds=search_seconds,
                         profiled_wall_seconds=elapsed,
                         fraction=search_seconds / elapsed,
-                        rust_trigger=search_seconds / elapsed >= 0.10,
+                        rust_trigger=search_seconds / elapsed >= 0.1,
                     ),
                 )
                 for sort in ("tottime", "cumtime"):
@@ -451,7 +420,6 @@ def main(*, diagnostics=True):
             status("complete", signatures_match=True, targets_match=True)
             return
         runtime.clear_caches()
-        # Fixed representative prefix lengths for a short, fully warmed CUDA trace.
         ordered = sorted(seeds, key=lambda s: (len(s.prefix_moves), s.seed_id))
         selected = [
             ordered[round(i * (len(ordered) - 1) / max(1, args.concurrency - 1))]
@@ -559,10 +527,10 @@ def main(*, diagnostics=True):
             args.output / "trace_summary.json",
             dict(
                 searches=len(results),
-                simulations=sum(r.simulations for r in results),
-                neural_evaluations=sum(r.neural_evaluations for r in results),
-                terminal_hits=sum(r.terminal_hits for r in results),
-                depth_cutoffs=sum(r.depth_cutoffs for r in results),
+                simulations=sum((r.simulations for r in results)),
+                neural_evaluations=sum((r.neural_evaluations for r in results)),
+                terminal_hits=sum((r.terminal_hits for r in results)),
+                depth_cutoffs=sum((r.depth_cutoffs for r in results)),
                 compiler_after=counters(),
             ),
         )

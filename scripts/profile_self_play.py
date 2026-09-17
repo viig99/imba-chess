@@ -5,7 +5,6 @@ from dataclasses import replace
 from pathlib import Path
 import random
 import torch
-
 from imba_chess.data.self_play_store import atomic_json
 from imba_chess.eval.batch_scheduler import BatchScheduler
 from imba_chess.self_play.benchmarks import histories
@@ -22,33 +21,13 @@ def main():
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--games", type=int, default=8)
     parser.add_argument("--simulations", type=int, default=16)
-    parser.add_argument("--one-query-per-game", action="store_true")
-    parser.add_argument("--cache-prefixes", action="store_true")
-    parser.add_argument("--batch-projection", action="store_true")
-    parser.add_argument("--batch-inputs", action="store_true")
-    parser.add_argument("--batch-suffix", action="store_true")
-    parser.add_argument(
-        "--decoder-mode",
-        choices=["current", "tensor", "compiled", "sdpa", "compiled-sdpa"],
-        default="current",
-    )
     args = parser.parse_args()
     torch.set_num_threads(4)
     cfg = load_config(args.config)
     config = replace(cfg.search, simulations=args.simulations)
     seeds = load_seeds(args.seeds)[: args.games]
     with run_lock(args.output):
-        runtime, _ = load_runtime(
-            cfg,
-            args.checkpoint,
-            "cuda",
-            one_query_per_game=args.one_query_per_game,
-            cache_prefixes=args.cache_prefixes,
-            batch_projection=args.batch_projection,
-            batch_inputs=args.batch_inputs,
-            batch_suffix=args.batch_suffix,
-            decoder_mode=args.decoder_mode,
-        )
+        runtime, _ = load_runtime(cfg, args.checkpoint, "cuda")
         actor = file_hash(args.checkpoint)
 
         def execute():
@@ -74,7 +53,7 @@ def main():
 
                 return call
 
-            results, errors = [], []
+            results, errors = ([], [])
             BatchScheduler(
                 game_factory=iter(factory()),
                 concurrent_games=args.games,
@@ -115,12 +94,6 @@ def main():
                 config=cfg.identifier,
                 seeds=[s.seed_id for s in seeds],
                 simulations=args.simulations,
-                one_query_per_game=args.one_query_per_game,
-                cache_prefixes=args.cache_prefixes,
-                batch_projection=args.batch_projection,
-                batch_inputs=args.batch_inputs,
-                batch_suffix=args.batch_suffix,
-                decoder_mode=args.decoder_mode,
                 torch=torch.__version__,
                 gpu=torch.cuda.get_device_name(),
                 peak_vram_bytes=torch.cuda.max_memory_allocated(),

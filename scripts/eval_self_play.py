@@ -34,15 +34,7 @@ def main():
     parser.add_argument("--pairs", type=int, default=50)
     parser.add_argument("--seconds", type=float, default=3600)
     parser.add_argument("--device", default="cuda")
-    parser.add_argument(
-        "--decoder-mode",
-        choices=["current", "compiled"],
-        default=None,
-        help="Default: compiled on CUDA, current (eager) on CPU",
-    )
     args = parser.parse_args()
-    if args.decoder_mode == "compiled" and args.device.split(":")[0] != "cuda":
-        parser.error("compiled decoding requires --device cuda")
     cfg = load_config(args.config)
     if args.pairs < 1 or args.seconds <= 0:
         parser.error("bounds must be positive")
@@ -65,31 +57,13 @@ def main():
         run_lock(args.output.parent),
         StopBudget(seconds=args.seconds, hard_exit=True) as stop,
     ):
-        runtime, positions = load_runtime(
-            cfg,
-            args.checkpoint,
-            args.device,
-            **(
-                {"decoder_mode": args.decoder_mode}
-                if args.decoder_mode is not None
-                else {}
-            ),
-        )
+        runtime, positions = load_runtime(cfg, args.checkpoint, args.device)
         if args.stockfish:
             best = StockfishRuntime(runtime, path=str(args.stockfish))
             best_id = stable_hash(json.dumps(best.protocol, sort_keys=True))
             atomic_json(args.output.with_suffix(".protocol.json"), best.protocol)
         else:
-            best, _ = load_runtime(
-                cfg,
-                args.best,
-                args.device,
-                **(
-                    {"decoder_mode": args.decoder_mode}
-                    if args.decoder_mode is not None
-                    else {}
-                ),
-            )
+            best, _ = load_runtime(cfg, args.best, args.device)
             best_id = file_hash(args.best)
         try:
             result = evaluate_pair_checkpoints(

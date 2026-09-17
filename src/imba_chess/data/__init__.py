@@ -1,19 +1,4 @@
-"""Data utilities for imba_chess.
-
-Lazy re-exports (PEP 562 module `__getattr__`) rather than eager top-level
-imports: `lichess_dataset.py` imports the `datasets` package, which in this
-environment transitively imports torch, and `torch_iterable.py` /
-`dataloader.py` are themselves torch-oriented. Eagerly importing them here
-would make `import imba_chess.data.<anything>` -- including
-`board_state.py`, `move_vocab.py`, `models.py`, `event_builder.py`, all of
-which the torch-free multiprocess eval actor worker needs
-(`src/imba_chess/eval/actor_worker.py`) -- transitively import torch merely
-by touching this package's `__init__`, regardless of what the target
-submodule itself imports. Lazy attribute resolution keeps
-`from imba_chess.data import LichessDataset` (etc.) working exactly as
-before while letting `import imba_chess.data.board_state` /
-`import imba_chess.data.move_vocab` stay genuinely torch-free.
-"""
+"""Data utilities. Lazy exports avoid loading torch and datasets for board or move-vocabulary helpers."""
 
 from __future__ import annotations
 

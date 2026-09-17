@@ -70,9 +70,7 @@ class PositionEvaluator(Protocol):
         self, handle: Any, move_uci: str, move_vocab_id: int | None = None
     ) -> Any: ...
 
-    def evaluate(
-        self, batch: list[tuple[Any, "cc.Board"]]
-    ) -> list[PositionEval]: ...
+    def evaluate(self, batch: list[tuple[Any, "cc.Board"]]) -> list[PositionEval]: ...
 
 
 class EvalRequest(NamedTuple):
@@ -86,7 +84,9 @@ class EvalRequest(NamedTuple):
     batch: list[tuple[Any, "cc.Board"]]
 
 
-def _drive(gen: Generator[EvalRequest, list[PositionEval], Any], evaluator: PositionEvaluator) -> Any:
+def _drive(
+    gen: Generator[EvalRequest, list[PositionEval], Any], evaluator: PositionEvaluator
+) -> Any:
     """Run a stepwise search generator to completion synchronously.
 
     This is the sync API's entire implementation: pump the generator,
@@ -143,10 +143,6 @@ def terminal_value_for_color(
     )
 
 
-def select_greedy(legal_log_priors: list[float]) -> int:
-    return max(range(len(legal_log_priors)), key=legal_log_priors.__getitem__)
-
-
 def _forcing_index_set_root(
     legal_moves: list[chess.Move],
     cozy_board: "cc.Board",
@@ -165,7 +161,9 @@ def _forcing_index_set_root(
         is_capture = board.is_capture(move)
         if move.promotion is not None or is_capture:
             forcing.add(idx)
-        elif cozy_bridge.gives_check(cozy_board, cozy_bridge.py_move_to_cozy(board, move)):
+        elif cozy_bridge.gives_check(
+            cozy_board, cozy_bridge.py_move_to_cozy(board, move)
+        ):
             forcing.add(idx)
     return forcing
 
@@ -178,7 +176,9 @@ def _prior_order(legal_log_priors: list[float]) -> list[int]:
     )
 
 
-def _gumbel_top_k_order(legal_log_priors: list[float], *, rng: random.Random) -> list[int]:
+def _gumbel_top_k_order(
+    legal_log_priors: list[float], *, rng: random.Random
+) -> list[int]:
     """Sample move indices without replacement via the Gumbel-Top-k trick.
 
     Adds i.i.d. Gumbel(0) noise to each move's log-prior and orders by the
@@ -189,11 +189,15 @@ def _gumbel_top_k_order(legal_log_priors: list[float], *, rng: random.Random) ->
     Example 1 constructs exactly this failure: a deterministic top-2 cut
     that misses the only good action and scores worse than the raw prior).
     """
+
     def gumbel_noise() -> float:
         u = max(rng.random(), 1e-12)
         return -math.log(-math.log(u))
 
-    scored = [(log_prior + gumbel_noise(), idx) for idx, log_prior in enumerate(legal_log_priors)]
+    scored = [
+        (log_prior + gumbel_noise(), idx)
+        for idx, log_prior in enumerate(legal_log_priors)
+    ]
     scored.sort(key=lambda pair: pair[0], reverse=True)
     return [idx for _, idx in scored]
 
@@ -227,7 +231,9 @@ def _root_hash_seed(board: chess.Board) -> list[int]:
     moves.reverse()  # chronological order, oldest first
     cozy = cozy_bridge.board_to_cozy(twin)
     history = [cozy_bridge.repetition_hash(cozy)]
-    for move in moves[:-1]:  # skip the last move: it reaches the CURRENT position, excluded
+    for move in moves[
+        :-1
+    ]:  # skip the last move: it reaches the CURRENT position, excluded
         cozy = copy.copy(cozy)
         cozy.play(cozy_bridge.py_move_to_cozy(twin, move))
         twin.push(move)
@@ -236,348 +242,11 @@ def _root_hash_seed(board: chess.Board) -> list[int]:
 
 
 @dataclass
-class _RootCandidate:
-    """One top-k root move expanded one ply deep.
-
-    terminal_value is the exact game result (root POV) when the move ends the
-    game, else None; board1_eval is the value/prior evaluation of the position
-    after the move. worst_reply_value / reply_candidates are filled by
-    value_search_d2 only. hash_history1 is cozy1's repetition hash_history
-    (per the _cozy_push contract), threaded into any further push from cozy1.
-    """
-
-    local_idx: int
-    move: chess.Move
-    cozy1: "cc.Board"
-    hash_history1: tuple[int, ...]
-    log_prior: float
-    terminal_value: Optional[float]
-    handle1: Any = None
-    board1_eval: Optional[PositionEval] = None
-    worst_reply_value: Optional[float] = None
-    reply_candidates: list[dict[str, Any]] = field(default_factory=list)
-
-
-def _expand_root_candidates_stepwise(
-    *,
-    extend: Callable[[Any, str], Any],
-    root_handle: Any,
-    board: chess.Board,
-    cozy_root: "cc.Board",
-    root_hash_seed: tuple[int, ...],
-    legal_moves: list[chess.Move],
-    legal_log_priors: list[float],
-    top_k: int,
-) -> Generator[EvalRequest, list[PositionEval], tuple[list[_RootCandidate], Optional[int]]]:
-    """Build the top-k prior root candidates and batch-evaluate their boards.
-
-    Stepwise generator core shared by select_value_rerank and
-    select_value_search_d2 (via `yield from`). Returns (candidates,
-    mate_index) as its StopIteration.value. When a candidate move delivers
-    checkmate no other move can score higher: mate_index is set, no eval
-    request is made, and the partially built candidates list must be
-    ignored. Terminal boards never appear as training tokens, so they carry
-    the exact game result instead of going through the value head.
-    """
-    candidates: list[_RootCandidate] = []
-    batch: list[tuple[Any, "cc.Board"]] = []
-    batch_to_candidate: list[int] = []
-    for local_idx in _prior_order(legal_log_priors)[: min(top_k, len(legal_moves))]:
-        move = legal_moves[local_idx]
-        cozy_move = cozy_bridge.py_move_to_cozy(board, move)
-        # One ply past the root: side to move at cozy1 is the opponent, so
-        # root-POV color is never the side to move here (color_is_stm=False).
-        cozy1, hash_history1, terminal_value = cc.push_and_classify(
-            cozy_root, cozy_move, root_hash_seed, False
-        )
-        if terminal_value is not None and terminal_value >= 1.0:
-            return candidates, local_idx
-        candidate = _RootCandidate(
-            local_idx=local_idx,
-            move=move,
-            cozy1=cozy1,
-            hash_history1=hash_history1,
-            log_prior=float(legal_log_priors[local_idx]),
-            terminal_value=terminal_value,
-        )
-        candidates.append(candidate)
-        if terminal_value is not None:
-            continue
-        candidate.handle1 = extend(root_handle, move.uci())
-        batch.append((candidate.handle1, cozy1))
-        batch_to_candidate.append(len(candidates) - 1)
-
-    if batch:
-        position_evals = yield EvalRequest(batch=batch)
-        for cand_idx, position_eval in zip(batch_to_candidate, position_evals):
-            candidates[cand_idx].board1_eval = position_eval
-    return candidates, None
-
-
-def _rerank_stepwise(
-    *,
-    extend: Callable[[Any, str], Any],
-    root_handle: Any,
-    board: chess.Board,
-    legal_moves: list[chess.Move],
-    legal_log_priors: list[float],
-    top_k: int,
-    lam: float,
-) -> Generator[EvalRequest, list[PositionEval], tuple[int, list[dict[str, Any]]]]:
-    root_cozy = cozy_bridge.board_to_cozy(board)
-    candidates, mate_index = yield from _expand_root_candidates_stepwise(
-        extend=extend,
-        root_handle=root_handle,
-        board=board,
-        cozy_root=root_cozy,
-        root_hash_seed=_root_hash_seed(board),
-        legal_moves=legal_moves,
-        legal_log_priors=legal_log_priors,
-        top_k=top_k,
-    )
-    if mate_index is not None:
-        return mate_index, [
-            {
-                "move_uci": legal_moves[mate_index].uci(),
-                "policy_logit": float(legal_log_priors[mate_index]),
-                "policy_log_prob": float(legal_log_priors[mate_index]),
-                "value_next": 1.0,
-                "terminal": True,
-                "rerank_score": 1.0,
-            }
-        ]
-
-    chosen_index = candidates[0].local_idx
-    best_score = float("-inf")
-    rerank_rows: list[dict[str, Any]] = []
-    for candidate in candidates:
-        if candidate.terminal_value is not None:
-            value_root = float(candidate.terminal_value)
-        else:
-            # Side-to-move at board1 is the opponent; negate to root POV.
-            value_root = -float(candidate.board1_eval.value_stm)
-        # Value-dominant score with a small log-prob policy prior as tiebreak.
-        rerank_score = value_root + (lam * candidate.log_prior)
-        rerank_rows.append(
-            {
-                "move_uci": candidate.move.uci(),
-                "policy_logit": candidate.log_prior,
-                "policy_log_prob": candidate.log_prior,
-                "value_next": value_root,
-                "terminal": candidate.terminal_value is not None,
-                "rerank_score": rerank_score,
-            }
-        )
-        if rerank_score > best_score:
-            best_score = rerank_score
-            chosen_index = candidate.local_idx
-
-    return chosen_index, rerank_rows
-
-
-def select_value_rerank(
-    *,
-    evaluator: PositionEvaluator,
-    root_handle: Any,
-    board: chess.Board,
-    legal_moves: list[chess.Move],
-    legal_log_priors: list[float],
-    top_k: int,
-    lam: float,
-) -> tuple[int, list[dict[str, Any]]]:
-    return _drive(
-        _rerank_stepwise(
-            extend=evaluator.extend,
-            root_handle=root_handle,
-            board=board,
-            legal_moves=legal_moves,
-            legal_log_priors=legal_log_priors,
-            top_k=top_k,
-            lam=lam,
-        ),
-        evaluator,
-    )
-
-
-def _d2_stepwise(
-    *,
-    extend: Callable[[Any, str], Any],
-    root_handle: Any,
-    board: chess.Board,
-    legal_moves: list[chess.Move],
-    legal_log_priors: list[float],
-    top_k: int,
-    lam: float,
-) -> Generator[EvalRequest, list[PositionEval], tuple[int, list[dict[str, Any]]]]:
-    root_cozy = cozy_bridge.board_to_cozy(board)
-    candidates, mate_index = yield from _expand_root_candidates_stepwise(
-        extend=extend,
-        root_handle=root_handle,
-        board=board,
-        cozy_root=root_cozy,
-        root_hash_seed=_root_hash_seed(board),
-        legal_moves=legal_moves,
-        legal_log_priors=legal_log_priors,
-        top_k=top_k,
-    )
-    if mate_index is not None:
-        return mate_index, [
-            {
-                "move_uci": legal_moves[mate_index].uci(),
-                "policy_logit": float(legal_log_priors[mate_index]),
-                "policy_log_prob": float(legal_log_priors[mate_index]),
-                "worst_reply_value": 1.0,
-                "best_reply_uci": None,
-                "search_score": 1.0,
-            }
-        ]
-
-    board2_batch: list[tuple[Any, "cc.Board"]] = []
-    board2_meta: list[tuple[_RootCandidate, int]] = []
-    for candidate in candidates:
-        if candidate.terminal_value is not None or candidate.board1_eval is None:
-            continue
-        board1_eval = candidate.board1_eval
-        if not board1_eval.legal_moves:
-            candidate.worst_reply_value = -float(board1_eval.value_stm)
-            continue
-
-        opp_indices = _prior_order(board1_eval.legal_log_priors)[
-            : min(top_k, len(board1_eval.legal_moves))
-        ]
-        # Always consider forcing replies (captures/checks/promotions): the
-        # tactical refutation is often a low-probability move under a
-        # human-imitation policy, so policy top-k alone misses it.
-        opp_seen = set(opp_indices)
-        opp_forcing = {
-            idx for idx, flag in enumerate(board1_eval.legal_forcing) if flag
-        }
-        for opp_idx in range(len(board1_eval.legal_moves)):
-            if opp_idx in opp_seen:
-                continue
-            if opp_idx in opp_forcing:
-                opp_indices.append(opp_idx)
-                opp_seen.add(opp_idx)
-
-        for opp_local_idx in opp_indices:
-            opp_uci = board1_eval.legal_ucis[opp_local_idx]
-            opp_move_cozy = board1_eval.legal_moves[opp_local_idx]
-            # Two plies past the root: side to move at cozy2 is root_color
-            # again, so root-POV color IS the side to move (color_is_stm=True).
-            cozy2, hash_history2, terminal_value = cc.push_and_classify(
-                candidate.cozy1, opp_move_cozy, candidate.hash_history1, True
-            )
-            candidate.reply_candidates.append(
-                {
-                    "move_uci": opp_uci,
-                    "opp_policy_logit": float(
-                        board1_eval.legal_log_priors[opp_local_idx]
-                    ),
-                    "value_after_reply": terminal_value,
-                    "terminal": terminal_value is not None,
-                }
-            )
-            if terminal_value is not None:
-                continue
-            board2_batch.append(
-                (
-                    extend(
-                        candidate.handle1,
-                        opp_uci,
-                        board1_eval.legal_ids[opp_local_idx],
-                    ),
-                    cozy2,
-                )
-            )
-            board2_meta.append((candidate, len(candidate.reply_candidates) - 1))
-
-    if board2_batch:
-        board2_evals = yield EvalRequest(batch=board2_batch)
-        for (candidate, reply_idx), position_eval in zip(
-            board2_meta, board2_evals
-        ):
-            # Side-to-move at board2 is the root color again: POV matches root.
-            candidate.reply_candidates[reply_idx]["value_after_reply"] = float(
-                position_eval.value_stm
-            )
-
-    chosen_index = candidates[0].local_idx
-    best_score = float("-inf")
-    search_rows: list[dict[str, Any]] = []
-    for candidate in candidates:
-        if candidate.terminal_value is not None:
-            worst_reply_value = float(candidate.terminal_value)
-            best_reply_uci = None
-        elif candidate.worst_reply_value is not None:
-            worst_reply_value = float(candidate.worst_reply_value)
-            best_reply_uci = None
-        else:
-            evaluated_replies = [
-                row
-                for row in candidate.reply_candidates
-                if row.get("value_after_reply") is not None
-            ]
-            if not evaluated_replies:
-                worst_reply_value = (
-                    -float(candidate.board1_eval.value_stm)
-                    if candidate.board1_eval is not None
-                    else 0.0
-                )
-                best_reply_uci = None
-            else:
-                best_reply = min(
-                    evaluated_replies, key=lambda row: float(row["value_after_reply"])
-                )
-                worst_reply_value = float(best_reply["value_after_reply"])
-                best_reply_uci = str(best_reply["move_uci"])
-
-        # Value-dominant score with a small log-prob policy prior as tiebreak.
-        search_score = worst_reply_value + (lam * candidate.log_prior)
-        search_rows.append(
-            {
-                "move_uci": candidate.move.uci(),
-                "policy_logit": candidate.log_prior,
-                "policy_log_prob": candidate.log_prior,
-                "worst_reply_value": worst_reply_value,
-                "best_reply_uci": best_reply_uci,
-                "search_score": search_score,
-            }
-        )
-        if search_score > best_score:
-            best_score = search_score
-            chosen_index = candidate.local_idx
-
-    return chosen_index, search_rows
-
-
-def select_value_search_d2(
-    *,
-    evaluator: PositionEvaluator,
-    root_handle: Any,
-    board: chess.Board,
-    legal_moves: list[chess.Move],
-    legal_log_priors: list[float],
-    top_k: int,
-    lam: float,
-) -> tuple[int, list[dict[str, Any]]]:
-    return _drive(
-        _d2_stepwise(
-            extend=evaluator.extend,
-            root_handle=root_handle,
-            board=board,
-            legal_moves=legal_moves,
-            legal_log_priors=legal_log_priors,
-            top_k=top_k,
-            lam=lam,
-        ),
-        evaluator,
-    )
-
-
-@dataclass
 class _TreeNode:
     cozy_board: "cc.Board"
-    hash_history: list[int]  # repetition_hash history per the push_and_classify contract
+    hash_history: list[
+        int
+    ]  # repetition_hash history per the push_and_classify contract
     handle: Any
     depth: int  # plies below the arm root (arm root = 0)
     path_log_prior: float
@@ -651,7 +320,10 @@ def _push_children(
     quiescence = config.quiescence_plies > 0 and node.depth >= config.max_depth
     # Set this even at the hard cap and when there are no tactical children.
     node.stand_pat = quiescence and not node.in_check
-    if node.depth >= config.max_depth + config.quiescence_plies or not position_eval.legal_moves:
+    if (
+        node.depth >= config.max_depth + config.quiescence_plies
+        or not position_eval.legal_moves
+    ):
         return
     node_stm_is_white = node.cozy_board.side_to_move() == cc.Color.White
     opponent_to_move = node_stm_is_white != root_color
@@ -660,16 +332,17 @@ def _push_children(
         # Evasions may be quiet; outside check only captures/promotions extend.
         forcing = set()
         picks = [
-            idx for idx in order
+            idx
+            for idx in order
             if node.in_check
             or position_eval.legal_moves[idx].promotion is not None
-            or cozy_bridge.is_capture_cozy(node.cozy_board, position_eval.legal_moves[idx])
+            or cozy_bridge.is_capture_cozy(
+                node.cozy_board, position_eval.legal_moves[idx]
+            )
         ]
         coverage_added = set()
     elif opponent_to_move:
-        forcing = {
-            idx for idx, flag in enumerate(position_eval.legal_forcing) if flag
-        }
+        forcing = {idx for idx, flag in enumerate(position_eval.legal_forcing) if flag}
         # Refutation floor: top-r replies by prior plus ALL forcing replies.
         picks = list(order[: config.refutation_top_r])
         seen = set(picks)
@@ -684,9 +357,12 @@ def _push_children(
     if not quiescence:
         legacy_picks = set(picks)
         if config.tactical_coverage:
-            forcing = {idx for idx, flag in enumerate(position_eval.legal_forcing) if flag}
+            forcing = {
+                idx for idx, flag in enumerate(position_eval.legal_forcing) if flag
+            }
             picks.extend(
-                idx for idx in range(len(position_eval.legal_moves))
+                idx
+                for idx in range(len(position_eval.legal_moves))
                 if idx not in legacy_picks and (node.in_check or idx in forcing)
             )
         coverage_added = set(picks) - legacy_picks
@@ -747,13 +423,22 @@ def summarize_search_rows(rows: list[dict[str, Any]]) -> dict[str, int]:
 
 def _arm_search_stats(arm: _Arm, config: HalvingConfig) -> dict[str, int]:
     """Measure the final tree once, including eliminated arms and unscored children."""
-    stats = dict.fromkeys((
-        "evals_spent", "quiescence_evals", "horizon_evals",
-        "coverage_added_generated", "coverage_added_evaluated",
-        "check_evasions_generated", "check_evasions_evaluated",
-        "max_depth", "max_quiescence_depth",
-        "unresolved_in_check_depth", "unresolved_in_check_other",
-    ), 0)
+    stats = dict.fromkeys(
+        (
+            "evals_spent",
+            "quiescence_evals",
+            "horizon_evals",
+            "coverage_added_generated",
+            "coverage_added_evaluated",
+            "check_evasions_generated",
+            "check_evasions_evaluated",
+            "max_depth",
+            "max_quiescence_depth",
+            "unresolved_in_check_depth",
+            "unresolved_in_check_other",
+        ),
+        0,
+    )
     # Terminal root candidates have no _TreeNode but were still generated.
     if arm.root_node is None:
         stats["coverage_added_generated"] = int(arm.root_coverage_added)
@@ -775,10 +460,20 @@ def _arm_search_stats(arm: _Arm, config: HalvingConfig) -> dict[str, int]:
             stats["max_quiescence_depth"] = max(
                 stats["max_quiescence_depth"], node.depth - config.max_depth
             )
-        if node.terminal_value_stm is None and not any(child.scored for child in node.children):
-            in_check = node.in_check if node.in_check is not None else bool(node.cozy_board.checkers())
+        if node.terminal_value_stm is None and not any(
+            child.scored for child in node.children
+        ):
+            in_check = (
+                node.in_check
+                if node.in_check is not None
+                else bool(node.cozy_board.checkers())
+            )
             if in_check:
-                cutoff = "depth" if node.depth >= config.max_depth + config.quiescence_plies else "other"
+                cutoff = (
+                    "depth"
+                    if node.depth >= config.max_depth + config.quiescence_plies
+                    else "other"
+                )
                 stats[f"unresolved_in_check_{cutoff}"] += 1
     return stats
 
@@ -807,7 +502,9 @@ def _halving_stepwise(
     root_cozy = cozy_bridge.board_to_cozy(board)
     root_hash_seed = _root_hash_seed(board)
     if config.gumbel_root_sampling:
-        order = _gumbel_top_k_order(legal_log_priors, rng=rng if rng is not None else random.Random())
+        order = _gumbel_top_k_order(
+            legal_log_priors, rng=rng if rng is not None else random.Random()
+        )
     else:
         order = _prior_order(legal_log_priors)
     picks = list(order[: min(config.top_m, len(order))])
@@ -906,7 +603,9 @@ def _halving_stepwise(
                     remaining[id(arm)] -= 1
             if not wave:
                 break
-            evals = yield EvalRequest(batch=[(node.handle, node.cozy_board) for _, node in wave])
+            evals = yield EvalRequest(
+                batch=[(node.handle, node.cozy_board) for _, node in wave]
+            )
             spent += len(wave)
             for (arm, node), position_eval in zip(wave, evals):
                 node.value_stm = float(position_eval.value_stm)

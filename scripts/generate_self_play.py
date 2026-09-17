@@ -19,29 +19,12 @@ def main():
     parser.add_argument("--games", type=int, default=32)
     parser.add_argument("--seconds", type=float, default=3600)
     parser.add_argument("--device", default="cuda")
-    parser.add_argument(
-        "--decoder-mode",
-        choices=["current", "compiled"],
-        default=None,
-        help="Default: compiled on CUDA, current (eager) on CPU",
-    )
     args = parser.parse_args()
-    if args.decoder_mode == "compiled" and args.device.split(":")[0] != "cuda":
-        parser.error("compiled decoding requires --device cuda")
     if args.games < 1 or args.seconds <= 0:
         parser.error("games and seconds must be positive")
     cfg = load_config(args.config)
     with run_lock(args.output), StopBudget(seconds=args.seconds) as stop:
-        runtime, positions = load_runtime(
-            cfg,
-            args.checkpoint,
-            args.device,
-            **(
-                {"decoder_mode": args.decoder_mode}
-                if args.decoder_mode is not None
-                else {}
-            ),
-        )
+        runtime, positions = load_runtime(cfg, args.checkpoint, args.device)
         store = SelfPlayStore(args.output / "replay", **asdict(cfg.replay))
         metrics = collect(
             seeds=load_seeds(args.seeds),

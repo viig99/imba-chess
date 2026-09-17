@@ -1,4 +1,4 @@
-"""Whole-neural-decoder compilation and an experimental reusable SDPA workspace.
+"""Compiled neural decoder with an executor-owned workspace.
 
 The workspace belongs to one executor/model, never to a search node. Returned
 K/V are fresh projections, not views into mutable workspace storage.
@@ -6,17 +6,15 @@ K/V are fresh projections, not views into mutable workspace storage.
 
 import torch
 import torch.nn.functional as F
-
-from .hstu_attention import GroupedDecodeCache, _batch_bias, _one_query_attention
+from .hstu_attention import GroupedDecodeCache, _one_query_attention
 
 
 class TensorDecoder(torch.nn.Module):
     """A single tensor graph from board features through logits and new K/V."""
 
-    def __init__(self, model, sdpa=False):
+    def __init__(self, model):
         super().__init__()
         self.model = model
-        self.sdpa = sdpa
 
     def forward(
         self,
@@ -54,37 +52,17 @@ class TensorDecoder(torch.nn.Module):
             k = layer._reshape_uvqk_for_mm(k, layer._num_heads, layer._attention_dim)
             v = layer._reshape_uvqk_for_mm(v, layer._num_heads, layer._linear_dim)
             self_bias = layer._ps_w[:, layer._max_seq_len - 1].view(1, -1, 1, 1)
-            if self.sdpa:
-                wk, wv = workspace[index]
-                wk[:, :, -1:] = k
-                wv[:, :, -1:] = v
-                bias = torch.cat(
-                    [
-                        _batch_bias(layer._ps_w, prefix_rel).masked_fill(
-                            prefix_fill, -torch.inf
-                        ),
-                        _batch_bias(layer._ps_w, suffix_rel).masked_fill(
-                            suffix_fill, -torch.inf
-                        ),
-                        self_bias.expand(x.size(0), -1, -1, -1),
-                    ],
-                    dim=-1,
-                )
-                attn = F.scaled_dot_product_attention(
-                    q, wk, wv, attn_mask=bias, dropout_p=0.0, is_causal=False
-                )
-            else:
-                attn = _one_query_attention(
-                    q,
-                    *prefix[index],
-                    k,
-                    v,
-                    *suffix[index],
-                    cache,
-                    layer._ps_w,
-                    self_bias,
-                    layer._attention_dim**-0.5,
-                )
+            attn = _one_query_attention(
+                q,
+                *prefix[index],
+                k,
+                v,
+                *suffix[index],
+                cache,
+                layer._ps_w,
+                self_bias,
+                layer._attention_dim ** (-0.5),
+            )
             attn = layer._norm_attn_output(
                 attn.permute(0, 2, 1, 3).reshape(
                     x.size(0), 1, layer._num_heads * layer._linear_dim
@@ -107,19 +85,13 @@ class DecoderRunner:
     persistent-slot/paged cache. Memory and retained owners are bounded to one wave.
     """
 
-    def __init__(self, model, mode, suffix_capacity=32):
+    def __init__(self, model, suffix_capacity=32):
         if model.training:
             raise ValueError("tensor decoder requires an evaluation-mode model")
-        if mode not in ("tensor", "compiled", "sdpa", "compiled-sdpa"):
-            raise ValueError("unknown tensor decoder mode")
         self.model = model
-        self.sdpa = "sdpa" in mode
         self.suffix_capacity = suffix_capacity
-        decoder = TensorDecoder(model, self.sdpa).eval()
-        self.decode = (
-            torch.compile(decoder, fullgraph=True, dynamic=True)
-            if mode.startswith("compiled")
-            else decoder
+        self.decode = torch.compile(
+            TensorDecoder(model).eval(), fullgraph=True, dynamic=True
         )
         self.clear()
 
@@ -134,7 +106,7 @@ class DecoderRunner:
             raise ValueError("tensor decoder requires one query per game")
         p = merged.prefix_kv_grouped[0][0].size(2)
         lengths = merged.prefix_lens_list
-        if any(n < 0 or n > p for n in lengths):
+        if any((n < 0 or n > p for n in lengths)):
             raise ValueError("invalid prefix lengths")
         s = 0 if merged.suffix_positions is None else merged.suffix_positions.size(1)
         capacity = self.suffix_capacity
@@ -180,28 +152,6 @@ class DecoderRunner:
             sm[:, :s] = merged.suffix_mask.to(device, non_blocking=True)
         suffix_rel = (sp - q + max_pos - 1).clamp(0, 2 * max_pos - 2)
         suffix_fill = ~sm[:, None, None, :]
-        if self.sdpa:
-            if workspace is not None:
-                # The executor packed roots directly into this allocation.
-                # Prefix views and the mutable branch share storage, but never
-                # overlap. No second prefix copy is needed here.
-                self.workspace = workspace
-                self.prefix_owner = merged.prefix_kv_grouped
-            elif self.prefix_owner is not merged.prefix_kv_grouped:
-                self.workspace = [
-                    (
-                        k.new_zeros((*k.shape[:2], p + capacity + 1, k.size(-1))),
-                        v.new_zeros((*v.shape[:2], p + capacity + 1, v.size(-1))),
-                    )
-                    for k, v in merged.prefix_kv_grouped
-                ]
-                for (wk, wv), (k, v) in zip(self.workspace, merged.prefix_kv_grouped):
-                    wk[:, :, :p].copy_(k)
-                    wv[:, :, :p].copy_(v)
-                self.prefix_owner = merged.prefix_kv_grouped
-            for (wk, wv), (sk, sv) in zip(self.workspace, suffix):
-                wk[:, :, p:-1].copy_(sk)
-                wv[:, :, p:-1].copy_(sv)
         return self.decode(
             batch,
             positions,
@@ -211,5 +161,5 @@ class DecoderRunner:
             prefix_fill,
             suffix_rel,
             suffix_fill,
-            self.workspace if self.sdpa else (),
+            (),
         )

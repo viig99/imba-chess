@@ -1,55 +1,27 @@
-#!/usr/bin/env python3
 from __future__ import annotations
-
+from imba_chess.eval.inference_runtime import load_runtime
+from imba_chess.eval.gumbel_search import GumbelConfig
 import argparse
 import json
-import multiprocessing
 import os
 import random
-import sys
 import time
-from dataclasses import asdict, dataclass, field
-from multiprocessing import connection as mp_connection
+from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Callable, Generator, Iterator
-
+from typing import Any, Generator, Iterator
 import chess
 import chess.engine
 import chess.pgn
 import torch
-
 from imba_chess.config import DEFAULT_CONFIG_PATH, load_repo_config
 from imba_chess.data.board_state import BoardStateEncoder
-from imba_chess.data.move_vocab import MoveVocab, load_or_create_static_move_vocab
+from imba_chess.data.move_vocab import MoveVocab
 from imba_chess.eval import search
-from imba_chess.eval.actor_protocol import (
-    GameDone,
-    RootEvalRequest,
-    WaveRequest,
-    WorkerFinished,
-)
-from imba_chess.eval.actor_server import ActorInferenceServer
-from imba_chess.eval.actor_worker import run_eval_worker
 from imba_chess.eval.batch_scheduler import BatchScheduler, WorkRequest
 from imba_chess.eval.engine_pool import EnginePool, make_sf_move_executor
 from imba_chess.eval.game_animation import render_game_html
-from imba_chess.eval.merged_executors import (
-    _make_decode_wave_executor,
-    _make_root_eval_executor,
-)
-from imba_chess.eval.position_evaluator import (
-    CachedPositionEvaluator,
-    _SequenceHistory,
-    _forward_model,
-    _project_legal_logits,
-    load_hstu_checkpoint,
-)
-from imba_chess.eval.search import (
-    EvalRequest,
-    HalvingConfig,
-    PositionEval,
-    select_greedy,
-)
+from imba_chess.eval.position_evaluator import _SequenceHistory
+from imba_chess.eval.search import HalvingConfig
 from tqdm.auto import tqdm
 
 
@@ -106,6 +78,7 @@ class SegmentSpec:
 
 _ACTOR_PROFILE = os.environ.get("IMBA_ACTOR_PROFILE") == "1"
 
+
 def _parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Evaluate a trained imba-chess model against Stockfish via UCI."
@@ -115,10 +88,7 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--games", type=int, default=None)
     parser.add_argument("--max-plies", type=int, default=None)
     parser.add_argument("--seed", type=int, default=None)
-
-    parser.add_argument(
-        "--stockfish-path", type=Path, default=None
-    )
+    parser.add_argument("--stockfish-path", type=Path, default=None)
     parser.add_argument("--stockfish-time-sec", type=float, default=None)
     parser.add_argument("--stockfish-nodes", type=int, default=None)
     parser.add_argument("--stockfish-depth", type=int, default=None)
@@ -134,10 +104,7 @@ def _parse_args() -> argparse.Namespace:
         "--ladder-elos",
         type=str,
         default=None,
-        help=(
-            "Comma-separated Elo ladder for segmented eval, e.g. "
-            "'1600,1800,2000,2200,2400,2600,2800'."
-        ),
+        help="Comma-separated Elo ladder for segmented eval, e.g. '1600,1800,2000,2200,2400,2600,2800'.",
     )
     parser.add_argument(
         "--ladder-games-per-segment",
@@ -151,53 +118,41 @@ def _parse_args() -> argparse.Namespace:
         default=None,
         help="In ladder mode, also run one full-strength Stockfish segment.",
     )
-
-    parser.add_argument(
-        "--device",
-        choices=["auto", "cpu", "cuda"],
-        default=None,
-    )
-    parser.add_argument(
-        "--dtype",
-        choices=["float32", "bfloat16", "float16"],
-        default=None,
-    )
-    parser.add_argument(
-        "--compile",
-        action=argparse.BooleanOptionalAction,
-        default=None,
-    )
+    parser.add_argument("--device", choices=["auto", "cpu", "cuda"], default=None)
     parser.add_argument(
         "--model-move-policy",
-        choices=["greedy", "value_rerank", "value_search_d2", "value_search_halving"],
+        choices=["gumbel", "value_search_halving"],
         default=None,
         help="Model move selection on legal moves.",
     )
     parser.add_argument(
-        "--value-rerank-top-k",
-        type=int,
-        default=None,
-        help="Top-k policy legal moves to evaluate with value_rerank.",
-    )
-    parser.add_argument(
-        "--value-rerank-lambda",
+        "--search-lambda",
         type=float,
         default=None,
-        help="Weight for value_rerank score adjustment.",
+        help="Weight for halving search value adjustment.",
     )
+    parser.add_argument("--gumbel-simulations", type=int, default=None)
     parser.add_argument("--search-budget", type=int, default=None)
     parser.add_argument("--search-top-m", type=int, default=None)
     parser.add_argument("--halving-rounds", type=int, default=None)
     parser.add_argument("--search-refutation-top-r", type=int, default=None)
     parser.add_argument("--search-expand-top", type=int, default=None)
-    parser.add_argument("--search-max-depth", type=int, default=None,
-                        help="Halving search depth, counting plies below a candidate root move.")
     parser.add_argument(
-        "--search-tactical-coverage", action=argparse.BooleanOptionalAction, default=None,
+        "--search-max-depth",
+        type=int,
+        default=None,
+        help="Halving search depth, counting plies below a candidate root move.",
+    )
+    parser.add_argument(
+        "--search-tactical-coverage",
+        action=argparse.BooleanOptionalAction,
+        default=None,
         help="Include forcing moves on both sides and all legal check evasions in halving search.",
     )
     parser.add_argument(
-        "--search-quiescence-plies", type=int, default=None,
+        "--search-quiescence-plies",
+        type=int,
+        default=None,
         help="Extra capture/promotion/evasion plies within the existing halving budget (default 0).",
     )
     parser.add_argument(
@@ -241,20 +196,7 @@ def _parse_args() -> argparse.Namespace:
         "--concurrent-games",
         type=int,
         default=None,
-        help="Run this many games concurrently per segment. Default 1: the "
-        "in-process, byte-deterministic scheduler driver (a single game at "
-        "a time, batch size 1 -- the reference/gate path). Values > 1 route "
-        "to actor mode instead: this many torch-free worker PROCESSES are "
-        "spawned (multiprocessing spawn), each playing its own share of "
-        "games with its own Stockfish engine, served by an in-process GPU "
-        "inference server that merges their model-turn requests -- NOT "
-        "byte-deterministic across runs (accepted; see the multiprocess "
-        "eval actors design spec). --debug-trace-games/--save-games are not "
-        "supported at concurrent_games > 1. At concurrent_games > 1, "
-        "--model-move-policy value_rerank/value_search_d2/"
-        "value_search_halving require a checkpoint with a value head "
-        "(same as at concurrent_games=1) and fail fast at startup "
-        "otherwise; greedy does not.",
+        help="Concurrent games; preserve algorithm-specific workload settings.",
     )
     return parser.parse_args()
 
@@ -263,14 +205,6 @@ def _resolve_device(device_arg: str) -> torch.device:
     if device_arg == "auto":
         return torch.device("cuda" if torch.cuda.is_available() else "cpu")
     return torch.device(device_arg)
-
-
-def _resolve_dtype(dtype_arg: str) -> torch.dtype:
-    return {
-        "float32": torch.float32,
-        "bfloat16": torch.bfloat16,
-        "float16": torch.float16,
-    }[dtype_arg]
 
 
 def _build_engine_limit(args: argparse.Namespace) -> chess.engine.Limit:
@@ -295,219 +229,66 @@ def _parse_ladder_elos(raw: str) -> list[int]:
         values.append(int(stripped))
     if not values:
         raise ValueError("--ladder-elos must contain at least one Elo value")
-    if any(v < 100 for v in values):
+    if any((v < 100 for v in values)):
         raise ValueError("Elo values in --ladder-elos must be >= 100")
     return values
 
 
-def _select_model_move(
-    *,
-    model: torch.nn.Module,
-    batch: dict[str, Any],
-    board: chess.Board,
-    move_vocab: MoveVocab,
-    board_state_encoder: BoardStateEncoder,
-    device: torch.device,
-    dtype: torch.dtype,
-    policy: str,
-    value_rerank_top_k: int,
-    value_rerank_lambda: float,
-    debug_topk: int = 0,
-    halving_config: HalvingConfig | None = None,
-) -> tuple[chess.Move, dict[str, Any]]:
-    """Run the shared selection controller with synchronous inference.
-
-    The scheduler uses the same controller but merges requests across games.
-    Greedy synchronous roots still omit KV caches.
-    """
+def _select_model_move(*, runtime, batch, board, config):
     gen = _select_model_move_stepwise(
-        model=model,
-        batch=batch,
-        board=board,
-        move_vocab=move_vocab,
-        board_state_encoder=board_state_encoder,
-        device=device,
-        dtype=dtype,
-        policy=policy,
-        value_rerank_top_k=value_rerank_top_k,
-        value_rerank_lambda=value_rerank_lambda,
-        debug_topk=debug_topk,
-        halving_config=halving_config,
+        runtime=runtime, batch=batch, board=board, config=config
     )
     try:
         request = next(gen)
         while True:
-            if request.kind == "root_eval":
-                response = _forward_model(
-                    model=model,
-                    batch=request.payload,
-                    device=device,
-                    dtype=dtype,
-                    return_kv=policy != "greedy",
-                )
-            elif request.kind == "decode_wave":
-                evaluator, wave = request.payload
-                response = evaluator.evaluate(wave)
-            else:
-                raise RuntimeError(f"Unexpected selection request: {request.kind}")
-            request = gen.send(response)
+            request = gen.send(runtime.executors[request.kind]([request.payload])[0])
     except StopIteration as stop:
         return stop.value
     finally:
         gen.close()
 
 
-def _drive_stepwise_as_decode_waves(
-    gen: Generator[EvalRequest, list[PositionEval], Any],
-    evaluator: CachedPositionEvaluator,
-) -> Generator[WorkRequest, Any, Any]:
-    """Pump a `*_stepwise` search generator to completion, forwarding every
-    `EvalRequest` it yields as `WorkRequest("decode_wave", (evaluator,
-    batch))` for the batch scheduler to answer.
+def _select_model_move_stepwise(*, runtime, batch, board, config, debug_topk=0):
+    topk = []
 
-    `search._rerank_stepwise` / `search._d2_stepwise` / `search.
-    _halving_stepwise` all share this same `EvalRequest` yield contract (via
-    `search._expand_root_candidates_stepwise`), so one driver here handles
-    all three policies. The shared merged executors answer these requests.
-    """
-    try:
-        request = next(gen)
-        while True:
-            position_evals = yield WorkRequest("decode_wave", (evaluator, request.batch))
-            request = gen.send(position_evals)
-    except StopIteration as stop:
-        return stop.value
+    def observe(moves, logits):
+        values, indices = torch.topk(logits, min(debug_topk, len(moves)))
+        topk.extend(
+            dict(move_uci=moves[index].uci(), logit=value)
+            for value, index in zip(values.tolist(), indices.tolist())
+        )
 
-
-def _select_model_move_stepwise(
-    *,
-    model: torch.nn.Module,
-    batch: dict[str, Any],
-    board: chess.Board,
-    move_vocab: MoveVocab,
-    board_state_encoder: BoardStateEncoder,
-    device: torch.device,
-    dtype: torch.dtype,
-    policy: str,
-    value_rerank_top_k: int,
-    value_rerank_lambda: float,
-    debug_topk: int = 0,
-    halving_config: HalvingConfig | None = None,
-) -> Generator[WorkRequest, Any, tuple[chess.Move, dict[str, Any]]]:
-    """Shared move selection, yielding root and leaf inference requests.
-
-    Direct callers answer requests synchronously; the batch scheduler merges
-    them across games. Legal projection, search dispatch, validation and debug
-    reporting therefore follow one implementation for both execution routes.
-    """
-    output = yield WorkRequest("root_eval", batch)
-
-    logits = output["logits"][-1]
-    legal_logits, legal_moves_with_ids, total_legal, mapped_legal = _project_legal_logits(
-        logits=logits,
+    result = yield from runtime.search_batch(
         board=board,
-        move_vocab=move_vocab,
+        batch=batch,
+        owner=(id(runtime), id(batch)),
+        config=config,
+        noise=0.0 if runtime.algorithm == "gumbel" else None,
+        root_observer=observe if debug_topk else None,
     )
-    legal_log_priors = torch.log_softmax(legal_logits.float(), dim=0).tolist()
-    evaluator: CachedPositionEvaluator | None = None
-    if policy != "greedy":
-        evaluator = CachedPositionEvaluator(
-            model=model,
-            move_vocab=move_vocab,
-            board_state_encoder=board_state_encoder,
-            device=device,
-            dtype=dtype,
-            prefix_kv=output["kv_caches"],
-            prefix_len=int(batch["total_tokens"]),
-        )
-    rerank_rows: list[dict[str, Any]] = []
-    search_rows: list[dict[str, Any]] = []
-    halving_rows: list[dict[str, Any]] = []
-    if policy == "greedy":
-        chosen_index = select_greedy(legal_log_priors)
-    elif policy == "value_rerank":
-        if output.get("value_logits") is None:
-            raise RuntimeError(
-                "model_move_policy=value_rerank requires a checkpoint with value head enabled."
-            )
-        chosen_index, rerank_rows = yield from _drive_stepwise_as_decode_waves(
-            search._rerank_stepwise(
-                extend=evaluator.extend,
-                root_handle=None,
-                board=board,
-                legal_moves=legal_moves_with_ids,
-                legal_log_priors=legal_log_priors,
-                top_k=value_rerank_top_k,
-                lam=value_rerank_lambda,
-            ),
-            evaluator,
-        )
-    elif policy == "value_search_d2":
-        if output.get("value_logits") is None:
-            raise RuntimeError(
-                "model_move_policy=value_search_d2 requires a checkpoint with value head enabled."
-            )
-        chosen_index, search_rows = yield from _drive_stepwise_as_decode_waves(
-            search._d2_stepwise(
-                extend=evaluator.extend,
-                root_handle=None,
-                board=board,
-                legal_moves=legal_moves_with_ids,
-                legal_log_priors=legal_log_priors,
-                top_k=value_rerank_top_k,
-                lam=value_rerank_lambda,
-            ),
-            evaluator,
-        )
-    elif policy == "value_search_halving":
-        if output.get("value_logits") is None:
-            raise RuntimeError(
-                "model_move_policy=value_search_halving requires a checkpoint with value head enabled."
-            )
-        if halving_config is None:
-            raise ValueError("policy=value_search_halving requires halving_config")
-        chosen_index, halving_rows = yield from _drive_stepwise_as_decode_waves(
-            search._halving_stepwise(
-                extend=evaluator.extend,
-                root_handle=None,
-                board=board,
-                legal_moves=legal_moves_with_ids,
-                legal_log_priors=legal_log_priors,
-                config=halving_config,
-            ),
-            evaluator,
+    legal = board.legal_moves.count()
+    debug = dict(
+        total_legal_moves=legal,
+        mapped_legal_moves=legal,
+        coverage=1.0,
+        policy=runtime.algorithm,
+    )
+    if topk:
+        debug["topk_legal"] = topk
+    if runtime.algorithm == "value_search_halving":
+        debug.update(
+            search_budget=config.budget,
+            value_search_halving_candidates=result.candidates,
+            search_stats=search.summarize_search_rows(result.candidates),
         )
     else:
-        raise ValueError(f"Unknown model move policy: {policy}")
-    debug: dict[str, Any] = {
-        "total_legal_moves": total_legal,
-        "mapped_legal_moves": mapped_legal,
-        "coverage": (mapped_legal / total_legal) if total_legal > 0 else float("nan"),
-        "policy": policy,
-    }
-    if policy == "value_rerank":
-        debug["value_rerank_top_k"] = int(min(int(value_rerank_top_k), mapped_legal))
-        debug["value_rerank_lambda"] = float(value_rerank_lambda)
-        debug["value_rerank_candidates"] = rerank_rows
-    if policy == "value_search_d2":
-        debug["value_rerank_top_k"] = int(min(int(value_rerank_top_k), mapped_legal))
-        debug["value_rerank_lambda"] = float(value_rerank_lambda)
-        debug["value_search_d2_candidates"] = search_rows
-    if policy == "value_search_halving":
-        debug["search_budget"] = int(halving_config.budget)
-        debug["value_search_halving_candidates"] = halving_rows
-        debug["search_stats"] = search.summarize_search_rows(halving_rows)
-    if debug_topk > 0:
-        k = min(int(debug_topk), mapped_legal)
-        top_values, top_indices = torch.topk(legal_logits, k=k, largest=True)
-        debug["topk_legal"] = [
-            {
-                "move_uci": legal_moves_with_ids[int(local_idx)].uci(),
-                "logit": float(value.item()),
-            }
-            for value, local_idx in zip(top_values, top_indices)
-        ]
-    return legal_moves_with_ids[chosen_index], debug
+        debug["search_stats"] = dict(
+            simulations=result.simulations,
+            neural_evaluations=result.neural_evaluations,
+            terminal_hits=result.terminal_hits,
+            depth_cutoffs=result.depth_cutoffs,
+        )
+    return (chess.Move.from_uci(result.move_uci), debug)
 
 
 def _update_summary(
@@ -524,11 +305,9 @@ def _update_summary(
         summary.games_as_white += 1
     else:
         summary.games_as_black += 1
-
     if not completed:
         summary.incomplete_games += 1
         return
-
     summary.completed_games += 1
     if result == "1/2-1/2":
         summary.draws += 1
@@ -537,9 +316,10 @@ def _update_summary(
         else:
             summary.draws_as_black += 1
         return
-
-    model_won = (model_color == chess.WHITE and result == "1-0") or (
-        model_color == chess.BLACK and result == "0-1"
+    model_won = (
+        model_color == chess.WHITE
+        and result == "1-0"
+        or (model_color == chess.BLACK and result == "0-1")
     )
     if model_won:
         summary.wins += 1
@@ -568,8 +348,7 @@ def _summary_to_payload(
     seed: int,
     max_plies: int,
     model_move_policy: str,
-    value_rerank_top_k: int,
-    value_rerank_lambda: float,
+    search_lambda: float,
     opening_random_plies: int,
     search_knobs: dict[str, int | bool],
 ) -> dict[str, Any]:
@@ -590,7 +369,6 @@ def _summary_to_payload(
         if summary.games > 0
         else float("nan")
     )
-
     return {
         "games": summary.games,
         "completed_games": summary.completed_games,
@@ -605,9 +383,10 @@ def _summary_to_payload(
         "game_records": summary.game_records,
         "inference_stats": summary.inference_stats,
         "model_selection_seconds": summary.model_selection_seconds,
-        "mean_model_selection_seconds": (
-            summary.model_selection_seconds / summary.model_turns if summary.model_turns else 0.0
-        ),
+        "mean_model_selection_seconds": summary.model_selection_seconds
+        / summary.model_turns
+        if summary.model_turns
+        else 0.0,
         "legal_moves_total": summary.legal_moves_total,
         "legal_moves_mapped_total": summary.legal_moves_mapped_total,
         "legal_move_coverage_rate": summary.legal_coverage_rate,
@@ -643,10 +422,22 @@ def _summary_to_payload(
             "seed": int(seed),
             "max_plies": int(max_plies),
             "model_move_policy": model_move_policy,
-            "value_rerank_top_k": int(value_rerank_top_k),
-            "value_rerank_lambda": float(value_rerank_lambda),
+            "search_lambda": float(search_lambda),
             "opening_random_plies": int(opening_random_plies),
             "search": search_knobs,
+            "algorithm": model_move_policy,
+            "precision": "float32",
+            "tf32": False,
+            "exploration": "zero_noise"
+            if model_move_policy == "gumbel"
+            else "deterministic",
+            "runtime_revision": "shared-search-v1",
+            "budget": search_knobs["gumbel_simulations"]
+            if model_move_policy == "gumbel"
+            else search_knobs["search_budget"],
+            "budget_unit": "simulations"
+            if model_move_policy == "gumbel"
+            else "neural_evaluations",
         },
     }
 
@@ -658,30 +449,22 @@ def _print_segment_summary(*, segment_name: str, payload: dict[str, Any]) -> Non
         f"  wins/draws/losses: {payload['wins']} / {payload['draws']} / {payload['losses']}"
     )
     print(
-        f"  completed_games: {payload['completed_games']} "
-        f"(incomplete={payload['incomplete_games']})"
+        f"  completed_games: {payload['completed_games']} (incomplete={payload['incomplete_games']})"
     )
     print(
-        f"  average plies/game: {payload['average_plies_per_game']:.2f} "
-        f"(avg full moves: {payload['average_full_moves_per_game']:.2f})"
+        f"  average plies/game: {payload['average_plies_per_game']:.2f} (avg full moves: {payload['average_full_moves_per_game']:.2f})"
     )
     print(
-        f"  legal coverage: {payload['legal_move_coverage_rate']:.4f} "
-        f"(mapped={payload['legal_moves_mapped_total']}, total={payload['legal_moves_total']})"
+        f"  legal coverage: {payload['legal_move_coverage_rate']:.4f} (mapped={payload['legal_moves_mapped_total']}, total={payload['legal_moves_total']})"
     )
     print(
-        f"  score_rate (completed games): {payload['score_rate']:.4f} "
-        f"(denominator={payload['rate_denominator_games']})"
+        f"  score_rate (completed games): {payload['score_rate']:.4f} (denominator={payload['rate_denominator_games']})"
     )
     print(f"  score_rate (all games): {payload['score_rate_all_games']:.4f}")
     white = payload["by_color"]["white"]
     black = payload["by_color"]["black"]
-    print(
-        f"  as_white (W/D/L): {white['wins']}/{white['draws']}/{white['losses']}"
-    )
-    print(
-        f"  as_black (W/D/L): {black['wins']}/{black['draws']}/{black['losses']}"
-    )
+    print(f"  as_white (W/D/L): {white['wins']}/{white['draws']}/{white['losses']}")
+    print(f"  as_black (W/D/L): {black['wins']}/{black['draws']}/{black['losses']}")
 
 
 def _stockfish_label(*, limit_strength: bool, elo: int | None) -> str:
@@ -690,15 +473,15 @@ def _stockfish_label(*, limit_strength: bool, elo: int | None) -> str:
     return "Stockfish (full strength)"
 
 
-def _outcome_label(
-    *, completed: bool, result: str, model_color: chess.Color
-) -> str:
+def _outcome_label(*, completed: bool, result: str, model_color: chess.Color) -> str:
     if not completed:
         return "incomplete"
     if result == "1/2-1/2":
         return "draw"
-    model_won = (model_color == chess.WHITE and result == "1-0") or (
-        model_color == chess.BLACK and result == "0-1"
+    model_won = (
+        model_color == chess.WHITE
+        and result == "1-0"
+        or (model_color == chess.BLACK and result == "0-1")
     )
     return "model_win" if model_won else "model_loss"
 
@@ -726,8 +509,9 @@ def _save_traced_game(
         stockfish_label if model_color == chess.WHITE else "imba-chess"
     )
     game.headers["Result"] = result
-
-    outcome = _outcome_label(completed=completed, result=result, model_color=model_color)
+    outcome = _outcome_label(
+        completed=completed, result=result, model_color=model_color
+    )
     base_name = f"{segment_name}_game{game_idx + 1:03d}_{outcome}"
     save_games_dir.mkdir(parents=True, exist_ok=True)
     (save_games_dir / f"{base_name}.pgn").write_text(str(game), encoding="utf-8")
@@ -737,10 +521,7 @@ def _save_traced_game(
 
 
 def _build_segment_options(
-    *,
-    base_threads: int,
-    base_hash_mb: int,
-    spec: SegmentSpec,
+    *, base_threads: int, base_hash_mb: int, spec: SegmentSpec
 ) -> dict[str, Any]:
     options: dict[str, Any] = {
         "Threads": int(base_threads),
@@ -773,7 +554,6 @@ def _build_segment_specs(args: argparse.Namespace) -> list[SegmentSpec]:
                 elo=int(args.stockfish_elo) if args.stockfish_elo is not None else None,
             )
         ]
-
     ladder_elos = _parse_ladder_elos(args.ladder_elos)
     games_per_segment = (
         int(args.games)
@@ -816,8 +596,7 @@ def _play_game(
     device: torch.device,
     dtype: torch.dtype,
     model_move_policy: str,
-    value_rerank_top_k: int,
-    value_rerank_lambda: float,
+    search_lambda: float,
     opening_random_plies: int,
     debug_trace_games: int,
     debug_trace_max_plies: int,
@@ -825,6 +604,7 @@ def _play_game(
     stockfish_label: str,
     save_games_dir: Path | None,
     halving_config: "HalvingConfig | None" = None,
+    runtime,
 ) -> Generator[WorkRequest, Any, EvalSummary]:
     """One game's coroutine core: the `BatchScheduler` game-factory contract.
 
@@ -833,7 +613,7 @@ def _play_game(
     `yield WorkRequest(...)` instead of synchronous calls, so
     `BatchScheduler` can merge them across concurrently-live games:
       - model turn: `yield from _select_model_move_stepwise(...)`, which
-        itself yields `WorkRequest("root_eval", ...)` then, for non-greedy
+        itself yields `WorkRequest("root_eval", ...)` then, for retained search
         policies, `WorkRequest("decode_wave", ...)` per search wave.
       - engine turn: `yield WorkRequest("sf_move", (engine, board.copy(),
         engine_limit))` -- `board.copy()` so the engine thread (sf_move
@@ -860,13 +640,11 @@ def _play_game(
     summary = EvalSummary()
     board = chess.Board()
     history = _SequenceHistory(
-        move_vocab=move_vocab,
-        board_state_encoder=board_state_encoder,
+        move_vocab=move_vocab, board_state_encoder=board_state_encoder
     )
-    model_color = chess.WHITE if (game_idx % 2 == 0) else chess.BLACK
+    model_color = chess.WHITE if game_idx % 2 == 0 else chess.BLACK
     completed = True
     plies = 0
-
     while not board.is_game_over(claim_draw=True):
         if plies >= max_plies:
             completed = False
@@ -879,81 +657,48 @@ def _play_game(
             if game_idx < debug_trace_games and plies < debug_trace_max_plies:
                 turn = "W" if board.turn == chess.WHITE else "B"
                 tqdm.write(
-                    f"[debug][{segment_name}] game={game_idx + 1} ply={plies + 1} turn={turn} "
-                    f"opening_random selected={move.uci()}"
+                    f"[debug][{segment_name}] game={game_idx + 1} ply={plies + 1} turn={turn} opening_random selected={move.uci()}"
                 )
         elif board.turn == model_color:
             selection_start = time.perf_counter()
             batch = history.build_batch_for_current_position(board)
             move, debug_info = yield from _select_model_move_stepwise(
-                model=model,
                 batch=batch,
                 board=board,
-                move_vocab=move_vocab,
-                board_state_encoder=board_state_encoder,
-                device=device,
-                dtype=dtype,
-                policy=model_move_policy,
-                value_rerank_top_k=value_rerank_top_k,
-                value_rerank_lambda=value_rerank_lambda,
-                debug_topk=debug_topk,
-                halving_config=halving_config,
+                runtime=runtime,
+                config=halving_config,
+                debug_topk=debug_topk
+                if game_idx < debug_trace_games and plies < debug_trace_max_plies
+                else 0,
             )
             summary.model_turns += 1
             summary.model_selection_seconds += time.perf_counter() - selection_start
-            search.merge_search_stats(summary.search_stats, debug_info.get("search_stats", {}))
-            summary.legal_moves_total += int(debug_info["total_legal_moves"])
-            summary.legal_moves_mapped_total += int(
-                debug_info["mapped_legal_moves"]
+            search.merge_search_stats(
+                summary.search_stats, debug_info.get("search_stats", {})
             )
+            summary.legal_moves_total += int(debug_info["total_legal_moves"])
+            summary.legal_moves_mapped_total += int(debug_info["mapped_legal_moves"])
             if int(debug_info["mapped_legal_moves"]) == 0:
                 summary.turns_with_no_vocab_legal_move += 1
-            if (
-                game_idx < debug_trace_games
-                and plies < debug_trace_max_plies
-            ):
+            if game_idx < debug_trace_games and plies < debug_trace_max_plies:
                 turn = "W" if board.turn == chess.WHITE else "B"
                 coverage = float(debug_info["coverage"])
                 tqdm.write(
-                    f"[debug][{segment_name}] game={game_idx + 1} ply={plies + 1} turn={turn} "
-                    f"coverage={coverage:.3f} selected={move.uci()}"
+                    f"[debug][{segment_name}] game={game_idx + 1} ply={plies + 1} turn={turn} coverage={coverage:.3f} selected={move.uci()}"
                 )
                 topk = debug_info.get("topk_legal")
                 if isinstance(topk, list) and topk:
                     topk_str = ", ".join(
-                        f"{entry['move_uci']}:{entry['logit']:.3f}"
-                        for entry in topk
+                        (f"{entry['move_uci']}:{entry['logit']:.3f}" for entry in topk)
                     )
                     tqdm.write(f"[debug][{segment_name}]   topk={topk_str}")
-                rerank_rows = debug_info.get("value_rerank_candidates")
-                if isinstance(rerank_rows, list) and rerank_rows:
-                    rerank_str = ", ".join(
-                        f"{entry['move_uci']}:logit={entry['policy_logit']:.3f}|"
-                        f"v_next={entry['value_next']:.3f}|score={entry['rerank_score']:.3f}"
-                        for entry in rerank_rows
-                    )
-                    tqdm.write(
-                        f"[debug][{segment_name}]   value_rerank={rerank_str}"
-                    )
-                search_rows = debug_info.get("value_search_d2_candidates")
-                if isinstance(search_rows, list) and search_rows:
-                    search_str = ", ".join(
-                        f"{entry['move_uci']}:logit={entry['policy_logit']:.3f}|"
-                        f"worst_reply={entry['worst_reply_value']:.3f}|"
-                        f"best_reply={entry['best_reply_uci']}|score={entry['search_score']:.3f}"
-                        for entry in search_rows
-                    )
-                    tqdm.write(
-                        f"[debug][{segment_name}]   value_search_d2={search_str}"
-                    )
                 halving_rows = debug_info.get("value_search_halving_candidates")
                 if isinstance(halving_rows, list) and halving_rows:
                     halving_str = ", ".join(
-                        f"{entry['move_uci']}:evals={entry['evals_spent']}"
-                        f"|backed={entry['backed_value']}"
-                        f"|score={entry['search_score']}"
-                        f"|out_r={entry['eliminated_round']}"
-                        for entry in halving_rows
+                        (
+                            f"{entry['move_uci']}:evals={entry['evals_spent']}|backed={entry['backed_value']}|score={entry['search_score']}|out_r={entry['eliminated_round']}"
+                            for entry in halving_rows
+                        )
                     )
                     tqdm.write(
                         f"[debug][{segment_name}]   value_search_halving={halving_str}"
@@ -963,12 +708,10 @@ def _play_game(
             if result.move is None:
                 raise RuntimeError("Stockfish returned no move.")
             move = result.move
-
         history.append_observed_position(board)
         history.record_played_move(move.uci())
         board.push(move)
         plies += 1
-
     result = board.result(claim_draw=True) if completed else "*"
     if save_games_dir is not None and game_idx < debug_trace_games:
         _save_traced_game(
@@ -988,8 +731,15 @@ def _play_game(
         completed=completed,
         plies=plies,
     )
-    summary.game_records.append(dict(game_idx=game_idx, result=result, completed=completed,
-                                     model_color="white" if model_color else "black", plies=plies))
+    summary.game_records.append(
+        dict(
+            game_idx=game_idx,
+            result=result,
+            completed=completed,
+            model_color="white" if model_color else "black",
+            plies=plies,
+        )
+    )
     return summary
 
 
@@ -1042,7 +792,7 @@ def _release_engine_on_finish(
 def _progress_postfix(summary: EvalSummary) -> dict[str, Any]:
     """tqdm postfix dict derived purely from a running `EvalSummary` --
     shared by `_run_segment`'s scheduler-driven `_on_game_done` (G=1) and
-    `_serve_actor_workers`'s in-order game completion (G>1 actor mode), so
+    concurrent game completion, so
     both progress bars report the same fields the same way. Pure refactor
     out of what `_run_segment`'s `_on_game_done` always computed inline; no
     change to the numbers themselves."""
@@ -1081,516 +831,29 @@ def _progress_postfix(summary: EvalSummary) -> dict[str, Any]:
     }
 
 
-# ---------------------------------------------------------------------------
-# Task 3: actor-mode orchestration (--concurrent-games > 1).
-#
-# Spawns `concurrent_games` torch-free worker processes (`run_eval_worker`,
-# `imba_chess.eval.actor_worker`), each playing a static round-robin share of
-# this segment's games against its OWN Stockfish `SimpleEngine`, and serves
-# their model-turn requests from an in-process `ActorInferenceServer` that
-# owns the model and all KV state. See
-# `docs/superpowers/specs/2026-07-19-multiprocess-eval-actors-design.md` for
-# the architecture and `.superpowers/sdd/task-3-report.md` for the
-# serve-loop design writeup, engine-orphan honesty, and cutover deletions.
-# ---------------------------------------------------------------------------
-
-
-def _limit_to_dict(limit: chess.engine.Limit) -> dict[str, float | int]:
-    """`chess.engine.Limit` -> the plain dict `actor_worker._build_engine_limit`
-    expects in `worker_config["engine"]["stockfish_limit"]` (a live `Limit`
-    object is not picklable-simple across `multiprocessing.get_context(
-    "spawn")`'s pickling of `worker_config`, and the worker never imports
-    `chess.engine`... actually it does (SimpleEngine), but `_build_engine_limit`
-    there is dict-driven by design -- see that function's own docstring --
-    so this mirrors the exact same kwarg set `_run_segment`'s own
-    `_build_engine_limit(args)` builds from argparse fields, just read back
-    off the already-constructed `Limit` instead of off `args` again)."""
-    out: dict[str, float | int] = {}
-    if limit.time is not None:
-        out["time"] = float(limit.time)
-    if limit.nodes is not None:
-        out["nodes"] = int(limit.nodes)
-    if limit.depth is not None:
-        out["depth"] = int(limit.depth)
-    return out
-
-
-def _assign_games_round_robin(games: int, concurrent_games: int) -> list[list[int]]:
-    """Static round-robin game assignment (design spec: "simpler and more
-    deterministic than work-stealing"): worker `w` plays every `game_idx`
-    with `game_idx % concurrent_games == w`, in ascending order -- equal
-    (+/-1) load per worker regardless of `games`."""
-    return [
-        [game_idx for game_idx in range(games) if game_idx % concurrent_games == w]
-        for w in range(concurrent_games)
-    ]
-
-
-def _worker_engine_config(
-    *,
-    stockfish_path: Path,
-    segment_options: dict[str, Any],
-    engine_limit: chess.engine.Limit,
-    fake_engine_factory: Callable[[], Any] | None,
-) -> dict[str, Any]:
-    """Builds `worker_config["engine"]` for one worker -- production supplies
-    `stockfish_path` (a plain string, picklable); `fake_engine_factory` is
-    test-only (must itself be a picklable module-level callable under real
-    spawn -- see `actor_worker._build_engine`'s docstring and this task's
-    report for why an in-test lambda closure, fine for Task 1's in-process
-    tests, does not work here)."""
-    engine_config: dict[str, Any] = {"stockfish_limit": _limit_to_dict(engine_limit)}
-    if fake_engine_factory is not None:
-        engine_config["fake_engine_factory"] = fake_engine_factory
-    else:
-        engine_config["stockfish_path"] = str(stockfish_path)
-        if segment_options:
-            engine_config["stockfish_options"] = dict(segment_options)
-    return engine_config
-
-
-def _build_worker_config(
-    *,
-    worker_id: int,
-    game_indices: list[int],
-    seed: int,
-    max_plies: int,
-    opening_random_plies: int,
-    model_move_policy: str,
-    value_rerank_top_k: int,
-    value_rerank_lambda: float,
-    halving_config: "HalvingConfig | None",
-    vocab_path: Path,
-    vocab_include_unk: bool,
-    board_state_config: dict[str, Any],
-    engine_config: dict[str, Any],
-) -> dict[str, Any]:
-    """Assembles one worker's `worker_config` dict, per the schema documented
-    in `actor_worker.run_eval_worker`'s own docstring -- every value here is
-    plain data (no `Path`/tensor/live objects besides the test-only engine
-    factory), so the whole dict pickles cleanly into a spawned child."""
-    return {
-        "worker_id": int(worker_id),
-        "game_indices": list(game_indices),
-        "seed": int(seed),
-        "max_plies": int(max_plies),
-        "opening_random_plies": int(opening_random_plies),
-        "model_move_policy": str(model_move_policy),
-        "value_rerank_top_k": int(value_rerank_top_k),
-        "value_rerank_lambda": float(value_rerank_lambda),
-        "halving_config": asdict(halving_config) if halving_config is not None else None,
-        "vocab_path": str(vocab_path),
-        "vocab_include_unk": bool(vocab_include_unk),
-        "board_state_config": dict(board_state_config),
-        "engine": engine_config,
-    }
-
-
-def _terminate_worker_processes(processes: list) -> None:
-    """Fail-fast supervision (Task 3): on any dead-worker/pipe-EOF/server
-    exception, terminate EVERY worker process -- SIGTERM first, a grace
-    period to exit on their own, then SIGKILL for stragglers.
-
-    ENGINE-ORPHAN HONESTY (documented, not solved -- see the task report for
-    the full writeup): `actor_worker.py` installs a SIGTERM handler
-    (`_install_sigterm_handler`) that turns SIGTERM into a Python exception,
-    so a worker that exits via the SIGTERM branch below still runs its own
-    `finally: engine.quit()` and its Stockfish child exits cleanly. A
-    straggler that needs the SIGKILL escalation gets NO such chance --
-    SIGKILL is unblockable by design, so that worker's process (and,
-    transitively, its live Stockfish subprocess, now reparented to
-    init/a subreaper) is simply gone with no cleanup hook able to run. This
-    is accepted: the alternative (blocking indefinitely for a worker that
-    refuses to die) is worse for a fail-fast eval run, and a leaked
-    Stockfish process is a bounded, self-terminating cost (it has no more
-    input coming and exits once its own analysis limit is reached or its
-    UCI stdin pipe closes), not a permanently-growing one.
-    """
-    for proc in processes:
-        if proc.is_alive():
-            proc.terminate()
-    for proc in processes:
-        proc.join(timeout=5.0)
-    for proc in processes:
-        if proc.is_alive():
-            proc.kill()
-    for proc in processes:
-        proc.join(timeout=5.0)
-
-
-def _check_workers_alive(processes: list, active_worker_ids: set[int]) -> None:
-    """Defensive liveness sweep: fires only when `mp_connection.wait(...)`
-    times out with nothing ready (see `_serve_actor_workers`) -- the primary
-    dead-worker signal is a pipe EOF/reset on `conn.recv()`, which fires the
-    instant a crashed worker's process (and its fd) is actually gone; this
-    sweep exists only to catch the pathological case where that hasn't
-    happened yet but `proc.is_alive()` already reports the process gone."""
-    for worker_id in sorted(active_worker_ids):
-        proc = processes[worker_id]
-        if not proc.is_alive():
-            raise RuntimeError(
-                f"actor worker {worker_id} (pid={proc.pid}) is no longer "
-                f"alive (exitcode={proc.exitcode}) without ever signaling "
-                "WorkerFinished or a pipe EOF -- treating as a fatal crash."
-            )
-
-
-def _serve_actor_workers(
-    *,
-    server: ActorInferenceServer,
-    parent_conns: list,
-    processes: list,
-    games: int,
-    segment_name: str,
-) -> EvalSummary:
-    """The GPU-server serve loop: poll all worker pipes (worker-id order),
-    batch this round's pending `RootEvalRequest`/`WaveRequest` messages into
-    one `server.service(...)` call, send responses back, and fold `GameDone`
-    fragments into the running `EvalSummary` -- but only in GAME-INDEX
-    ORDER, via a hold-back buffer that exactly mirrors
-    `batch_scheduler.BatchScheduler`'s own `_held_back`/`_emit_ready`
-    stream-order discipline (see that module): games can finish in whatever
-    real order their assigned worker gets to them, but the aggregate summary
-    (and the progress bar) must advance deterministically by game_idx.
-
-    `release_turn` (Task 2's explicit-release design, see
-    `ActorInferenceServer`'s own docstring) fires here, not in the server:
-    once per worker, the moment its NEXT `RootEvalRequest` (a different
-    turn_id) proves the previous turn's search is over, and once more on
-    `WorkerFinished` for whatever turn was still open at that point.
-    `release_game` (incremental-root-KV optimization, `docs/superpowers/
-    sdd/increm-report.md`) fires on a DIFFERENT lifetime -- once per
-    `GameDone` (that game's persisted root prefix is done growing) and
-    defensively again on `WorkerFinished` -- since the persisted prefix
-    now spans a whole game across turns, not just one turn's decode-wave
-    search tree.
-
-    Fail-fast: a pipe EOF/reset (`conn.recv()` raising `EOFError`/`OSError`)
-    or an unexpected message shape raises immediately, propagating out to
-    `_run_segment_actor_mode`'s `except BaseException` -> terminate-all path
-    -- this function does not itself terminate any process.
-    """
-    summary = EvalSummary()
-    concurrent_games = len(parent_conns)
-    active_worker_ids: set[int] = set(range(concurrent_games))
-    last_turn_by_worker: dict[int, int] = {}
-    held_back: dict[int, dict[str, Any]] = {}
-    next_expected_game_idx = 0
-
-    serve_stats: dict[str, float] = {
-        "start": time.perf_counter(),
-        "wait_s": 0.0, "recv_s": 0.0, "service_s": 0.0, "send_s": 0.0,
-        "rounds": 0, "round_reqs": 0,
-    }
-    with tqdm(
-        total=games,
-        desc=f"stockfish-eval-actors[{segment_name}]",
-        unit="game",
-        dynamic_ncols=True,
-    ) as progress:
-        while active_worker_ids:
-            _t_loop = time.perf_counter()
-            live_conns = [parent_conns[w] for w in sorted(active_worker_ids)]
-            ready = mp_connection.wait(live_conns, timeout=30.0)
-            serve_stats["wait_s"] += time.perf_counter() - _t_loop
-            if not ready:
-                _check_workers_alive(processes, active_worker_ids)
-                continue
-            ready_set = set(ready)
-            ready_worker_ids = [
-                w for w in sorted(active_worker_ids) if parent_conns[w] in ready_set
-            ]
-
-            _t_recv = time.perf_counter()
-            requests: list[tuple[int, Any]] = []
-            for worker_id in ready_worker_ids:
-                conn = parent_conns[worker_id]
-                try:
-                    message = conn.recv()
-                except (EOFError, OSError) as exc:
-                    raise RuntimeError(
-                        f"actor worker {worker_id}: pipe closed unexpectedly "
-                        "(EOF/reset) -- the worker process likely crashed or "
-                        "was killed mid-run."
-                    ) from exc
-
-                if isinstance(message, RootEvalRequest):
-                    prev_turn = last_turn_by_worker.get(worker_id)
-                    if prev_turn is not None and prev_turn != message.turn_id:
-                        server.release_turn(worker_id, prev_turn)
-                    last_turn_by_worker[worker_id] = message.turn_id
-                    requests.append((worker_id, message))
-                elif isinstance(message, WaveRequest):
-                    requests.append((worker_id, message))
-                elif isinstance(message, GameDone):
-                    # Incremental-root-KV optimization (docs/superpowers/sdd/
-                    # increm-report.md): the worker's persisted per-game
-                    # prefix KV lives for exactly this long -- this game just
-                    # finished, so free it here (NOT on the worker's next
-                    # RootEvalRequest, unlike release_turn's per-turn arena/
-                    # node-chain state above, which is unrelated and still
-                    # released that way): the worker's NEXT game (if any)
-                    # always starts with a FULL RootEvalRequest anyway (a
-                    # fresh _PlainSequenceHistory has server_prefix_len=None),
-                    # which would overwrite this entry regardless -- but
-                    # releasing it here promptly frees that memory instead of
-                    # leaving it live for however long this worker takes to
-                    # reach its next game.
-                    server.release_game(worker_id)
-                    held_back[message.game_idx] = message.summary_fragment
-                    while next_expected_game_idx in held_back:
-                        fragment = held_back.pop(next_expected_game_idx)
-                        _accumulate_summary(summary, EvalSummary(**fragment))
-                        progress.update(1)
-                        progress.set_postfix(_progress_postfix(summary))
-                        next_expected_game_idx += 1
-                elif isinstance(message, WorkerFinished):
-                    prev_turn = last_turn_by_worker.pop(worker_id, None)
-                    if prev_turn is not None:
-                        server.release_turn(worker_id, prev_turn)
-                    # Defensive backstop (release_game is idempotent): every
-                    # game already released its own prefix via GameDone
-                    # above, so this is normally a no-op -- mirrors
-                    # release_turn's own defensive WorkerFinished call.
-                    server.release_game(worker_id)
-                    active_worker_ids.discard(worker_id)
-                else:  # pragma: no cover - fail fast on a protocol violation
-                    raise RuntimeError(
-                        f"actor worker {worker_id}: unexpected message from "
-                        f"worker pipe: {message!r}"
-                    )
-
-            serve_stats["recv_s"] += time.perf_counter() - _t_recv
-
-            if requests:
-                _t_svc = time.perf_counter()
-                responses = server.service([msg for _, msg in requests])
-                _t_send = time.perf_counter()
-                for (worker_id, _msg), response in zip(requests, responses):
-                    parent_conns[worker_id].send(response)
-                serve_stats["service_s"] += _t_send - _t_svc
-                serve_stats["send_s"] += time.perf_counter() - _t_send
-                serve_stats["rounds"] += 1
-                serve_stats["round_reqs"] += len(requests)
-
-    if _ACTOR_PROFILE:
-        total = time.perf_counter() - serve_stats["start"]
-        lines = [f"[actor-profile] segment wall {total:.1f}s; serve-loop buckets:"]
-        for key in ("wait_s", "recv_s", "service_s", "send_s"):
-            lines.append(f"  {key}: {serve_stats[key]:.1f}s ({100 * serve_stats[key] / total:.1f}%)")
-        if serve_stats["rounds"]:
-            lines.append(
-                f"  rounds: {serve_stats['rounds']}  mean reqs/round: "
-                f"{serve_stats['round_reqs'] / serve_stats['rounds']:.2f}"
-            )
-        lines.append("  server buckets (cuda-synced):")
-        for key, value in server.stats.items():
-            lines.append(f"    {key}: {value:.1f}" if isinstance(value, float) else f"    {key}: {value}")
-        print("\n".join(lines), file=sys.stderr)
-
-    if next_expected_game_idx != games:
-        raise RuntimeError(
-            f"actor mode: only {next_expected_game_idx}/{games} games were "
-            "accounted for in game-index order before every worker signaled "
-            "WorkerFinished -- a game_idx is missing (protocol/ordering bug)."
-        )
-    return summary
-
-
-def _join_and_verify_workers(processes: list) -> None:
-    """Post-serve-loop join/exitcode check, called only after
-    `_serve_actor_workers` has already returned normally (every worker
-    already sent `WorkerFinished`). Wrapped in its OWN try/except so ANY bad
-    outcome here -- a worker that never actually exits within the grace
-    period, OR one that exited with a nonzero code -- terminates EVERY
-    worker (`_terminate_worker_processes`) before propagating, not just the
-    one whose check failed: `processes` is walked in order, so a
-    LATER-indexed worker may still be perfectly alive at the moment an
-    EARLIER one's check fails, and without this wrapper that later worker
-    would be left running. (Code-review fix: the original inline version of
-    this check only called `_terminate_worker_processes` from the
-    `is_alive()` branch; the `exitcode != 0` branch raised directly,
-    leaving any still-alive worker after it in `processes` running --
-    contradicting `_run_segment_actor_mode`'s own docstring claim that it
-    "never leaves a worker process running on its way out, success or
-    failure." Regression-pinned by
-    `tests/test_eval_vs_stockfish.py::test_join_and_verify_workers_terminates_all_on_late_nonzero_exitcode`
-    with fake process stand-ins, deterministically, rather than relying on
-    a real-subprocess race.)
-    """
-    try:
-        for proc in processes:
-            proc.join(timeout=30.0)
-            if proc.is_alive():
-                raise RuntimeError(
-                    f"actor worker pid={proc.pid} did not exit within the "
-                    "grace period after sending WorkerFinished."
-                )
-            if proc.exitcode != 0:
-                raise RuntimeError(
-                    f"actor worker pid={proc.pid} exited with nonzero code "
-                    f"{proc.exitcode}."
-                )
-    except BaseException:
-        _terminate_worker_processes(processes)
-        raise
-
-
-def _run_segment_actor_mode(
-    *,
-    stockfish_path: Path,
-    segment_options: dict[str, Any],
-    segment_name: str,
-    model: torch.nn.Module,
-    games: int,
-    max_plies: int,
-    engine_limit: chess.engine.Limit,
-    device: torch.device,
-    dtype: torch.dtype,
-    model_move_policy: str,
-    value_rerank_top_k: int,
-    value_rerank_lambda: float,
-    opening_random_plies: int,
-    seed: int,
-    concurrent_games: int,
-    vocab_path: Path,
-    vocab_include_unk: bool,
-    board_state_config: dict[str, Any],
-    halving_config: "HalvingConfig | None" = None,
-    fake_engine_factory: Callable[[], Any] | None = None,
-) -> EvalSummary:
-    """Run one segment's `games` games at `concurrent_games > 1` via actor
-    mode: spawn `concurrent_games` torch-free worker processes
-    (`multiprocessing.get_context("spawn")` -- CUDA-safe, and cheap since
-    workers never import torch), each owning its own Stockfish
-    `SimpleEngine` and a static round-robin share of `games` (see
-    `_assign_games_round_robin`); serve their model-turn requests from an
-    in-process `ActorInferenceServer` built on this segment's already-loaded
-    `model`/`device`/`dtype` (see `_serve_actor_workers` for the serve loop
-    itself). The WORKER processes load their own vocab/board-state-config
-    copies from `vocab_path`/`board_state_config` (see
-    `_build_worker_config`) -- since the profile-driven thin-down
-    (`docs/superpowers/sdd/thin-report.md`), the server itself needs neither
-    a `MoveVocab` nor a `BoardStateEncoder` at all: it never runs movegen or
-    vocab lookups anymore (that moved to the workers), so this function no
-    longer takes them as parameters and `ActorInferenceServer` no longer
-    takes them as constructor arguments.
-
-    `fake_engine_factory` is test-only (see `_worker_engine_config`); every
-    other parameter mirrors `_run_segment`'s own, minus the debug-trace/
-    save-games knobs -- out of scope for actor-mode workers per Task 1's own
-    scoping decision (`actor_worker.py`'s module docstring), and `main()`
-    warns the user if those flags were requested alongside
-    `concurrent_games > 1` rather than silently dropping them.
-
-    Determinism: NOT byte-deterministic across runs or against the G=1
-    reference path (accepted, documented in the design spec's "Collection
-    policy and determinism" section) -- batch composition depends on OS
-    process scheduling. `_run_segment` (`concurrent_games=1`) remains the
-    byte-deterministic reference/gate path.
-
-    Fail-fast supervision: ANY exception here (a worker crash/pipe EOF
-    surfacing inside `_serve_actor_workers`, an `ActorInferenceServer`
-    exception, a worker that does not actually exit after sending
-    `WorkerFinished`, or a worker whose final exit code is nonzero)
-    terminates every worker process (`_terminate_worker_processes`) before
-    propagating -- this function never leaves a worker process running on
-    its way out, success or failure. The exception itself then reaches
-    `main()` -> `_main_with_hard_exit_on_crash`'s existing hard-exit wrapper,
-    which is what turns it into an actual nonzero process exit.
-    """
-    if concurrent_games <= 1:
-        raise ValueError(
-            "_run_segment_actor_mode requires concurrent_games > 1 "
-            f"(got {concurrent_games}); concurrent_games=1 uses _run_segment."
-        )
-
-    server = ActorInferenceServer(
-        model=model,
-        device=device,
-        dtype=dtype,
-        profile_sync=_ACTOR_PROFILE,
-        # Same value-head requirement as the G=1 path's own
-        # load_hstu_checkpoint(require_value_head=...) gate: only the three
-        # value-dependent policies need a real value_stm. "greedy" is the
-        # one policy that never reads it, so it's the only one allowed to
-        # run actor mode against a value-head-less checkpoint (every
-        # response's value_stm is then a documented 0.0 placeholder --
-        # see ActorInferenceServer.__init__/_ensure_value_logits_placeholder).
-        require_value_head=model_move_policy
-        in {"value_rerank", "value_search_d2", "value_search_halving"},
-    )
-    game_indices_by_worker = _assign_games_round_robin(games, concurrent_games)
-    engine_config = _worker_engine_config(
-        stockfish_path=stockfish_path,
-        segment_options=segment_options,
-        engine_limit=engine_limit,
-        fake_engine_factory=fake_engine_factory,
-    )
-
-    ctx = multiprocessing.get_context("spawn")
-    processes: list = []
-    parent_conns: list = []
-    try:
-        for worker_id in range(concurrent_games):
-            worker_config = _build_worker_config(
-                worker_id=worker_id,
-                game_indices=game_indices_by_worker[worker_id],
-                seed=seed,
-                max_plies=max_plies,
-                opening_random_plies=opening_random_plies,
-                model_move_policy=model_move_policy,
-                value_rerank_top_k=value_rerank_top_k,
-                value_rerank_lambda=value_rerank_lambda,
-                halving_config=halving_config,
-                vocab_path=vocab_path,
-                vocab_include_unk=vocab_include_unk,
-                board_state_config=board_state_config,
-                engine_config=engine_config,
-            )
-            parent_conn, child_conn = ctx.Pipe()
-            proc = ctx.Process(target=run_eval_worker, args=(child_conn, worker_config))
-            proc.start()
-            # Close OUR copy of the child's end: multiprocessing's spawn
-            # pickling dup()s Connection fds, so if we keep this open, the
-            # underlying socket never reaches full closure when the worker
-            # exits/dies -- parent_conn.recv() would then block forever
-            # instead of raising EOFError, defeating fail-fast detection.
-            child_conn.close()
-            processes.append(proc)
-            parent_conns.append(parent_conn)
-
-        summary = _serve_actor_workers(
-            server=server,
-            parent_conns=parent_conns,
-            processes=processes,
-            games=games,
-            segment_name=segment_name,
-        )
-    except BaseException:
-        _terminate_worker_processes(processes)
-        raise
-    finally:
-        for conn in parent_conns:
-            conn.close()
-
-    _join_and_verify_workers(processes)
-    summary.inference_stats.update(server.stats)
-    return summary
-
-
 def _record_inference(executor, stats, kind):
     """Count actual calls and merged rows where the existing executor runs."""
+
     def measured(payloads):
-        rows = len(payloads) if kind == "root" else sum(len(batch) for _, batch in payloads)
+        rows = (
+            len(payloads)
+            if kind == "root"
+            else sum((len(payload[1][1]) for payload in payloads))
+        )
         started = time.perf_counter()
         result = executor(payloads)
-        search.merge_search_stats(stats, {
-            f"{kind}_calls": 1, f"{kind}_requests": len(payloads),
-            f"{kind}_rows": rows, f"{kind}_batch_size_{rows}": 1,
-            f"{kind}_seconds": time.perf_counter() - started,
-        })
+        search.merge_search_stats(
+            stats,
+            {
+                f"{kind}_calls": 1,
+                f"{kind}_requests": len(payloads),
+                f"{kind}_rows": rows,
+                f"{kind}_batch_size_{rows}": 1,
+                f"{kind}_seconds": time.perf_counter() - started,
+            },
+        )
         return result
+
     return measured
 
 
@@ -1608,8 +871,7 @@ def _run_segment(
     device: torch.device,
     dtype: torch.dtype,
     model_move_policy: str,
-    value_rerank_top_k: int,
-    value_rerank_lambda: float,
+    search_lambda: float,
     opening_random_plies: int,
     debug_trace_games: int,
     debug_trace_max_plies: int,
@@ -1618,60 +880,9 @@ def _run_segment(
     save_games_dir: Path | None,
     concurrent_games: int,
     halving_config: "HalvingConfig | None" = None,
+    runtime,
 ) -> EvalSummary:
-    """Run one segment's `games` games through `BatchScheduler`, for any
-    `concurrent_games >= 1`.
-
-    Owns one `EnginePool` of `concurrent_games` Stockfish processes, spawned
-    fresh for this segment (each configured with `segment_options` at spawn
-    time, matching today's per-segment `engine.configure(...)` call
-    generalized to every pool engine) and closed when the segment ends --
-    see the module docstring / task report for why this replaces the old
-    single-engine-reused-and-reconfigured-across-segments lifecycle.
-
-    Engine-to-game assignment goes through `EnginePool.acquire`/`release`
-    (checked out exactly when the scheduler admits a game into a live slot;
-    released via `_release_engine_on_finish` when that game's coroutine
-    finishes normally or raises from its OWN code -- see that function's
-    docstring for the executor-exception case, which it does not cover and
-    which instead relies on this function's own `finally: pool.close()`
-    below) rather than a static `game_idx % concurrent_games` round robin:
-    games can take wildly different numbers of plies, so a static round
-    robin can hand two *simultaneously live* games the same physical engine
-    the moment their durations diverge -- corrupting that engine's UCI
-    session and racing its `play()` calls across two `ThreadPoolExecutor`
-    workers in the same tick. Checkout/return brackets each game's actual
-    live-slot lifetime instead, which is race-free by construction
-    regardless of game-length variance.
-
-    At `concurrent_games=1` the scheduler never holds more than one game
-    live at a time (`_fill_slots` only admits a new game once the current
-    one's slot frees), so every root_eval/decode_wave/sf_move executor call
-    carries exactly one payload -- the same single-item call sequence
-    `_select_model_move`/`engine.play()` made directly, pre-scheduler.
-
-    CUTOVER NOTE (Task 3, multiprocess-eval-actors): this function's own
-    `concurrent_games` generality -- an `EnginePool`/`BatchScheduler`/
-    `make_sf_move_executor` sized to `concurrent_games` -- used to ALSO be
-    the in-process path for `concurrent_games > 1` (fast-clean-evals). That
-    capability is deleted here (not merely rerouted around): the guard right
-    below makes `concurrent_games > 1` a hard error, so this in-process
-    scheduler machinery can no longer be scaled past one live game no matter
-    how it is called. `--concurrent-games > 1` now spawns actor-mode worker
-    processes instead (`_run_segment_actor_mode`, this module) -- see that
-    function and `docs/superpowers/specs/2026-07-19-multiprocess-eval-actors-design.md`.
-    The body below is otherwise byte-for-byte what it always was, since it
-    is still the sole `concurrent_games=1` reference/gate path and must stay
-    byte-deterministic.
-    """
-    if concurrent_games != 1:
-        raise ValueError(
-            "_run_segment only supports concurrent_games=1 (the in-process "
-            "byte-deterministic reference path) -- concurrent_games > 1 was "
-            "superseded by actor-mode workers at cutover; call "
-            "_run_segment_actor_mode instead. Got "
-            f"concurrent_games={concurrent_games}."
-        )
+    """Run all games through shared inference and concurrent Stockfish calls."""
     summary = EvalSummary()
 
     def _spawn_engine() -> chess.engine.SimpleEngine:
@@ -1681,6 +892,7 @@ def _run_segment(
 
     pool = EnginePool(spawn=_spawn_engine, size=concurrent_games)
     try:
+
         def _game_factory() -> Iterator[tuple[str, Any]]:
             for game_idx in range(games):
                 slot_index, slot_engine = pool.acquire()
@@ -1696,8 +908,7 @@ def _run_segment(
                     device=device,
                     dtype=dtype,
                     model_move_policy=model_move_policy,
-                    value_rerank_top_k=value_rerank_top_k,
-                    value_rerank_lambda=value_rerank_lambda,
+                    search_lambda=search_lambda,
                     opening_random_plies=opening_random_plies,
                     debug_trace_games=debug_trace_games,
                     debug_trace_max_plies=debug_trace_max_plies,
@@ -1705,6 +916,7 @@ def _run_segment(
                     stockfish_label=stockfish_label,
                     save_games_dir=save_games_dir,
                     halving_config=halving_config,
+                    runtime=runtime,
                 )
                 yield (
                     f"{segment_name}-game{game_idx}",
@@ -1719,29 +931,25 @@ def _run_segment(
         ) as progress:
 
             def _on_game_done(game_id: str, rows: EvalSummary | None) -> None:
-                # rows is never None here: _on_game_error below always
-                # re-raises rather than letting the scheduler continue on to
-                # report a (game_id, None) completion for a failed game.
                 assert rows is not None
                 _accumulate_summary(summary, rows)
-
                 progress.update(1)
                 progress.set_postfix(_progress_postfix(summary))
 
             def _on_game_error(game_id: str, exc: BaseException) -> None:
-                # A failed game invalidates the evaluation segment; propagate
-                # the error instead of silently skipping a planned result.
                 raise exc
 
             scheduler = BatchScheduler(
                 game_factory=_game_factory(),
                 executors={
-                    "root_eval": _record_inference(_make_root_eval_executor(
-                        model=model, device=device, dtype=dtype, stats=None
-                    ), summary.inference_stats, "root"),
-                    "decode_wave": _record_inference(_make_decode_wave_executor(
-                        model=model, device=device, dtype=dtype, stats=None
-                    ), summary.inference_stats, "decode"),
+                    "root_eval": _record_inference(
+                        runtime.executors["root_eval"], summary.inference_stats, "root"
+                    ),
+                    "decode_wave": _record_inference(
+                        runtime.executors["decode_wave"],
+                        summary.inference_stats,
+                        "decode",
+                    ),
                     "sf_move": make_sf_move_executor(pool_threads=concurrent_games),
                 },
                 concurrent_games=concurrent_games,
@@ -1750,13 +958,8 @@ def _run_segment(
             )
             scheduler.run()
     finally:
-        # Unconditional: this is the ONLY cleanup path for a game whose
-        # engine slot was abandoned mid-tick by an executor-phase exception
-        # (see _release_engine_on_finish's docstring) -- pool.close() quits
-        # every engine regardless of whether its slot was ever explicitly
-        # released, so no process leaks even on that path.
+        runtime.clear_caches()
         pool.close()
-
     return summary
 
 
@@ -1805,7 +1008,6 @@ def main() -> None:
     args = _parse_args()
     repo_config = load_repo_config(args.config)
     eval_cfg = repo_config.eval_vs_stockfish
-
     args.games = int(eval_cfg.games if args.games is None else args.games)
     args.max_plies = int(
         eval_cfg.max_plies if args.max_plies is None else args.max_plies
@@ -1861,22 +1063,34 @@ def main() -> None:
         else args.include_full_strength_segment
     )
     args.device = str(eval_cfg.device if args.device is None else args.device)
-    args.dtype = str(eval_cfg.dtype if args.dtype is None else args.dtype)
-    args.compile = bool(eval_cfg.compile if args.compile is None else args.compile)
     args.model_move_policy = str(
         eval_cfg.model_move_policy
         if args.model_move_policy is None
         else args.model_move_policy
     )
-    args.value_rerank_top_k = int(
-        eval_cfg.value_rerank_top_k
-        if args.value_rerank_top_k is None
-        else args.value_rerank_top_k
+    if args.model_move_policy == "gumbel":
+        for flag in (
+            "search_budget",
+            "search_lambda",
+            "search_top_m",
+            "halving_rounds",
+            "search_refutation_top_r",
+            "search_expand_top",
+            "search_max_depth",
+            "search_tactical_coverage",
+            "search_quiescence_plies",
+        ):
+            if getattr(args, flag) is not None:
+                raise ValueError(
+                    f"--{flag.replace('_', '-')} applies only to value_search_halving"
+                )
+    elif args.gumbel_simulations is not None:
+        raise ValueError("--gumbel-simulations applies only to gumbel")
+    args.gumbel_simulations = (
+        128 if args.gumbel_simulations is None else args.gumbel_simulations
     )
-    args.value_rerank_lambda = float(
-        eval_cfg.value_rerank_lambda
-        if args.value_rerank_lambda is None
-        else args.value_rerank_lambda
+    args.search_lambda = float(
+        eval_cfg.search_lambda if args.search_lambda is None else args.search_lambda
     )
     args.search_budget = int(
         eval_cfg.search_budget if args.search_budget is None else args.search_budget
@@ -1904,11 +1118,13 @@ def main() -> None:
     )
     args.search_tactical_coverage = bool(
         eval_cfg.search_tactical_coverage
-        if args.search_tactical_coverage is None else args.search_tactical_coverage
+        if args.search_tactical_coverage is None
+        else args.search_tactical_coverage
     )
     args.search_quiescence_plies = int(
         eval_cfg.search_quiescence_plies
-        if args.search_quiescence_plies is None else args.search_quiescence_plies
+        if args.search_quiescence_plies is None
+        else args.search_quiescence_plies
     )
     args.opening_random_plies = int(
         eval_cfg.opening_random_plies
@@ -1932,16 +1148,13 @@ def main() -> None:
         eval_cfg.save_games if args.save_games is None else args.save_games
     )
     args.save_games_dir = Path(
-        eval_cfg.save_games_dir
-        if args.save_games_dir is None
-        else args.save_games_dir
+        eval_cfg.save_games_dir if args.save_games_dir is None else args.save_games_dir
     )
     args.concurrent_games = int(
         eval_cfg.concurrent_games
         if args.concurrent_games is None
         else args.concurrent_games
     )
-
     if args.games < 1:
         raise ValueError("--games must be >= 1")
     if args.max_plies < 1:
@@ -1956,20 +1169,10 @@ def main() -> None:
         raise ValueError("--stockfish-hash-mb must be >= 1")
     if args.opening_random_plies < 0:
         raise ValueError("--opening-random-plies must be >= 0")
-    if args.value_rerank_top_k < 1:
-        raise ValueError("--value-rerank-top-k must be >= 1")
-    if float(args.value_rerank_lambda) < 0.0:
-        raise ValueError("--value-rerank-lambda must be >= 0")
-    if args.model_move_policy not in {
-        "greedy",
-        "value_rerank",
-        "value_search_d2",
-        "value_search_halving",
-    }:
-        raise ValueError(
-            "--model-move-policy must be one of: greedy, value_rerank, "
-            "value_search_d2, value_search_halving"
-        )
+    if float(args.search_lambda) < 0.0:
+        raise ValueError("--search-lambda must be >= 0")
+    if args.model_move_policy not in {"gumbel", "value_search_halving"}:
+        raise ValueError("unsupported search algorithm")
     if args.search_budget < 1:
         raise ValueError("--search-budget must be >= 1")
     if args.search_top_m < 1:
@@ -1984,39 +1187,36 @@ def main() -> None:
         raise ValueError("--search-max-depth must be >= 1")
     if args.search_quiescence_plies < 0:
         raise ValueError("--search-quiescence-plies must be >= 0")
-    if (args.search_tactical_coverage or args.search_quiescence_plies) and args.model_move_policy != "value_search_halving":
-        raise ValueError("Tactical coverage and quiescence require --model-move-policy value_search_halving")
+    if (
+        args.search_tactical_coverage or args.search_quiescence_plies
+    ) and args.model_move_policy != "value_search_halving":
+        raise ValueError(
+            "Tactical coverage and quiescence require --model-move-policy value_search_halving"
+        )
     if args.concurrent_games < 1:
         raise ValueError("--concurrent-games must be >= 1")
     if not args.stockfish_path.exists():
         raise FileNotFoundError(f"Stockfish binary not found: {args.stockfish_path}")
-
     random.seed(args.seed)
     torch.manual_seed(args.seed)
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(args.seed)
     device = _resolve_device(args.device)
-    dtype = _resolve_dtype(args.dtype)
-    if device.type == "cuda" and not torch.cuda.is_available():
+    dtype = torch.float32
+    if device.type == "cuda" and (not torch.cuda.is_available()):
         raise RuntimeError("CUDA device requested but not available.")
-
-    move_vocab = load_or_create_static_move_vocab(
-        path=repo_config.vocab.path,
-        include_unk=repo_config.vocab.include_unk,
-    )
-    board_state_encoder = BoardStateEncoder(repo_config.board_state)
-
-    model, compile_enabled = load_hstu_checkpoint(
-        checkpoint_path=args.checkpoint,
+    runtime, _ = load_runtime(
         repo_config=repo_config,
-        move_vocab=move_vocab,
+        checkpoint=args.checkpoint,
         device=device,
-        compile_model=bool(args.compile),
-        require_value_head=(
-            str(args.model_move_policy)
-            in {"value_rerank", "value_search_d2", "value_search_halving"}
-        ),
+        algorithm=args.model_move_policy,
     )
+    model, move_vocab, board_state_encoder = (
+        runtime.model,
+        runtime.move_vocab,
+        runtime.encoder,
+    )
+    compile_enabled = args.model_move_policy == "gumbel"
     engine_limit = _build_engine_limit(args)
     segment_specs = _build_segment_specs(args)
     print("Running model vs Stockfish")
@@ -2024,38 +1224,9 @@ def main() -> None:
     print(f"  stockfish={args.stockfish_path}")
     print(f"  limit={engine_limit}")
     print(f"  device={device}, dtype={dtype}, compile={compile_enabled}")
-    print(
-        "  model_policy="
-        f"{args.model_move_policy}, "
-        f"value_rerank_top_k={args.value_rerank_top_k}, "
-        f"value_rerank_lambda={args.value_rerank_lambda}, "
-        f"opening_random_plies={args.opening_random_plies}"
-    )
     print(f"  concurrent_games={args.concurrent_games}")
-
-    actor_mode = int(args.concurrent_games) > 1
-    if actor_mode:
-        print("  mode=actor (spawned worker processes; see Task 3 design spec)")
-        if int(args.debug_trace_games) > 0 or bool(args.save_games):
-            # Task 1 scoped debug-trace/game-save plumbing out of the
-            # torch-free worker (actor_worker.py's own module docstring):
-            # neither knob has anywhere to go once concurrent_games > 1
-            # routes through actor mode, so this is a loud no-op rather
-            # than a silently-ignored flag. stderr (not stdout), per code
-            # review, so it's visible/greppable independent of stdout
-            # redirection (e.g. --output-json pipelines).
-            print(
-                "WARNING: --debug-trace-games/--save-games are not "
-                "supported in actor mode (concurrent_games > 1) -- ignored "
-                "for this run. Use --concurrent-games 1 for debug traces or "
-                "saved games.",
-                file=sys.stderr,
-            )
-    board_state_config_dict = asdict(repo_config.board_state)
-
     segment_results: list[dict[str, Any]] = []
     segment_summaries: list[EvalSummary] = []
-
     for spec in segment_specs:
         segment_options = _build_segment_options(
             base_threads=args.stockfish_threads,
@@ -2063,9 +1234,7 @@ def main() -> None:
             spec=spec,
         )
         print(
-            f"\nRunning segment '{spec.name}' "
-            f"(games={spec.games}, options={segment_options}, "
-            f"concurrent_games={args.concurrent_games})"
+            f"\nRunning segment '{spec.name}' (games={spec.games}, options={segment_options}, concurrent_games={args.concurrent_games})"
         )
         halving_config = HalvingConfig(
             budget=int(args.search_budget),
@@ -2074,60 +1243,39 @@ def main() -> None:
             refutation_top_r=int(args.search_refutation_top_r),
             expand_top=int(args.search_expand_top),
             max_depth=int(args.search_max_depth),
-            lam=float(args.value_rerank_lambda),
+            lam=float(args.search_lambda),
             tactical_coverage=bool(args.search_tactical_coverage),
             quiescence_plies=int(args.search_quiescence_plies),
         )
-        if actor_mode:
-            segment_summary = _run_segment_actor_mode(
-                stockfish_path=args.stockfish_path,
-                segment_options=segment_options,
-                segment_name=spec.name,
-                model=model,
-                games=spec.games,
-                max_plies=args.max_plies,
-                engine_limit=engine_limit,
-                device=device,
-                dtype=dtype,
-                model_move_policy=str(args.model_move_policy),
-                value_rerank_top_k=int(args.value_rerank_top_k),
-                value_rerank_lambda=float(args.value_rerank_lambda),
-                opening_random_plies=int(args.opening_random_plies),
-                seed=int(args.seed),
-                concurrent_games=int(args.concurrent_games),
-                vocab_path=Path(repo_config.vocab.path),
-                vocab_include_unk=bool(repo_config.vocab.include_unk),
-                board_state_config=board_state_config_dict,
-                halving_config=halving_config,
-            )
-        else:
-            segment_summary = _run_segment(
-                stockfish_path=args.stockfish_path,
-                segment_options=segment_options,
-                segment_name=spec.name,
-                model=model,
-                move_vocab=move_vocab,
-                board_state_encoder=board_state_encoder,
-                games=spec.games,
-                max_plies=args.max_plies,
-                engine_limit=engine_limit,
-                device=device,
-                dtype=dtype,
-                model_move_policy=str(args.model_move_policy),
-                value_rerank_top_k=int(args.value_rerank_top_k),
-                value_rerank_lambda=float(args.value_rerank_lambda),
-                opening_random_plies=int(args.opening_random_plies),
-                debug_trace_games=max(0, int(args.debug_trace_games)),
-                debug_trace_max_plies=max(0, int(args.debug_trace_max_plies)),
-                debug_topk=max(0, int(args.debug_topk)),
-                stockfish_label=_stockfish_label(
-                    limit_strength=bool(spec.limit_strength),
-                    elo=int(spec.elo) if spec.elo is not None else None,
-                ),
-                save_games_dir=Path(args.save_games_dir) if args.save_games else None,
-                concurrent_games=int(args.concurrent_games),
-                halving_config=halving_config,
-            )
+        if args.model_move_policy == "gumbel":
+            halving_config = GumbelConfig(simulations=args.gumbel_simulations)
+        segment_summary = _run_segment(
+            stockfish_path=args.stockfish_path,
+            segment_options=segment_options,
+            segment_name=spec.name,
+            model=model,
+            move_vocab=move_vocab,
+            board_state_encoder=board_state_encoder,
+            games=spec.games,
+            max_plies=args.max_plies,
+            engine_limit=engine_limit,
+            device=device,
+            dtype=dtype,
+            model_move_policy=str(args.model_move_policy),
+            search_lambda=float(args.search_lambda),
+            opening_random_plies=int(args.opening_random_plies),
+            debug_trace_games=max(0, int(args.debug_trace_games)),
+            debug_trace_max_plies=max(0, int(args.debug_trace_max_plies)),
+            debug_topk=max(0, int(args.debug_topk)),
+            stockfish_label=_stockfish_label(
+                limit_strength=bool(spec.limit_strength),
+                elo=int(spec.elo) if spec.elo is not None else None,
+            ),
+            save_games_dir=Path(args.save_games_dir) if args.save_games else None,
+            concurrent_games=int(args.concurrent_games),
+            halving_config=halving_config,
+            runtime=runtime,
+        )
         segment_payload = _summary_to_payload(
             summary=segment_summary,
             checkpoint_path=args.checkpoint,
@@ -2140,10 +1288,10 @@ def main() -> None:
             seed=args.seed,
             max_plies=args.max_plies,
             model_move_policy=str(args.model_move_policy),
-            value_rerank_top_k=int(args.value_rerank_top_k),
-            value_rerank_lambda=float(args.value_rerank_lambda),
+            search_lambda=float(args.search_lambda),
             opening_random_plies=int(args.opening_random_plies),
             search_knobs={
+                "gumbel_simulations": int(args.gumbel_simulations),
                 "search_budget": int(args.search_budget),
                 "search_top_m": int(args.search_top_m),
                 "halving_rounds": int(args.halving_rounds),
@@ -2168,7 +1316,6 @@ def main() -> None:
                 "results": segment_payload,
             }
         )
-
     aggregate_summary = _merge_summaries(segment_summaries)
     aggregate_payload = _summary_to_payload(
         summary=aggregate_summary,
@@ -2177,10 +1324,7 @@ def main() -> None:
         engine_limit=engine_limit,
         stockfish_options={
             "segments": [
-                {
-                    "name": result["name"],
-                    "options": result["stockfish"]["options"],
-                }
+                {"name": result["name"], "options": result["stockfish"]["options"]}
                 for result in segment_results
             ]
         },
@@ -2190,10 +1334,10 @@ def main() -> None:
         seed=args.seed,
         max_plies=args.max_plies,
         model_move_policy=str(args.model_move_policy),
-        value_rerank_top_k=int(args.value_rerank_top_k),
-        value_rerank_lambda=float(args.value_rerank_lambda),
+        search_lambda=float(args.search_lambda),
         opening_random_plies=int(args.opening_random_plies),
         search_knobs={
+            "gumbel_simulations": int(args.gumbel_simulations),
             "search_budget": int(args.search_budget),
             "search_top_m": int(args.search_top_m),
             "halving_rounds": int(args.halving_rounds),
@@ -2205,9 +1349,7 @@ def main() -> None:
         },
     )
     _print_segment_summary(segment_name="aggregate", payload=aggregate_payload)
-
     if len(segment_results) == 1 and args.ladder_elos is None:
-        # Backward-compatible single-segment payload shape.
         payload = segment_results[0]["results"]
     else:
         payload = {
@@ -2215,7 +1357,6 @@ def main() -> None:
             "segments": segment_results,
             "aggregate": aggregate_payload,
         }
-
     if args.output_json is not None:
         args.output_json.parent.mkdir(parents=True, exist_ok=True)
         args.output_json.write_text(json.dumps(payload, indent=2), encoding="utf-8")

@@ -65,7 +65,7 @@ def main():
     args.output.mkdir(parents=True, exist_ok=True)
     torch.set_num_threads(args.threads)
     cfg = load_config(args.config)
-    runtime, max_positions = load_runtime(cfg, args.checkpoint, "cuda", optimized=False)
+    runtime, max_positions = load_runtime(cfg, args.checkpoint, "cuda")
     store = SelfPlayStore(args.replay, read_only=True, **asdict(cfg.replay))
     initial = cpu_state(runtime.model.state_dict())
     inputs = dict(config=asdict(cfg), checkpoint_sha256=file_hash(args.checkpoint),

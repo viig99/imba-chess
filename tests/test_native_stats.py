@@ -3,10 +3,10 @@ import random
 import pytest
 from imba_chess_native import NodeStats, gumbel_backup as backup
 
+from tests.test_gumbel_search import interior_action
 from imba_chess.eval.gumbel_search import (
     softmax,
     completed_q,
-    interior_action,
     GumbelConfig,
 )
 

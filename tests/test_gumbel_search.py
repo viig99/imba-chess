@@ -12,7 +12,6 @@ from imba_chess.eval.gumbel_search import (
     GumbelConfig,
     completed_q,
     considered_visits,
-    interior_action,
     select_gumbel,
     REFERENCE_REVISION,
 )
@@ -192,3 +191,12 @@ def test_fixed_noise_upstream_search_fixtures():
         assert result.visits == row["visits"]
         assert result.move_uci == root.legal_ucis[row["action"]]
         assert result.policy == pytest.approx(row["policy"], abs=2e-6)
+
+
+def interior_action(value, priors, visits, qvalues, config, prior_probs=None):
+    transformed = completed_q(value, priors, visits, qvalues, config, prior_probs)
+    logits = [p + q for p, q in zip(priors, transformed)]
+    weights = [math.exp(x - max(logits)) for x in logits]
+    policy = [x / math.fsum(weights) for x in weights]
+    denominator = 1 + sum(visits)
+    return max(range(len(priors)), key=lambda i: policy[i] - visits[i] / denominator)

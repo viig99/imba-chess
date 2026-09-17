@@ -48,10 +48,11 @@ class _FakeEvaluator:
 
     def __init__(self, n: int) -> None:
         self.n = n
+        self.history_revision = 0
         self.built = 0
         self.consumed = 0
 
-    def build_decode_request(self, batch):
+    def build_decode_request(self, batch, **kwargs):
         self.built += 1
         # Busy work standing in for encode_cozy + suffix cat/pad.
         sum(i * i for i in range(20000))
@@ -82,9 +83,17 @@ def _install_fakes(monkeypatch, stats):
         suffix_positions = None
         suffix_mask = None
 
-    monkeypatch.setattr(me, "_merge_decode_requests", lambda reqs: _Merged())
+    monkeypatch.setattr(me, "_merge_decode_requests", lambda reqs, **kw: _Merged())
     monkeypatch.setattr(
         me, "_split_decode_output", lambda out, counts: [None for _ in counts]
+    )
+    monkeypatch.setattr(me, "_pack_prefixes", lambda requests: [])
+    monkeypatch.setattr(
+        "imba_chess.eval.position_evaluator.consume_batched_decode_results",
+        lambda payloads, requests, out: [
+            ev.consume_decode_result(req, out)
+            for (ev, _), req in zip(payloads, requests)
+        ],
     )
     monkeypatch.setattr(me, "_autocast_context", lambda device, dtype: _noop())
 
@@ -168,7 +177,7 @@ def test_prefix_cache_tracks_order_and_does_not_retain_evaluators(monkeypatch):
         packed.append(token)
         return token
 
-    def merge(requests, *, prefix_kv_grouped):
+    def merge(requests, *, prefix_kv_grouped, **kwargs):
         seen.append(prefix_kv_grouped)
         return original_merge(requests)
 
@@ -179,7 +188,6 @@ def test_prefix_cache_tracks_order_and_does_not_retain_evaluators(monkeypatch):
         device=torch.device("cpu"),
         dtype=torch.float32,
         stats=None,
-        cache_prefixes=True,
     )
     a, b = _FakeEvaluator(1), _FakeEvaluator(1)
     executor([(a, [0]), (b, [0])])

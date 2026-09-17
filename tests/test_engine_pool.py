@@ -18,7 +18,9 @@ class _FakeEngine:
     """Records every `play`/`quit` call; sleeps in `play` to simulate
     engine "thinking" time; can be configured to raise from either."""
 
-    def __init__(self, *, play_sleep=0.0, play_result=None, play_exc=None, quit_exc=None):
+    def __init__(
+        self, *, play_sleep=0.0, play_result=None, play_exc=None, quit_exc=None
+    ):
         self.play_calls: list[tuple] = []
         self.quit_calls = 0
         self._play_sleep = play_sleep
@@ -170,7 +172,9 @@ def _payloads(engines):
 
 
 def test_sf_move_executor_fans_out_concurrently_not_serially():
-    engines = [_FakeEngine(play_sleep=_THINK, play_result=f"move_{i}") for i in range(_N)]
+    engines = [
+        _FakeEngine(play_sleep=_THINK, play_result=f"move_{i}") for i in range(_N)
+    ]
     executor = make_sf_move_executor(pool_threads=_N)
 
     t0 = time.perf_counter()
@@ -181,7 +185,9 @@ def test_sf_move_executor_fans_out_concurrently_not_serially():
     # Serial execution would take ~= _N * _THINK; concurrent fan-out should
     # take ~= one think. Generous margin (2x one think) for CI jitter, while
     # still being well under _N * _THINK (0.2s) if it were serialized.
-    assert elapsed < _THINK * 2, f"elapsed={elapsed} suggests serial, not concurrent, execution"
+    assert (
+        elapsed < _THINK * 2
+    ), f"elapsed={elapsed} suggests serial, not concurrent, execution"
 
 
 def test_sf_move_executor_preserves_payload_order_regardless_of_completion_order():
@@ -190,7 +196,8 @@ def test_sf_move_executor_preserves_payload_order_regardless_of_completion_order
     # order, not completion order.
     sleeps = [0.04, 0.03, 0.02, 0.01]
     engines = [
-        _FakeEngine(play_sleep=sleep, play_result=f"move_{i}") for i, sleep in enumerate(sleeps)
+        _FakeEngine(play_sleep=sleep, play_result=f"move_{i}")
+        for i, sleep in enumerate(sleeps)
     ]
     executor = make_sf_move_executor(pool_threads=len(engines))
 
@@ -224,7 +231,10 @@ def test_sf_move_executor_is_stateless_across_calls():
 
     # A prior call raising must not leave the executor (or some shared pool)
     # broken for subsequent calls.
-    bad_engines = [_FakeEngine(play_exc=RuntimeError("boom")), _FakeEngine(play_result="ok")]
+    bad_engines = [
+        _FakeEngine(play_exc=RuntimeError("boom")),
+        _FakeEngine(play_result="ok"),
+    ]
     with pytest.raises(RuntimeError, match="boom"):
         executor(_payloads(bad_engines))
 
@@ -235,3 +245,18 @@ def test_sf_move_executor_is_stateless_across_calls():
 def test_sf_move_executor_handles_empty_payload_list():
     executor = make_sf_move_executor(pool_threads=2)
     assert executor([]) == []
+
+
+def test_partial_spawn_failure_closes_all_created_engines():
+    engines = [_FakeEngine(quit_exc=ValueError("quit failed")), _FakeEngine()]
+    pending = iter(engines)
+
+    def spawn():
+        try:
+            return next(pending)
+        except StopIteration:
+            raise RuntimeError("spawn failed")
+
+    with pytest.raises(RuntimeError, match="spawn failed"):
+        EnginePool(spawn=spawn, size=3)
+    assert [engine.quit_calls for engine in engines] == [1, 1]
