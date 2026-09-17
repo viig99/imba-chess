@@ -13,6 +13,31 @@ import torch
 from . import cozy_bridge
 from .position_evaluator import _batched_value_scalars
 from .search import PositionEval
+from imba_chess.data.event_builder import EVENT_TOKEN_ID
+
+
+FEATURE_KEYS = (
+    "seq_token_id", "turn_id", "castle_id", "ep_file_id",
+    "halfmove_bucket_id", "fullmove_bucket_id", "prev_move_id",
+)
+
+
+@dataclass(slots=True)
+class _StagedRequest:
+    nodes: tuple
+    boards: tuple
+    prefix_kv: object
+    prefix_len: int
+    encoded: object
+
+
+def _stage_request(evaluator, batch):
+    node, board = batch[0]
+    evaluator._validate_handles((node,))
+    return _StagedRequest(
+        (node,), (board,), evaluator._prefix_kv, evaluator._prefix_len,
+        evaluator._board_state_encoder.encode_cozy(board),
+    )
 
 
 @dataclass
@@ -185,7 +210,7 @@ class DecodeWorkspace:
                 self.free_rows.extend(slot.rows)
                 del self.slots[key]
         requests = [
-            e.build_decode_request(batch, defer_tensors=True, defer_suffix=True)
+            _stage_request(e, batch)
             for e, batch in payloads
         ]
         chains = []
@@ -278,15 +303,20 @@ class DecodeWorkspace:
         self.counters["history_full_refreshes"] += int(full_refresh)
         # Logical rows are contiguous just like the compiled reference. Capacity
         # padding lives after the used range, outside each layer's active view.
-        keys = tuple(k for k in requests[0].new_token_batch if k != "piece_ids")
+        keys = FEATURE_KEYS
         dirty = []
         for row, (req, chain, (slot, dest), legal) in enumerate(
             zip(requests, chains, slots_rows, per_node)
         ):
-            host_fields[0][row] = req.new_token_batch["piece_ids"][0]
-            for col, key in enumerate(keys):
-                host_fields[1][col, row] = req.new_token_batch[key][0]
-            host_fields[2][:, row] = req.positions[0], req.prefix_len, len(chain), dest
+            state, node = req.encoded, req.nodes[0]
+            host_fields[0][row] = state.piece_ids
+            host_fields[1][:, row] = (
+                EVENT_TOKEN_ID, state.turn_id, state.castle_id, state.ep_file_id,
+                state.halfmove_bucket_id, state.fullmove_bucket_id, node.move_id,
+            )
+            host_fields[2][:, row] = (
+                req.prefix_len + node.depth, req.prefix_len, len(chain), dest,
+            )
             host_fields[3][row, : len(chain)] = chain
             host_fields[4][row, : len(legal[0])] = legal[0]
             owner = (slot.owner, slot.stamp)

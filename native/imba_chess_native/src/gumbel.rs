@@ -1,4 +1,4 @@
-//! Fused scalar Gumbel selectors. Tree ownership and RNG remain in Python.
+//! Native-owned search statistics. Python retains tree ownership and RNG.
 use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
 
@@ -116,14 +116,13 @@ fn validate_priors(priors: &[f64], n: usize) -> PyResult<()> {
     Ok(())
 }
 
-#[pyfunction]
 #[allow(clippy::too_many_arguments)]
 fn gumbel_interior_action(
     value: f64,
-    priors: Vec<f64>,
-    visits: Vec<u64>,
-    qvalues: Vec<f64>,
-    prior_probs: Vec<f64>,
+    priors: &[f64],
+    visits: &[u64],
+    qvalues: &[f64],
+    prior_probs: &[f64],
     maxvisit_init: f64,
     value_scale: f64,
     epsilon: f64,
@@ -146,7 +145,7 @@ fn gumbel_interior_action(
     let mut action = 0;
     let mut best = f64::NEG_INFINITY;
     for (i, (weight, n)) in weights.iter().zip(visits).enumerate() {
-        let score = weight / total - n as f64 / denominator;
+        let score = weight / total - *n as f64 / denominator;
         if score > best {
             // Strict comparison preserves first-index ties.
             best = score;
@@ -156,18 +155,17 @@ fn gumbel_interior_action(
     Ok(action)
 }
 
-#[pyfunction]
 #[allow(clippy::too_many_arguments)]
 fn gumbel_root_action(
     value: f64,
-    priors: Vec<f64>,
-    visits: Vec<u64>,
-    qvalues: Vec<f64>,
-    prior_probs: Vec<f64>,
+    priors: &[f64],
+    visits: &[u64],
+    qvalues: &[f64],
+    prior_probs: &[f64],
     maxvisit_init: f64,
     value_scale: f64,
     epsilon: f64,
-    noise: Vec<f64>,
+    noise: &[f64],
     eligible_visit: u64,
     max_prior: f64,
 ) -> PyResult<usize> {
@@ -199,6 +197,123 @@ fn gumbel_root_action(
     action.ok_or_else(|| PyValueError::new_err("no eligible root action"))
 }
 
+#[pyclass]
+struct NodeStats {
+    value: f64,
+    priors: Vec<f64>,
+    probs: Vec<f64>,
+    visits: Vec<u64>,
+    sums: Vec<f64>,
+    means: Vec<f64>,
+    noise: Vec<f64>,
+    max_prior: f64,
+}
+
+#[pymethods]
+impl NodeStats {
+    #[new]
+    fn new(value: f64, priors: Vec<f64>, probs: Vec<f64>) -> PyResult<Self> {
+        let n = priors.len();
+        if n == 0
+            || probs.len() != n
+            || !value.is_finite()
+            || priors.iter().any(|x| !x.is_finite())
+            || probs.iter().any(|x| !x.is_finite() || *x < 0.0)
+        {
+            return Err(PyValueError::new_err("invalid node statistics"));
+        }
+        let max_prior = priors.iter().copied().fold(f64::NEG_INFINITY, f64::max);
+        Ok(Self {
+            value,
+            priors,
+            probs,
+            visits: vec![0; n],
+            sums: vec![0.0; n],
+            means: vec![0.0; n],
+            noise: Vec::new(),
+            max_prior,
+        })
+    }
+
+    fn set_noise(&mut self, noise: Vec<f64>) -> PyResult<()> {
+        if noise.len() != self.priors.len() || noise.iter().any(|x| !x.is_finite()) {
+            return Err(PyValueError::new_err("invalid root noise"));
+        }
+        self.noise = noise;
+        Ok(())
+    }
+
+    fn interior(&self, maxvisit_init: f64, value_scale: f64, epsilon: f64) -> PyResult<usize> {
+        gumbel_interior_action(
+            self.value,
+            &self.priors,
+            &self.visits,
+            &self.means,
+            &self.probs,
+            maxvisit_init,
+            value_scale,
+            epsilon,
+        )
+    }
+
+    fn root(
+        &self,
+        visit: u64,
+        maxvisit_init: f64,
+        value_scale: f64,
+        epsilon: f64,
+    ) -> PyResult<usize> {
+        gumbel_root_action(
+            self.value,
+            &self.priors,
+            &self.visits,
+            &self.means,
+            &self.probs,
+            maxvisit_init,
+            value_scale,
+            epsilon,
+            &self.noise,
+            visit,
+            self.max_prior,
+        )
+    }
+
+    fn snapshot(&self) -> (Vec<u64>, Vec<f64>, Vec<f64>) {
+        (self.visits.clone(), self.sums.clone(), self.means.clone())
+    }
+}
+
+#[pyfunction]
+fn gumbel_backup(
+    py: Python<'_>,
+    path: Vec<(Py<NodeStats>, usize)>,
+    mut value: f64,
+) -> PyResult<()> {
+    if !value.is_finite() || value.abs() > 1.000001 {
+        return Err(PyValueError::new_err("invalid backup value"));
+    }
+    // Validate the complete path before mutating any node. Real search paths
+    // contain one edge per distinct node; reject aliases to preserve that rule.
+    let mut seen = std::collections::HashSet::new();
+    for (node, edge) in &path {
+        if !seen.insert(node.as_ptr()) {
+            return Err(PyValueError::new_err("duplicate backup node"));
+        }
+        let node = node.try_borrow(py)?;
+        if *edge >= node.visits.len() || node.visits[*edge] == u64::MAX {
+            return Err(PyValueError::new_err("invalid backup edge or overflow"));
+        }
+    }
+    for (node, edge) in path.iter().rev() {
+        value = -value;
+        let mut node = node.try_borrow_mut(py)?;
+        node.visits[*edge] += 1;
+        node.sums[*edge] += value;
+        node.means[*edge] = node.sums[*edge] / node.visits[*edge] as f64;
+    }
+    Ok(())
+}
+
 // Exposed for direct numerical parity tests; selectors never round-trip Q arrays.
 #[pyfunction]
 fn _gumbel_completed_q(
@@ -222,8 +337,8 @@ fn _gumbel_completed_q(
 }
 
 pub fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {
-    m.add_function(wrap_pyfunction!(gumbel_interior_action, m)?)?;
-    m.add_function(wrap_pyfunction!(gumbel_root_action, m)?)?;
+    m.add_class::<NodeStats>()?;
+    m.add_function(wrap_pyfunction!(gumbel_backup, m)?)?;
     m.add_function(wrap_pyfunction!(_gumbel_completed_q, m)?)?;
     Ok(())
 }

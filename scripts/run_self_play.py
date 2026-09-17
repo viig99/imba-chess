@@ -36,6 +36,18 @@ def main():
     parser.add_argument("--device", default="cuda")
     parser.add_argument("--max-iterations", type=int, default=100000)
     parser.add_argument(
+        "--checkpoint-seconds", type=int, default=60,
+        help="Training recovery-save interval; phase boundaries always save",
+    )
+    parser.add_argument(
+        "--keep-recovery-checkpoints", type=int, default=1,
+        help="Recent recovery checkpoints to retain in addition to actor and best",
+    )
+    parser.add_argument(
+        "--screen-seconds", type=int,
+        help="Screen at phase boundaries after this interval instead of every N actors",
+    )
+    parser.add_argument(
         "--concurrent-games", type=int,
         help="Collection slots; execution-only override preserves resume config identity",
     )
@@ -68,6 +80,12 @@ def main():
         parser.error("--concurrent-games must be positive")
     if args.screen_every < 1:
         parser.error("--screen-every must be positive")
+    if args.checkpoint_seconds < 1:
+        parser.error("--checkpoint-seconds must be positive")
+    if args.keep_recovery_checkpoints < 1:
+        parser.error("--keep-recovery-checkpoints must be positive")
+    if args.screen_seconds is not None and args.screen_seconds < 1:
+        parser.error("--screen-seconds must be positive")
     if args.until is not None and args.until.tzinfo is None:
         parser.error("--until needs an explicit timezone")
     cfg = load_config(args.config)
@@ -171,6 +189,11 @@ def main():
             keep = {
                 str(Path(state[k]).resolve()) for k in ("actor", "best", "checkpoint")
             }
+            recovery = sorted(
+                args.output.glob("state-*.pt"),
+                key=lambda p: (p.stat().st_mtime_ns, p.name), reverse=True,
+            )
+            keep.update(str(p.resolve()) for p in recovery[:args.keep_recovery_checkpoints])
             for old in args.output.glob("*.pt"):
                 if str(old.resolve()) not in keep:
                     old.unlink()
@@ -197,6 +220,9 @@ def main():
                 inference_options=getattr(runtime, "options", {}),
                 until=args.until.isoformat() if args.until else None,
                 screen_every=args.screen_every,
+                checkpoint_seconds=args.checkpoint_seconds,
+                keep_recovery_checkpoints=args.keep_recovery_checkpoints,
+                screen_seconds=args.screen_seconds,
                 defer_confirmation=args.defer_confirmation,
             )
         )
@@ -211,6 +237,7 @@ def main():
                 del saved
             store.collect_garbage(pinned_shards=pinned)
 
+        next_screen = time.monotonic() + (args.screen_seconds or 0)
         while state["iteration"] < args.max_iterations and not budget.stop():
             if state["phase"] == "collect":
                 if not budget.launch():
@@ -277,7 +304,7 @@ def main():
                 def step(metrics):
                     nonlocal last_save
                     log(metrics)
-                    if time.monotonic() - last_save >= 60:
+                    if time.monotonic() - last_save >= args.checkpoint_seconds:
                         publish_checkpoint()
                         last_save = time.monotonic()
 
@@ -305,11 +332,14 @@ def main():
                 atomic_json(state_path, state)
             if state["phase"] == "evaluate":
                 screen_path = args.output / f'screen-{state["iteration"]:06d}.json'
-                if (
-                    state["iteration"] + 1
-                ) % args.screen_every and not screen_path.exists():
+                screen_deferred = (
+                    time.monotonic() < next_screen if args.screen_seconds is not None
+                    else (state["iteration"] + 1) % args.screen_every != 0
+                )
+                if screen_deferred and not screen_path.exists():
                     log(
-                        dict(decision="screen_deferred", screen_every=args.screen_every)
+                        dict(decision="screen_deferred", screen_every=args.screen_every,
+                             screen_seconds=args.screen_seconds)
                     )
                     finish_iteration()
                     continue
@@ -389,6 +419,7 @@ def main():
                     break
                 if action == "promote":
                     state.update(best=state["actor"], best_id=state["actor_id"])
+                next_screen = time.monotonic() + (args.screen_seconds or 0)
                 finish_iteration()
         print(
             f'Stopped at iteration {state["iteration"]}, phase {state["phase"]}; '

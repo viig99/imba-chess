@@ -323,7 +323,8 @@ def test_corrupt_outcome_rejected():
 
 
 @pytest.mark.parametrize("failure_stage", ["screen", "confirmation"])
-def test_multiple_iterations_and_runner_resume(tmp_path, monkeypatch, failure_stage):
+@pytest.mark.parametrize("timed_screen", [False, True])
+def test_multiple_iterations_and_runner_resume(tmp_path, monkeypatch, failure_stage, timed_screen):
     import sys
     import scripts.run_self_play as runner
     from imba_chess.self_play.config import (
@@ -443,13 +444,20 @@ def test_multiple_iterations_and_runner_resume(tmp_path, monkeypatch, failure_st
             "6",
             "--screen-every",
             "3",
+            "--checkpoint-seconds",
+            "3600",
+            "--keep-recovery-checkpoints",
+            "2",
             "--defer-confirmation",
-        ],
+        ] + (["--screen-seconds", "10800"] if timed_screen else []),
     )
     runner.main()
     state = json.loads((output / "state.json").read_text())
     assert state["iteration"] == 6 and not state["halted"]
-    assert calls == ["screen-000005.json"]
+    assert calls == ([] if timed_screen else ["screen-000005.json"])
+    assert len(list(output.glob("state-*.pt"))) == 2
+    for key in ("actor", "best", "checkpoint"):
+        assert Path(state[key]).exists()
     assert state["best"].endswith("actor-000000.pt")
     monkeypatch.setattr(runner, "evaluate_pair_checkpoints", original_evaluate)
 

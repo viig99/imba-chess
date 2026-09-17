@@ -10,14 +10,13 @@ import pytest
 from imba_chess.eval.gumbel_search import (
     GumbelConfig,
     completed_q,
-    interior_action,
     select_gumbel,
     softmax,
 )
 from tests.test_gumbel_search import FakeEvaluator
 
 
-def test_native_q_and_fused_selections_match_python_exactly():
+def test_native_q_matches_python_exactly():
     from imba_chess_native.imba_chess_native import _gumbel_completed_q
 
     rng = random.Random(721)
@@ -38,22 +37,6 @@ def test_native_q_and_fused_selections_match_python_exactly():
         constants = (cfg.maxvisit_init, cfg.value_scale, cfg.epsilon)
         expected = completed_q(value, priors, visits, qs, cfg, probs)
         assert _gumbel_completed_q(value, visits, qs, probs, *constants) == expected
-        assert cc.gumbel_interior_action(
-            value, priors, visits, qs, probs, *constants
-        ) == interior_action(value, priors, visits, qs, cfg, probs)
-        noise = [0.0 if case % 11 == 0 else rng.uniform(-1e12, 10) for _ in range(n)]
-        eligible = rng.choice(visits)
-        max_prior = max(priors)
-        action = max(
-            (i for i in range(n) if visits[i] == eligible),
-            key=lambda i: max(-1e9, noise[i] + priors[i] - max_prior + expected[i]),
-        )
-        assert (
-            cc.gumbel_root_action(
-                value, priors, visits, qs, probs, *constants, noise, eligible, max_prior
-            )
-            == action
-        )
 
 
 @pytest.mark.parametrize("budget", [1, 3, 128])
@@ -74,10 +57,10 @@ def test_native_search_keeps_rng_visits_targets_and_counters(fen, budget):
 
 def test_native_rejects_malformed_inputs_and_ineligible_root():
     with pytest.raises(ValueError):
-        cc.gumbel_interior_action(0.0, [0.0], [], [], [], 50.0, 0.1, 1e-8)
+        cc.NodeStats(0.0, [0.0], [])
+    node = cc.NodeStats(0.0, [0.0], [1.0])
+    node.set_noise([0.0])
     with pytest.raises(ValueError, match="eligible"):
-        cc.gumbel_root_action(
-            0.0, [0.0], [0], [0.0], [1.0], 50.0, 0.1, 1e-8, [0.0], 1, 0.0
-        )
+        node.root(1, 50.0, 0.1, 1e-8)
     with pytest.raises(ValueError):
-        cc.gumbel_interior_action(math.nan, [0.0], [0], [0.0], [1.0], 50.0, 0.1, 1e-8)
+        cc.NodeStats(math.nan, [0.0], [1.0])

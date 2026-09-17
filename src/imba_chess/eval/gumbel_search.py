@@ -123,13 +123,14 @@ class _Node:
     handle: Any
     value: float | None = None
     evaluation: PositionEval | None = None
-    visits: list[int] = field(default_factory=list)
-    sums: list[float] = field(default_factory=list)
-    means: list[float] = field(default_factory=list)
+    visits: list[int] | None = None
+    sums: list[float] | None = None
+    means: list[float] | None = None
     prior_probs: list[float] = field(default_factory=list)
     children: dict[int, Any] = field(default_factory=dict)
+    stats: Any = None
 
-    def initialize(self, evaluation):
+    def initialize(self, evaluation, native=False):
         n = len(evaluation.legal_ids)
         if not n or not all(
             len(x) == n
@@ -148,12 +149,16 @@ class _Node:
             raise ValueError("nonfinite or invalid network evaluation")
         self.evaluation = evaluation
         self.value = evaluation.value_stm
-        self.visits = [0] * n
-        self.sums = [0.0] * n
-        self.means = [0.0] * n
         self.prior_probs = [
             max(p, 1.1754943508222875e-38) for p in softmax(evaluation.legal_log_priors)
         ]
+
+        if native:
+            self.stats = cc.NodeStats(self.value, evaluation.legal_log_priors, self.prior_probs)
+        else:
+            self.visits = [0] * n
+            self.sums = [0.0] * n
+            self.means = [0.0] * n
 
     def qs(self):
         return self.means
@@ -187,31 +192,23 @@ def gumbel_stepwise(
         raise ValueError("cannot search terminal root")
     if root_eval is None:
         (root_eval,) = yield EvalRequest([(root_handle, root.board)])
-    root.initialize(root_eval)
-    n = len(root.visits)
+    root.initialize(root_eval, native_selection)
+    n = len(root_eval.legal_ids)
     if noise is None:
         rng = rng or random.Random()
         noise = [-math.log(-math.log(max(rng.random(), 1e-12))) for _ in range(n)]
     if len(noise) != n or not all(math.isfinite(x) for x in noise):
         raise ValueError("noise must contain one finite value per legal action")
+    if native_selection:
+        root.stats.set_noise(noise)
     priors = root_eval.legal_log_priors
     max_prior = max(priors)
     evaluations, terminal_hits, cutoffs, deepest = 1, 0, 0, 0
 
     def root_action(visit):
         if native_selection:
-            return cc.gumbel_root_action(
-                root.value,
-                priors,
-                root.visits,
-                root.qs(),
-                root.prior_probs,
-                config.maxvisit_init,
-                config.value_scale,
-                config.epsilon,
-                noise,
-                visit,
-                max_prior,
+            return root.stats.root(
+                visit, config.maxvisit_init, config.value_scale, config.epsilon
             )
         q = completed_q(
             root.value, priors, root.visits, root.qs(), config, root.prior_probs
@@ -228,7 +225,7 @@ def gumbel_stepwise(
             raise InterruptedError("search cancelled")
         node, action, depth, path = root, root_action(visit), 0, []
         while True:
-            path.append((node, action))
+            path.append((node.stats if native_selection else node, action))
             depth += 1
             deepest = max(deepest, depth)
             if action not in node.children:
@@ -243,7 +240,7 @@ def gumbel_stepwise(
                         node.handle, ev.legal_ucis[action], ev.legal_ids[action]
                     )
                     (evaluation,) = yield EvalRequest([(child.handle, child.board)])
-                    child.initialize(evaluation)
+                    child.initialize(evaluation, native_selection)
                     evaluations += 1
                 leaf = child
                 if terminal is not None:
@@ -261,15 +258,8 @@ def gumbel_stepwise(
                 leaf = node
                 break
             if native_selection:
-                action = cc.gumbel_interior_action(
-                    node.value,
-                    node.evaluation.legal_log_priors,
-                    node.visits,
-                    node.qs(),
-                    node.prior_probs,
-                    config.maxvisit_init,
-                    config.value_scale,
-                    config.epsilon,
+                action = node.stats.interior(
+                    config.maxvisit_init, config.value_scale, config.epsilon
                 )
                 continue
             action = interior_action(
@@ -280,12 +270,17 @@ def gumbel_stepwise(
                 config,
                 node.prior_probs,
             )
-        value = leaf.value
-        for parent, edge in reversed(path):
-            value = -value
-            parent.visits[edge] += 1
-            parent.sums[edge] += value
-            parent.means[edge] = parent.sums[edge] / parent.visits[edge]
+        if native_selection:
+            cc.gumbel_backup(path, leaf.value)
+        else:
+            value = leaf.value
+            for parent, edge in reversed(path):
+                value = -value
+                parent.visits[edge] += 1
+                parent.sums[edge] += value
+                parent.means[edge] = parent.sums[edge] / parent.visits[edge]
+    if native_selection:
+        root.visits, root.sums, root.means = root.stats.snapshot()
     action = root_action(max(root.visits))
     q = completed_q(
         root.value, priors, root.visits, root.qs(), config, root.prior_probs
