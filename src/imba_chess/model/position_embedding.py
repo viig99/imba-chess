@@ -43,7 +43,9 @@ class PositionEmbedding(nn.Module):
         S = content.shape[0]
         positions = torch.arange(S, device=offsets.device, dtype=torch.long)
         lengths = offsets[1:] - offsets[:-1]
-        sequence_starts = torch.repeat_interleave(offsets[:-1], lengths)
+        # The flattened length is already known; avoid a data-dependent output
+        # shape (and GPU synchronization) when capturing the full training graph.
+        sequence_starts = torch.repeat_interleave(offsets[:-1], lengths, output_size=S)
         positions = torch.clamp(positions - sequence_starts, max=self.max_seq_len - 1)
 
         x = content * (self._embedding_dim**0.5) + self.embedding(positions)

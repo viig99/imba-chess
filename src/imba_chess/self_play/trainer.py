@@ -16,6 +16,25 @@ from .dataset import reconstruct, collate_self_play
 from .losses import self_play_loss
 
 
+def _model_loss(model, batch, mask, value_weight):
+    output = model(batch, block_mask=mask, return_loss=False)
+    return self_play_loss(output, batch, value_weight=value_weight)
+
+
+def _training_loss(model, batch, value_weight, *, model_loss=_model_loss):
+    device = model.piece_square_embedding.weight.device
+    mask_factory = (
+        create_batch_block_mask if device.type == "cuda" else create_batch_dense_mask
+    )
+    with torch.no_grad():
+        mask = mask_factory(
+            batch["seq_offsets"].to(device),
+            total_tokens=batch["total_tokens"],
+            device=device,
+        )
+    return model_loss(model, batch, mask, value_weight)
+
+
 def atomic_checkpoint(path, state):
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -39,6 +58,9 @@ class Stage2Trainer:
             encoder,
         )
         self.device, self.max_positions = device, max_positions
+        # Keep the model shared with collection and plain checkpoint keys. The
+        # benchmark wraps this tensor-only callable without replacing the model.
+        self._loss_fn = _training_loss
         self.optimizer = StableAdamW(
             build_decay_param_groups(model, weight_decay=config.weight_decay),
             lr=config.lr,
@@ -102,21 +124,7 @@ class Stage2Trainer:
                 step_start = time.perf_counter()
                 batch, gids = self._next_batch(store)
                 self.optimizer.zero_grad(set_to_none=True)
-                mask_factory = (
-                    create_batch_block_mask
-                    if self.device.type == "cuda"
-                    else create_batch_dense_mask
-                )
-                with torch.no_grad():
-                    mask = mask_factory(
-                        batch["seq_offsets"].to(self.device),
-                        total_tokens=batch["total_tokens"],
-                        device=self.device,
-                    )
-                output = self.model(batch, block_mask=mask, return_loss=False)
-                losses = self_play_loss(
-                    output, batch, value_weight=self.config.value_weight
-                )
+                losses = self._loss_fn(self.model, batch, self.config.value_weight)
                 if not torch.isfinite(losses["loss"]):
                     raise FloatingPointError("nonfinite stage-2 loss")
                 losses["loss"].backward()
