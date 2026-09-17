@@ -115,3 +115,30 @@ A disposable actor-000002/replay training sweep measured 1,024-token batches at 
 Synchronous move selection now drives the same stepwise controller used by the single-process scheduler. Legal projection, value-head/config guards, search dispatch and debug formatting have one implementation. Synchronous greedy evaluation still skips KV output. The halving algorithm, Stockfish settings, CLI defaults, actor worker/server route, and stage-2 morning evaluation code are unchanged. The script shrank by 80 lines; larger actor/reporting consolidation remains a separate decision.
 
 Validation: `.venv/bin/python /tmp/verify_stockfish_refactor.py` compared the saved pre-refactor source against both current execution modes for greedy, value rerank, depth-two and halving policies. Selected moves, complete debug dictionaries (including top-k logits/search statistics) and inference counts matched exactly on deterministic fixtures. Existing parity tests now check complete debug dictionaries. `OMP_NUM_THREADS=4 MKL_NUM_THREADS=4 .venv/bin/python -m pytest -q` passed 2,267 tests, 17 extended deselected, in 24.06 seconds. Reproduction script/source copies, differential results and CUDA/Stockfish smoke logs are under `artifacts/self_play_validation/stockfish_refactor_2026-09-13/`. Smoke checks use ckpt34, halving budget 32/top-m 4, two games capped at eight plies, and concurrency 1 then 2. Capped smoke games remain incomplete and supply no strength evidence. Specify both `--games 2` and `--ladder-games-per-segment 2`; the retained v4 ladder has its own game count.
+
+
+## Authorized longer continuation and September schedule — September 13, 08:01 EDT
+
+The user authorized continuing actor15 with the original optimizer/replay and learning settings, then requested nightly training from 22:00 to 06:00 for the month. This supersedes the earlier decision to leave all learning paused. The original `laptop-pilot` and diagnosis snapshot remain unchanged. A separate research run is active at `artifacts/self_play/laptop-continuation-2026-09-13/`.
+
+The transient draw-adaptation hypothesis remains untested by the short coefficient fork. Earlier decisive-trajectory accuracy was three-class WDL argmax accuracy, not conditional win-versus-loss accuracy. Increased draw probability can reduce it without reversing win/loss ordering. Telemetry now adds conditional win/loss CE and accuracy plus the decisive-position count; batches with zero decisive positions report zero and must be excluded from aggregation. These are training metrics, not held-out strength measurements, and do not change gradients or the training objective.
+
+`operation/prepare.py` copied the original configuration/seed manifest, hard-linked immutable source checkpoints/shards and preserved model, optimizer, scheduler, all RNG and sampler state. It advanced only the completed phase from iteration 14/evaluate to 15/collect and remapped run paths. Serialized state was read back and checked recursively for exact equality. Resume begins at **325 updates / 195,583 exposures / 49,936 active replay positions**. Config identity remains `8181aaffcb1c204ddf219b22f1e7becd0040cf74d7489ef2477d8a46899fbb10`.
+
+Settings: 24 collection slots (execution override), compiled FP32, search 128/16/32, root and training token limits 1,024, fresh training threshold 4,096, reuse 2, LR 1e-5, value coefficient 1, decay .01, gradient clip 1. Screens run every five trained actors on the original fixed 50 monitoring prefixes, colors swapped. The explicit `--observe-only-screen` research option logs the ordinary decision but neither rolls back nor promotes best. Invalid/nonfinite training and evaluation protocol failures still stop the run. Default runner behavior retains its existing rollback/promotion rules. The baseline remains fixed; periodic screens are exploratory repeated measurements, not confirmation of improvement.
+
+The immediate window started **08:01 EDT September 13**, bounded until approximately **12:01 EDT**. Enabled user timer `imba-self-play-september.timer` schedules **September 13–30 inclusive at 22:00 America/Toronto**, each ending by 06:00 the next morning (last endpoint October 1). `Persistent=false` prevents daytime catch-up; the wrapper additionally refuses starts outside the date/time window. The user manager already has lingering enabled. An active sleep inhibitor blocks automatic sleep during runs; the laptop must be powered on and awake at the scheduled start. Collection reserve/drain remain 15/10 minutes, and systemd limits the whole nightly process group to eight hours. Published phases resume the following night; completed session endpoints preserve checkpoint/replay snapshots. No morning GPU work extends past the requested window.
+
+Operational source files and reviewed service definitions: `operation/run_window.py`, `operation/*.service`, `operation/*.timer`. Installed under `/home/vigi99/.config/systemd/user/`. Per-window exact commands/PIDs/deadlines and logs: `sessions/*/launch.json`, `training.log`, `monitor.log`; final state snapshots under `sessions/*/snapshot/`. TensorBoard: **http://127.0.0.1:6007/**, backed by the dedicated `imba-self-play-tensorboard.service`.
+
+Verification: 18 self-play tests and six overnight/runtime-option tests passed. Added checks establish draw-logit invariance of conditional win/loss metrics, empty-decisive handling, observation-only continuation through a regression, and baseline retention; existing protocol-failure stop/resume coverage passes. Host systemd unit validation and calendar parsing passed. Immediate service, GPU process, HTTP 200, sleep inhibitor, and next 22:00 timer trigger were observed after launch.
+
+Control commands:
+
+```bash
+systemctl --user status imba-self-play-september.timer imba-self-play-september.service
+systemctl --user stop imba-self-play-continuation-now.service imba-self-play-september.service
+systemctl --user disable --now imba-self-play-september.timer
+```
+
+Stopping a service stops the current window; disabling the timer cancels future starts. The schedule does not wake a sleeping or powered-off laptop.

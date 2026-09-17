@@ -23,6 +23,12 @@ def self_play_loss(output, batch, *, value_weight=1.0):
     entropy = -(target * target.clamp_min(1e-38).log()).sum(-1).mean()
     with torch.no_grad():
         model_entropy = -(log_probs.exp() * log_probs).sum(-1).mean()
+        decisive = wdl[:, 1] == 0
+        decisive_count = decisive.sum()
+        wl_logits = value_logits[:, [0, 2]]
+        wl_targets = wdl[:, [0, 2]]
+        wl_ce = -(wl_targets * F.log_softmax(wl_logits, -1)).sum(-1)
+        wl_correct = wl_logits.argmax(-1) == wl_targets.argmax(-1)
     actor_kl = {}
     if "actor_log_priors" in batch:
         available = batch["actor_prior_available"].to(logits.device)
@@ -39,6 +45,9 @@ def self_play_loss(output, batch, *, value_weight=1.0):
         value_loss=value_loss,
         policy_entropy=entropy,
         model_policy_entropy=model_entropy,
+        decisive_positions=decisive_count,
+        conditional_wl_loss=(wl_ce * decisive).sum() / decisive_count.clamp_min(1),
+        conditional_wl_accuracy=(wl_correct * decisive).sum() / decisive_count.clamp_min(1),
         policy_target_kl=policy_loss - entropy,
         **actor_kl,
         brier=(probs - wdl).square().sum(-1).mean(),

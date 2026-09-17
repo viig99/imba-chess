@@ -68,6 +68,11 @@ def main():
         help="Keep the evaluated best and defer 500-game promotion confirmation",
     )
     parser.add_argument(
+        "--observe-only-screen",
+        action="store_true",
+        help="Research runs: record strength screens without rollback or best promotion",
+    )
+    parser.add_argument(
         "--decoder-mode",
         choices=["current", "compiled"],
         default=None,
@@ -224,6 +229,7 @@ def main():
                 keep_recovery_checkpoints=args.keep_recovery_checkpoints,
                 screen_seconds=args.screen_seconds,
                 defer_confirmation=args.defer_confirmation,
+                observe_only_screen=args.observe_only_screen,
             )
         )
 
@@ -377,6 +383,7 @@ def main():
                         and screen["score"] > 0.5
                         and screen["upper"] >= 0.45
                         and not args.defer_confirmation
+                        and not args.observe_only_screen
                     ):
                         confirmation = evaluate_pair_checkpoints(
                             **common,
@@ -399,12 +406,14 @@ def main():
                 del best, common
                 if screen is None:
                     break
-                action = decision(screen, confirmation)
+                recommended_action = decision(screen, confirmation)
+                action = "observe_only" if args.observe_only_screen else recommended_action
                 log(
                     dict(
                         screen=screen,
                         confirmation=confirmation,
                         decision=action,
+                        recommended_decision=recommended_action,
                         confirmation_deferred=bool(
                             args.defer_confirmation and screen["score"] > 0.5
                         ),

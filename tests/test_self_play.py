@@ -180,6 +180,17 @@ def test_sparse_loss_by_hand_and_finite_gradients():
     torch.testing.assert_close(
         logits.grad, torch.tensor([[0.0, 0.125, -0.125], [0.0, 0.0, 0.0]])
     )
+    # Draw logits must not affect conditional win/loss discrimination.
+    for draw_logit in (0.0, 100.0):
+        values = torch.tensor([[0.0, draw_logit, math.log(3)]]).repeat(2, 1)
+        metrics = self_play_loss(dict(logits=logits, value_logits=values), batch)
+        assert metrics["decisive_positions"] == 1
+        assert metrics["conditional_wl_accuracy"] == 1
+        assert metrics["conditional_wl_loss"].item() == pytest.approx(-math.log(.75))
+    batch["value_target"][:] = torch.tensor([0.0, 1.0, 0.0])
+    metrics = self_play_loss(dict(logits=logits, value_logits=value), batch)
+    assert metrics["decisive_positions"] == 0
+    assert metrics["conditional_wl_loss"] == 0  # No decisive samples; ignore this batch.
 
 
 def tiny_model():
@@ -459,6 +470,21 @@ def test_multiple_iterations_and_runner_resume(tmp_path, monkeypatch, failure_st
     for key in ("actor", "best", "checkpoint"):
         assert Path(state[key]).exists()
     assert state["best"].endswith("actor-000000.pt")
+    # Research screens remain observable without halting or promoting best.
+    for upper, limit in ((0.40, 7), (0.80, 8)):
+        monkeypatch.setattr(
+            runner, "evaluate_pair_checkpoints",
+            lambda **kw: dict(score=upper - .05, lower=upper - .1, upper=upper),
+        )
+        monkeypatch.setattr(sys, "argv", base + [
+            "--resume", "--max-iterations", str(limit), "--observe-only-screen",
+        ])
+        runner.main()
+        state = json.loads((output / "state.json").read_text())
+        assert state["iteration"] == limit and not state["halted"]
+        assert state["best"].endswith("actor-000000.pt")
+        assert state["actor"] != state["best"]
+    assert '"recommended_decision": "rollback_stop"' in (output / "metrics.jsonl").read_text()
     monkeypatch.setattr(runner, "evaluate_pair_checkpoints", original_evaluate)
 
     def failed_evaluation(**kwargs):
@@ -469,11 +495,11 @@ def test_multiple_iterations_and_runner_resume(tmp_path, monkeypatch, failure_st
         raise runner.EvaluationProtocolError("game_limit")
 
     monkeypatch.setattr(runner, "evaluate_pair_checkpoints", failed_evaluation)
-    monkeypatch.setattr(sys, "argv", base + ["--resume", "--max-iterations", "7"])
+    monkeypatch.setattr(sys, "argv", base + ["--resume", "--max-iterations", "9"])
     runner.main()
     state = json.loads((output / "state.json").read_text())
     assert state["halted"] and state["halt_reason"] == "evaluation_protocol"
-    assert state["phase"] == "evaluate" and state["iteration"] == 6
+    assert state["phase"] == "evaluate" and state["iteration"] == 8
     assert state["actor"] != state["best"]
     assert all(Path(state[key]).exists() for key in ("actor", "best", "checkpoint"))
     assert "protocol_stop" in (output / "metrics.jsonl").read_text()
