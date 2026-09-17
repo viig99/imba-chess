@@ -1,0 +1,34 @@
+/* Hallmark · macrostructure: Long Document · theme: Almanac · tone: technical reference · anchor hue: 155
+ * nav: N3 Side-rail · footer: Ft4 Dense colophon · audience: imba-chess developer learning attention
+ * pre-emit critique: P4 H4 E4 S5 R5 V4 */
+:root {
+  --color-paper: oklch(97% .009 90);
+  --color-paper-2: oklch(93% .013 90);
+  --color-ink: oklch(24% .012 155);
+  --color-muted: oklch(43% .014 155);
+  --color-rule: oklch(77% .012 155);
+  --color-control: oklch(53% .015 155);
+  --color-accent: oklch(38% .077 155);
+  --color-accent-ink: oklch(98% .008 155);
+  --color-focus: oklch(40% .12 265);
+  --color-selected: oklch(87% .047 155);
+  --color-masked: oklch(91% .009 155);
+  --color-error: oklch(42% .12 30);
+  --color-square-light: oklch(89% .03 90);
+  --color-square-dark: oklch(63% .045 155);
+  --color-piece-white: oklch(99% .004 90);
+  --color-piece-black: oklch(19% .01 155);
+  --font-display: 'Charter', 'Noto Serif', 'DejaVu Serif', serif;
+  --font-body: 'Cantarell', 'Noto Sans', 'DejaVu Sans', sans-serif;
+  --font-mono: 'Source Code Pro', 'DejaVu Sans Mono', monospace;
+  --space-xs: 4px;
+  --space-sm: 8px;
+  --space-md: 16px;
+  --space-lg: 24px;
+  --space-xl: 32px;
+  --space-2xl: 48px;
+  --space-3xl: 80px;
+  --ease-out: cubic-bezier(.16,1,.3,1);
+  --ease-in: cubic-bezier(.7,0,.84,0);
+  --ease-in-out: cubic-bezier(.65,0,.35,1);
+}

@@ -1,0 +1,10 @@
+{
+  "date": "2026-09-13",
+  "scope": "docs/attention-lab",
+  "existing_web_system": false,
+  "framework": "offline vanilla HTML",
+  "font_stack": "offline installed serif/sans/mono fallbacks",
+  "motion": "cut; manual interactions",
+  "palette": "Almanac reading palette",
+  "reference": "pyproject.toml; no existing HTML/CSS found"
+}
