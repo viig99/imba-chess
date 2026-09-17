@@ -552,6 +552,7 @@ def _select_model_move(
     value_rerank_top_k: int,
     value_rerank_lambda: float,
     halving_config: "search.HalvingConfig | None",
+    gumbel_config=None,
 ) -> tuple[chess.Move, dict]:
     """Torch-free, protocol-driven twin of `scripts/eval_vs_stockfish.py`'s
     `_select_model_move`: the model forward becomes one `RootEvalRequest`/
@@ -639,7 +640,7 @@ def _select_model_move(
 
     if policy == "greedy":
         chosen_index = search.select_greedy(legal_log_priors)
-    elif policy in ("value_rerank", "value_search_d2", "value_search_halving"):
+    elif policy in ("value_rerank", "value_search_d2", "value_search_halving", "gumbel"):
         evaluator = _WaveEvaluator(
             conn=conn,
             worker_id=worker_id,
@@ -647,7 +648,21 @@ def _select_model_move(
             move_vocab=move_vocab,
             board_state_encoder=board_state_encoder,
         )
-        if policy == "value_rerank":
+        if policy == "gumbel":
+            from .gumbel_search import select_gumbel
+
+            if gumbel_config is None:
+                raise ValueError("policy=gumbel requires gumbel_config")
+            root_eval = search.PositionEval(
+                float(response.value_stm), _cozy_legal_moves, legal_ucis,
+                legal_log_priors, _legal_forcing, legal_vocab_ids,
+            )
+            gumbel_result = select_gumbel(
+                evaluator=evaluator, board=board, root_eval=root_eval,
+                config=gumbel_config, noise=[0.0] * len(legal_moves),
+            )
+            chosen_index = legal_ucis.index(gumbel_result.move_uci)
+        elif policy == "value_rerank":
             chosen_index, _rows = search.select_value_rerank(
                 evaluator=evaluator,
                 root_handle=None,
@@ -687,6 +702,13 @@ def _select_model_move(
     }
     if policy == "value_search_halving":
         debug_info["search_stats"] = search.summarize_search_rows(_rows)
+    elif policy == "gumbel":
+        debug_info["search_stats"] = {
+            "simulations": gumbel_result.simulations,
+            "neural_evaluations": gumbel_result.neural_evaluations,
+            "terminal_hits": gumbel_result.terminal_hits,
+            "depth_cutoffs": gumbel_result.depth_cutoffs,
+        }
     return legal_moves[chosen_index], debug_info
 
 
@@ -707,6 +729,7 @@ def _play_one_game(
     max_plies: int,
     rng: random.Random,
     turn_counter: "itertools.count",
+    gumbel_config=None,
 ) -> _EvalSummaryFragment:
     """One game's synchronous core: a direct (non-generator) port of
     `scripts/eval_vs_stockfish.py`'s `_play_game`, minus the `WorkRequest`
@@ -753,6 +776,7 @@ def _play_one_game(
                 value_rerank_top_k=value_rerank_top_k,
                 value_rerank_lambda=value_rerank_lambda,
                 halving_config=halving_config,
+                gumbel_config=gumbel_config,
             )
             summary.model_turns += 1
             summary.model_selection_seconds += perf_counter() - selection_start
@@ -892,6 +916,13 @@ def run_eval_worker(conn, worker_config: dict) -> None:
 
     rng = random.Random(seed + worker_id)
     turn_counter = itertools.count()
+    gumbel_config = None
+    if policy == "gumbel":
+        from .gumbel_search import GumbelConfig
+
+        if "gumbel_config" not in worker_config:
+            raise ValueError("policy=gumbel requires gumbel_config")
+        gumbel_config = GumbelConfig(**worker_config["gumbel_config"])
 
     engine_config = worker_config["engine"]
     # Limit first, engine second: _build_engine_limit is pure (no
@@ -921,6 +952,7 @@ def run_eval_worker(conn, worker_config: dict) -> None:
                 max_plies=max_plies,
                 rng=rng,
                 turn_counter=turn_counter,
+                gumbel_config=gumbel_config,
             )
             conn.send(
                 GameDone(

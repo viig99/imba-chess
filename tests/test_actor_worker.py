@@ -155,7 +155,7 @@ def _run_fake_server(conn, received: list) -> None:
             raise AssertionError(f"unexpected message from worker: {msg!r}")
 
 
-def _run_two_short_games(*, model_move_policy: str, halving_config=None) -> tuple[list, dict]:
+def _run_two_short_games(*, model_move_policy: str, halving_config=None, gumbel_config=None) -> tuple[list, dict]:
     """Drives `run_eval_worker` over a real `multiprocessing.Pipe()` for 2
     short (max_plies=2) games, worker on a background thread, this thread
     playing the fake server. Returns (received_messages, engine)."""
@@ -173,6 +173,7 @@ def _run_two_short_games(*, model_move_policy: str, halving_config=None) -> tupl
         "opening_random_plies": 0,
         "model_move_policy": model_move_policy,
         "halving_config": halving_config,
+        "gumbel_config": gumbel_config,
         "value_rerank_top_k": 1,
         "value_rerank_lambda": 0.0,
         "vocab_path": str(STATIC_VOCAB_PATH),
@@ -213,6 +214,35 @@ def test_halving_flags_and_stats_through_worker_protocol(coverage, q):
         assert game.summary_fragment["model_selection_seconds"] > 0
         if not q:
             assert stats["quiescence_evals"] == 0
+
+
+def test_gumbel_worker_uses_root_value_and_zero_noise(monkeypatch):
+    from imba_chess.eval import gumbel_search
+
+    original = gumbel_search.select_gumbel
+    seen = []
+
+    def checked(**kwargs):
+        assert kwargs["noise"] == [0.0] * len(kwargs["root_eval"].legal_ids)
+        # Fake server's root value must reach completed-Q, rather than being
+        # replaced by zero or requesting the already-cached root as a leaf.
+        assert kwargs["root_eval"].value_stm == 0.1
+        result = original(**kwargs)
+        seen.append(result)
+        return result
+
+    monkeypatch.setattr(gumbel_search, "select_gumbel", checked)
+    received, _ = _run_two_short_games(
+        model_move_policy="gumbel",
+        gumbel_config=dict(simulations=16, top_m=4, max_depth=3),
+    )
+    games = [m for m in received if isinstance(m, GameDone)]
+    assert len(games) == len(seen) == 2
+    for game, result in zip(games, seen):
+        assert sum(result.visits) == 16
+        assert game.summary_fragment["search_stats"]["simulations"] == 16
+        assert result.neural_evaluations <= 17
+    assert sum(isinstance(m, RootEvalRequest) for m in received) == 2
 
 
 def test_two_short_games_end_to_end_message_ordering_and_summaries() -> None:
