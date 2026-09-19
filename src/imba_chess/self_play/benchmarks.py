@@ -176,6 +176,8 @@ def benchmark_component(args, cfg, runtime, seeds, max_positions, actor_id):
                     top_m=int(args.candidates.split(",")[0]),
                 )
                 sync(runtime.device)
+                if runtime.device.type == "cuda":
+                    torch.cuda.reset_peak_memory_stats(runtime.device)
                 start = time.perf_counter()
                 result_rows = []
                 lengths = []
@@ -289,6 +291,10 @@ def benchmark_component(args, cfg, runtime, seeds, max_positions, actor_id):
                     maximum_depth=max(
                         (r["maximum_depth"] for r in result_rows), default=0
                     ),
+                    peak_vram_bytes=torch.cuda.max_memory_allocated(runtime.device)
+                    if runtime.device.type == "cuda" else None,
+                    peak_reserved_vram_bytes=torch.cuda.max_memory_reserved(runtime.device)
+                    if runtime.device.type == "cuda" else None,
                 )
                 if args.component in ("leaf", "search"):
                     row.update(service_seconds=seconds_by_kind, errors=errors)

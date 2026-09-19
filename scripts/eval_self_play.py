@@ -27,6 +27,8 @@ def main():
     opponent = parser.add_mutually_exclusive_group(required=True)
     opponent.add_argument("--best", type=Path)
     opponent.add_argument("--stockfish", type=Path)
+    parser.add_argument("--stockfish-limit-strength", action=argparse.BooleanOptionalAction, default=False)
+    parser.add_argument("--stockfish-elo", type=int, default=2400)
     starts = parser.add_mutually_exclusive_group(required=True)
     starts.add_argument("--seeds", type=Path)
     starts.add_argument("--initial-board", action="store_true")
@@ -59,7 +61,10 @@ def main():
     ):
         runtime, positions = load_runtime(cfg, args.checkpoint, args.device)
         if args.stockfish:
-            best = StockfishRuntime(runtime, path=str(args.stockfish))
+            best = StockfishRuntime(
+                runtime, path=str(args.stockfish),
+                limit_strength=args.stockfish_limit_strength, elo=args.stockfish_elo,
+            )
             best_id = stable_hash(json.dumps(best.protocol, sort_keys=True))
             atomic_json(args.output.with_suffix(".protocol.json"), best.protocol)
         else:
