@@ -51,6 +51,17 @@ class LearningConfig:
     grad_clip: float = 1.0
     reuse: float = 2.0
     microbatch_tokens: int = 1024
+    policy_surprise_enabled: bool = False
+    policy_surprise_fraction: float = 0.5
+    policy_surprise_cap: float = 3.0
+
+    def __post_init__(self):
+        if type(self.policy_surprise_enabled) is not bool:
+            raise ValueError("policy_surprise_enabled must be boolean")
+        if not math.isfinite(self.policy_surprise_fraction) or not 0 <= self.policy_surprise_fraction <= 1:
+            raise ValueError("policy_surprise_fraction must be in [0, 1]")
+        if not math.isfinite(self.policy_surprise_cap) or self.policy_surprise_cap < 1:
+            raise ValueError("policy_surprise_cap must be >= 1")
 
 
 @dataclass(frozen=True)
@@ -85,6 +96,11 @@ class SelfPlayConfig:
     @cached_property
     def identifier(self):
         settings = asdict(self)
+        defaults = LearningConfig()
+        keys = ("policy_surprise_enabled", "policy_surprise_fraction", "policy_surprise_cap")
+        if all(getattr(self.learning, k) == getattr(defaults, k) for k in keys):
+            for key in keys:
+                settings["learning"].pop(key)
         if self.streaming is None:
             settings.pop("streaming")  # Preserve existing run identities.
         return hashlib.sha256(
@@ -112,7 +128,7 @@ def load_config(path):
         **{k: constructors[k](**v) if k in constructors else v for k, v in raw.items()}
     )
     for section in (cfg.collection, cfg.replay, cfg.learning):
-        if any(not math.isfinite(v) or v <= 0 for v in asdict(section).values()):
+        if any(not math.isfinite(v) or v <= 0 for k, v in asdict(section).items() if not k.startswith("policy_surprise_")):
             raise ValueError("stage-2 sizes and learning settings must be positive")
     if not all(math.isfinite(v) for v in asdict(cfg.run).values()):
         raise ValueError("run settings must be finite")

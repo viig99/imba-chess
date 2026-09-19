@@ -1,5 +1,6 @@
 """Full accepted histories, sparse continuation policy targets and outcome WDL."""
 
+import math
 import chess
 import torch
 from imba_chess.data.collate import collate_jagged_batch
@@ -12,7 +13,38 @@ def outcome_wdl(outcome_white, white_to_move):
     return [float(outcome == -1), float(outcome == 0), float(outcome == 1)]
 
 
-def reconstruct(game, *, move_vocab, encoder, max_positions):
+def policy_weights(targets, *, learning=None):
+    """Compute detached weights over one complete continuation, never a batch.
+
+    Missing priors retain multiplier one and do not enter normalization.
+    """
+    base = [t.get("policy_training_weight", 1.0) for t in targets]
+    surprise = [
+        max(0.0, math.fsum(p * (math.log(p) - lp)
+                         for p, lp in zip(t["policy"], t["root_log_priors"]) if p > 0))
+        if t.get("root_log_priors") is not None else 0.0
+        for t in targets
+    ]
+    eligible = [i for i, t in enumerate(targets)
+                if base[i] > 0 and t.get("root_log_priors") is not None]
+    weights, clipped = [1.0] * len(targets), [False] * len(targets)
+    if learning is not None and learning.policy_surprise_enabled and eligible:
+        mean = math.fsum(surprise[i] for i in eligible) / len(eligible)
+        if mean > 0:
+            fraction, cap = learning.policy_surprise_fraction, learning.policy_surprise_cap
+            raw = [(1 - fraction) + fraction * surprise[i] / (mean + 1e-8) for i in eligible]
+            bounded = [min(cap, u) for u in raw]
+            normalizer = math.fsum(bounded) / len(bounded)
+            for i, u, r in zip(eligible, bounded, raw):
+                weights[i], clipped[i] = u / normalizer, r > cap
+    eligible_set = set(eligible)
+    return dict(policy_training_weight=[b * w for b, w in zip(base, weights)],
+                policy_surprise_weight=weights, policy_surprise=surprise,
+                policy_surprise_eligible=[i in eligible_set for i in range(len(targets))],
+                policy_eligible=[b > 0 for b in base], policy_surprise_clipped=clipped)
+
+
+def reconstruct(game, *, move_vocab, encoder, max_positions, learning=None):
     validate_game(game)
     history = _SequenceHistory(move_vocab=move_vocab, board_state_encoder=encoder)
     board = chess.Board()
@@ -68,6 +100,7 @@ def reconstruct(game, *, move_vocab, encoder, max_positions):
         policy=policies,
         actor_log_priors=[t.get("root_log_priors") for t in game["targets"]],
     )
+    sample.update(policy_weights(game["targets"], learning=learning))
     return sample
 
 
@@ -103,5 +136,23 @@ def collate_self_play(samples):
             for p in actor_priors
         ],
         dtype=torch.float32,
+    )
+    for key in ("policy_training_weight", "policy_surprise_weight", "policy_surprise",
+                "policy_surprise_eligible", "policy_eligible", "policy_surprise_clipped"):
+        batch[key] = torch.tensor([v for sample in samples for v in sample[key]])
+    # CPU diagnostics avoid dynamic selection/quantiles in the compiled GPU loss.
+    eligible = batch["policy_surprise_eligible"]
+    surprises = batch["policy_surprise"][eligible].float()
+    policy_eligible = batch["policy_eligible"]
+    weights = batch["policy_surprise_weight"][policy_eligible].float()
+    effective = batch["policy_training_weight"].float()
+    batch["policy_weight_metrics"] = dict(
+        eligible_surprise_mean=surprises.mean() if surprises.numel() else torch.tensor(0.),
+        eligible_surprise_p95=torch.quantile(surprises, .95) if surprises.numel() else torch.tensor(0.),
+        missing_actor_prior_fraction=(policy_eligible & ~batch["actor_prior_available"]).sum() / policy_eligible.sum().clamp_min(1),
+        policy_weight_mean=weights.mean() if weights.numel() else torch.tensor(0.),
+        policy_weight_max=weights.max() if weights.numel() else torch.tensor(0.),
+        policy_weight_clipping_fraction=batch["policy_surprise_clipped"].sum() / eligible.sum().clamp_min(1),
+        policy_weight_ess=effective.sum().square() / effective.square().sum().clamp_min(1e-38),
     )
     return batch

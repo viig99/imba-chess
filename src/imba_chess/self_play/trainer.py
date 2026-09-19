@@ -13,6 +13,7 @@ from imba_chess.model import create_batch_dense_mask, create_batch_block_mask
 from imba_chess.optim import build_decay_param_groups
 from imba_chess.data.self_play_store import sync_directory
 from .dataset import reconstruct, collate_self_play
+from .config import LearningConfig
 from .losses import self_play_loss
 
 
@@ -143,6 +144,7 @@ class Stage2Trainer:
                 move_vocab=self.move_vocab,
                 encoder=self.encoder,
                 max_positions=self.max_positions,
+                learning=self.config,
             )
             size = len(sample["seq_token_id"])
             if size > self.config.microbatch_tokens:
@@ -248,7 +250,7 @@ class Stage2Trainer:
             raise ValueError(
                 "resume requires a stage-2 checkpoint; use initialize for stage-1"
             )
-        if state["config_id"] != config_id or state["learning_config"] != asdict(
+        if state["config_id"] != config_id or asdict(LearningConfig(**state["learning_config"])) != asdict(
             self.config
         ):
             raise ValueError("resume configuration changed")

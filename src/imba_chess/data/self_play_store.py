@@ -45,6 +45,14 @@ def validate_game(game):
     ):
         raise ValueError("trajectory alignment mismatch")
     for target in game["targets"]:
+        weight = target.get("policy_training_weight", 1.0)
+        if not math.isfinite(weight) or weight < 0:
+            raise ValueError("policy_training_weight must be finite and nonnegative")
+        priors = target.get("root_log_priors")
+        if priors is not None and (
+            len(priors) != len(target["policy"]) or any(not math.isfinite(p) for p in priors)
+        ):
+            raise ValueError("actor log priors must be finite and aligned")
         ids, policy = target["legal_ids"], target["policy"]
         if (
             not ids

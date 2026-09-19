@@ -238,6 +238,9 @@ def test_legacy_configuration_identity_is_preserved():
     cfg = load_config("config/self_play_laptop_pilot.toml")
     old_settings = asdict(cfg)
     del old_settings["streaming"]
+    for key in list(old_settings["learning"]):
+        if key.startswith("policy_surprise_"):
+            del old_settings["learning"][key]
     previous = hashlib.sha256(
         json.dumps(
             dict(

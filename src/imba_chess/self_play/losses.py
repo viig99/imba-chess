@@ -12,7 +12,15 @@ def self_play_loss(output, batch, *, value_weight=1.0):
     target = batch["policy"].to(logits.device).float()
     legal_logits = logits.gather(1, legal).masked_fill(~mask, -torch.inf)
     log_probs = F.log_softmax(legal_logits, -1).masked_fill(~mask, 0.0)
-    policy_loss = -(target * log_probs).sum(-1).mean()
+    per_position_ce = -(target * log_probs).sum(-1)
+    policy_loss = per_position_ce.mean()
+    weighted_policy_loss = policy_loss
+    if "policy_training_weight" in batch:
+        weights = batch["policy_training_weight"].to(logits.device).float().detach()
+        denominator = weights.sum()
+        weighted_policy_loss = (weights * per_position_ce).sum() / torch.where(
+            denominator > 0, denominator, torch.ones_like(denominator)
+        )
     value_logits = output["value_logits"].index_select(0, indices).float()
     wdl = batch["value_target"].to(logits.device).index_select(0, indices).float()
     value_log_probs = F.log_softmax(value_logits, -1)
@@ -40,7 +48,9 @@ def self_play_loss(output, batch, *, value_weight=1.0):
             actor_prior_positions=available.sum(),
         )
     return dict(
-        loss=policy_loss + value_weight * value_loss,
+        loss=weighted_policy_loss + value_weight * value_loss,
+        weighted_policy_loss=weighted_policy_loss,
+        **batch.get("policy_weight_metrics", {}),
         policy_loss=policy_loss,
         value_loss=value_loss,
         policy_entropy=entropy,
