@@ -76,6 +76,51 @@ class Stage2Trainer:
         self.reuse_counts = {}
         self.sample_ids = []
 
+    def _restore_optimization(self, state):
+        schedule = state["scheduler"]
+        kind = state.get("scheduler_type", "LambdaLR")
+        if kind == "OneCycleLR":
+            # Construction changes optimizer rates; restore its saved state after
+            # constructing the correct scheduler, then restore the schedule clock.
+            if schedule.get("cycle_momentum", False):
+                raise ValueError("momentum-cycling schedules are not supported")
+            self.scheduler = torch.optim.lr_scheduler.OneCycleLR(
+                self.optimizer,
+                max_lr=[g["max_lr"] for g in state["optimizer"]["param_groups"]],
+                total_steps=schedule["total_steps"],
+                cycle_momentum=False,
+            )
+        elif kind != "LambdaLR":
+            raise ValueError(f"unsupported scheduler: {kind}")
+        self.optimizer.load_state_dict(state["optimizer"])
+        self.scheduler.load_state_dict(schedule)
+
+    def initialize_optimization(self, path):
+        """Carry supervised optimizer/schedule into a fresh self-play dataset."""
+        state = torch.load(path, map_location="cpu", weights_only=False)
+        if state.get("stage2_schema") or "_schedule_phases" not in state["scheduler"]:
+            raise ValueError("expected a supervised OneCycleLR checkpoint")
+        source = {k.removeprefix("_orig_mod."): v for k, v in state["model"].items()}
+        current = self.model.state_dict()
+        if source.keys() != current.keys() or any(
+            not torch.equal(v.detach().cpu(), source[k]) for k, v in current.items()
+        ):
+            raise ValueError("optimizer source must match initialized model weights")
+        groups = state["optimizer"]["param_groups"]
+        if len(groups) != len(self.optimizer.param_groups):
+            raise ValueError("optimizer parameter groups differ")
+        for saved, actual in zip(groups, self.optimizer.param_groups):
+            if len(saved["params"]) != len(actual["params"]):
+                raise ValueError("optimizer parameter counts differ")
+            if saved["lr"] != self.config.lr or saved["weight_decay"] != actual["weight_decay"]:
+                raise ValueError("configuration must match saved LR and weight decay")
+            for key, param in zip(saved["params"], actual["params"]):
+                moments = state["optimizer"]["state"].get(key, {})
+                for name in ("exp_avg", "exp_avg_sq"):
+                    if name in moments and moments[name].shape != param.shape:
+                        raise ValueError("optimizer parameter shapes differ")
+        self._restore_optimization(dict(state, scheduler_type="OneCycleLR"))
+
     def begin_phase(self, store):
         self.phase_exposures = 0
         self.sample_ids = store.game_ids("train")
@@ -133,6 +178,7 @@ class Stage2Trainer:
                     self.config.grad_clip,
                     error_if_nonfinite=True,
                 )
+                learning_rate = self.optimizer.param_groups[0]["lr"]
                 self.optimizer.step()
                 self.scheduler.step()
                 positions = len(batch["supervised_indices"])
@@ -146,6 +192,7 @@ class Stage2Trainer:
                 metrics = dict(
                     {key: float(value.detach()) for key, value in losses.items()},
                     gradient_norm=float(norm),
+                    learning_rate=learning_rate,
                     steps=self.steps,
                     exposures=self.exposures,
                     phase_exposures=self.phase_exposures,
@@ -174,6 +221,7 @@ class Stage2Trainer:
                 model=self.model.state_dict(),
                 optimizer=self.optimizer.state_dict(),
                 scheduler=self.scheduler.state_dict(),
+                scheduler_type=type(self.scheduler).__name__,
                 torch_rng=torch.get_rng_state(),
                 cuda_rng=torch.cuda.get_rng_state_all()
                 if torch.cuda.is_available()
@@ -208,8 +256,7 @@ class Stage2Trainer:
             if not (store.directory / name).exists():
                 raise FileNotFoundError(f"checkpoint replay shard missing: {name}")
         self.model.load_state_dict(state["model"], strict=True)
-        self.optimizer.load_state_dict(state["optimizer"])
-        self.scheduler.load_state_dict(state["scheduler"])
+        self._restore_optimization(state)
         torch.set_rng_state(state["torch_rng"])
         if state["cuda_rng"] and torch.cuda.is_available():
             torch.cuda.set_rng_state_all(state["cuda_rng"])

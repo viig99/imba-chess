@@ -30,6 +30,10 @@ def main():
     source = parser.add_mutually_exclusive_group(required=True)
     source.add_argument("--initialize", type=Path)
     source.add_argument("--resume", action="store_true")
+    parser.add_argument(
+        "--initialize-optimizer", action="store_true",
+        help="Carry the supervised checkpoint optimizer and OneCycleLR schedule into self-play",
+    )
     parser.add_argument("--seeds", type=Path, required=True)
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--device", default="cuda")
@@ -79,6 +83,8 @@ def main():
         help="Research runs: record strength screens without rollback or best promotion",
     )
     args = parser.parse_args()
+    if args.initialize_optimizer and not args.initialize:
+        parser.error("--initialize-optimizer requires --initialize")
     if args.concurrent_games is not None and args.concurrent_games < 1:
         parser.error("--concurrent-games must be positive")
     if args.screen_every < 1:
@@ -180,6 +186,8 @@ def main():
             ):
                 raise ValueError("checkpoint and published phase disagree")
         else:
+            if args.initialize_optimizer:
+                trainer.initialize_optimization(checkpoint)
             actor = args.output / "actor-000000.pt"
             state.update(actor=str(actor), best=str(actor), checkpoint=str(actor))
             trainer.checkpoint(

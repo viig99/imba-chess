@@ -35,6 +35,8 @@ def command(args, now):
         if (args.run / "state.json").exists()
         else ["--initialize", str(args.initialize)]
     )
+    if not (args.run / "state.json").exists() and getattr(args, "initialize_optimizer", False):
+        source.append("--initialize-optimizer")
     return [
         sys.executable,
         "-u",
@@ -67,6 +69,7 @@ def main():
     parser.add_argument("--config", type=Path, required=True)
     parser.add_argument("--seeds", type=Path, required=True)
     parser.add_argument("--initialize", type=Path, required=True)
+    parser.add_argument("--initialize-optimizer", action="store_true")
     parser.add_argument("--until", type=datetime.fromisoformat)
     args = parser.parse_args()
     now = datetime.now(ZoneInfo("America/Toronto"))

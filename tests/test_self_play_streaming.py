@@ -267,8 +267,11 @@ def test_nightly_deadline_and_initialize_resume(tmp_path):
     argv = command(args, now)
     assert argv[argv.index("--until") + 1] == "2026-09-18T08:00:00-04:00"
     assert argv[argv.index("--initialize") + 1] == "ckpt34.pt"
+    args.initialize_optimizer = True
+    assert "--initialize-optimizer" in command(args, now)
     (tmp_path / "state.json").write_text("{}")
     assert "--resume" in command(args, now)
+    assert "--initialize-optimizer" not in command(args, now)
     args.until = datetime(2026, 9, 18, 8)
     with pytest.raises(ValueError, match="timezone"):
         command(args, now)
