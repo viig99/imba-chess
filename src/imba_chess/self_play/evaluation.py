@@ -58,6 +58,7 @@ def evaluate_pair_checkpoints(
     output,
     pairs,
     should_stop=lambda: False,
+    gumbel_noise=False,
 ):
     if len(seeds) < pairs or any(s.split != "monitor" for s in seeds[:pairs]):
         raise ValueError(f"evaluation needs {pairs} held-out source-game prefixes")
@@ -82,7 +83,7 @@ def evaluate_pair_checkpoints(
             best=getattr(best, "options", {}),
             algorithm="gumbel",
             simulations=config.search.simulations,
-            exploration="gumbel_noise",
+            exploration="gumbel_noise" if gumbel_noise else "zero_gumbel_noise",
             precision="float32",
             tf32=False,
         ),
@@ -163,6 +164,7 @@ def evaluate_pair_checkpoints(
                         config_id=config.identifier,
                         should_stop=should_stop,
                         actor_for_turn=actors,
+                        gumbel_noise=gumbel_noise,
                     ),
                 )
 

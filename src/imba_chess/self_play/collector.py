@@ -42,6 +42,7 @@ def play_game(
     should_stop=lambda: False,
     on_position=lambda result, elapsed: None,
     actor_for_turn=None,
+    gumbel_noise=True,
 ):
     board = seed.board()
     history = _SequenceHistory(
@@ -107,6 +108,7 @@ def play_game(
                 config=search_config,
                 rng=rng,
                 should_stop=should_stop,
+                **({} if gumbel_noise else {"noise": 0.0}),
             )
             move = chess.Move.from_uci(result.move_uci)
             if move not in board.legal_moves:
