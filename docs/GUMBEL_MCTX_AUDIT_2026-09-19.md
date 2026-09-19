@@ -153,8 +153,9 @@ Completed checkpoint 73 comparison: historical noisy score **32.0%** (paired
 removing evaluation noise. This does not establish that training scale 1.0
 caused the regression or that scale 0.1 is stronger. Checkpoint 53 also remains weaker: noisy **38.0%** (30.5–45.5%),
 zero-noise **37.0%** (28.5–45.5%). Its change is −1.0 percentage point
-(paired 95% interval −9.0 to +7.0). Checkpoint 33 is still being evaluated
-as of this report revision.
+(paired 95% interval −9.0 to +7.0). Checkpoint 33 could not be rerun: the saved candidate checkpoint disappeared
+from both the frozen campaign and original evaluation directories before its
+evaluation started. Completed results for 53 and 73 remain available.
 
 Validation after making zero noise the evaluation default: **2,299 tests passed**,
 19 extended tests deselected; three existing warnings.
