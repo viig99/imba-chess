@@ -17,7 +17,9 @@ ON = LearningConfig(policy_surprise_enabled=True)
 
 
 def target(d, base=1):
-    return dict(policy=[1., 0.], root_log_priors=[-d, -100.], policy_training_weight=base)
+    if d == 0:
+        return dict(policy=[.5, .5], root_log_priors=[math.log(.5)] * 2, policy_training_weight=base)
+    return dict(policy=[1., 0.], root_log_priors=[-d, math.log1p(-math.exp(-d))], policy_training_weight=base)
 
 
 def test_hand_weights_and_edge_cases():
@@ -43,12 +45,14 @@ def sample(game, learning=None):
 def test_game_normalization_and_legacy_replay(tmp_path):
     g = mate_game()
     for i, t in enumerate(g['targets']):
-        t['root_log_priors'] = [math.log(p) - i for p in t['policy']]
+        n = len(t['policy'])
+        t['policy'] = [1.] + [0.] * (n - 1)
+        t['root_log_priors'] = [-(i + 1.)] + [math.log1p(-math.exp(-(i + 1.))) - math.log(n - 1)] * (n - 1)
     a = sample(g, ON)
     b = sample(mate_game('other', prefix=['f2f3', 'e7e5']), ON)
     one, two = collate_self_play([a]), collate_self_play([b, a])
     assert torch.equal(one['policy_training_weight'], two['policy_training_weight'][-4:])
-    assert one['policy_weight_metrics']['eligible_surprise_mean'] == pytest.approx(1.5)
+    assert one['policy_weight_metrics']['eligible_surprise_mean'] == pytest.approx(2.5)
     for t in g['targets']:
         t.pop('root_log_priors')
     store = SelfPlayStore(tmp_path, flush_games=1)

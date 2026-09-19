@@ -13,6 +13,24 @@ def outcome_wdl(outcome_white, white_to_move):
     return [float(outcome == -1), float(outcome == 0), float(outcome == 1)]
 
 
+def _policy_surprise(target, actor_logs):
+    """KL(target || actor), removing stored FP32 normalization roundoff.
+
+    Search accepts logits up to an additive constant. Re-normalize the stored
+    actor logs in float64 so that this constant cannot become training surprise.
+    Normalize the target too, and suppress residual double-precision cancellation
+    far below the 1e-8 denominator regularizer used for game-relative weighting.
+    """
+    maximum = max(actor_logs)
+    log_sum = math.log(math.fsum(math.exp(lp - maximum) for lp in actor_logs))
+    mass = math.fsum(target)
+    divergence = math.fsum(
+        (p / mass) * (math.log(p / mass) - ((lp - maximum) - log_sum))
+        for p, lp in zip(target, actor_logs) if p > 0
+    )
+    return divergence if divergence > 1e-12 else 0.0
+
+
 def policy_weights(targets, *, learning=None):
     """Compute detached weights over one complete continuation, never a batch.
 
@@ -20,8 +38,7 @@ def policy_weights(targets, *, learning=None):
     """
     base = [t.get("policy_training_weight", 1.0) for t in targets]
     surprise = [
-        max(0.0, math.fsum(p * (math.log(p) - lp)
-                         for p, lp in zip(t["policy"], t["root_log_priors"]) if p > 0))
+        _policy_surprise(t["policy"], t["root_log_priors"])
         if t.get("root_log_priors") is not None else 0.0
         for t in targets
     ]

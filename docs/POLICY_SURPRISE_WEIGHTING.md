@@ -9,7 +9,10 @@ policy_surprise_cap = 3.0
 ```
 
 `dataset.policy_weights` computes KL(target || stored actor prior) over the
-unpadded legal moves of each completed continuation. Zero target probabilities
+unpadded legal moves of each completed continuation. Stored actor logs and target
+mass are re-normalized in double precision; KL at or below `1e-12` is treated as
+roundoff, preventing false surprise when the target equals the actor policy.
+Zero target probabilities
 contribute zero. Positive base policy weights with available priors participate
 in the game mean and normalization; missing priors retain multiplier 1. All-zero
 surprise also retains multiplier 1. The cap applies before normalization.
