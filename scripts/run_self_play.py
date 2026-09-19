@@ -4,6 +4,7 @@ The external nightly schedule is deliberately not installed by this command.
 """
 
 import argparse
+from contextlib import ExitStack
 from dataclasses import asdict
 from datetime import datetime
 import json
@@ -32,6 +33,7 @@ def main():
     parser.add_argument("--seeds", type=Path, required=True)
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--device", default="cuda")
+    parser.add_argument("--continuous", action="store_true", help="Run until interrupted; no time or default iteration cutoff")
     parser.add_argument("--max-iterations", type=int, default=100000)
     parser.add_argument(
         "--checkpoint-seconds",
@@ -89,6 +91,8 @@ def main():
         parser.error("--screen-seconds must be positive")
     if args.until is not None and args.until.tzinfo is None:
         parser.error("--until needs an explicit timezone")
+    if args.continuous and args.until is not None:
+        parser.error("--continuous cannot be combined with --until")
     cfg = load_config(args.config)
     seeds = load_seeds(args.seeds)
     monitor = [s for s in seeds if s.split == "monitor"]
@@ -99,7 +103,7 @@ def main():
     train_seeds = [s for s in seeds if s.split == "train"]
     if not train_seeds:
         parser.error("seed manifest has no training prefixes")
-    seconds = (
+    seconds = float("inf") if args.continuous else (
         cfg.run.hours * 3600
         if args.until is None
         else args.until.timestamp() - time.time()
@@ -109,11 +113,12 @@ def main():
     state_path = args.output / "state.json"
     with (
         run_lock(args.output),
+        ExitStack() as resources,
         StopBudget(
             seconds=seconds,
             reserve_seconds=cfg.run.reserve_minutes * 60,
             drain_seconds=cfg.run.drain_minutes * 60,
-            hard_exit=True,
+            hard_exit=not args.continuous,
         ) as budget,
     ):
         if args.resume:
@@ -139,6 +144,23 @@ def main():
                 phase="collect",
                 halted=False,
             )
+        start_sampler = None
+        if cfg.streaming is not None:
+            from imba_chess.self_play.streaming import StreamingStarts
+
+            if args.resume and not (args.output / "stream" / "consumer.json").exists():
+                raise FileNotFoundError(
+                    "stream consumer state missing; refusing source rewind"
+                )
+            start_sampler = resources.enter_context(
+                StreamingStarts(
+                    args.output / "stream", cfg, should_stop=lambda: not budget.launch()
+                )
+            )
+            if args.resume and state.get("stream_identity") != start_sampler.identity:
+                raise ValueError("run and stream identities disagree")
+            start_sampler.warm()
+            state["stream_identity"] = start_sampler.identity
         runtime, max_positions = load_runtime(cfg, checkpoint, args.device)
         store = SelfPlayStore(args.output / "replay", **asdict(cfg.replay))
         trainer = Stage2Trainer(
@@ -214,6 +236,7 @@ def main():
                 or cfg.collection.concurrent_games,
                 inference_options=getattr(runtime, "options", {}),
                 until=args.until.isoformat() if args.until else None,
+                continuous=args.continuous,
                 screen_every=args.screen_every,
                 checkpoint_seconds=args.checkpoint_seconds,
                 keep_recovery_checkpoints=args.keep_recovery_checkpoints,
@@ -234,7 +257,7 @@ def main():
             store.collect_garbage(pinned_shards=pinned)
 
         next_screen = time.monotonic() + (args.screen_seconds or 0)
-        while state["iteration"] < args.max_iterations and (not budget.stop()):
+        while (args.continuous or state["iteration"] < args.max_iterations) and (not budget.stop()):
             if state["phase"] == "collect":
                 if not budget.launch():
                     break
@@ -263,7 +286,7 @@ def main():
                         )
 
                 metrics = collect(
-                    seeds=seeds,
+                    seeds=seeds if start_sampler is None else [],
                     runtime=runtime,
                     config=cfg,
                     actor_id=state["actor_id"],
@@ -275,11 +298,14 @@ def main():
                     skip_ids=store.seen,
                     metrics=metrics,
                     on_game=record_game,
+                    start_sampler=start_sampler,
                     **{"concurrent_games": args.concurrent_games}
                     if args.concurrent_games is not None
                     else {},
                 )
                 log(metrics.report())
+                if start_sampler is not None:
+                    log(start_sampler.report())
                 if (
                     metrics.counts["training_positions"]
                     < cfg.collection.fresh_positions
@@ -287,6 +313,8 @@ def main():
                     publish_checkpoint()
                     break
                 trainer.begin_phase(store)
+                if start_sampler is not None:
+                    start_sampler.finish_phase()
                 state.update(
                     phase="train",
                     exposure_budget=int(

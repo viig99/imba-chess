@@ -108,6 +108,7 @@ class LichessDataset:
         *,
         shard_id: Optional[int] = None,
         num_shards: Optional[int] = None,
+        filter_rows: bool = True,
     ) -> tuple[Optional[Iterable[Dict[str, Any]]], bool]:
         """The exact raw-row iterable `stream()` parses, plus its prefiltered flag.
 
@@ -116,6 +117,10 @@ class LichessDataset:
         `.shuffle(seed=train_month_shuffle_seed)`. Capturing rows here is what
         makes materialization order-identical, and therefore alignment-safe for
         the `(game_id, ply)` keys that join rollouts to training.
+
+        `filter_rows=False` exposes the raw source to the durable self-play
+        adapter, which applies the same predicate while checkpointing the raw
+        cursor. Normal supervised loading keeps filtering enabled here.
         """
         if self.cache_dir is not None:
             Path(self.cache_dir).mkdir(parents=True, exist_ok=True)
@@ -138,7 +143,7 @@ class LichessDataset:
             load_kwargs.pop("batch_size", None)
             rows = load_dataset(**load_kwargs)
         prefiltered = False
-        if hasattr(rows, "filter"):
+        if filter_rows and hasattr(rows, "filter"):
             try:
                 rows = rows.filter(
                     self._game_filter_from_columns,

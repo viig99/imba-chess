@@ -326,6 +326,20 @@ def test_run_lock_and_stop_budget(tmp_path):
         assert budget.stop_collection()
 
 
+
+def test_continuous_stop_budget_remains_interruptible():
+    from imba_chess.self_play.runtime import StopBudget
+
+    with StopBudget(seconds=float("inf"), drain_seconds=10) as budget:
+        assert budget.timer is None
+        assert budget.launch() and not budget.stop()
+        budget._signal(None, None)
+        assert not budget.launch() and budget.stop()
+        assert not budget.stop_collection()
+        budget._signal(None, None)
+        assert budget.stop_collection()
+
+
 def test_corrupt_outcome_rejected():
     game = mate_game()
     game["outcome_white"] = 1

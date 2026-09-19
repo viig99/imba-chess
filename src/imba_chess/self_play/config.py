@@ -64,6 +64,15 @@ class RunConfig:
 
 
 @dataclass(frozen=True)
+class StreamingConfig:
+    # Durable block shuffle replaces HF's non-checkpointable shuffle buffer.
+    block_rows: int = 10000
+    prefetch_blocks: int = 2
+    startup_timeout: float = 300.0
+    shutdown_timeout: float = 5.0
+
+
+@dataclass(frozen=True)
 class SelfPlayConfig:
     base_config: str = "config/imba_chess_v4.toml"
     search: GumbelConfig = field(default_factory=GumbelConfig)
@@ -71,13 +80,17 @@ class SelfPlayConfig:
     replay: ReplayConfig = field(default_factory=ReplayConfig)
     learning: LearningConfig = field(default_factory=LearningConfig)
     run: RunConfig = field(default_factory=RunConfig)
+    streaming: StreamingConfig | None = None
 
     @cached_property
     def identifier(self):
+        settings = asdict(self)
+        if self.streaming is None:
+            settings.pop("streaming")  # Preserve existing run identities.
         return hashlib.sha256(
             json.dumps(
                 dict(
-                    settings=asdict(self),
+                    settings=settings,
                     base_sha256=_base_config_identity(self.base_config),
                 ),
                 sort_keys=True,
@@ -93,6 +106,7 @@ def load_config(path):
         replay=ReplayConfig,
         learning=LearningConfig,
         run=RunConfig,
+        streaming=StreamingConfig,
     )
     cfg = SelfPlayConfig(
         **{k: constructors[k](**v) if k in constructors else v for k, v in raw.items()}
@@ -106,4 +120,20 @@ def load_config(path):
         raise ValueError("require 0 < drain <= reserve < run duration")
     if cfg.run.screen_pairs < 1 or cfg.run.confirmation_pairs < 1:
         raise ValueError("evaluation pair counts must be positive")
+    if cfg.streaming is not None:
+        if any(not math.isfinite(v) or v <= 0 for v in asdict(cfg.streaming).values()):
+            raise ValueError("streaming sizes and timeouts must be positive")
+        if cfg.streaming.block_rows < 4:
+            raise ValueError("streaming block_rows must be >= 4")
+        if any(
+            type(v) is not int
+            for v in (cfg.streaming.block_rows, cfg.streaming.prefetch_blocks)
+        ):
+            raise ValueError(
+                "streaming block_rows and prefetch_blocks must be integers"
+            )
+        if cfg.streaming.prefetch_blocks < 2:
+            raise ValueError(
+                "streaming prefetch_blocks must be >= 2 for independent bucket cursors"
+            )
     return cfg

@@ -189,6 +189,7 @@ def collect(
     skip_ids=(),
     metrics=None,
     concurrent_games=None,
+    start_sampler=None,
 ):
     if concurrent_games is not None and concurrent_games < 1:
         raise ValueError("concurrent_games must be positive")
@@ -196,8 +197,10 @@ def collect(
     skipped = set(skip_ids)
     active = {}
     seed_order = list(seeds)
-    if not seed_order:
+    if not seed_order and start_sampler is None:
         raise ValueError("collection requires at least one seed")
+    if start_sampler is not None:
+        start_sampler.begin_phase(iteration, actor_id, skipped)
     if game_count is None:
         # Sample sources uniformly without replacement in each iteration;
         # fixed-size audits retain manifest order for comparable benchmarks.
@@ -212,10 +215,16 @@ def collect(
                 >= config.collection.fresh_positions
             ):
                 return
-            seed = seed_order[index % len(seed_order)]
-            gid = stable_hash(
-                f"{config.run.seed}:{iteration}:{index}:{seed.seed_id}:{actor_id}"
-            )
+            if start_sampler is None:
+                seed = seed_order[index % len(seed_order)]
+                gid = stable_hash(
+                    f"{config.run.seed}:{iteration}:{index}:{seed.seed_id}:{actor_id}"
+                )
+            else:
+                try:
+                    seed, gid = start_sampler.next_launch(iteration, actor_id)
+                except InterruptedError:
+                    return
             index += 1
             if gid in skipped:
                 continue
@@ -255,6 +264,11 @@ def collect(
         metrics.done(game)
         if game["status"] == "completed":
             store.add(game)
+        elif start_sampler is not None and game.get("termination") not in (
+            "interrupted",
+            "error",
+        ):
+            start_sampler.retire(gid, game.get("termination", "unknown"))
         on_game(game)
 
     try:
@@ -280,4 +294,6 @@ def collect(
     finally:
         getattr(runtime, "clear_caches", lambda: None)()
         store.flush()
+        if start_sampler is not None:
+            start_sampler.reconcile(store.seen)
     return metrics
