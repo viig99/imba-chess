@@ -1,0 +1,43 @@
+# Remote 5090 fresh ckpt34 run.
+base_config = "config/imba_chess_v4.toml"
+
+[search]
+simulations = 512
+top_m = 16
+max_depth = 32
+maxvisit_init = 50.0
+value_scale = 0.1
+epsilon = 1e-8
+
+[collection]
+concurrent_games = 12
+root_batch_tokens = 1024
+max_game_plies = 512
+fresh_positions = 4096
+
+[replay]
+window_positions = 50000
+flush_games = 16
+flush_positions = 2048
+
+[learning]
+lr = 1e-4
+value_weight = 1.0
+weight_decay = 0.01
+grad_clip = 1.0
+reuse = 2.0
+microbatch_tokens = 1024
+
+[run]
+seed = 42
+hours = 12.0
+reserve_minutes = 15.0
+drain_minutes = 10.0
+screen_pairs = 50
+confirmation_pairs = 250
+
+[streaming]
+block_rows = 10000
+prefetch_blocks = 2
+startup_timeout = 300.0
+shutdown_timeout = 5.0

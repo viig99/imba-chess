@@ -8,7 +8,7 @@ import sys
 import time
 
 ROOT = Path(__file__).resolve().parents[1]
-OUT = ROOT / 'artifacts/eval/remote5090-q01-detached-value-2026-09-20'
+OUT = ROOT / 'artifacts/eval/remote5090-q01-detached-value-eval01-2026-09-20'
 RUN = ROOT / 'artifacts/self_play/remote5090-ckpt34-s200-q01-detached-value-surprise-2026-09-20'
 BASE = ROOT / 'artifacts/checkpoints_v4/best_hr10_checkpoint_34_hr10=0.9677.pt'
 ENV = dict(os.environ, OMP_NUM_THREADS='4', MKL_NUM_THREADS='4', PYTHONUNBUFFERED='1')
@@ -51,7 +51,7 @@ def main():
     if not frozen.exists():
         os.link(actor, frozen)
     digest = hashlib.file_digest(frozen.open('rb'), 'sha256').hexdigest()
-    save(batch / 'manifest.json', dict(checkpoint_sha256=digest, source=str(actor), remote_state=state, simulations=512, scale=1.0, exploration="zero_gumbel_noise", pairs=50, stockfish_elo=2400, stockfish_nodes=40000, created=time.time()))
+    save(batch / 'manifest.json', dict(checkpoint_sha256=digest, source=str(actor), remote_state=state, simulations=512, scale=0.1, exploration="zero_gumbel_noise", pairs=50, stockfish_elo=2400, stockfish_nodes=40000, created=time.time()))
     legs = [
         ('vs_ckpt34', frozen, ['--best', str(BASE)], batch / 'vs_ckpt34'),
         ('vs_stockfish2400', frozen, ['--stockfish', '/usr/bin/stockfish', '--stockfish-limit-strength', '--stockfish-elo', '2400'], batch / 'vs_stockfish2400'),
@@ -61,7 +61,7 @@ def main():
     for label, candidate, opponent, directory in legs:
         directory.mkdir(exist_ok=True)
         output = directory / 'results.json'
-        cmd = [sys.executable, '-u', 'scripts/eval_self_play.py', '--config', str(OUT / 'config.toml'), '--checkpoint', str(candidate), *opponent, '--seeds', str(OUT / 'monitor-seeds.json'), '--output', str(output), '--pairs', '50', '--seconds', '5400', '--device', 'cuda']
+        cmd = [sys.executable, '-u', 'scripts/eval_self_play.py', '--config', str(ROOT / 'config/self_play_eval.toml'), '--checkpoint', str(candidate), *opponent, '--seeds', str(OUT / 'monitor-seeds.json'), '--output', str(output), '--pairs', '50', '--seconds', '5400', '--device', 'cuda']
         save(directory / 'command.json', cmd)
         if summarize(output)['status'] != 'complete':
             print(f'START {actor.stem} {label}', flush=True)
