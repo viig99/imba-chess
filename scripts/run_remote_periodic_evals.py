@@ -8,8 +8,8 @@ import sys
 import time
 
 ROOT = Path(__file__).resolve().parents[1]
-OUT = ROOT / 'artifacts/eval/remote5090-q01-value0-frozen-2026-09-20'
-RUN = ROOT / 'artifacts/self_play/remote5090-ckpt34-s200-q01-value0-frozen-surprise-2026-09-20'
+OUT = ROOT / 'artifacts/eval/remote5090-q01-detached-value-2026-09-20'
+RUN = ROOT / 'artifacts/self_play/remote5090-ckpt34-s200-q01-detached-value-surprise-2026-09-20'
 BASE = ROOT / 'artifacts/checkpoints_v4/best_hr10_checkpoint_34_hr10=0.9677.pt'
 ENV = dict(os.environ, OMP_NUM_THREADS='4', MKL_NUM_THREADS='4', PYTHONUNBUFFERED='1')
 

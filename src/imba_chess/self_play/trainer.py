@@ -62,10 +62,15 @@ class Stage2Trainer:
         # Keep the model shared with collection and plain checkpoint keys. The
         # benchmark wraps this tensor-only callable without replacing the model.
         self._loss_fn = _training_loss
+        model.detach_value_features = config.detach_value_features
         # Zero value weight means policy-only training. Freeze before grouping
         # so the head receives neither optimizer moments nor weight decay.
         if config.value_weight == 0 and getattr(model, "value_head", None) is not None:
             model.value_head.requires_grad_(False)
+        head = getattr(model, "value_head", None)
+        self.value_parameters = list(head.parameters()) if head is not None else []
+        value_ids = {id(p) for p in self.value_parameters}
+        self.policy_parameters = [p for p in model.parameters() if id(p) not in value_ids]
         self.optimizer = StableAdamW(
             build_decay_param_groups(model, weight_decay=config.weight_decay),
             lr=config.lr,
@@ -80,6 +85,19 @@ class Stage2Trainer:
         self.queue = []
         self.reuse_counts = {}
         self.sample_ids = []
+
+    def _clip_gradients(self):
+        if not self.config.detach_value_features:
+            return torch.nn.utils.clip_grad_norm_(
+                self.model.parameters(), self.config.grad_clip, error_if_nonfinite=True
+            ), None
+        policy_norm = torch.nn.utils.clip_grad_norm_(
+            self.policy_parameters, self.config.grad_clip, error_if_nonfinite=True
+        )
+        value_norm = torch.nn.utils.clip_grad_norm_(
+            self.value_parameters, self.config.grad_clip, error_if_nonfinite=True
+        )
+        return policy_norm, value_norm
 
     def _restore_optimization(self, state):
         schedule = state["scheduler"]
@@ -179,11 +197,7 @@ class Stage2Trainer:
                 if not torch.isfinite(losses["loss"]):
                     raise FloatingPointError("nonfinite stage-2 loss")
                 losses["loss"].backward()
-                norm = torch.nn.utils.clip_grad_norm_(
-                    self.model.parameters(),
-                    self.config.grad_clip,
-                    error_if_nonfinite=True,
-                )
+                norm, value_norm = self._clip_gradients()
                 learning_rate = self.optimizer.param_groups[0]["lr"]
                 self.optimizer.step()
                 self.scheduler.step()
@@ -198,6 +212,8 @@ class Stage2Trainer:
                 metrics = dict(
                     {key: float(value.detach()) for key, value in losses.items()},
                     gradient_norm=float(norm),
+                    **({"policy_gradient_norm": float(norm),
+                        "value_gradient_norm": float(value_norm)} if value_norm is not None else {}),
                     learning_rate=learning_rate,
                     steps=self.steps,
                     exposures=self.exposures,
@@ -254,7 +270,7 @@ class Stage2Trainer:
             raise ValueError(
                 "resume requires a stage-2 checkpoint; use initialize for stage-1"
             )
-        if state["config_id"] != config_id or asdict(LearningConfig(**state["learning_config"])) != asdict(
+        if state["config_id"] != config_id or asdict(LearningConfig(**{"detach_value_features": False, **state["learning_config"]})) != asdict(
             self.config
         ):
             raise ValueError("resume configuration changed")

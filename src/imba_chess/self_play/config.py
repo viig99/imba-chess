@@ -46,7 +46,8 @@ class ReplayConfig:
 @dataclass(frozen=True)
 class LearningConfig:
     lr: float = 1e-5
-    value_weight: float = 0.0
+    value_weight: float = 1.0
+    detach_value_features: bool = True
     weight_decay: float = 0.01
     grad_clip: float = 1.0
     reuse: float = 2.0
@@ -56,6 +57,8 @@ class LearningConfig:
     policy_surprise_cap: float = 3.0
 
     def __post_init__(self):
+        if type(self.detach_value_features) is not bool:
+            raise ValueError("detach_value_features must be boolean")
         if not math.isfinite(self.value_weight) or self.value_weight < 0:
             raise ValueError("value_weight must be finite and nonnegative")
         if type(self.policy_surprise_enabled) is not bool:
@@ -98,6 +101,8 @@ class SelfPlayConfig:
     @cached_property
     def identifier(self):
         settings = asdict(self)
+        if not self.learning.detach_value_features:
+            settings["learning"].pop("detach_value_features")
         defaults = LearningConfig()
         keys = ("policy_surprise_enabled", "policy_surprise_fraction", "policy_surprise_cap")
         if all(getattr(self.learning, k) == getattr(defaults, k) for k in keys):
@@ -130,7 +135,7 @@ def load_config(path):
         **{k: constructors[k](**v) if k in constructors else v for k, v in raw.items()}
     )
     for section in (cfg.collection, cfg.replay, cfg.learning):
-        if any(not math.isfinite(v) or v <= 0 for k, v in asdict(section).items() if not k.startswith("policy_surprise_") and k != "value_weight"):
+        if any(not math.isfinite(v) or v <= 0 for k, v in asdict(section).items() if not k.startswith("policy_surprise_") and k not in ("value_weight", "detach_value_features")):
             raise ValueError("stage-2 sizes and learning settings must be positive")
     if not all(math.isfinite(v) for v in asdict(cfg.run).values()):
         raise ValueError("run settings must be finite")

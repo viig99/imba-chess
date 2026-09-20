@@ -746,6 +746,48 @@ def test_invalid_value_weight(weight):
 
 def test_policy_only_default_configs():
     from imba_chess.self_play.config import load_config
-    assert LearningConfig().value_weight == 0
+    assert LearningConfig().value_weight == 1
+    assert LearningConfig().detach_value_features
     for path in Path('config').glob('self_play*.toml'):
-        assert load_config(path).learning.value_weight == 0
+        assert load_config(path).learning.value_weight == 1
+        assert load_config(path).learning.detach_value_features
+
+
+def test_detached_value_gradients_and_independent_clipping(tmp_path):
+    from imba_chess.self_play.trainer import _training_loss
+    torch.set_num_threads(1)
+    torch.manual_seed(42)
+    model = tiny_model()
+    trainer = Stage2Trainer(model=model, config=LearningConfig(value_weight=1),
+                            move_vocab=VOCAB, encoder=ENCODER,
+                            device=torch.device('cpu'), max_positions=128)
+    sample = reconstruct(mate_game(), move_vocab=VOCAB, encoder=ENCODER, max_positions=128)
+    batch = collate_self_play([sample])
+    model.eval()
+    detached = model(batch, return_loss=False)
+    model.detach_value_features = False
+    attached = model(batch, return_loss=False)
+    assert torch.equal(detached['value_logits'], attached['value_logits'])
+    model.detach_value_features = True
+    losses = _training_loss(model, batch, 1)
+    losses['value_loss'].backward()
+    assert all(p.grad is None for p in trainer.policy_parameters)
+    assert any(p.grad is not None and p.grad.abs().sum() > 0 for p in trainer.value_parameters)
+    model.zero_grad(set_to_none=True)
+    _training_loss(model, batch, 1)['weighted_policy_loss'].backward()
+    assert all(p.grad is None for p in trainer.value_parameters)
+    assert any(p.grad is not None and p.grad.abs().sum() > 0 for p in trainer.policy_parameters)
+    before = {k:v.clone() for k,v in model.state_dict().items()}
+    model.zero_grad(set_to_none=True)
+    _training_loss(model, batch, 1)['loss'].backward()
+    trainer._clip_gradients()
+    trainer.optimizer.step()
+    assert any(not torch.equal(v, before[k]) for k,v in model.state_dict().items() if k.startswith('value_head.'))
+    assert any(not torch.equal(v, before[k]) for k,v in model.state_dict().items() if not k.startswith('value_head.'))
+    clipped = []
+    for magnitude in (1., 1000000.):
+        for p in trainer.policy_parameters: p.grad = torch.ones_like(p)
+        for p in trainer.value_parameters: p.grad = torch.full_like(p, magnitude)
+        trainer._clip_gradients()
+        clipped.append([p.grad.clone() for p in trainer.policy_parameters])
+    assert all(torch.equal(a,b) for a,b in zip(*clipped))

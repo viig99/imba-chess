@@ -482,7 +482,9 @@ class HSTUChessModel(nn.Module):
             output["kv_caches"] = kv_caches  # type: ignore[assignment]
         value_logits: torch.Tensor | None = None
         if self.value_head is not None:
-            value_logits = self.value_head(x)
+            value_logits = self.value_head(
+                x.detach() if getattr(self, "detach_value_features", False) else x
+            )
             output["value_logits"] = value_logits
 
         if return_loss:
