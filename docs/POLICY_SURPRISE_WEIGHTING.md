@@ -83,3 +83,17 @@ and a single captured published manifest are used).
 Review paired results and incomplete-game counts before drawing strength
 conclusions. Lower weighted loss alone is not evidence of stronger play. Keep
 online weighting disabled until the controlled comparison has been reviewed.
+
+## Policy-only self-play default
+
+Self-play now defaults to `learning.value_weight = 0.0`. With zero value weight,
+`Stage2Trainer` freezes all value-head parameters before constructing optimizer
+groups. They are excluded from the optimizer, including weight decay and moment
+state, on both initialization and resume. The training objective contains only
+the policy loss; value metrics are still reported for monitoring.
+
+The shared backbone remains trainable, so value predictions can change even
+though value-head parameters remain identical. Set an explicit positive
+`value_weight` to enable joint policy/value training. Existing run configurations
+with explicit positive weights retain their behavior; do not replace their
+configurations with the new default templates when resuming them.

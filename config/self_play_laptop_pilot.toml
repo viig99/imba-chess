@@ -24,7 +24,7 @@ flush_positions = 2048
 
 [learning]
 lr = 1e-5
-value_weight = 1.0
+value_weight = 0.0
 weight_decay = 0.01
 grad_clip = 1.0
 reuse = 2.0

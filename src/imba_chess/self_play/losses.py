@@ -48,7 +48,8 @@ def self_play_loss(output, batch, *, value_weight=1.0):
             actor_prior_positions=available.sum(),
         )
     return dict(
-        loss=weighted_policy_loss + value_weight * value_loss,
+        loss=(weighted_policy_loss if value_weight == 0 else
+              weighted_policy_loss + value_weight * value_loss),
         weighted_policy_loss=weighted_policy_loss,
         **batch.get("policy_weight_metrics", {}),
         policy_loss=policy_loss,

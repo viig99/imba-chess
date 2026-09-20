@@ -46,7 +46,7 @@ class ReplayConfig:
 @dataclass(frozen=True)
 class LearningConfig:
     lr: float = 1e-5
-    value_weight: float = 1.0
+    value_weight: float = 0.0
     weight_decay: float = 0.01
     grad_clip: float = 1.0
     reuse: float = 2.0
@@ -56,6 +56,8 @@ class LearningConfig:
     policy_surprise_cap: float = 3.0
 
     def __post_init__(self):
+        if not math.isfinite(self.value_weight) or self.value_weight < 0:
+            raise ValueError("value_weight must be finite and nonnegative")
         if type(self.policy_surprise_enabled) is not bool:
             raise ValueError("policy_surprise_enabled must be boolean")
         if not math.isfinite(self.policy_surprise_fraction) or not 0 <= self.policy_surprise_fraction <= 1:
@@ -128,7 +130,7 @@ def load_config(path):
         **{k: constructors[k](**v) if k in constructors else v for k, v in raw.items()}
     )
     for section in (cfg.collection, cfg.replay, cfg.learning):
-        if any(not math.isfinite(v) or v <= 0 for k, v in asdict(section).items() if not k.startswith("policy_surprise_")):
+        if any(not math.isfinite(v) or v <= 0 for k, v in asdict(section).items() if not k.startswith("policy_surprise_") and k != "value_weight"):
             raise ValueError("stage-2 sizes and learning settings must be positive")
     if not all(math.isfinite(v) for v in asdict(cfg.run).values()):
         raise ValueError("run settings must be finite")

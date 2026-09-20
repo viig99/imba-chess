@@ -62,6 +62,10 @@ class Stage2Trainer:
         # Keep the model shared with collection and plain checkpoint keys. The
         # benchmark wraps this tensor-only callable without replacing the model.
         self._loss_fn = _training_loss
+        # Zero value weight means policy-only training. Freeze before grouping
+        # so the head receives neither optimizer moments nor weight decay.
+        if config.value_weight == 0 and getattr(model, "value_head", None) is not None:
+            model.value_head.requires_grad_(False)
         self.optimizer = StableAdamW(
             build_decay_param_groups(model, weight_decay=config.weight_decay),
             lr=config.lr,

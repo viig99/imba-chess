@@ -704,3 +704,48 @@ def test_evaluation_interruption_remains_resumable(tmp_path, monkeypatch):
     assert evaluation.evaluate_pair_checkpoints(**args)["score"] == 0.5
     assert calls[:2] == calls[2:]
     assert "protocol_failure" not in json.loads(output.read_text())
+
+
+def test_zero_value_weight_freezes_head_across_training_and_resume(tmp_path):
+    torch.set_num_threads(1)
+    torch.manual_seed(42)
+    store = SelfPlayStore(tmp_path / 'replay', flush_games=1)
+    store.add(mate_game())
+    config = LearningConfig(lr=0.01, value_weight=0, weight_decay=0.1)
+
+    def make_trainer():
+        return Stage2Trainer(model=tiny_model(), config=config, move_vocab=VOCAB,
+                             encoder=ENCODER, device=torch.device('cpu'), max_positions=128)
+
+    a = make_trainer()
+    initial = {k: v.clone() for k, v in a.model.state_dict().items()}
+    head_ids = {id(p) for p in a.model.value_head.parameters()}
+    assert all(not p.requires_grad for p in a.model.value_head.parameters())
+    assert not head_ids.intersection(id(p) for g in a.optimizer.param_groups for p in g['params'])
+    a.begin_phase(store)
+    a.train(store, exposure_budget=16)
+    a.checkpoint(tmp_path / 'state.pt', progress={'phase': 'train'}, store=store, config_id='zero')
+    a.train(store, exposure_budget=24)
+    b = make_trainer()
+    b.resume(tmp_path / 'state.pt', store=store, config_id='zero')
+    b.train(store, exposure_budget=24)
+    for k, v in a.model.state_dict().items():
+        assert torch.equal(v, b.model.state_dict()[k])
+        if k.startswith('value_head.'):
+            assert torch.equal(v, initial[k])
+    assert any(not torch.equal(v, initial[k]) for k, v in a.model.state_dict().items()
+               if not k.startswith('value_head.'))
+    assert all(p.grad is None for p in b.model.value_head.parameters())
+
+
+@pytest.mark.parametrize('weight', [-1, float('nan'), float('inf')])
+def test_invalid_value_weight(weight):
+    with pytest.raises(ValueError, match='value_weight'):
+        LearningConfig(value_weight=weight)
+
+
+def test_policy_only_default_configs():
+    from imba_chess.self_play.config import load_config
+    assert LearningConfig().value_weight == 0
+    for path in Path('config').glob('self_play*.toml'):
+        assert load_config(path).learning.value_weight == 0
