@@ -84,23 +84,19 @@ Review paired results and incomplete-game counts before drawing strength
 conclusions. Lower weighted loss alone is not evidence of stronger play. Keep
 online weighting disabled until the controlled comparison has been reviewed.
 
-## Detached-value self-play default
+## Joint policy/value self-play with separate clipping
 
-Self-play defaults to `learning.value_weight = 1.0` and
-`learning.detach_value_features = true`. The value head learns from detached
-backbone features, so value loss updates the head but not the shared backbone.
-Policy loss still updates the backbone and policy head. The two parameter groups
-are clipped independently at `learning.grad_clip`; metrics report
-`policy_gradient_norm` and `value_gradient_norm` before clipping. The historical
-`gradient_norm` key reports the policy/backbone norm in this mode.
+Self-play defaults to `learning.value_weight = 1.0`. Value-head inputs are not
+detached: both policy and value losses update the shared backbone, and the value
+loss also updates the value head. Value-head parameters are clipped separately
+from the combined backbone/policy-head group, each at `learning.grad_clip`.
+This separates the clipping norms, not the loss contributions to the backbone.
 
-Detachment leaves forward predictions unchanged. Stage-1 training is unaffected.
-Value predictions can change through both head updates and policy-driven backbone
-updates, and therefore still influence subsequent self-play search targets.
+Metrics report `policy_gradient_norm` (the backbone/policy parameter group,
+including value-loss contributions), `value_gradient_norm` (value-head group),
+and `gradient_norm` (alias for the former), all before clipping.
 
-Set `detach_value_features = false` for legacy joint training and global clipping.
-Set `value_weight = 0` for the frozen-value-head ablation: the head is excluded
-from optimizer groups, weight decay, and moments. Older checkpoints without the
-detachment field are interpreted as non-detached when checking resume settings;
-resume them using an explicit `detach_value_features = false` configuration.
-Changing this mode requires a fresh experiment rather than silently resuming.
+Set `value_weight = 0` for the frozen-value-head ablation. Stage-1 training is
+unaffected. Checkpoints from the detached-feature or legacy global-clipping experiments are incompatible
+with this training mode and must not be silently resumed. Their running remote
+process and evaluation artifacts are retained independently.

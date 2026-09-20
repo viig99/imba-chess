@@ -62,7 +62,6 @@ class Stage2Trainer:
         # Keep the model shared with collection and plain checkpoint keys. The
         # benchmark wraps this tensor-only callable without replacing the model.
         self._loss_fn = _training_loss
-        model.detach_value_features = config.detach_value_features
         # Zero value weight means policy-only training. Freeze before grouping
         # so the head receives neither optimizer moments nor weight decay.
         if config.value_weight == 0 and getattr(model, "value_head", None) is not None:
@@ -87,10 +86,6 @@ class Stage2Trainer:
         self.sample_ids = []
 
     def _clip_gradients(self):
-        if not self.config.detach_value_features:
-            return torch.nn.utils.clip_grad_norm_(
-                self.model.parameters(), self.config.grad_clip, error_if_nonfinite=True
-            ), None
         policy_norm = torch.nn.utils.clip_grad_norm_(
             self.policy_parameters, self.config.grad_clip, error_if_nonfinite=True
         )
@@ -261,6 +256,7 @@ class Stage2Trainer:
                 progress=progress,
                 config_id=config_id,
                 learning_config=asdict(self.config),
+                gradient_clipping="separate_value_head_v1",
             ),
         )
 
@@ -270,7 +266,11 @@ class Stage2Trainer:
             raise ValueError(
                 "resume requires a stage-2 checkpoint; use initialize for stage-1"
             )
-        if state["config_id"] != config_id or asdict(LearningConfig(**{"detach_value_features": False, **state["learning_config"]})) != asdict(
+        if state.get("gradient_clipping") != "separate_value_head_v1":
+            raise ValueError("resume configuration changed: gradient clipping mode")
+        if "detach_value_features" in state["learning_config"]:
+            raise ValueError("resume configuration changed: detached-value checkpoint")
+        if state["config_id"] != config_id or asdict(LearningConfig(**state["learning_config"])) != asdict(
             self.config
         ):
             raise ValueError("resume configuration changed")

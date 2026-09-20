@@ -747,13 +747,11 @@ def test_invalid_value_weight(weight):
 def test_policy_only_default_configs():
     from imba_chess.self_play.config import load_config
     assert LearningConfig().value_weight == 1
-    assert LearningConfig().detach_value_features
     for path in Path('config').glob('self_play*.toml'):
         assert load_config(path).learning.value_weight == 1
-        assert load_config(path).learning.detach_value_features
 
 
-def test_detached_value_gradients_and_independent_clipping(tmp_path):
+def test_joint_value_gradients_and_independent_clipping(tmp_path):
     from imba_chess.self_play.trainer import _training_loss
     torch.set_num_threads(1)
     torch.manual_seed(42)
@@ -764,14 +762,9 @@ def test_detached_value_gradients_and_independent_clipping(tmp_path):
     sample = reconstruct(mate_game(), move_vocab=VOCAB, encoder=ENCODER, max_positions=128)
     batch = collate_self_play([sample])
     model.eval()
-    detached = model(batch, return_loss=False)
-    model.detach_value_features = False
-    attached = model(batch, return_loss=False)
-    assert torch.equal(detached['value_logits'], attached['value_logits'])
-    model.detach_value_features = True
     losses = _training_loss(model, batch, 1)
     losses['value_loss'].backward()
-    assert all(p.grad is None for p in trainer.policy_parameters)
+    assert any(p.grad is not None and p.grad.abs().sum() > 0 for p in trainer.policy_parameters)
     assert any(p.grad is not None and p.grad.abs().sum() > 0 for p in trainer.value_parameters)
     model.zero_grad(set_to_none=True)
     _training_loss(model, batch, 1)['weighted_policy_loss'].backward()
