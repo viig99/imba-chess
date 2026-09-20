@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import argparse
 import contextlib
+import json
 import math
 import random
 from dataclasses import replace
@@ -21,6 +22,7 @@ except ImportError:  # pragma: no cover
     StableAdamW = None  # type: ignore[assignment]
 
 from imba_chess.config import DEFAULT_CONFIG_PATH, load_repo_config
+from imba_chess.model.checkpoint import load_initial_weights
 from imba_chess.data import (
     LichessDataset,
     build_event_dataloader,
@@ -52,6 +54,10 @@ def parse_args() -> argparse.Namespace:
         help="Checkpoint path to resume from (or to load in eval-only mode).",
     )
     parser.add_argument("--eval-only", action="store_true")
+    parser.add_argument(
+        "--init-weights", type=Path, default=None,
+        help="Strictly load model weights only; start a fresh optimizer, schedule and step count.",
+    )
     parser.add_argument(
         "--eval-split",
         choices=["val", "test", "both"],
@@ -301,6 +307,8 @@ def _print_eval_metrics(split: str, metrics: dict[str, float]) -> None:
     print(f"  top3_acc: {metrics['top3_acc']:.6f}")
     print(f"  top5_acc: {metrics['top5_acc']:.6f}")
     print(f"  hr@10: {metrics['top10_acc']:.6f}")
+    if "top16_acc" in metrics:
+        print(f"  hr@16: {metrics['top16_acc']:.6f}")
     print(f"  mrr: {metrics['mrr']:.6f}")
 
 
@@ -376,6 +384,8 @@ def _run_deterministic_eval(
 
 def main() -> None:
     args = parse_args()
+    if args.init_weights is not None and (args.resume is not None or args.eval_only):
+        raise ValueError("--init-weights cannot be combined with --resume or --eval-only")
     disable_progress_bar()
     repo_config = load_repo_config(args.config)
     if create_next_move_evaluator is None:
@@ -448,6 +458,13 @@ def main() -> None:
         move_vocab_size=len(move_vocab),
     )
     model: torch.nn.Module = HSTUChessModel(model_cfg).to(device)
+    initialization = None
+    if args.init_weights is not None:
+        checkpoint = torch.load(args.init_weights, map_location="cpu", weights_only=False)
+        load_initial_weights(model, checkpoint)
+        initialization = {"source": str(args.init_weights.resolve())}
+        del checkpoint
+        print(f"Initialized model weights from {args.init_weights}; optimizer and schedule start fresh")
     _print_model_summary(model)
     if repo_config.training.compile_model:
         model = torch.compile(model, dynamic=True, fullgraph=True)
@@ -457,7 +474,7 @@ def main() -> None:
         device=device,
         dtype=dtype,
         ignore_index=repo_config.model.ignore_index,
-        topk=(1, 3, 5, 10),
+        topk=(1, 3, 5, 10, 16),
         track_value_loss=bool(repo_config.model.enable_value_head),
     )
     full_val_evaluator = create_next_move_evaluator(
@@ -465,7 +482,7 @@ def main() -> None:
         device=device,
         dtype=dtype,
         ignore_index=repo_config.model.ignore_index,
-        topk=(1, 3, 5, 10),
+        topk=(1, 3, 5, 10, 16),
         track_value_loss=bool(repo_config.model.enable_value_head),
     )
     test_evaluator = create_next_move_evaluator(
@@ -473,7 +490,7 @@ def main() -> None:
         device=device,
         dtype=dtype,
         ignore_index=repo_config.model.ignore_index,
-        topk=(1, 3, 5, 10),
+        topk=(1, 3, 5, 10, 16),
         track_value_loss=bool(repo_config.model.enable_value_head),
     )
 
@@ -513,7 +530,7 @@ def main() -> None:
 
     if args.eval_only:
         checkpoint = torch.load(args.resume, map_location="cpu")
-        Checkpoint.load_objects(to_load={"model": model}, checkpoint=checkpoint)
+        load_initial_weights(model, checkpoint)
         print(f"Loaded checkpoint for eval: {args.resume}")
         _run_eval_only()
         return
@@ -654,6 +671,11 @@ def main() -> None:
         "trainer": trainer,
         "scaler": scaler,
     }
+    # Keep the branch origin alongside the new run's checkpoints.
+    if initialization is not None:
+        checkpoint_dir.joinpath("initialization.json").write_text(
+            json.dumps(initialization, indent=2) + "\n"
+        )
     if args.resume is not None:
         checkpoint = torch.load(args.resume, map_location="cpu")
         Checkpoint.load_objects(to_load=checkpoint_objects, checkpoint=checkpoint)

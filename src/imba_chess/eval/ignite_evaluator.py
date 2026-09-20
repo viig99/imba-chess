@@ -33,7 +33,7 @@ def create_next_move_evaluator(
     device: torch.device,
     dtype: torch.dtype,
     ignore_index: int,
-    topk: Iterable[int] = (1, 3, 5, 10),
+    topk: Iterable[int] = (1, 3, 5, 10, 16),
     track_value_loss: bool = False,
 ) -> Engine:
     """track_value_loss: also run the model's loss path and report the

@@ -235,13 +235,10 @@ class _SquareAttentionBlock(nn.Module):
 
 
 class BoardSquareEncoder(nn.Module):
-    """Bidirectional attention over the 64 squares of each position.
+    """Square attention followed by an ordered, learned whole-board readout.
 
-    Mean-pooling (piece, square) vectors is a linear aggregation: no square
-    conditions on any other before the board collapses to one vector, so
-    square interactions (attacks, pins, pawn structure) have to be recovered
-    statistically by the trunk. A couple of attention layers over the squares
-    let the board vector carry those interactions directly.
+    Preserve all 64 square feature vectors through flattening, then project
+    their concatenation into the history trunk's width.
     """
 
     def __init__(
@@ -255,7 +252,7 @@ class BoardSquareEncoder(nn.Module):
             ]
         )
         self.final_norm = nn.LayerNorm(dim)
-        self.out_proj = nn.Linear(dim, out_dim)
+        self.out_proj = nn.Linear(64 * dim, out_dim)
 
     def forward(self, squares: torch.Tensor) -> torch.Tensor:
         # Not checkpointed: under torch.compile, checkpointing a block that
@@ -266,7 +263,7 @@ class BoardSquareEncoder(nn.Module):
         # is fine; it's specifically the compiled-recompute path that's broken.
         for block in self.blocks:
             squares = block(squares)
-        return self.out_proj(self.final_norm(squares).mean(dim=1))
+        return self.out_proj(self.final_norm(squares).flatten(1))
 
 
 class HSTUChessModel(nn.Module):

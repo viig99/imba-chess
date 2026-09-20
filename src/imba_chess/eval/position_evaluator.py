@@ -8,6 +8,7 @@ from typing import Any
 import chess
 import imba_chess_native as cc
 import torch
+from imba_chess.model.checkpoint import load_initial_weights, normalized_model_state
 
 
 from imba_chess.data.board_state import BoardStateEncoder
@@ -129,24 +130,11 @@ def load_hstu_checkpoint(
     require_value_head: bool = False,
 ) -> tuple[torch.nn.Module, bool]:
     checkpoint = torch.load(checkpoint_path, map_location="cpu")
-    if isinstance(checkpoint, dict) and "model" in checkpoint:
-        state_dict = checkpoint["model"]
-    else:
-        state_dict = checkpoint
-    if not isinstance(state_dict, dict):
+    if not isinstance(checkpoint, dict):
         raise TypeError(
             "Checkpoint must be a model state_dict or Ignite checkpoint containing key 'model'."
         )
-    normalized_state_dict: dict[str, Any] = {}
-    for key, value in state_dict.items():
-        if not isinstance(key, str):
-            raise TypeError("Checkpoint state_dict keys must be strings")
-        new_key = key
-        if new_key.startswith("module."):
-            new_key = new_key[len("module.") :]
-        if new_key.startswith("_orig_mod."):
-            new_key = new_key[len("_orig_mod.") :]
-        normalized_state_dict[new_key] = value
+    normalized_state_dict = normalized_model_state(checkpoint)
     checkpoint_has_value_head = any(
         key.startswith("value_head.") for key in normalized_state_dict
     )
@@ -168,7 +156,7 @@ def load_hstu_checkpoint(
         model_cfg = replace(model_cfg, enable_value_head=checkpoint_has_value_head)
 
     model: torch.nn.Module = HSTUChessModel(model_cfg).to(device)
-    model.load_state_dict(normalized_state_dict, strict=True)
+    load_initial_weights(model, {"model": normalized_state_dict})
     model.eval()
     compile_enabled = False
     if compile_model:

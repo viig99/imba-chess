@@ -24,6 +24,16 @@ The offline halving-target generator and its storage format have been retired. B
 
 Games use a static 1,970-token UCI vocabulary, placement-aware board encoding, BOS, and pre-move board/previous-move events. Complete histories are packed into jagged batches. The shared trunk has policy, WDL value and moves-left heads.
 
+New models use a flattened square readout: two square-attention blocks, per-square
+normalization, flatten 64×64 features, and a 4096→model-width projection. There is
+one model architecture, with no pooling switch or runtime checkpoint conversion.
+For a training warm start use `--init-weights`; `--resume` requires a flattened checkpoint
+with compatible optimizer state. See [continuation and promotion](docs/FLATTEN_BOARD_CONTINUATION.md).
+
+**The experiment baseline remains the verified flattened copy of ckpt34 until a trained
+candidate passes the matched SF2400 halving comparison.** Architecture adoption
+does not itself promote a checkpoint.
+
 Stage 1 learns human moves with full-vocabulary cross entropy and configured Elo weighting. Stockfish annotations supervise the value head where present, using the fixed win-percent transform; moves-left supervision remains available. See [event alignment](TRAINING_EVENT_SCHEMA.md), [board encoding](FEN_TO_BOARD_STATE.md) and [value targets](docs/VALUE_TARGET_WINPERCENT_HANDOFF.md).
 
 Stage 2 starts from a checkpoint and human-game prefixes. One frozen actor controls both colors through each continuation. Completed games provide noise-free improved Gumbel policies and actual outcome WDL targets; human prefixes provide unsupervised context. Loss is soft legal-policy cross entropy plus outcome WDL cross entropy, with no Elo weighting or moves-left loss. Unfinished games receive no labels.
@@ -41,7 +51,7 @@ Install project dependencies and native bindings with `uv sync --extra dev`. Dat
 # New laptop stage-2 run (requires a prepared training/monitor seed manifest).
 .venv/bin/python scripts/run_self_play.py \
   --config config/self_play_laptop_fast.toml \
-  --initialize artifacts/checkpoints_v4/best_hr10_checkpoint_34_hr10=0.9677.pt \
+  --initialize artifacts/flatten-board-ckpt34/initial.pt \
   --seeds artifacts/corpus/v4_self_play_seeds_4096.json \
   --output artifacts/self_play/new-run --device cuda
 

@@ -1,10 +1,11 @@
-# v4: from-scratch run, ~48M params, WinPercent value target.
+# v4: flattened square readout, ~52.4M params, WinPercent value target.
+# Checkpoints must use the flattened board projection.
 #
 # Three deliberate changes from the ckpt23/ckpt27 lineage (768d x 8L, ~27M):
 #
 #   1. Trunk widened 768 -> 1024 at the same depth. At the compute already
 #      spent on ckpt23 (70-210 tokens/param) the compute-optimal model was
-#      50-86M, so 27M was 2-3x undersized. 48M stays cheap enough at
+#      50-86M, so 27M was 2-3x undersized. The original 48M v4 was sized for
 #      inference, which matters because search runs ~1300 forward passes per
 #      move and the eval card is 8GB.
 #   2. Convex Elo weighting (alpha 2, strength 3). The old alpha 1 /

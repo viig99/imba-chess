@@ -1,0 +1,69 @@
+# Frozen SF2400 halving recipe: adopted ckpt34 r4/b2048 confirmation, seed 1042.
+
+[board_state]
+en_passant = "legal"
+halfmove_max = 100
+halfmove_bucket_size = 2
+fullmove_max = 200
+fullmove_bucket_size = 2
+
+
+[vocab]
+path = "artifacts/move_vocab_static_uci.json"
+include_unk = false
+
+
+[model]
+model_dim = 1024
+linear_hidden_dim = 64
+attention_dim = 64
+num_heads = 16
+num_layers = 8
+dropout = 0.0
+max_position_embeddings = 513
+halfmove_vocab_size = 128
+fullmove_vocab_size = 128
+ignore_index = -100
+relative_attention_bias = "position"
+label_smoothing = 0.0
+elo_weight_min_elo = 2000
+elo_weight_max_elo = 2800
+elo_loss_weight_alpha = 2.0
+elo_loss_weight_strength = 3.0
+enable_value_head = true
+value_loss_weight = 1.0
+value_head_width = 512
+value_head_blocks = 2
+value_head_expansion = 2
+moves_left_loss_weight = 0.05
+
+
+[eval_vs_stockfish]
+games = 750
+max_plies = 512
+seed = 1042
+stockfish_path = "/usr/bin/stockfish"
+stockfish_time_sec = 5.0
+stockfish_nodes = 40000
+concurrent_games = 4
+stockfish_threads = 1
+stockfish_hash_mb = 64
+stockfish_limit_strength = true
+ladder_elos = "2400"
+ladder_games_per_segment = 750
+include_full_strength_segment = false
+device = "auto"
+model_move_policy = "value_search_halving"
+search_lambda = 0.05
+search_budget = 2048
+search_top_m = 16
+halving_rounds = 0
+search_refutation_top_r = 4
+search_expand_top = 3
+search_max_depth = 8
+opening_random_plies = 0
+debug_trace_games = 0
+debug_trace_max_plies = 80
+debug_topk = 5
+save_games = false
+save_games_dir = "artifacts/eval/flatten-sf2400/games"
