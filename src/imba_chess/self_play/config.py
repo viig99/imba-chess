@@ -47,6 +47,10 @@ class ReplayConfig:
 class LearningConfig:
     lr: float = 1e-5
     value_weight: float = 1.0
+    auxiliary_value_weight: float = 1.0
+    # A list trains one auxiliary WDL readout per TD horizon, each weighted
+    # by auxiliary_value_weight; the model needs as many auxiliary heads.
+    auxiliary_value_lambda: float | tuple[float, ...] = 0.95
     weight_decay: float = 0.01
     grad_clip: float = 1.0
     reuse: float = 2.0
@@ -55,7 +59,23 @@ class LearningConfig:
     policy_surprise_fraction: float = 0.5
     policy_surprise_cap: float = 3.0
 
+    @property
+    def auxiliary_value_lambdas(self):
+        value = self.auxiliary_value_lambda
+        return value if isinstance(value, tuple) else (value,)
+
     def __post_init__(self):
+        if not math.isfinite(self.auxiliary_value_weight) or self.auxiliary_value_weight < 0:
+            raise ValueError("auxiliary_value_weight must be finite and nonnegative")
+        if isinstance(self.auxiliary_value_lambda, (list, tuple)):
+            object.__setattr__(self, "auxiliary_value_lambda", tuple(self.auxiliary_value_lambda))
+            if not self.auxiliary_value_lambda:
+                raise ValueError("auxiliary_value_lambda list must be nonempty")
+        if any(
+            type(v) not in (int, float) or not math.isfinite(v) or not 0 <= v <= 1
+            for v in self.auxiliary_value_lambdas
+        ):
+            raise ValueError("auxiliary_value_lambda must be in [0, 1]")
         if not math.isfinite(self.value_weight) or self.value_weight < 0:
             raise ValueError("value_weight must be finite and nonnegative")
         if type(self.policy_surprise_enabled) is not bool:
@@ -99,6 +119,11 @@ class SelfPlayConfig:
     def identifier(self):
         settings = asdict(self)
         defaults = LearningConfig()
+        # Omit only historical defaults, so new loss defaults cannot collide
+        # with identities from runs that predate auxiliary learning.
+        for key, legacy_default in (("auxiliary_value_weight", 0.0), ("auxiliary_value_lambda", 0.95)):
+            if getattr(self.learning, key) == legacy_default:
+                settings["learning"].pop(key)
         keys = ("policy_surprise_enabled", "policy_surprise_fraction", "policy_surprise_cap")
         if all(getattr(self.learning, k) == getattr(defaults, k) for k in keys):
             for key in keys:
@@ -130,7 +155,7 @@ def load_config(path):
         **{k: constructors[k](**v) if k in constructors else v for k, v in raw.items()}
     )
     for section in (cfg.collection, cfg.replay, cfg.learning):
-        if any(not math.isfinite(v) or v <= 0 for k, v in asdict(section).items() if not k.startswith("policy_surprise_") and k != "value_weight"):
+        if any(not math.isfinite(v) or v <= 0 for k, v in asdict(section).items() if not k.startswith(("policy_surprise_", "auxiliary_value_")) and k != "value_weight"):
             raise ValueError("stage-2 sizes and learning settings must be positive")
     if not all(math.isfinite(v) for v in asdict(cfg.run).values()):
         raise ValueError("run settings must be finite")

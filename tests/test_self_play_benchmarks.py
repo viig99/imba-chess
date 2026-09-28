@@ -15,6 +15,7 @@ from tests.test_self_play import VOCAB, ENCODER, tiny_model, mate_game
 def test_component_entrypoints(tmp_path):
     torch.set_num_threads(1)
     cfg = SelfPlayConfig(collection=CollectionConfig(concurrent_games=2))
+    cfg = replace(cfg, learning=replace(cfg.learning, auxiliary_value_weight=0.0))
     cfg = replace(cfg, search=replace(cfg.search, simulations=2, max_depth=2))
     runtime = InferenceRuntime(
         model=tiny_model().eval(),

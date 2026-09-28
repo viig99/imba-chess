@@ -13,7 +13,7 @@ from tests.test_self_play import mate_game, VOCAB, ENCODER, tiny_model
 from imba_chess.self_play.trainer import Stage2Trainer
 from imba_chess.data.self_play_store import SelfPlayStore, validate_game
 
-ON = LearningConfig(policy_surprise_enabled=True)
+ON = LearningConfig(auxiliary_value_weight=0.0, policy_surprise_enabled=True)
 
 
 def target(d, base=1):
@@ -69,15 +69,15 @@ def test_loss_gradient_parity_zero_weights_padding_and_detach():
     out = dict(logits=logits, value_logits=values)
     original = dict(batch)
     original.pop('policy_training_weight')
-    old = self_play_loss(out, original)
-    new = self_play_loss(out, batch)
+    old = self_play_loss(out, original, auxiliary_value_weight=0.0)
+    new = self_play_loss(out, batch, auxiliary_value_weight=0.0)
     assert torch.equal(old['loss'], new['loss'])
     old_grads = torch.autograd.grad(old['loss'], (logits, values), retain_graph=True)
     new_grads = torch.autograd.grad(new['loss'], (logits, values), retain_graph=True)
     assert all(torch.equal(a, b) for a, b in zip(old_grads, new_grads))
     weights = torch.tensor([0., .5, 1.5, 2.], requires_grad=True)
     batch['policy_training_weight'] = weights
-    weighted = self_play_loss(out, batch)
+    weighted = self_play_loss(out, batch, auxiliary_value_weight=0.0)
     indices = batch['supervised_indices']
     logs = logits[indices].gather(1, batch['legal_ids']).masked_fill(~batch['legal_mask'], -torch.inf).log_softmax(-1).masked_fill(~batch['legal_mask'], 0)
     ce = -(batch['policy'] * logs).sum(-1)
@@ -86,24 +86,25 @@ def test_loss_gradient_parity_zero_weights_padding_and_detach():
     assert torch.equal(grads[1], old_grads[1]) and grads[2] is None
     assert grads[0][indices[0]].count_nonzero() == 0
     batch['policy_training_weight'] = torch.zeros(4)
-    zero = self_play_loss(out, batch)
+    zero = self_play_loss(out, batch, auxiliary_value_weight=0.0)
     assert zero['weighted_policy_loss'] == 0
     assert torch.autograd.grad(zero['loss'], logits)[0].count_nonzero() == 0
 
 
 def test_old_identity_and_validation():
-    cfg = SelfPlayConfig()
+    cfg = SelfPlayConfig(learning=LearningConfig(auxiliary_value_weight=0.0))
     old = asdict(cfg)
     old.pop('streaming')
     for k in list(old['learning']):
-        if k.startswith('policy_surprise_'):
+        if k.startswith(('policy_surprise_', 'auxiliary_value_', 'gradient_accumulation')):
             old['learning'].pop(k)
     expected = hashlib.sha256(json.dumps(dict(settings=old, base_sha256=_base_config_identity(cfg.base_config)), sort_keys=True).encode()).hexdigest()
     assert cfg.identifier == expected
+    assert replace(cfg, learning=LearningConfig()).identifier != expected
     assert replace(cfg, learning=ON).identifier != expected
     for kwargs in (dict(policy_surprise_fraction=-.1), dict(policy_surprise_fraction=float('nan')), dict(policy_surprise_cap=.5), dict(policy_surprise_enabled=1)):
         with pytest.raises(ValueError):
-            LearningConfig(**kwargs)
+            LearningConfig(auxiliary_value_weight=0.0, **kwargs)
     g = mate_game()
     g['targets'][0]['policy_training_weight'] = -1
     with pytest.raises(ValueError):
@@ -116,16 +117,16 @@ def test_legacy_checkpoint_and_incompatible_resume(tmp_path):
     def trainer(config):
         return Stage2Trainer(model=tiny_model(), config=config, move_vocab=VOCAB,
                              encoder=ENCODER, device=torch.device('cpu'), max_positions=128)
-    a = trainer(LearningConfig())
+    a = trainer(LearningConfig(auxiliary_value_weight=0.0))
     a.begin_phase(store)
     path = tmp_path / 'old.pt'
     a.checkpoint(path, progress={}, store=store, config_id='same')
     state = torch.load(path, weights_only=False)
     for k in list(state['learning_config']):
-        if k.startswith('policy_surprise_'):
+        if k.startswith(('policy_surprise_', 'auxiliary_value_', 'gradient_accumulation')):
             state['learning_config'].pop(k)
     torch.save(state, path)
-    trainer(LearningConfig()).resume(path, store=store, config_id='same')
-    for cfg in (ON, LearningConfig(policy_surprise_cap=4), LearningConfig(policy_surprise_fraction=.2)):
+    trainer(LearningConfig(auxiliary_value_weight=0.0)).resume(path, store=store, config_id='same')
+    for cfg in (ON, LearningConfig(auxiliary_value_weight=0.0, policy_surprise_cap=4), LearningConfig(auxiliary_value_weight=0.0, policy_surprise_fraction=.2)):
         with pytest.raises(ValueError, match='configuration changed'):
             trainer(cfg).resume(path, store=store, config_id='same')

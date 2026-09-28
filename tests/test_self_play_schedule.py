@@ -9,7 +9,7 @@ from imba_chess.self_play.trainer import Stage2Trainer
 
 
 def trainer(model, lr):
-    return Stage2Trainer(model=model, config=LearningConfig(lr=lr), move_vocab=None,
+    return Stage2Trainer(model=model, config=LearningConfig(auxiliary_value_weight=0.0, lr=lr), move_vocab=None,
                          encoder=None, device=torch.device('cpu'), max_positions=128)
 
 

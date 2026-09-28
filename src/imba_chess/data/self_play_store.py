@@ -45,6 +45,12 @@ def validate_game(game):
     ):
         raise ValueError("trajectory alignment mismatch")
     for target in game["targets"]:
+        wdl = target.get("search_wdl")
+        if wdl is not None and (
+            len(wdl) != 3 or any(not math.isfinite(p) or p < 0 for p in wdl)
+            or abs(sum(wdl) - 1) > 1e-5
+        ):
+            raise ValueError("search_wdl must be a normalized loss/draw/win distribution")
         weight = target.get("policy_training_weight", 1.0)
         if not math.isfinite(weight) or weight < 0:
             raise ValueError("policy_training_weight must be finite and nonnegative")

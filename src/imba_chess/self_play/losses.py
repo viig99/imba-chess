@@ -4,7 +4,7 @@ import torch
 import torch.nn.functional as F
 
 
-def self_play_loss(output, batch, *, value_weight=1.0):
+def self_play_loss(output, batch, *, value_weight=1.0, auxiliary_value_weight=1.0):
     indices = batch["supervised_indices"].to(output["logits"].device)
     logits = output["logits"].index_select(0, indices).float()
     legal = batch["legal_ids"].to(logits.device)
@@ -47,9 +47,36 @@ def self_play_loss(output, batch, *, value_weight=1.0):
             / available.sum().clamp_min(1),
             actor_prior_positions=available.sum(),
         )
+    loss = weighted_policy_loss if value_weight == 0 else weighted_policy_loss + value_weight * value_loss
+    auxiliary_metrics = {}
+    if auxiliary_value_weight > 0:
+        auxiliary_logits = output["auxiliary_value_logits"].index_select(0, indices).float()
+        auxiliary_target = batch["auxiliary_value_target"].to(logits.device).float().detach()
+        if auxiliary_target.dim() == 2:
+            auxiliary_target = auxiliary_target.unsqueeze(1)
+        horizons = auxiliary_target.shape[1]
+        if auxiliary_logits.shape[-1] != 3 * horizons:
+            raise ValueError("auxiliary head count does not match auxiliary targets")
+        auxiliary_logits = auxiliary_logits.view(-1, horizons, 3)
+        # Each horizon is a separate loss term with the full auxiliary weight.
+        head_losses = [
+            -(auxiliary_target[:, h] * F.log_softmax(auxiliary_logits[:, h], -1)).sum(-1).mean()
+            for h in range(horizons)
+        ]
+        for head_loss in head_losses:
+            loss = loss + auxiliary_value_weight * head_loss
+        auxiliary_metrics = dict(
+            auxiliary_value_loss=head_losses[0] if horizons == 1 else sum(head_losses) / horizons,
+            auxiliary_target_draw=auxiliary_target[..., 1].mean(),
+            auxiliary_predicted_draw=auxiliary_logits.softmax(-1)[..., 1].mean(),
+        )
+        if horizons > 1:
+            auxiliary_metrics.update(
+                {f"auxiliary_value_loss_{h}": head_loss for h, head_loss in enumerate(head_losses)}
+            )
     return dict(
-        loss=(weighted_policy_loss if value_weight == 0 else
-              weighted_policy_loss + value_weight * value_loss),
+        loss=loss,
+        **auxiliary_metrics,
         weighted_policy_loss=weighted_policy_loss,
         **batch.get("policy_weight_metrics", {}),
         policy_loss=policy_loss,

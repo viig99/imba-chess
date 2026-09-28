@@ -17,12 +17,13 @@ from .config import LearningConfig
 from .losses import self_play_loss
 
 
-def _model_loss(model, batch, mask, value_weight):
+def _model_loss(model, batch, mask, value_weight, auxiliary_value_weight=1.0):
     output = model(batch, block_mask=mask, return_loss=False)
-    return self_play_loss(output, batch, value_weight=value_weight)
+    return self_play_loss(output, batch, value_weight=value_weight,
+                          auxiliary_value_weight=auxiliary_value_weight)
 
 
-def _training_loss(model, batch, value_weight, *, model_loss=_model_loss):
+def _training_loss(model, batch, value_weight, auxiliary_value_weight=1.0, *, model_loss=_model_loss):
     device = model.piece_square_embedding.weight.device
     mask_factory = (
         create_batch_block_mask if device.type == "cuda" else create_batch_dense_mask
@@ -33,7 +34,7 @@ def _training_loss(model, batch, value_weight, *, model_loss=_model_loss):
             total_tokens=batch["total_tokens"],
             device=device,
         )
-    return model_loss(model, batch, mask, value_weight)
+    return model_loss(model, batch, mask, value_weight, auxiliary_value_weight)
 
 
 def atomic_checkpoint(path, state):
@@ -62,12 +63,22 @@ class Stage2Trainer:
         # Keep the model shared with collection and plain checkpoint keys. The
         # benchmark wraps this tensor-only callable without replacing the model.
         self._loss_fn = _training_loss
+        auxiliary = getattr(model, "auxiliary_value_head", None)
+        if config.auxiliary_value_weight > 0 and auxiliary is None:
+            raise ValueError("auxiliary value loss requires an enabled auxiliary value head")
+        if (auxiliary is not None and config.auxiliary_value_weight > 0
+                and auxiliary.out_features != 3 * len(config.auxiliary_value_lambdas)):
+            raise ValueError("model auxiliary head count must match auxiliary_value_lambda")
+        if auxiliary is not None and config.auxiliary_value_weight == 0:
+            auxiliary.requires_grad_(False)
         # Zero value weight means policy-only training. Freeze before grouping
         # so the head receives neither optimizer moments nor weight decay.
-        if config.value_weight == 0 and getattr(model, "value_head", None) is not None:
+        if config.value_weight == 0 and config.auxiliary_value_weight == 0 and getattr(model, "value_head", None) is not None:
             model.value_head.requires_grad_(False)
         head = getattr(model, "value_head", None)
         self.value_parameters = list(head.parameters()) if head is not None else []
+        if auxiliary is not None:
+            self.value_parameters.extend(auxiliary.parameters())
         value_ids = {id(p) for p in self.value_parameters}
         self.policy_parameters = [p for p in model.parameters() if id(p) not in value_ids]
         self.optimizer = StableAdamW(
@@ -188,7 +199,8 @@ class Stage2Trainer:
                 step_start = time.perf_counter()
                 batch, gids = self._next_batch(store)
                 self.optimizer.zero_grad(set_to_none=True)
-                losses = self._loss_fn(self.model, batch, self.config.value_weight)
+                losses = self._loss_fn(self.model, batch, self.config.value_weight,
+                                       self.config.auxiliary_value_weight)
                 if not torch.isfinite(losses["loss"]):
                     raise FloatingPointError("nonfinite stage-2 loss")
                 losses["loss"].backward()
@@ -270,7 +282,8 @@ class Stage2Trainer:
             raise ValueError("resume configuration changed: gradient clipping mode")
         if "detach_value_features" in state["learning_config"]:
             raise ValueError("resume configuration changed: detached-value checkpoint")
-        if state["config_id"] != config_id or asdict(LearningConfig(**state["learning_config"])) != asdict(
+        saved_learning = {"auxiliary_value_weight": 0.0, **state["learning_config"]}
+        if state["config_id"] != config_id or asdict(LearningConfig(**saved_learning)) != asdict(
             self.config
         ):
             raise ValueError("resume configuration changed")

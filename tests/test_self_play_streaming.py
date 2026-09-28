@@ -236,10 +236,11 @@ def test_legacy_configuration_identity_is_preserved():
     from imba_chess.self_play.config import _base_config_identity
 
     cfg = load_config("config/self_play_laptop_pilot.toml")
+    cfg = replace(cfg, learning=replace(cfg.learning, auxiliary_value_weight=0.0))
     old_settings = asdict(cfg)
     del old_settings["streaming"]
     for key in list(old_settings["learning"]):
-        if key.startswith("policy_surprise_"):
+        if key.startswith(("policy_surprise_", "auxiliary_value_", "gradient_accumulation")):
             del old_settings["learning"][key]
     previous = hashlib.sha256(
         json.dumps(

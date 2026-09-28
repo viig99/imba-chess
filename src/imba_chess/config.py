@@ -96,6 +96,9 @@ class ModelConfig:
     # Stockfish eval (stockfish_evals.winpercent_wdl). Enabling it turns on
     # [%eval] parsing for every split; unannotated plies have zero value weight.
     enable_value_head: bool = False
+    enable_auxiliary_value_head: bool = False
+    # Number of 3-way WDL readouts in the auxiliary head (one per TD horizon).
+    auxiliary_value_heads: int = 1
     value_loss_weight: float = 0.15
     # Value readout depth/width. Defaults reproduce the original
     # single-hidden-layer head, so existing checkpoints keep loading.

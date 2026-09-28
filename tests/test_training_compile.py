@@ -25,7 +25,7 @@ def test_compiled_learning_matches_eager_across_batch_shapes():
     compiled.load_state_dict(eager.state_dict())
 
     def trainer(model):
-        return Stage2Trainer(model=model, config=LearningConfig(), move_vocab=VOCAB,
+        return Stage2Trainer(model=model, config=LearningConfig(auxiliary_value_weight=0.0), move_vocab=VOCAB,
                              encoder=ENCODER, device=torch.device("cuda"), max_positions=128)
 
     reference, candidate = trainer(eager), trainer(compiled)
@@ -37,7 +37,7 @@ def test_compiled_learning_matches_eager_across_batch_shapes():
         results = []
         for t in (reference, candidate):
             t.optimizer.zero_grad(set_to_none=True)
-            losses = t._loss_fn(t.model, batch, t.config.value_weight)
+            losses = t._loss_fn(t.model, batch, t.config.value_weight, t.config.auxiliary_value_weight)
             losses["loss"].backward()
             results.append(losses)
         for key in results[0]:

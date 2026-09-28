@@ -39,6 +39,8 @@ class HSTUChessConfig:
     elo_loss_weight_alpha: float = 1.0
     elo_loss_weight_strength: float = 0.0
     enable_value_head: bool = False
+    enable_auxiliary_value_head: bool = False
+    auxiliary_value_heads: int = 1
     value_loss_weight: float = 0.15
     # Value readout shape. blocks=0 is the original single-hidden-layer MLP
     # and is kept as the default so checkpoints trained before the deep head
@@ -74,6 +76,8 @@ def build_hstu_chess_config(
         elo_loss_weight_alpha=float(model_config.elo_loss_weight_alpha),
         elo_loss_weight_strength=float(model_config.elo_loss_weight_strength),
         enable_value_head=bool(model_config.enable_value_head),
+        enable_auxiliary_value_head=bool(model_config.enable_auxiliary_value_head),
+        auxiliary_value_heads=int(model_config.auxiliary_value_heads),
         value_loss_weight=float(model_config.value_loss_weight),
         value_head_width=(
             None
@@ -357,6 +361,21 @@ class HSTUChessModel(nn.Module):
             nn.SiLU(),
             nn.Linear(d // 2, 1),
         )
+        if config.enable_auxiliary_value_head and self.value_head is None:
+            raise ValueError("auxiliary value head requires the main value head")
+        if config.auxiliary_value_heads < 1:
+            raise ValueError("auxiliary_value_heads must be positive")
+        # Training-only readout of the SAME private value features. Keep main
+        # parameter names intact and do not evaluate this output in decode.
+        # Consecutive WDL triples are separate horizons; one head keeps the
+        # original (3, width) shape so existing checkpoints load strictly.
+        self.auxiliary_value_head = (
+            nn.Linear(self.value_head[-1].in_features, 3 * config.auxiliary_value_heads)
+            if config.enable_auxiliary_value_head else None
+        )
+        if self.auxiliary_value_head is not None:
+            nn.init.zeros_(self.auxiliary_value_head.weight)
+            nn.init.zeros_(self.auxiliary_value_head.bias)
 
         self.register_buffer(
             "square_ids", torch.arange(64, dtype=torch.long), persistent=False
@@ -479,7 +498,12 @@ class HSTUChessModel(nn.Module):
             output["kv_caches"] = kv_caches  # type: ignore[assignment]
         value_logits: torch.Tensor | None = None
         if self.value_head is not None:
-            value_logits = self.value_head(x)
+            if self.training and self.auxiliary_value_head is not None:
+                features = self.value_head[:-1](x)
+                value_logits = self.value_head[-1](features)
+                output["auxiliary_value_logits"] = self.auxiliary_value_head(features)
+            else:
+                value_logits = self.value_head(x)
             output["value_logits"] = value_logits
 
         if return_loss:

@@ -19,6 +19,7 @@ from imba_chess.self_play.evaluation import (
     decision,
     EvaluationProtocolError,
 )
+from imba_chess.eval.composed_runtime import ComposedRuntime
 from imba_chess.self_play.runtime import load_runtime, run_lock, StopBudget
 from imba_chess.self_play.seeds import file_hash, load_seeds
 from imba_chess.self_play.trainer import Stage2Trainer
@@ -78,6 +79,12 @@ def main():
         help="Keep the evaluated best and defer 500-game promotion confirmation",
     )
     parser.add_argument(
+        "--frozen-evaluator",
+        type=Path,
+        help="Research control: take node values from this frozen checkpoint while only "
+             "the policy trains. Requires learning.value_weight = 0.",
+    )
+    parser.add_argument(
         "--observe-only-screen",
         action="store_true",
         help="Research runs: record strength screens without rollback or best promotion",
@@ -99,7 +106,14 @@ def main():
         parser.error("--until needs an explicit timezone")
     if args.continuous and args.until is not None:
         parser.error("--continuous cannot be combined with --until")
+    if args.frozen_evaluator is not None and not args.frozen_evaluator.exists():
+        parser.error("--frozen-evaluator checkpoint does not exist")
     cfg = load_config(args.config)
+    if args.frozen_evaluator is not None and (cfg.learning.value_weight != 0 or cfg.learning.auxiliary_value_weight != 0):
+        parser.error(
+            "--frozen-evaluator isolates policy learning and requires "
+            "learning.value_weight = 0 and auxiliary_value_weight = 0; the learner's own value head must not train"
+        )
     seeds = load_seeds(args.seeds)
     monitor = [s for s in seeds if s.split == "monitor"]
     if len(monitor) < max(cfg.run.screen_pairs, cfg.run.confirmation_pairs):
@@ -168,6 +182,30 @@ def main():
             start_sampler.warm()
             state["stream_identity"] = start_sampler.identity
         runtime, max_positions = load_runtime(cfg, checkpoint, args.device)
+        frozen_evaluator = None
+        if args.frozen_evaluator is not None:
+            frozen_evaluator, frozen_positions = load_runtime(
+                cfg, args.frozen_evaluator, args.device
+            )
+            if frozen_positions != max_positions:
+                raise ValueError("frozen evaluator context limit differs from the learner")
+            frozen_id = file_hash(args.frozen_evaluator)
+            if args.resume and state.get("frozen_evaluator_id") != frozen_id:
+                raise ValueError("run and frozen evaluator identities disagree")
+            state["frozen_evaluator"] = str(args.frozen_evaluator)
+            state["frozen_evaluator_id"] = frozen_id
+        elif args.resume and state.get("frozen_evaluator_id"):
+            raise ValueError("run was created with a frozen evaluator; supply it again")
+
+        def acting(policy_runtime):
+            """The runtime that plays: learner policy, frozen values when controlled."""
+            return (
+                policy_runtime
+                if frozen_evaluator is None
+                else ComposedRuntime(policy_runtime, frozen_evaluator)
+            )
+
+        actor_runtime = acting(runtime)
         store = SelfPlayStore(args.output / "replay", **asdict(cfg.replay))
         trainer = Stage2Trainer(
             model=runtime.model,
@@ -242,7 +280,7 @@ def main():
                 event="run_start",
                 concurrent_games=args.concurrent_games
                 or cfg.collection.concurrent_games,
-                inference_options=getattr(runtime, "options", {}),
+                inference_options=getattr(actor_runtime, "options", {}),
                 until=args.until.isoformat() if args.until else None,
                 continuous=args.continuous,
                 screen_every=args.screen_every,
@@ -295,7 +333,7 @@ def main():
 
                 metrics = collect(
                     seeds=seeds if start_sampler is None else [],
-                    runtime=runtime,
+                    runtime=actor_runtime,
                     config=cfg,
                     actor_id=state["actor_id"],
                     store=store,
@@ -381,8 +419,8 @@ def main():
                     continue
                 best, _ = load_runtime(cfg, Path(state["best"]), args.device)
                 common = dict(
-                    candidate=runtime,
-                    best=best,
+                    candidate=actor_runtime,
+                    best=acting(best),
                     candidate_id=state["actor_id"],
                     best_id=state["best_id"],
                     seeds=monitor,

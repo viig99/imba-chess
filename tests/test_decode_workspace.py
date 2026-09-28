@@ -257,7 +257,11 @@ def test_scratch_collect_update_collect_and_cancellation(tmp_path):
         for reuse in (False, True)
     ]
     cfg = SelfPlayConfig()
-    cfg = replace(cfg, collection=replace(cfg.collection, concurrent_games=3))
+    cfg = replace(
+        cfg,
+        collection=replace(cfg.collection, concurrent_games=3),
+        learning=replace(cfg.learning, auxiliary_value_weight=0.0),
+    )
     seeds = [Seed("mate", "source", ["f2f3", "e7e5", "g2g4"], 3, "train", "test")]
     for cycle in range(2):
         games = []

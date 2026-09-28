@@ -13,6 +13,30 @@ def outcome_wdl(outcome_white, white_to_move):
     return [float(outcome == -1), float(outcome == 0), float(outcome == 1)]
 
 
+def smoothed_search_wdl(game, decay):
+    """Completed-game TD-style target, current-position side-to-move POV.
+
+    y_t = (1-decay) search_wdl_t + decay * swap(y_{t+1}); y_T is
+    the actual terminal outcome. Uses all continuation plies BEFORE batching.
+    Missing historical search distributions are errors, not raw-root substitutes.
+    """
+    if not math.isfinite(decay) or not 0 <= decay <= 1:
+        raise ValueError("auxiliary value decay must be in [0, 1]")
+    validate_game(game)
+    targets = game["targets"]
+    terminal_white_to_move = (game["takeover_ply"] + len(targets)) % 2 == 0
+    following = outcome_wdl(game["outcome_white"], terminal_white_to_move)
+    result = [None] * len(targets)
+    for index in range(len(targets) - 1, -1, -1):
+        search = targets[index].get("search_wdl")
+        if search is None:
+            raise ValueError("auxiliary value training requires recorded search_wdl at every ply")
+        following = [(1 - decay) * p + decay * q
+                     for p, q in zip(search, following[::-1])]
+        result[index] = following
+    return result
+
+
 def _policy_surprise(target, actor_logs):
     """KL(target || actor), removing stored FP32 normalization roundoff.
 
@@ -118,6 +142,16 @@ def reconstruct(game, *, move_vocab, encoder, max_positions, learning=None):
         actor_log_priors=[t.get("root_log_priors") for t in game["targets"]],
     )
     sample.update(policy_weights(game["targets"], learning=learning))
+    if learning is not None and learning.auxiliary_value_weight > 0:
+        if isinstance(learning.auxiliary_value_lambda, tuple):
+            # Per position: one WDL row per horizon, shape (horizons, 3).
+            horizons = [smoothed_search_wdl(game, decay)
+                        for decay in learning.auxiliary_value_lambda]
+            sample["auxiliary_value_target"] = [list(rows) for rows in zip(*horizons)]
+        else:
+            sample["auxiliary_value_target"] = smoothed_search_wdl(
+                game, learning.auxiliary_value_lambda
+            )
     return sample
 
 
@@ -133,6 +167,14 @@ def collate_self_play(samples):
         offset += len(sample["seq_token_id"])
     if not indices:
         raise ValueError("empty supervised batch")
+    if any("auxiliary_value_target" in sample for sample in samples):
+        if not all("auxiliary_value_target" in sample for sample in samples):
+            raise ValueError("mixed auxiliary target availability in training batch")
+        # Targets already correspond to supervised_indices, including offsets.
+        batch["auxiliary_value_target"] = torch.tensor(
+            [row for sample in samples for row in sample["auxiliary_value_target"]],
+            dtype=torch.float32,
+        )
     width = max(map(len, legal))
     batch["supervised_indices"] = torch.tensor(indices, dtype=torch.long)
     batch["legal_ids"] = torch.tensor(

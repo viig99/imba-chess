@@ -167,7 +167,7 @@ def test_sparse_loss_by_hand_and_finite_gradients():
         policy=torch.tensor([[0.25, 0.75], [1.0, 0.0]]),
         value_target=torch.tensor([[0.0, 1.0, 0.0], [0.0, 0.0, 1.0]]),
     )
-    loss = self_play_loss(dict(logits=logits, value_logits=value), batch)
+    loss = self_play_loss(dict(logits=logits, value_logits=value), batch, auxiliary_value_weight=0.0)
     assert loss["policy_loss"].item() == pytest.approx(math.log(2) / 2)
     assert loss["value_loss"].item() == pytest.approx(math.log(3))
     assert loss["model_policy_entropy"].item() == pytest.approx(math.log(2) / 2)
@@ -183,17 +183,17 @@ def test_sparse_loss_by_hand_and_finite_gradients():
     # Draw logits must not affect conditional win/loss discrimination.
     for draw_logit in (0.0, 100.0):
         values = torch.tensor([[0.0, draw_logit, math.log(3)]]).repeat(2, 1)
-        metrics = self_play_loss(dict(logits=logits, value_logits=values), batch)
+        metrics = self_play_loss(dict(logits=logits, value_logits=values), batch, auxiliary_value_weight=0.0)
         assert metrics["decisive_positions"] == 1
         assert metrics["conditional_wl_accuracy"] == 1
         assert metrics["conditional_wl_loss"].item() == pytest.approx(-math.log(.75))
     batch["value_target"][:] = torch.tensor([0.0, 1.0, 0.0])
-    metrics = self_play_loss(dict(logits=logits, value_logits=value), batch)
+    metrics = self_play_loss(dict(logits=logits, value_logits=value), batch, auxiliary_value_weight=0.0)
     assert metrics["decisive_positions"] == 0
     assert metrics["conditional_wl_loss"] == 0  # No decisive samples; ignore this batch.
 
 
-def tiny_model():
+def tiny_model(**overrides):
     return HSTUChessModel(
         HSTUChessConfig(
             move_vocab_size=len(VOCAB),
@@ -204,6 +204,7 @@ def tiny_model():
             num_layers=1,
             max_position_embeddings=128,
             enable_value_head=True,
+            **overrides,
         )
     )
 
@@ -214,7 +215,7 @@ def test_trainer_overfit_and_exact_resume(tmp_path):
     store = SelfPlayStore(tmp_path / "replay", flush_games=1)
     store.add(mate_game())
     model = tiny_model()
-    config = LearningConfig(lr=0.01)
+    config = LearningConfig(auxiliary_value_weight=0.0, lr=0.01)
 
     def trainer(model):
         return Stage2Trainer(
@@ -394,6 +395,7 @@ def test_multiple_iterations_and_runner_resume(tmp_path, monkeypatch, failure_st
         return IdentifiedRuntime(model), 128
 
     cfg = SelfPlayConfig(
+        learning=LearningConfig(auxiliary_value_weight=0.0),
         search=GumbelConfig(simulations=1, max_depth=1),
         collection=CollectionConfig(concurrent_games=2, fresh_positions=2),
         replay=ReplayConfig(window_positions=20, flush_games=2),
@@ -711,7 +713,7 @@ def test_zero_value_weight_freezes_head_across_training_and_resume(tmp_path):
     torch.manual_seed(42)
     store = SelfPlayStore(tmp_path / 'replay', flush_games=1)
     store.add(mate_game())
-    config = LearningConfig(lr=0.01, value_weight=0, weight_decay=0.1)
+    config = LearningConfig(auxiliary_value_weight=0.0, lr=0.01, value_weight=0, weight_decay=0.1)
 
     def make_trainer():
         return Stage2Trainer(model=tiny_model(), config=config, move_vocab=VOCAB,
@@ -741,14 +743,17 @@ def test_zero_value_weight_freezes_head_across_training_and_resume(tmp_path):
 @pytest.mark.parametrize('weight', [-1, float('nan'), float('inf')])
 def test_invalid_value_weight(weight):
     with pytest.raises(ValueError, match='value_weight'):
-        LearningConfig(value_weight=weight)
+        LearningConfig(auxiliary_value_weight=0.0, value_weight=weight)
 
 
 def test_policy_only_default_configs():
     from imba_chess.self_play.config import load_config
     assert LearningConfig().value_weight == 1
+    assert LearningConfig().auxiliary_value_weight == 1
+    assert LearningConfig().auxiliary_value_lambda == .95
     for path in Path('config').glob('self_play*.toml'):
         assert load_config(path).learning.value_weight == 1
+        assert load_config(path).learning.auxiliary_value_weight == 1
 
 
 def test_joint_value_gradients_and_independent_clipping(tmp_path):
@@ -756,23 +761,23 @@ def test_joint_value_gradients_and_independent_clipping(tmp_path):
     torch.set_num_threads(1)
     torch.manual_seed(42)
     model = tiny_model()
-    trainer = Stage2Trainer(model=model, config=LearningConfig(value_weight=1),
+    trainer = Stage2Trainer(model=model, config=LearningConfig(auxiliary_value_weight=0.0, value_weight=1),
                             move_vocab=VOCAB, encoder=ENCODER,
                             device=torch.device('cpu'), max_positions=128)
     sample = reconstruct(mate_game(), move_vocab=VOCAB, encoder=ENCODER, max_positions=128)
     batch = collate_self_play([sample])
     model.eval()
-    losses = _training_loss(model, batch, 1)
+    losses = _training_loss(model, batch, 1, auxiliary_value_weight=0.0)
     losses['value_loss'].backward()
     assert any(p.grad is not None and p.grad.abs().sum() > 0 for p in trainer.policy_parameters)
     assert any(p.grad is not None and p.grad.abs().sum() > 0 for p in trainer.value_parameters)
     model.zero_grad(set_to_none=True)
-    _training_loss(model, batch, 1)['weighted_policy_loss'].backward()
+    _training_loss(model, batch, 1, auxiliary_value_weight=0.0)['weighted_policy_loss'].backward()
     assert all(p.grad is None for p in trainer.value_parameters)
     assert any(p.grad is not None and p.grad.abs().sum() > 0 for p in trainer.policy_parameters)
     before = {k:v.clone() for k,v in model.state_dict().items()}
     model.zero_grad(set_to_none=True)
-    _training_loss(model, batch, 1)['loss'].backward()
+    _training_loss(model, batch, 1, auxiliary_value_weight=0.0)['loss'].backward()
     trainer._clip_gradients()
     trainer.optimizer.step()
     assert any(not torch.equal(v, before[k]) for k,v in model.state_dict().items() if k.startswith('value_head.'))

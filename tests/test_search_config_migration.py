@@ -10,8 +10,9 @@ from imba_chess.self_play.config import _base_config_identity, _BASE_CONFIG_IDEN
 def test_shipped_config_identity_is_preserved_and_changes_are_rejected(path, tmp_path):
     data = path.read_bytes()
     current = hashlib.sha256(data).hexdigest()
-    assert current in _BASE_CONFIG_IDENTITIES
-    assert _base_config_identity(path) == _BASE_CONFIG_IDENTITIES[current]
+    # Later architecture/training configs must retain their NEW identity;
+    # only exact historical evaluation-only edits receive an alias.
+    assert _base_config_identity(path) == _BASE_CONFIG_IDENTITIES.get(current, current)
     changed = tmp_path / path.name
     changed.write_bytes(data + b"\n# user modification\n")
     assert _base_config_identity(changed) != _base_config_identity(path)
