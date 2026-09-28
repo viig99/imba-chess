@@ -465,6 +465,7 @@ class DecodeWorkspace:
         self.counters["readbacks"] += 1
         self.counters["d2h_bytes"] += packed.numel() * packed.element_size()
         values = _batched_value_scalars(packed[:, width:].contiguous())
+        wdls = torch.softmax(packed[:, width:].contiguous(), -1).tolist()
         lens = [len(row[0]) for row in per_node]
         # Match the reference's logical width and contiguous CPU normalization.
         priors = packed[:, :width].contiguous()
@@ -482,6 +483,7 @@ class DecodeWorkspace:
                     legal_log_priors=prior_rows[row][: len(ids)],
                     legal_forcing=forcing,
                     legal_ids=ids,
+                    wdl=tuple(wdls[row]),
                 )
             ]
             for row, (ids, moves, ucis, forcing, _) in enumerate(per_node)

@@ -234,6 +234,7 @@ class InferenceRuntime:
             torch.log_softmax(logits.float(), 0).tolist(),
             [False] * len(moves),
             [self.move_vocab.encode(m.uci()) for m in moves],
+            wdl=wdl,
         )
         evaluator = CachedPositionEvaluator(
             model=self.model,

@@ -1,6 +1,6 @@
 from __future__ import annotations
 from imba_chess.eval.inference_runtime import load_runtime
-from imba_chess.eval.gumbel_search import GumbelConfig
+from imba_chess.eval.gumbel_search import FINAL_MOVE_RULES, GumbelConfig, final_move_index
 import argparse
 import json
 import os
@@ -132,6 +132,20 @@ def _parse_args() -> argparse.Namespace:
         help="Weight for halving search value adjustment.",
     )
     parser.add_argument("--gumbel-simulations", type=int, default=None)
+    parser.add_argument(
+        "--gumbel-final-move",
+        choices=FINAL_MOVE_RULES,
+        default="gumbel",
+        help="Evaluation-only rule for the played root move; search is unchanged.",
+    )
+    parser.add_argument("--lcb-z", type=float, default=1.96)
+    parser.add_argument(
+        "--gumbel-value-scale",
+        type=float,
+        default=None,
+        help="Gumbel c_scale for the completed-Q transform (default: GumbelConfig's 0.1)",
+    )
+    parser.add_argument("--lcb-min-visit-prop", type=float, default=0.15)
     parser.add_argument("--search-budget", type=int, default=None)
     parser.add_argument("--search-top-m", type=int, default=None)
     parser.add_argument("--halving-rounds", type=int, default=None)
@@ -248,7 +262,9 @@ def _select_model_move(*, runtime, batch, board, config):
         gen.close()
 
 
-def _select_model_move_stepwise(*, runtime, batch, board, config, debug_topk=0):
+def _select_model_move_stepwise(
+    *, runtime, batch, board, config, debug_topk=0, final_move=None
+):
     topk = []
 
     def observe(moves, logits):
@@ -288,6 +304,25 @@ def _select_model_move_stepwise(*, runtime, batch, board, config, debug_topk=0):
             terminal_hits=result.terminal_hits,
             depth_cutoffs=result.depth_cutoffs,
         )
+        index = (
+            None
+            if final_move is None
+            else final_move_index(
+                result.visits,
+                result.qvalues,
+                final_move["rule"],
+                lcb_z=final_move["lcb_z"],
+                lcb_min_visit_prop=final_move["lcb_min_visit_prop"],
+            )
+        )
+        if index is not None:
+            move_uci = runtime.move_vocab.decode(result.legal_ids[index])
+            if chess.Move.from_uci(move_uci) not in board.legal_moves:
+                raise RuntimeError(f"final move rule chose illegal {move_uci}")
+            debug["search_stats"]["final_move_overrides"] = int(
+                move_uci != result.move_uci
+            )
+            return (chess.Move.from_uci(move_uci), debug)
     return (chess.Move.from_uci(result.move_uci), debug)
 
 
@@ -604,6 +639,7 @@ def _play_game(
     stockfish_label: str,
     save_games_dir: Path | None,
     halving_config: "HalvingConfig | None" = None,
+    final_move: dict | None = None,
     runtime,
 ) -> Generator[WorkRequest, Any, EvalSummary]:
     """One game's coroutine core: the `BatchScheduler` game-factory contract.
@@ -667,6 +703,7 @@ def _play_game(
                 board=board,
                 runtime=runtime,
                 config=halving_config,
+                final_move=final_move,
                 debug_topk=debug_topk
                 if game_idx < debug_trace_games and plies < debug_trace_max_plies
                 else 0,
@@ -880,6 +917,7 @@ def _run_segment(
     save_games_dir: Path | None,
     concurrent_games: int,
     halving_config: "HalvingConfig | None" = None,
+    final_move: dict | None = None,
     runtime,
 ) -> EvalSummary:
     """Run all games through shared inference and concurrent Stockfish calls."""
@@ -916,6 +954,7 @@ def _run_segment(
                     stockfish_label=stockfish_label,
                     save_games_dir=save_games_dir,
                     halving_config=halving_config,
+                    final_move=final_move,
                     runtime=runtime,
                 )
                 yield (
@@ -1086,6 +1125,15 @@ def main() -> None:
                 )
     elif args.gumbel_simulations is not None:
         raise ValueError("--gumbel-simulations applies only to gumbel")
+    if args.model_move_policy != "gumbel" and args.gumbel_final_move != "gumbel":
+        raise ValueError("--gumbel-final-move applies only to gumbel")
+    if args.model_move_policy != "gumbel" and args.gumbel_value_scale is not None:
+        raise ValueError("--gumbel-value-scale applies only to gumbel")
+    args.gumbel_value_scale = float(
+        GumbelConfig.value_scale
+        if args.gumbel_value_scale is None
+        else args.gumbel_value_scale
+    )
     args.gumbel_simulations = (
         128 if args.gumbel_simulations is None else args.gumbel_simulations
     )
@@ -1248,7 +1296,19 @@ def main() -> None:
             quiescence_plies=int(args.search_quiescence_plies),
         )
         if args.model_move_policy == "gumbel":
-            halving_config = GumbelConfig(simulations=args.gumbel_simulations)
+            halving_config = GumbelConfig(
+                simulations=args.gumbel_simulations,
+                value_scale=args.gumbel_value_scale,
+            )
+        final_move = (
+            None
+            if args.gumbel_final_move == "gumbel"
+            else dict(
+                rule=args.gumbel_final_move,
+                lcb_z=float(args.lcb_z),
+                lcb_min_visit_prop=float(args.lcb_min_visit_prop),
+            )
+        )
         segment_summary = _run_segment(
             stockfish_path=args.stockfish_path,
             segment_options=segment_options,
@@ -1274,6 +1334,7 @@ def main() -> None:
             save_games_dir=Path(args.save_games_dir) if args.save_games else None,
             concurrent_games=int(args.concurrent_games),
             halving_config=halving_config,
+            final_move=final_move,
             runtime=runtime,
         )
         segment_payload = _summary_to_payload(
@@ -1298,6 +1359,10 @@ def main() -> None:
                 "search_refutation_top_r": int(args.search_refutation_top_r),
                 "search_expand_top": int(args.search_expand_top),
                 "search_max_depth": int(args.search_max_depth),
+                "gumbel_final_move": str(args.gumbel_final_move),
+                "gumbel_value_scale": float(args.gumbel_value_scale),
+                "lcb_z": float(args.lcb_z),
+                "lcb_min_visit_prop": float(args.lcb_min_visit_prop),
                 "search_tactical_coverage": bool(args.search_tactical_coverage),
                 "search_quiescence_plies": int(args.search_quiescence_plies),
             },
@@ -1344,6 +1409,10 @@ def main() -> None:
             "search_refutation_top_r": int(args.search_refutation_top_r),
             "search_expand_top": int(args.search_expand_top),
             "search_max_depth": int(args.search_max_depth),
+            "gumbel_final_move": str(args.gumbel_final_move),
+            "gumbel_value_scale": float(args.gumbel_value_scale),
+            "lcb_z": float(args.lcb_z),
+            "lcb_min_visit_prop": float(args.lcb_min_visit_prop),
             "search_tactical_coverage": bool(args.search_tactical_coverage),
             "search_quiescence_plies": int(args.search_quiescence_plies),
         },

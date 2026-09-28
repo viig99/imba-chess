@@ -57,6 +57,8 @@ class PositionEval(NamedTuple):
     legal_log_priors: list[float]
     legal_forcing: list[bool]
     legal_ids: list[int]
+    # Optional for scalar-only evaluators; never infer draw mass from a scalar.
+    wdl: tuple[float, float, float] | None = None  # loss, draw, win; side to move
 
 
 class PositionEvaluator(Protocol):

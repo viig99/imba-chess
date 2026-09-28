@@ -55,6 +55,9 @@ def compare_results(a, b):
         assert x.legal_ids == y.legal_ids and x.legal_ucis == y.legal_ucis
         assert x.legal_forcing == y.legal_forcing
         assert x.value_stm == pytest.approx(y.value_stm, abs=1e-6)
+        assert x.wdl == pytest.approx(y.wdl, abs=1e-6)
+        assert sum(x.wdl) == pytest.approx(1)
+        assert x.wdl[2] - x.wdl[0] == pytest.approx(x.value_stm, abs=1e-6)
         torch.testing.assert_close(
             torch.tensor(x.legal_log_priors),
             torch.tensor(y.legal_log_priors),

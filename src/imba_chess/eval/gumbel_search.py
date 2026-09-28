@@ -107,6 +107,10 @@ class GumbelResult:
     depth_cutoffs: int
     maximum_depth: int
     root_log_priors: list[float] | None = None
+    # Mean backed-up leaf WDL over the exact simulations, root-player POV.
+    # Distinct from root_wdl (the raw network prediction). Measurement only:
+    # neither this distribution nor the auxiliary head affects tree selection.
+    search_wdl: tuple[float, float, float] | None = None
 
 
 @dataclass
@@ -143,6 +147,12 @@ class _Node:
         ):
             raise ValueError("nonfinite or invalid network evaluation")
         self.evaluation = evaluation
+        if evaluation.wdl is not None:
+            wdl = evaluation.wdl
+            if (len(wdl) != 3 or any(not math.isfinite(p) or p < 0 for p in wdl)
+                    or abs(sum(wdl) - 1) > 1e-5
+                    or abs(wdl[2] - wdl[0] - evaluation.value_stm) > 1e-5):
+                raise ValueError("invalid or inconsistent evaluation WDL")
         self.value = evaluation.value_stm
         self.prior_probs = [
             max(p, 1.1754943508222875e-38) for p in softmax(evaluation.legal_log_priors)
@@ -193,6 +203,8 @@ def gumbel_stepwise(
     priors = root_eval.legal_log_priors
     max_prior = max(priors)
     evaluations, terminal_hits, cutoffs, deepest = (1, 0, 0, 0)
+    wdl_sums = [0.0, 0.0, 0.0]
+    wdl_available = True
 
     def root_action(visit):
         return root.stats.root(
@@ -243,6 +255,17 @@ def gumbel_stepwise(
             )
             continue
         cc.gumbel_backup(path, leaf.value)
+        if leaf.evaluation is None:
+            leaf_wdl = (float(leaf.value == -1), float(leaf.value == 0), float(leaf.value == 1))
+        else:
+            leaf_wdl = leaf.evaluation.wdl
+        if leaf_wdl is None:
+            wdl_available = False
+        else:
+            # Every chess ply swaps players; draws retain their perspective.
+            root_pov = leaf_wdl[::-1] if depth % 2 else leaf_wdl
+            for i, probability in enumerate(root_pov):
+                wdl_sums[i] += probability
     root.visits, root.sums, root.means = root.stats.snapshot()
     action = root_action(max(root.visits))
     q = completed_q(
@@ -263,7 +286,43 @@ def gumbel_stepwise(
         cutoffs,
         deepest,
         list(priors),
+        tuple(p / config.simulations for p in wdl_sums) if wdl_available else None,
     )
+
+
+FINAL_MOVE_RULES = ("gumbel", "most_visited", "lcb")
+
+
+def final_move_index(
+    visits, qvalues, rule, *, lcb_z=1.96, lcb_min_visit_prop=0.15
+):
+    """Evaluation-only override of the played root move; None keeps Gumbel's choice.
+
+    Search, visits and policy targets are untouched. `most_visited` breaks visit
+    ties by root-perspective mean Q. `lcb` (KataGo-style) considers children with at
+    least `lcb_min_visit_prop` of the maximum visits and maximizes
+    q - z * sd / sqrt(n); the native stats keep no second moment, so sd is the
+    Bhatia-Davis bound sqrt(1 - q^2) for values in [-1, 1].
+    """
+    if rule not in FINAL_MOVE_RULES:
+        raise ValueError(f"unknown final move rule {rule!r}")
+    if len(visits) != len(qvalues) or not any(visits):
+        raise ValueError("final move rule needs matching, visited root statistics")
+    if rule == "gumbel":
+        return None
+    visited = [i for i, n in enumerate(visits) if n]
+    if rule == "most_visited":
+        return max(visited, key=lambda i: (visits[i], qvalues[i]))
+    if lcb_z < 0 or not 0 <= lcb_min_visit_prop <= 1:
+        raise ValueError("invalid LCB parameters")
+    floor = lcb_min_visit_prop * max(visits)
+    eligible = [i for i in visited if visits[i] >= floor]
+
+    def bound(i):
+        q = qvalues[i]
+        return q - lcb_z * math.sqrt(max(1.0 - q * q, 0.0) / visits[i])
+
+    return max(eligible, key=lambda i: (bound(i), visits[i]))
 
 
 def select_gumbel(*, evaluator, **kwargs):

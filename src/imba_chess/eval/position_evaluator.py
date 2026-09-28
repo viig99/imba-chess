@@ -487,6 +487,7 @@ def _project_decode_results(per_node, out):
     # torch.tensor, an index_select and a log_softmax per node over
     # ~31-element rows, where dispatch dominated the arithmetic.
     values = _batched_value_scalars(value_logits)
+    wdls = torch.softmax(value_logits.float(), -1).tolist()
 
     id_lists = [ids for ids, _, _, _, _ in per_node]
     prior_rows: list[list[float]] = [[] for _ in id_lists]
@@ -515,6 +516,7 @@ def _project_decode_results(per_node, out):
             legal_log_priors=prior_rows[row],
             legal_forcing=forcing,
             legal_ids=ids,
+            wdl=tuple(wdls[row]),
         )
         for row, (ids, moves, ucis, forcing, _total) in enumerate(per_node)
     ]
