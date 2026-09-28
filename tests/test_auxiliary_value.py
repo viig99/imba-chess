@@ -234,3 +234,23 @@ def test_multi_horizon_auxiliary_heads(tmp_path):
     with pytest.raises(ValueError, match="configuration changed"):
         trainer(replace(cfg, auxiliary_value_lambda=(.8, .9, .98))).resume(
             tmp_path / "state.pt", store=store, config_id="aux3")
+
+
+def test_value_search_mix_blends_outcome_with_ply_search_wdl():
+    game = game_with_wdl(prefix=["f2f3", "e7e5"])
+    game["targets"][0]["search_wdl"] = [.6, .3, .1]  # White to move, will lose.
+    plain = reconstruct(game, move_vocab=VOCAB, encoder=ENCODER, max_positions=128,
+                        learning=LearningConfig())
+    mixed = reconstruct(game, move_vocab=VOCAB, encoder=ENCODER, max_positions=128,
+                        learning=LearningConfig(value_search_mix=.25))
+    rows = [i for i, flag in enumerate(plain["has_value_target"]) if flag]
+    assert [plain["value_target"][i] for i in rows] == [[1., 0, 0], [0, 0, 1.]]
+    assert [v for i in rows for v in mixed["value_target"][i]] == pytest.approx(
+        [.75 + .25 * .6, .25 * .3, .25 * .1, .25 * .2, .25 * .3, .75 + .25 * .5])
+    assert all(sum(mixed["value_target"][i]) == pytest.approx(1) for i in rows)
+    assert mixed["value_target"][:rows[0]] == plain["value_target"][:rows[0]]
+    with pytest.raises(ValueError, match="value_search_mix requires"):
+        reconstruct(mate_game(), move_vocab=VOCAB, encoder=ENCODER, max_positions=128,
+                    learning=LearningConfig(value_search_mix=.25))
+    with pytest.raises(ValueError, match=r"value_search_mix must be in \[0, 1\]"):
+        LearningConfig(value_search_mix=1.5)

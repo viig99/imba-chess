@@ -241,7 +241,7 @@ def test_legacy_configuration_identity_is_preserved():
     del old_settings["streaming"]
     del old_settings["regret"]
     for key in list(old_settings["learning"]):
-        if key.startswith(("policy_surprise_", "auxiliary_value_", "gradient_accumulation")):
+        if key.startswith(("policy_surprise_", "auxiliary_value_", "gradient_accumulation", "value_search_mix")):
             del old_settings["learning"][key]
     previous = hashlib.sha256(
         json.dumps(

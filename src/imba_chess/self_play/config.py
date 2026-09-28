@@ -55,6 +55,8 @@ class LearningConfig:
     grad_clip: float = 1.0
     reuse: float = 2.0
     microbatch_tokens: int = 1024
+    # Main value label = (1 - mix) * game result + mix * this ply's search WDL.
+    value_search_mix: float = 0.0
     # Microbatches summed per optimizer step; each step spans ~10 games per microbatch.
     gradient_accumulation: int = 1
     policy_surprise_enabled: bool = False
@@ -80,6 +82,8 @@ class LearningConfig:
             raise ValueError("auxiliary_value_lambda must be in [0, 1]")
         if not math.isfinite(self.value_weight) or self.value_weight < 0:
             raise ValueError("value_weight must be finite and nonnegative")
+        if not math.isfinite(self.value_search_mix) or not 0 <= self.value_search_mix <= 1:
+            raise ValueError("value_search_mix must be in [0, 1]")
         if type(self.gradient_accumulation) is not int or self.gradient_accumulation < 1:
             raise ValueError("gradient_accumulation must be a positive integer")
         if type(self.policy_surprise_enabled) is not bool:
@@ -156,6 +160,8 @@ class SelfPlayConfig:
                 settings["learning"].pop(key)
         if self.learning.gradient_accumulation == 1:
             settings["learning"].pop("gradient_accumulation")  # Preserve run identities.
+        if self.learning.value_search_mix == 0:
+            settings["learning"].pop("value_search_mix")  # Preserve run identities.
         if self.streaming is None:
             settings.pop("streaming")  # Preserve existing run identities.
         return hashlib.sha256(
@@ -184,7 +190,7 @@ def load_config(path):
         **{k: constructors[k](**v) if k in constructors else v for k, v in raw.items()}
     )
     for section in (cfg.collection, cfg.replay, cfg.learning):
-        if any(not math.isfinite(v) or v <= 0 for k, v in asdict(section).items() if not k.startswith(("policy_surprise_", "auxiliary_value_")) and k != "value_weight"):
+        if any(not math.isfinite(v) or v <= 0 for k, v in asdict(section).items() if not k.startswith(("policy_surprise_", "auxiliary_value_")) and k not in ("value_weight", "value_search_mix")):
             raise ValueError("stage-2 sizes and learning settings must be positive")
     if not all(math.isfinite(v) for v in asdict(cfg.run).values()):
         raise ValueError("run settings must be finite")

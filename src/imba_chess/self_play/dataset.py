@@ -105,7 +105,16 @@ def reconstruct(game, *, move_vocab, encoder, max_positions, learning=None):
         legal.append(target["legal_ids"])
         policies.append(target["policy"])
         history.append_observed_position(board)
-        values.append(outcome_wdl(game["outcome_white"], board.turn))
+        outcome = outcome_wdl(game["outcome_white"], board.turn)
+        mix = 0.0 if learning is None else learning.value_search_mix
+        if mix > 0:
+            # Lc0-style q_ratio: blend the result with this position's own
+            # side-to-move search WDL (not the smoothed auxiliary target).
+            search = target.get("search_wdl")
+            if search is None:
+                raise ValueError("value_search_mix requires recorded search_wdl at every ply")
+            outcome = [(1 - mix) * z + mix * q for z, q in zip(outcome, search)]
+        values.append(outcome)
         history.record_played_move(uci)
         board.push_uci(uci)
     from .collector import terminal_outcome

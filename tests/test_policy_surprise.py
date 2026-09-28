@@ -97,7 +97,7 @@ def test_old_identity_and_validation():
     old.pop('streaming')
     old.pop('regret')
     for k in list(old['learning']):
-        if k.startswith(('policy_surprise_', 'auxiliary_value_', 'gradient_accumulation')):
+        if k.startswith(('policy_surprise_', 'auxiliary_value_', 'gradient_accumulation', 'value_search_mix')):
             old['learning'].pop(k)
     expected = hashlib.sha256(json.dumps(dict(settings=old, base_sha256=_base_config_identity(cfg.base_config)), sort_keys=True).encode()).hexdigest()
     assert cfg.identifier == expected
@@ -124,7 +124,7 @@ def test_legacy_checkpoint_and_incompatible_resume(tmp_path):
     a.checkpoint(path, progress={}, store=store, config_id='same')
     state = torch.load(path, weights_only=False)
     for k in list(state['learning_config']):
-        if k.startswith(('policy_surprise_', 'auxiliary_value_', 'gradient_accumulation')):
+        if k.startswith(('policy_surprise_', 'auxiliary_value_', 'gradient_accumulation', 'value_search_mix')):
             state['learning_config'].pop(k)
     torch.save(state, path)
     trainer(LearningConfig(auxiliary_value_weight=0.0)).resume(path, store=store, config_id='same')
