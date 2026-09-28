@@ -90,6 +90,7 @@ def reconstruct(game, *, move_vocab, encoder, max_positions, learning=None):
     history = _SequenceHistory(move_vocab=move_vocab, board_state_encoder=encoder)
     board = chess.Board()
     values, indices, policies, legal = [[0.0, 0.0, 0.0]], [], [], []
+    outcomes = []
     for uci in game["prefix_moves"]:
         history.append_observed_position(board)
         values.append([0.0, 0.0, 0.0])
@@ -106,6 +107,7 @@ def reconstruct(game, *, move_vocab, encoder, max_positions, learning=None):
         policies.append(target["policy"])
         history.append_observed_position(board)
         outcome = outcome_wdl(game["outcome_white"], board.turn)
+        outcomes.append(outcome)
         mix = 0.0 if learning is None else learning.value_search_mix
         if mix > 0:
             # Lc0-style q_ratio: blend the result with this position's own
@@ -150,6 +152,10 @@ def reconstruct(game, *, move_vocab, encoder, max_positions, learning=None):
         policy=policies,
         actor_log_priors=[t.get("root_log_priors") for t in game["targets"]],
     )
+    if learning is not None and learning.value_search_mix > 0:
+        # Blended labels are never one-hot; keep the actual result per
+        # supervised position so win/loss and draw diagnostics stay meaningful.
+        sample["outcome_target"] = outcomes
     sample.update(policy_weights(game["targets"], learning=learning))
     if learning is not None and learning.auxiliary_value_weight > 0:
         if isinstance(learning.auxiliary_value_lambda, tuple):
@@ -182,6 +188,13 @@ def collate_self_play(samples):
         # Targets already correspond to supervised_indices, including offsets.
         batch["auxiliary_value_target"] = torch.tensor(
             [row for sample in samples for row in sample["auxiliary_value_target"]],
+            dtype=torch.float32,
+        )
+    if any("outcome_target" in sample for sample in samples):
+        if not all("outcome_target" in sample for sample in samples):
+            raise ValueError("mixed outcome target availability in training batch")
+        batch["outcome_target"] = torch.tensor(
+            [row for sample in samples for row in sample["outcome_target"]],
             dtype=torch.float32,
         )
     width = max(map(len, legal))

@@ -254,3 +254,26 @@ def test_value_search_mix_blends_outcome_with_ply_search_wdl():
                     learning=LearningConfig(value_search_mix=.25))
     with pytest.raises(ValueError, match=r"value_search_mix must be in \[0, 1\]"):
         LearningConfig(value_search_mix=1.5)
+
+
+def test_value_mix_diagnostics_use_actual_outcome():
+    game = game_with_wdl(prefix=["f2f3", "e7e5"])
+    learning = LearningConfig(value_search_mix=.25)
+    sample = reconstruct(game, move_vocab=VOCAB, encoder=ENCODER, max_positions=128, learning=learning)
+    assert sample["outcome_target"] == [[1., 0, 0], [0, 0, 1.]]
+    batch = collate_self_play([sample])
+    n = batch["total_tokens"]
+    # Favour the correct side at both positions: White loses, Black wins.
+    value_logits = torch.zeros(n, 3)
+    value_logits[batch["supervised_indices"][0]] = torch.tensor([2., 0, 0])
+    value_logits[batch["supervised_indices"][1]] = torch.tensor([0., 0, 2.])
+    output = dict(logits=torch.zeros(n, len(VOCAB)), value_logits=value_logits)
+    mixed = self_play_loss(output, batch, auxiliary_value_weight=0.0)
+    assert mixed["decisive_positions"] == 2
+    assert mixed["conditional_wl_accuracy"] == 1
+    assert mixed["observed_draw"] == 0
+    labels = batch["value_target"].index_select(0, batch["supervised_indices"])
+    expected = -(labels * value_logits.index_select(0, batch["supervised_indices"]).log_softmax(-1)).sum(-1).mean()
+    torch.testing.assert_close(mixed["value_loss"], expected)
+    assert "outcome_target" not in reconstruct(
+        game, move_vocab=VOCAB, encoder=ENCODER, max_positions=128, learning=LearningConfig())

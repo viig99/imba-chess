@@ -29,12 +29,18 @@ def self_play_loss(output, batch, *, value_weight=1.0, auxiliary_value_weight=1.
     # Keep the historical target entropy key; model entropy measures the
     # student's distribution and can move in a different direction.
     entropy = -(target * target.clamp_min(1e-38).log()).sum(-1).mean()
+    # Diagnostics use the actual game result. With value_search_mix the
+    # training label is a blend and is never exactly decisive.
+    outcome = (
+        batch["outcome_target"].to(logits.device).float()
+        if "outcome_target" in batch else wdl
+    )
     with torch.no_grad():
         model_entropy = -(log_probs.exp() * log_probs).sum(-1).mean()
-        decisive = wdl[:, 1] == 0
+        decisive = outcome[:, 1] == 0
         decisive_count = decisive.sum()
         wl_logits = value_logits[:, [0, 2]]
-        wl_targets = wdl[:, [0, 2]]
+        wl_targets = outcome[:, [0, 2]]
         wl_ce = -(wl_targets * F.log_softmax(wl_logits, -1)).sum(-1)
         wl_correct = wl_logits.argmax(-1) == wl_targets.argmax(-1)
     actor_kl = {}
@@ -88,8 +94,8 @@ def self_play_loss(output, batch, *, value_weight=1.0, auxiliary_value_weight=1.
         conditional_wl_accuracy=(wl_correct * decisive).sum() / decisive_count.clamp_min(1),
         policy_target_kl=policy_loss - entropy,
         **actor_kl,
-        brier=(probs - wdl).square().sum(-1).mean(),
+        brier=(probs - outcome).square().sum(-1).mean(),
         predicted_draw=probs[:, 1].mean(),
-        observed_draw=wdl[:, 1].mean(),
+        observed_draw=outcome[:, 1].mean(),
         predicted_value=(probs[:, 2] - probs[:, 0]).mean(),
     )
