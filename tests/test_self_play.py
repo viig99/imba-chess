@@ -789,3 +789,54 @@ def test_joint_value_gradients_and_independent_clipping(tmp_path):
         trainer._clip_gradients()
         clipped.append([p.grad.clone() for p in trainer.policy_parameters])
     assert all(torch.equal(a,b) for a,b in zip(*clipped))
+
+
+def test_gradient_accumulation_matches_single_step_and_resumes(tmp_path):
+    from dataclasses import replace
+    from imba_chess.self_play.config import SelfPlayConfig
+
+    torch.set_num_threads(1)
+    store = SelfPlayStore(tmp_path / "replay", flush_games=1)
+    store.add(mate_game())
+    positions = store.index["g"][1]["positions"]
+
+    def trainer(accumulation, seed=42):
+        torch.manual_seed(seed)
+        config = LearningConfig(auxiliary_value_weight=0.0, lr=0.01,
+                                gradient_accumulation=accumulation)
+        # Dropout-free, as in production, so repeated microbatches match.
+        t = Stage2Trainer(model=tiny_model(dropout=0.0), config=config, move_vocab=VOCAB,
+                          encoder=ENCODER, device=torch.device("cpu"), max_positions=128)
+        t.begin_phase(store)
+        return t
+
+    # With one stored game every microbatch is identical, so averaging two
+    # halves of the same gradient must reproduce the single-microbatch step.
+    single, double = trainer(1), trainer(2)
+    records = []
+    single.train(store, exposure_budget=1)
+    double.train(store, exposure_budget=1, on_step=records.append)
+    assert single.steps == double.steps == 1
+    assert double.exposures == 2 * single.exposures == 2 * positions
+    assert records[0]["microbatches"] == 2
+    assert records[0]["supervised_positions"] == 2 * positions
+    for x, y in zip(single.model.parameters(), double.model.parameters()):
+        torch.testing.assert_close(x, y, rtol=0, atol=0)
+
+    double.checkpoint(tmp_path / "state.pt", progress={"phase": "train"},
+                      store=store, config_id="cfg")
+    double.train(store, exposure_budget=6 * positions)
+    resumed = trainer(2, seed=7)
+    resumed.resume(tmp_path / "state.pt", store=store, config_id="cfg")
+    resumed.train(store, exposure_budget=6 * positions)
+    assert resumed.steps == double.steps == 3
+    for x, y in zip(double.model.parameters(), resumed.model.parameters()):
+        torch.testing.assert_close(x, y, rtol=0, atol=0)
+
+    with pytest.raises(ValueError, match="gradient_accumulation"):
+        LearningConfig(gradient_accumulation=0)
+    cfg = SelfPlayConfig()
+    assert cfg.identifier == replace(
+        cfg, learning=replace(cfg.learning, gradient_accumulation=1)).identifier
+    assert cfg.identifier != replace(
+        cfg, learning=replace(cfg.learning, gradient_accumulation=16)).identifier

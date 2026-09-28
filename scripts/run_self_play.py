@@ -361,12 +361,15 @@ def main():
                 trainer.begin_phase(store)
                 if start_sampler is not None:
                     start_sampler.finish_phase()
-                state.update(
-                    phase="train",
-                    exposure_budget=int(
-                        metrics.counts["training_positions"] * cfg.learning.reuse
-                    ),
+                exposure_budget = int(
+                    metrics.counts["training_positions"] * cfg.learning.reuse
                 )
+                if cfg.learning.gradient_accumulation > 1:
+                    # An accumulated step can overshoot a phase's budget by up
+                    # to one step; charge that overshoot to the next phase so
+                    # long-run reuse matches the configuration.
+                    exposure_budget -= state.get("exposure_carry", 0)
+                state.update(phase="train", exposure_budget=exposure_budget)
                 publish_checkpoint()
             if state["phase"] == "train":
                 last_save = time.monotonic()
@@ -392,6 +395,10 @@ def main():
                 if trainer.phase_exposures < state["exposure_budget"]:
                     publish_checkpoint()
                     break
+                if cfg.learning.gradient_accumulation > 1:
+                    state["exposure_carry"] = (
+                        trainer.phase_exposures - state["exposure_budget"]
+                    )
                 state["phase"] = "evaluate"
                 actor = args.output / f"actor-{state['iteration'] + 1:06d}.pt"
                 state.update(actor=str(actor), checkpoint=str(actor))

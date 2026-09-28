@@ -55,6 +55,8 @@ class LearningConfig:
     grad_clip: float = 1.0
     reuse: float = 2.0
     microbatch_tokens: int = 1024
+    # Microbatches summed per optimizer step; each step spans ~10 games per microbatch.
+    gradient_accumulation: int = 1
     policy_surprise_enabled: bool = False
     policy_surprise_fraction: float = 0.5
     policy_surprise_cap: float = 3.0
@@ -78,6 +80,8 @@ class LearningConfig:
             raise ValueError("auxiliary_value_lambda must be in [0, 1]")
         if not math.isfinite(self.value_weight) or self.value_weight < 0:
             raise ValueError("value_weight must be finite and nonnegative")
+        if type(self.gradient_accumulation) is not int or self.gradient_accumulation < 1:
+            raise ValueError("gradient_accumulation must be a positive integer")
         if type(self.policy_surprise_enabled) is not bool:
             raise ValueError("policy_surprise_enabled must be boolean")
         if not math.isfinite(self.policy_surprise_fraction) or not 0 <= self.policy_surprise_fraction <= 1:
@@ -128,6 +132,8 @@ class SelfPlayConfig:
         if all(getattr(self.learning, k) == getattr(defaults, k) for k in keys):
             for key in keys:
                 settings["learning"].pop(key)
+        if self.learning.gradient_accumulation == 1:
+            settings["learning"].pop("gradient_accumulation")  # Preserve run identities.
         if self.streaming is None:
             settings.pop("streaming")  # Preserve existing run identities.
         return hashlib.sha256(

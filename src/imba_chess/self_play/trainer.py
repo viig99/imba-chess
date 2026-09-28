@@ -197,27 +197,36 @@ class Stage2Trainer:
         try:
             while self.phase_exposures < exposure_budget and not should_stop():
                 step_start = time.perf_counter()
-                batch, gids = self._next_batch(store)
                 self.optimizer.zero_grad(set_to_none=True)
-                losses = self._loss_fn(self.model, batch, self.config.value_weight,
-                                       self.config.auxiliary_value_weight)
-                if not torch.isfinite(losses["loss"]):
-                    raise FloatingPointError("nonfinite stage-2 loss")
-                losses["loss"].backward()
+                # An optimizer step always completes all microbatches, so
+                # checkpoints never land mid-accumulation. Loss metrics are
+                # means over the step's equally weighted microbatches.
+                accumulation = self.config.gradient_accumulation
+                loss_sums, positions, tokens = {}, 0, 0
+                for _ in range(accumulation):
+                    batch, gids = self._next_batch(store)
+                    losses = self._loss_fn(self.model, batch, self.config.value_weight,
+                                          self.config.auxiliary_value_weight)
+                    if not torch.isfinite(losses["loss"]):
+                        raise FloatingPointError("nonfinite stage-2 loss")
+                    (losses["loss"] / accumulation).backward()
+                    for key, value in losses.items():
+                        loss_sums[key] = loss_sums.get(key, 0.0) + float(value.detach())
+                    positions += len(batch["supervised_indices"])
+                    tokens += batch["total_tokens"]
+                    for gid in gids:
+                        self.reuse_counts[gid] = (
+                            self.reuse_counts.get(gid, 0) + store.index[gid][1]["positions"]
+                        )
                 norm, value_norm = self._clip_gradients()
                 learning_rate = self.optimizer.param_groups[0]["lr"]
                 self.optimizer.step()
                 self.scheduler.step()
-                positions = len(batch["supervised_indices"])
                 self.steps += 1
                 self.exposures += positions
                 self.phase_exposures += positions
-                for gid in gids:
-                    self.reuse_counts[gid] = (
-                        self.reuse_counts.get(gid, 0) + store.index[gid][1]["positions"]
-                    )
                 metrics = dict(
-                    {key: float(value.detach()) for key, value in losses.items()},
+                    {key: value / accumulation for key, value in loss_sums.items()},
                     gradient_norm=float(norm),
                     **({"policy_gradient_norm": float(norm),
                         "value_gradient_norm": float(value_norm)} if value_norm is not None else {}),
@@ -226,7 +235,8 @@ class Stage2Trainer:
                     exposures=self.exposures,
                     phase_exposures=self.phase_exposures,
                     supervised_positions=positions,
-                    context_tokens=batch["total_tokens"],
+                    context_tokens=tokens,
+                    microbatches=accumulation,
                     replay_unique_positions=sum(
                         store.index[g][1]["positions"] for g in self.sample_ids
                     ),
@@ -235,7 +245,7 @@ class Stage2Trainer:
                 metrics.update(
                     step_seconds=elapsed,
                     supervised_positions_per_second=positions / elapsed,
-                    context_tokens_per_second=batch["total_tokens"] / elapsed,
+                    context_tokens_per_second=tokens / elapsed,
                 )
                 on_step(metrics)
         finally:
