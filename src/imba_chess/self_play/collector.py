@@ -1,6 +1,6 @@
 """One sequential search per game, inference batched across independent games."""
 
-from collections import Counter, deque
+from collections import Counter, defaultdict, deque
 from dataclasses import asdict
 import random
 import time
@@ -136,18 +136,56 @@ class CollectionMetrics:
         self.terminations = Counter()
         self.latencies = deque(maxlen=4096)
         self.start = time.perf_counter()
+        self.buckets = defaultdict(Counter)
+        self.restarted_positions = set()
 
-    def position(self, result, elapsed):
+    def launched(self, metadata):
+        if "starting_bucket" in metadata:
+            counts = self.buckets[metadata["starting_bucket"]]
+            counts["launch_attempts"] += 1
+            counts["fallbacks"] += (
+                metadata["requested_bucket"] != metadata["starting_bucket"]
+            )
+            if "restart_parent" in metadata:
+                self.restarted_positions.add(metadata["restart_parent"]["history_id"])
+
+    def position(self, result, elapsed, bucket=None):
         self.counts["searched_positions"] += 1
         self.counts["neural_evaluations"] += result.neural_evaluations
         self.counts["simulations"] += result.simulations
         self.counts["terminal_hits"] += result.terminal_hits
         self.counts["depth_cutoffs"] += result.depth_cutoffs
         self.latencies.append(elapsed)
+        if bucket is not None:
+            counts = self.buckets[bucket]
+            for key in (
+                "neural_evaluations",
+                "simulations",
+                "terminal_hits",
+                "depth_cutoffs",
+            ):
+                counts[key] += getattr(result, key)
+            counts["searched_positions"] += 1
+            counts["search_seconds"] += elapsed
 
     def done(self, game):
         self.counts[game["status"] + "_games"] += 1
         self.terminations[game["termination"]] += 1
+        if "starting_bucket" in game:
+            counts = self.buckets[game["starting_bucket"]]
+            counts["finished_games"] += 1
+            counts[game["status"] + "_games"] += 1
+            counts["limited_games"] += game["termination"] in (
+                "context_limit",
+                "game_limit",
+            )
+            length = len(game["moves"])
+            counts["continuation_plies"] += length
+            counts["max_continuation_plies"] = max(
+                counts["max_continuation_plies"], length
+            )
+            if game["status"] == "completed":
+                counts["completed_continuation_plies"] += length
         if game["status"] == "completed":
             self.counts["completed_positions"] += len(game["moves"])
             if game["split"] == "train":
@@ -157,7 +195,7 @@ class CollectionMetrics:
     def report(self):
         elapsed = max(time.perf_counter() - self.start, 1e-9)
         latencies = sorted(self.latencies)
-        return dict(
+        report = dict(
             self.counts,
             seconds=elapsed,
             terminations=dict(self.terminations),
@@ -173,6 +211,29 @@ class CollectionMetrics:
             if latencies
             else 0,
         )
+        if self.buckets:
+            report["starting_buckets"] = {
+                bucket: dict(
+                    counts,
+                    completion_rate=counts["completed_games"]
+                    / max(1, counts["finished_games"]),
+                    limit_rate=counts["limited_games"]
+                    / max(1, counts["finished_games"]),
+                    mean_continuation_plies=counts["continuation_plies"]
+                    / max(1, counts["finished_games"]),
+                    mean_completed_continuation_plies=counts[
+                        "completed_continuation_plies"
+                    ]
+                    / max(1, counts["completed_games"]),
+                    search_position_share=counts["searched_positions"]
+                    / max(1, self.counts["searched_positions"]),
+                    neural_evaluation_share=counts["neural_evaluations"]
+                    / max(1, self.counts["neural_evaluations"]),
+                )
+                for bucket, counts in sorted(self.buckets.items())
+            }
+            report["distinct_restarted_positions"] = len(self.restarted_positions)
+        return report
 
 
 def collect(
@@ -195,6 +256,8 @@ def collect(
 ):
     if concurrent_games is not None and concurrent_games < 1:
         raise ValueError("concurrent_games must be positive")
+    if config.regret is not None and start_sampler is None:
+        raise ValueError("regret collection requires a streaming start sampler")
     metrics = metrics or CollectionMetrics()
     skipped = set(skip_ids)
     active = {}
@@ -202,7 +265,12 @@ def collect(
     if not seed_order and start_sampler is None:
         raise ValueError("collection requires at least one seed")
     if start_sampler is not None:
-        start_sampler.begin_phase(iteration, actor_id, skipped)
+        if config.regret is None:
+            start_sampler.begin_phase(iteration, actor_id, skipped)
+        else:
+            start_sampler.begin_phase(
+                iteration, actor_id, store, max_positions=max_positions
+            )
     if game_count is None:
         # Sample sources uniformly without replacement in each iteration;
         # fixed-size audits retain manifest order for comparable benchmarks.
@@ -241,6 +309,11 @@ def collect(
                 targets=[],
                 outcome_white=None,
             )
+            metadata = (
+                start_sampler.launch_metadata(gid) if start_sampler is not None else {}
+            )
+            active[gid].update(metadata)
+            metrics.launched(metadata)
             yield (
                 gid,
                 play_game(
@@ -254,7 +327,11 @@ def collect(
                     run_seed=config.run.seed,
                     config_id=config.identifier,
                     should_stop=should_stop,
-                    on_position=metrics.position,
+                    on_position=lambda result,
+                    elapsed,
+                    bucket=metadata.get("starting_bucket"): metrics.position(
+                        result, elapsed, bucket
+                    ),
                 ),
             )
 
@@ -262,10 +339,33 @@ def collect(
         metadata = active.pop(gid)
         if game is None:
             game = metadata
+        else:
+            game.update(
+                {
+                    k: metadata[k]
+                    for k in (
+                        "requested_bucket",
+                        "starting_bucket",
+                        "restart_parent",
+                        "exploration_seed",
+                    )
+                    if k in metadata
+                }
+            )
         game["iteration"] = iteration
         metrics.done(game)
         if game["status"] == "completed":
+            if start_sampler is not None and config.regret is not None:
+                from .regret import suffix_regrets
+
+                suffix_regrets(game)  # Fail explicitly before replay serialization.
             store.add(game)
+            if (
+                start_sampler is not None
+                and config.regret is not None
+                and gid in store.seen
+            ):
+                start_sampler.reconcile(store)
         elif start_sampler is not None and game.get("termination") not in (
             "interrupted",
             "error",
@@ -297,5 +397,5 @@ def collect(
         getattr(runtime, "clear_caches", lambda: None)()
         store.flush()
         if start_sampler is not None:
-            start_sampler.reconcile(store.seen)
+            start_sampler.reconcile(store.seen if config.regret is None else store)
     return metrics

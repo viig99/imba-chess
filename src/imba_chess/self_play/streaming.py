@@ -8,6 +8,7 @@ reissued with identical game IDs, prefixes and exploration RNG.
 """
 
 from dataclasses import asdict
+from copy import deepcopy
 import inspect
 import json
 import os
@@ -21,6 +22,7 @@ from imba_chess.config import load_repo_config
 from imba_chess.data.lichess_dataset import LichessDataset
 from imba_chess.data.self_play_store import atomic_json
 from imba_chess.self_play.seeds import Seed, source_split, stable_hash
+from imba_chess.self_play.regret import RegretBuffer, RegretProtocolError, empty_buffer
 
 BUCKETS = ((0, 0), (1, 30), (31, 70), (71, 120))
 
@@ -203,6 +205,13 @@ class StreamingStarts:
             buckets=BUCKETS,
             schema_version=1,
         )
+        if config.regret is not None:
+            settings.update(
+                regret=asdict(config.regret),
+                schema_version=2,
+                max_game_plies=config.collection.max_game_plies,
+                max_depth=config.search.max_depth,
+            )
         settings["identity"] = stable_hash(json.dumps(settings, sort_keys=True))
         # Normalize tuples through JSON before comparing saved settings.
         settings = json.loads(json.dumps(settings))
@@ -229,6 +238,14 @@ class StreamingStarts:
                 launched=[0, 0, 0, 0],
                 retired={},
             )
+            if config.regret is not None:
+                self.state.update(
+                    regret=empty_buffer(),
+                    launched=[0] * 5,
+                    requested=[0] * 5,
+                    fallback_sequence=0,
+                    fallbacks=[0] * 4,
+                )
             self.save()
         if start_worker:
             self.log = (self.directory / "producer.log").open("ab", buffering=0)
@@ -293,7 +310,24 @@ class StreamingStarts:
     def warm(self):
         self._block()
 
-    def begin_phase(self, iteration, actor_id, completed):
+    @property
+    def regret_buffer(self):
+        return RegretBuffer(
+            self.state["regret"],
+            self.config.regret,
+            max_positions=self.state["regret_max_positions"],
+            max_game_plies=self.config.collection.max_game_plies,
+            max_depth=self.config.search.max_depth,
+        )
+
+    def begin_phase(self, iteration, actor_id, completed, *, max_positions=None):
+        if self.config.regret is not None:
+            if max_positions is None:
+                raise ValueError("regret starts require the collection context limit")
+            previous = self.state.get("regret_max_positions", max_positions)
+            if previous != max_positions:
+                raise ValueError("regret context limit changed; use a separate run")
+            self.state["regret_max_positions"] = max_positions
         self.reconcile(completed)
         for gid, record in list(self.state["pending"].items()):
             if (record["iteration"], record["actor_id"]) != (iteration, actor_id):
@@ -306,6 +340,46 @@ class StreamingStarts:
         )
 
     def reconcile(self, completed):
+        if self.config.regret is not None:
+            # Read replay only after publication. A private state copy makes an
+            # error/retry safe even in this process; save observations and acks
+            # together, never acknowledging an unread durable trajectory.
+            previous = self.state
+            self.state = deepcopy(previous)
+            try:
+                pending = self.state["pending"]
+                for gid in sorted(pending, key=lambda gid: pending[gid]["sequence"]):
+                    if gid not in completed.seen:
+                        continue
+                    game = completed.read_game(gid)
+                    launch = pending[gid]
+                    seed = launch["seed"]
+                    if (
+                        game["game_id"] != gid
+                        or game["actor_id"] != launch["actor_id"]
+                        or game.get("iteration") != launch["iteration"]
+                        or any(
+                            game[k] != seed[k]
+                            for k in (
+                                "prefix_moves",
+                                "takeover_ply",
+                                "source_id",
+                                "split",
+                                "corpus_id",
+                            )
+                        )
+                    ):
+                        raise RegretProtocolError(
+                            "durable game/launch identity mismatch"
+                        )
+                    self.regret_buffer.observe(game, launch)
+                    del pending[gid]
+                self.save()
+            except BaseException:
+                self.state = previous
+                raise
+            self.retry = [gid for gid in self.retry if gid in self.state["pending"]]
+            return
         for gid in list(self.state["pending"]):
             if gid in completed:
                 del self.state["pending"][gid]
@@ -327,14 +401,29 @@ class StreamingStarts:
             gid = self.retry.pop(0)
             return Seed(**self.state["pending"][gid]["seed"]), gid
         seq = self.state["sequence"]
-        order = list(range(4))
-        random.Random(f"{self.config.run.seed}:mixture:{seq // 4}").shuffle(order)
-        bucket = order[seq % 4]
+        size = 5 if self.config.regret is not None else 4
+        order = list(range(size))
+        random.Random(f"{self.config.run.seed}:mixture:{seq // size}").shuffle(order)
+        bucket = requested = order[seq % size]
+        restart = None
+        if bucket == 4:
+            restart = self.regret_buffer.sample(
+                random.Random(f"{self.config.run.seed}:regret:{seq}")
+            )
+            if restart is None:
+                fallback = self.state["fallback_sequence"]
+                order = list(range(4))
+                random.Random(
+                    f"{self.config.run.seed}:fallback:{fallback // 4}"
+                ).shuffle(order)
+                bucket = order[fallback % 4]
         if bucket == 0:
             source = f"self-play-initial:{self.identity}:{seq}"
             while source_split(source) != "train":
                 source += "x"
             seed = Seed(stable_hash(source), source, [], 0, "train", self.identity)
+        elif bucket == 4:
+            seed = Seed(**restart["seed"])
         else:
             while True:
                 if self.should_stop():
@@ -360,17 +449,55 @@ class StreamingStarts:
         self.state["pending"][gid] = dict(
             seed=asdict(seed), iteration=iteration, actor_id=actor_id, sequence=seq
         )
+        if self.config.regret is not None:
+            self.state["requested"][requested] += 1
+            if requested == 4 and bucket != 4:
+                self.state["fallback_sequence"] += 1
+                self.state["fallbacks"][bucket] += 1
+            record = self.state["pending"][gid]
+            record.update(
+                requested_bucket=requested,
+                starting_bucket=bucket,
+                exploration_seed=f"{self.config.run.seed}:{gid}",
+            )
+            if restart is not None:
+                record["restart_parent"] = dict(
+                    history_id=restart["history_id"],
+                    admission_id=restart["admission_id"],
+                    game_id=restart["parent_game_id"],
+                    ply=restart["parent_ply"],
+                )
         self.save()  # Durable before the collector launches the game.
         return seed, gid
 
+    def launch_metadata(self, gid):
+        record = self.state["pending"][gid]
+        return {
+            k: deepcopy(record[k])
+            for k in (
+                "requested_bucket",
+                "starting_bucket",
+                "restart_parent",
+                "exploration_seed",
+            )
+            if k in record
+        }
+
     def report(self):
-        return dict(
+        report = dict(
             stream_launched=self.state["launched"],
             stream_pending=len(self.state["pending"]),
             stream_block=self.state["block"],
             stream_wait_seconds=self.wait_seconds,
             stream_retired=self.state["retired"],
         )
+        if self.config.regret is not None:
+            report.update(
+                stream_requested=self.state["requested"],
+                stream_fallbacks=self.state["fallbacks"],
+                regret=self.regret_buffer.report(),
+            )
+        return report
 
 
 if __name__ == "__main__":

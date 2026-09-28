@@ -239,6 +239,7 @@ def test_legacy_configuration_identity_is_preserved():
     cfg = replace(cfg, learning=replace(cfg.learning, auxiliary_value_weight=0.0))
     old_settings = asdict(cfg)
     del old_settings["streaming"]
+    del old_settings["regret"]
     for key in list(old_settings["learning"]):
         if key.startswith(("policy_surprise_", "auxiliary_value_", "gradient_accumulation")):
             del old_settings["learning"][key]

@@ -95,6 +95,7 @@ def test_old_identity_and_validation():
     cfg = SelfPlayConfig(learning=LearningConfig(auxiliary_value_weight=0.0))
     old = asdict(cfg)
     old.pop('streaming')
+    old.pop('regret')
     for k in list(old['learning']):
         if k.startswith(('policy_surprise_', 'auxiliary_value_', 'gradient_accumulation')):
             old['learning'].pop(k)

@@ -110,6 +110,21 @@ class StreamingConfig:
 
 
 @dataclass(frozen=True)
+class RegretConfig:
+    capacity: int = 256
+    temperature: float = 0.1
+    ema_alpha: float = 0.5
+
+    def __post_init__(self):
+        if type(self.capacity) is not int or self.capacity < 1:
+            raise ValueError("regret capacity must be a positive integer")
+        if not math.isfinite(self.temperature) or self.temperature <= 0:
+            raise ValueError("regret temperature must be finite and positive")
+        if not math.isfinite(self.ema_alpha) or not 0 < self.ema_alpha <= 1:
+            raise ValueError("regret ema_alpha must be in (0, 1]")
+
+
+@dataclass(frozen=True)
 class SelfPlayConfig:
     base_config: str = "config/imba_chess_v4.toml"
     search: GumbelConfig = field(default_factory=GumbelConfig)
@@ -118,10 +133,17 @@ class SelfPlayConfig:
     learning: LearningConfig = field(default_factory=LearningConfig)
     run: RunConfig = field(default_factory=RunConfig)
     streaming: StreamingConfig | None = None
+    regret: RegretConfig | None = None
+
+    def __post_init__(self):
+        if self.regret is not None and self.streaming is None:
+            raise ValueError("regret restarts require streaming starts")
 
     @cached_property
     def identifier(self):
         settings = asdict(self)
+        if self.regret is None:
+            settings.pop("regret")  # Preserve historical run identities.
         defaults = LearningConfig()
         # Omit only historical defaults, so new loss defaults cannot collide
         # with identities from runs that predate auxiliary learning.
@@ -156,6 +178,7 @@ def load_config(path):
         learning=LearningConfig,
         run=RunConfig,
         streaming=StreamingConfig,
+        regret=RegretConfig,
     )
     cfg = SelfPlayConfig(
         **{k: constructors[k](**v) if k in constructors else v for k, v in raw.items()}

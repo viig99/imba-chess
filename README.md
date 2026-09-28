@@ -40,6 +40,10 @@ Stage 2 starts from a checkpoint and human-game prefixes. One frozen actor contr
 
 Collection and training alternate on one GPU. Optimizer steps occur per training batch; the collection actor advances after a completed training phase. Immutable replay, atomic checkpoints, RNG/sampler state and phase progress support resume. Search uses one pending neural leaf per game, exact terminal values, full repetition history and explicit context limits.
 
+Streaming runs can opt into [regret-guided restarts](docs/SELF_PLAY_REGRET_RESTARTS.md),
+which allocate a fifth starting-position bucket to high-error observed histories.
+Enable `[regret]` in a new run; existing configurations keep their four-bucket curriculum.
+
 ## Setup and commands
 
 Install project dependencies and native bindings with `uv sync --extra dev`. Dataset/checkpoint files are local artifacts and are not committed. Use each command's `--help` for its required inputs.
