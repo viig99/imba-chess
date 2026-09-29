@@ -158,18 +158,6 @@ def _parse_args() -> argparse.Namespace:
         help="Halving search depth, counting plies below a candidate root move.",
     )
     parser.add_argument(
-        "--search-tactical-coverage",
-        action=argparse.BooleanOptionalAction,
-        default=None,
-        help="Include forcing moves on both sides and all legal check evasions in halving search.",
-    )
-    parser.add_argument(
-        "--search-quiescence-plies",
-        type=int,
-        default=None,
-        help="Extra capture/promotion/evasion plies within the existing halving budget (default 0).",
-    )
-    parser.add_argument(
         "--opening-random-plies",
         type=int,
         default=None,
@@ -1116,8 +1104,6 @@ def main() -> None:
             "search_refutation_top_r",
             "search_expand_top",
             "search_max_depth",
-            "search_tactical_coverage",
-            "search_quiescence_plies",
         ):
             if getattr(args, flag) is not None:
                 raise ValueError(
@@ -1163,16 +1149,6 @@ def main() -> None:
         eval_cfg.search_max_depth
         if args.search_max_depth is None
         else args.search_max_depth
-    )
-    args.search_tactical_coverage = bool(
-        eval_cfg.search_tactical_coverage
-        if args.search_tactical_coverage is None
-        else args.search_tactical_coverage
-    )
-    args.search_quiescence_plies = int(
-        eval_cfg.search_quiescence_plies
-        if args.search_quiescence_plies is None
-        else args.search_quiescence_plies
     )
     args.opening_random_plies = int(
         eval_cfg.opening_random_plies
@@ -1233,14 +1209,6 @@ def main() -> None:
         raise ValueError("--search-expand-top must be >= 1")
     if args.search_max_depth < 1:
         raise ValueError("--search-max-depth must be >= 1")
-    if args.search_quiescence_plies < 0:
-        raise ValueError("--search-quiescence-plies must be >= 0")
-    if (
-        args.search_tactical_coverage or args.search_quiescence_plies
-    ) and args.model_move_policy != "value_search_halving":
-        raise ValueError(
-            "Tactical coverage and quiescence require --model-move-policy value_search_halving"
-        )
     if args.concurrent_games < 1:
         raise ValueError("--concurrent-games must be >= 1")
     if not args.stockfish_path.exists():
@@ -1292,8 +1260,6 @@ def main() -> None:
             expand_top=int(args.search_expand_top),
             max_depth=int(args.search_max_depth),
             lam=float(args.search_lambda),
-            tactical_coverage=bool(args.search_tactical_coverage),
-            quiescence_plies=int(args.search_quiescence_plies),
         )
         if args.model_move_policy == "gumbel":
             halving_config = GumbelConfig(
@@ -1363,8 +1329,6 @@ def main() -> None:
                 "gumbel_value_scale": float(args.gumbel_value_scale),
                 "lcb_z": float(args.lcb_z),
                 "lcb_min_visit_prop": float(args.lcb_min_visit_prop),
-                "search_tactical_coverage": bool(args.search_tactical_coverage),
-                "search_quiescence_plies": int(args.search_quiescence_plies),
             },
         )
         _print_segment_summary(segment_name=spec.name, payload=segment_payload)
@@ -1413,8 +1377,6 @@ def main() -> None:
             "gumbel_value_scale": float(args.gumbel_value_scale),
             "lcb_z": float(args.lcb_z),
             "lcb_min_visit_prop": float(args.lcb_min_visit_prop),
-            "search_tactical_coverage": bool(args.search_tactical_coverage),
-            "search_quiescence_plies": int(args.search_quiescence_plies),
         },
     )
     _print_segment_summary(segment_name="aggregate", payload=aggregate_payload)

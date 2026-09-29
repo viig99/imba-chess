@@ -9,13 +9,11 @@ Chess sequence modeling, Gumbel self-play learning, and model evaluation against
 | Supervised pretraining / fine-tuning | `scripts/train.py` |
 | Established halving evaluation against Stockfish | `scripts/eval_vs_stockfish.py` |
 | Halving model A versus model B | `scripts/match_two_checkpoints.py` |
-| Prepare offline human-prefix seeds | `scripts/materialize_corpus.py`, `scripts/prepare_self_play_seeds.py` |
-| Collect completed Gumbel self-play games | `scripts/generate_self_play.py` |
+| Prepare the held-out monitor-opening manifest | `scripts/materialize_corpus.py`, `scripts/prepare_self_play_seeds.py` |
 | Train from stage-2 replay | `scripts/train_self_play.py` |
-| Alternate collection, training and paired evaluation | `scripts/run_self_play.py` |
-| Resume until a deadline, then evaluate in the morning | `scripts/run_self_play_overnight.py` |
+| Alternate streamed collection, training and paired evaluation | `scripts/run_self_play.py` |
+| Start or resume a streamed run until 08:00 | `scripts/run_streaming_self_play_nightly.py` |
 | Gumbel model pairs or Gumbel versus Stockfish | `scripts/eval_self_play.py` |
-| Throughput / profiling | `scripts/bench_self_play.py`, `scripts/profile_self_play.py` |
 | Live TensorBoard metrics | `scripts/monitor_self_play.py` |
 
 The offline halving-target generator and its storage format have been retired. Both the halving search algorithm and the Stockfish evaluation pipeline remain supported.
@@ -36,11 +34,11 @@ does not itself promote a checkpoint.
 
 Stage 1 learns human moves with full-vocabulary cross entropy and configured Elo weighting. Stockfish annotations supervise the value head where present, using the fixed win-percent transform; moves-left supervision remains available. See [event alignment](TRAINING_EVENT_SCHEMA.md), [board encoding](FEN_TO_BOARD_STATE.md) and [value targets](docs/VALUE_TARGET_WINPERCENT_HANDOFF.md).
 
-Stage 2 starts from a checkpoint and human-game prefixes. One frozen actor controls both colors through each continuation. Completed games provide noise-free improved Gumbel policies and actual outcome WDL targets; human prefixes provide unsupervised context. Loss is soft legal-policy cross entropy plus outcome WDL cross entropy, with no Elo weighting or moves-left loss. Unfinished games receive no labels.
+Stage 2 starts from a checkpoint and human-game prefixes streamed from the training corpus. One frozen actor controls both colors through each continuation. Completed games provide noise-free improved Gumbel policies and actual outcome WDL targets; human prefixes provide unsupervised context. Loss is soft legal-policy cross entropy plus outcome WDL cross entropy, with no Elo weighting or moves-left loss. Unfinished games receive no labels.
 
 Collection and training alternate on one GPU. Optimizer steps occur per training batch; the collection actor advances after a completed training phase. Immutable replay, atomic checkpoints, RNG/sampler state and phase progress support resume. Search uses one pending neural leaf per game, exact terminal values, full repetition history and explicit context limits.
 
-Streaming runs can opt into [regret-guided restarts](docs/SELF_PLAY_REGRET_RESTARTS.md),
+Runs can opt into [regret-guided restarts](docs/SELF_PLAY_REGRET_RESTARTS.md),
 which allocate a fifth starting-position bucket to high-error observed histories.
 Enable `[regret]` in a new run; existing configurations keep their four-bucket curriculum.
 
@@ -52,23 +50,23 @@ Install project dependencies and native bindings with `uv sync --extra dev`. Dat
 # Stage 1: use the config matching the intended architecture.
 .venv/bin/python scripts/train.py --config config/imba_chess_v4.toml
 
-# New laptop stage-2 run (requires a prepared training/monitor seed manifest).
+# New laptop stage-2 run (requires a prepared monitor seed manifest).
 .venv/bin/python scripts/run_self_play.py \
-  --config config/self_play_laptop_fast.toml \
+  --config config/self_play_streaming.toml \
   --initialize artifacts/flatten-board-ckpt34/initial.pt \
   --seeds artifacts/corpus/v4_self_play_seeds_4096.json \
   --output artifacts/self_play/new-run --device cuda
 
 # Resume the same run/config with its optimizer and replay state.
 .venv/bin/python scripts/run_self_play.py \
-  --config config/self_play_laptop_fast.toml \
+  --config config/self_play_streaming.toml \
   --resume --seeds artifacts/corpus/v4_self_play_seeds_4096.json \
   --output artifacts/self_play/new-run --device cuda
 ```
 
-Search inference uses CUDA FP32 with TF32 disabled. Gumbel uses the compiled decoder and reusable workspace (maximum depth 32); halving uses the grouped cached decoder with its configured depth and quiescence. Runtime choices follow the selected algorithm. Ordinary model-component SDPA remains unchanged. Compilation adds first-use latency. Historical measurements remain in the [readiness report](docs/SELF_PLAY_READINESS_REVIEW_2026-09-11.md).
+Search inference uses CUDA FP32 with TF32 disabled. Gumbel uses the compiled decoder and reusable workspace (maximum depth 32); halving uses the grouped cached decoder with its configured depth. Runtime choices follow the selected algorithm. Ordinary model-component SDPA remains unchanged. Compilation adds first-use latency. Historical measurements remain in the [readiness report](docs/SELF_PLAY_READINESS_REVIEW_2026-09-11.md).
 
-Use [the config guide](docs/CONFIG_GUIDE.md) before changing an existing run. Older configs are retained for checkpoint compatibility. The 5090 recipe is a pilot configuration, not a measured performance promise.
+Use [the config guide](docs/CONFIG_GUIDE.md) before changing an existing run. The 5090 recipe is a pilot configuration, not a measured performance promise.
 
 ## Evaluation and monitoring
 
@@ -89,16 +87,13 @@ Track usable completed positions/hour, completion/discard rates, training positi
 .venv/bin/python -m pytest -q native/imba_chess_native/tests
 ```
 
-The extended suite should run on decoder, attention or native-rule changes. Retained tests cover loss/gradient behavior, replay recovery, worker cleanup, chess edge cases, and full-forward → cached → grouped → optimized decoder parity. See [test maintenance](docs/TEST_MAINTENANCE_AUDIT_2026-09-12.md).
+The extended suite should run on decoder, attention or native-rule changes. Retained tests cover loss/gradient behavior, replay recovery, worker cleanup, chess edge cases, and full-forward → cached → grouped → optimized decoder parity. See [test maintenance](https://github.com/viig99/imba-chess/blob/0997951a18984ebdf16a5e1097a9d28382075e00/docs/TEST_MAINTENANCE_AUDIT_2026-09-12.md).
 
 ## Status and retained history
-
-- [Search inference consolidation and validation](docs/search-consolidation-validation.md)
 
 - [Self-play implementation, measurements and remaining gates](docs/SELF_PLAY_READINESS_REVIEW_2026-09-11.md)
 - [Current roadmap](PLAN.md)
 - [Configuration compatibility](docs/CONFIG_GUIDE.md)
-- [Historical results and retired implementation recipes](docs/EXPERIMENT_HISTORY.md)
-- [Maintenance decisions and remaining refactors](docs/MAINTAINABILITY_REVIEW_2026-09-13.md)
+- [Historical results, retired tools and retired reports](docs/EXPERIMENT_HISTORY.md)
 
 Inspiration: [grpo_chess](https://github.com/noamdwc/grpo_chess) and [searchless_chess](https://github.com/google-deepmind/searchless_chess).

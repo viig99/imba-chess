@@ -188,16 +188,3 @@ def test_executors_are_namespaced_by_role_and_options_record_both():
     assert runtime.options["policy"] == {"name": "policy"}
     assert runtime.options["value"] == {"name": "value"}
     assert runtime.options["algorithm"] == "gumbel-composed"
-
-
-def test_audit_subclass_still_refuses_nonzero_noise():
-    """The completed 2026-09-20 audit ran zero-noise; that guard must survive."""
-    from scripts.audit_policy_regression import MixedRuntime
-
-    policy = FakeRuntime("policy", value=0.1, prior=-0.5)
-    value = FakeRuntime("value", value=0.9, prior=-2.0)
-    mixed = MixedRuntime(policy, value)
-    assert mixed.options == {"algorithm": "gumbel-mixed", "dtype": "float32", "tf32": False}
-    with pytest.raises(ValueError, match="zero noise"):
-        drive(mixed, chess.Board(), rng=random.Random(1))
-    assert drive(mixed, chess.Board(), noise=0.0).move_uci == "e2e4"

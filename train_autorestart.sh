@@ -17,7 +17,7 @@
 #
 # Usage:
 #   ./train_autorestart.sh --config config/imba_chess_v4.toml
-#   ./train_autorestart.sh --config config/imba_chess.toml --max-games 2000000
+#   ./train_autorestart.sh --config config/imba_chess_v4_laptop.toml
 #
 # Env overrides: PYTHON, CHECKPOINT_DIR, LOG_FILE, RESTART_DELAY_SEC.
 
@@ -37,8 +37,8 @@ if [[ ! -x "${PYTHON}" ]] && ! command -v "${PYTHON}" >/dev/null 2>&1; then
 fi
 
 # Resolve the checkpoint directory: an explicit CHECKPOINT_DIR wins, otherwise
-# read it out of the --config TOML, otherwise the repo default.
-config_path=""
+# read it out of the --config TOML (train.py's default config when omitted).
+config_path="config/imba_chess_v4.toml"
 want_config=0
 for arg in "$@"; do
     if (( want_config )); then
@@ -67,7 +67,6 @@ if [[ -z "${CHECKPOINT_DIR:-}" && -n "${config_path}" ]]; then
         exit 1
     fi
 fi
-CHECKPOINT_DIR="${CHECKPOINT_DIR:-artifacts/checkpoints}"
 mkdir -p "${CHECKPOINT_DIR}"
 LOG_FILE="${LOG_FILE:-${CHECKPOINT_DIR}/train.log}"
 

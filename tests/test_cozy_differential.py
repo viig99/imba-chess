@@ -56,41 +56,6 @@ def test_gives_check_curated_edge_cases(fen, uci, expected):
     assert gives_check(board_to_cozy(board), py_move_to_cozy(board, move)) == expected
 
 
-@pytest.mark.parametrize("n_games", [3, pytest.param(200, marks=pytest.mark.extended)])
-def test_is_capture_cozy_matches_python_chess_everywhere(n_games):
-    """cozy_bridge.is_capture_cozy (Stage 3 Task 5) is the capture test
-    _forcing_index_set_tree uses at cozy-only tree nodes -- python-chess is_capture
-    remains the oracle, castling included (cozy's king-takes-own-rook
-    encoding must NOT read as a capture despite the destination being
-    occupied by the player's own rook)."""
-    from imba_chess.eval.cozy_bridge import is_capture_cozy
-
-    checked = 0
-    for board in differential_positions(n_games, seed=1234):
-        cozy = board_to_cozy(board)
-        for move in board.legal_moves:
-            cozy_move = py_move_to_cozy(board, move)
-            assert is_capture_cozy(cozy, cozy_move) == board.is_capture(move), (
-                board.fen(), move.uci(),
-            )
-            checked += 1
-    assert checked > 100
-
-
-def test_is_capture_cozy_curated_castling_is_not_a_capture():
-    from imba_chess.eval.cozy_bridge import is_capture_cozy
-
-    for fen, uci in [
-        ("5k2/8/8/8/8/8/8/4K2R w K - 0 1", "e1g1"),
-        ("r3k3/8/8/8/8/8/8/4K3 b q - 0 1", "e8c8"),
-    ]:
-        board = chess.Board(fen)
-        move = chess.Move.from_uci(uci)
-        assert move in board.legal_moves, "test fixture is broken: move not legal"
-        assert not board.is_capture(move), "test fixture is broken: oracle disagrees"
-        assert is_capture_cozy(board_to_cozy(board), py_move_to_cozy(board, move)) is False
-
-
 def test_encode_cozy_matches_encode_on_conversions_and_played_lines():
     import random
 

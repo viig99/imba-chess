@@ -24,7 +24,7 @@ Reviewed 2026-09-13 against commit `1e9e64e` plus its working tree. Existing cha
 
 The local PyTorch implementation explicitly warns that uncompiled FlexAttention materializes the score matrix: `.venv/lib/python3.*/site-packages/torch/nn/attention/flex_attention.py`, around line 2599 in this environment. Compiling `create_block_mask` does not compile a later model's attention call. A future performance experiment should validate gradients and allocation behavior before adopting regional/whole-model compilation in stage-2 learning.
 
-Configuration sources: [original lineage](../../config/imba_chess.toml), [v4](../../config/imba_chess_v4.toml), [default self-play](../../config/self_play.toml). Historical ckpt34 benchmark numbers must not be described as v4 measurements. The checkpoint loader builds the requested architecture from config and then loads weights strictly.
+Configuration sources: [original lineage](https://github.com/viig99/imba-chess/blob/0997951a18984ebdf16a5e1097a9d28382075e00/config/imba_chess.toml), [v4](../../config/imba_chess_v4.toml), [default self-play](https://github.com/viig99/imba-chess/blob/0997951a18984ebdf16a5e1097a9d28382075e00/config/self_play.toml). Historical ckpt34 benchmark numbers must not be described as v4 measurements. The checkpoint loader builds the requested architecture from config and then loads weights strictly.
 
 ## Exact cache arithmetic
 
@@ -57,7 +57,7 @@ The calculator's GQA, latent, layer-sharing and FP4 rows are separate hypothetic
 
 The source records a 0.001105 maximum target-probability outlier for compiled SDPA. Matching root visits or game trajectories does not prove all internal search arithmetic was identical. Two trials are too few for a strong estimate of a small variable difference. These are collection measurements, not per-attention-call latency or strength tests.
 
-[Maintenance review](../MAINTAINABILITY_REVIEW_2026-09-13.md) records the disposable stage-2 replay sweep: 1,024 tokens, 8,669 supervised exposures / 15 optimizer steps in 15.88 / 10.47 / 9.12 seconds, peak allocated 2.725 GB. At 2,048 tokens, backward ran out of memory. These values have a different workload and phase from the collection benchmark.
+[Maintenance review](https://github.com/viig99/imba-chess/blob/0997951a18984ebdf16a5e1097a9d28382075e00/docs/MAINTAINABILITY_REVIEW_2026-09-13.md) records the disposable stage-2 replay sweep: 1,024 tokens, 8,669 supervised exposures / 15 optimizer steps in 15.88 / 10.47 / 9.12 seconds, peak allocated 2.725 GB. At 2,048 tokens, backward ran out of memory. These values have a different workload and phase from the collection benchmark.
 
 A new benchmark should use identical checkpoints/replay and shapes; isolate cold compilation from warmed trials; synchronize completed CUDA work or use `torch.utils.benchmark.Timer`; report median/dispersion and peak allocated/reserved memory; collect a profiler trace separately. Inspect actual backend names and score/bias allocations. Measure both model and end-to-end search time. Amdahl's law is a scenario calculation, not a device benchmark.
 

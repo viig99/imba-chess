@@ -1,14 +1,16 @@
 """Shared runtime protocol checks; tensor math is covered by decoder integration."""
 
+import math
 from types import SimpleNamespace
 
 import chess
 import pytest
 import torch
 
+from imba_chess.eval import cozy_bridge
 from imba_chess.eval import inference_runtime as runtime
 from imba_chess.eval.gumbel_search import GumbelConfig
-from imba_chess.eval.search import HalvingConfig
+from imba_chess.eval.search import HalvingConfig, PositionEval
 from tests.test_self_play import VOCAB, ENCODER
 
 
@@ -99,6 +101,27 @@ def test_cpu_is_rejected_before_decoder_construction():
         )
 
 
+class UniformEvaluator:
+    def __init__(self, vocab):
+        self.vocab = vocab
+
+    def extend(self, handle, uci, move_vocab_id=None):
+        return (handle or ()) + (uci,)
+
+    def evaluate(self, batch):
+        rows = []
+        for _, board in batch:
+            ids, moves, ucis, forcing, _ = cozy_bridge.project_legal_moves(
+                board, self.vocab
+            )
+            rows.append(
+                PositionEval(
+                    0.0, moves, ucis, [-math.log(len(ids))] * len(ids), forcing, ids
+                )
+            )
+        return rows
+
+
 @pytest.mark.parametrize(
     "algorithm,config",
     [
@@ -111,7 +134,6 @@ def test_shared_dispatch_preserves_search_results(monkeypatch, algorithm, config
     from imba_chess.eval.position_evaluator import _project_legal_logits
     from imba_chess.eval.gumbel_search import select_gumbel
     from imba_chess.eval.search import select_value_search_halving
-    from imba_chess.self_play.benchmarks import UniformEvaluator
 
     instance, _ = make_runtime(monkeypatch, algorithm)
     evaluator = UniformEvaluator(VOCAB)

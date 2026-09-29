@@ -1,7 +1,7 @@
 # Fixed-function WDL value target: handoff
 
 Written 2026-09-03 for a fresh session. Self-contained; assumes no memory of the
-conversation that produced it. Companion to `docs/loss_audit_2026-09.md`, which
+conversation that produced it. Companion to [`docs/loss_audit_2026-09.md`](https://github.com/viig99/imba-chess/blob/0997951a18984ebdf16a5e1097a9d28382075e00/docs/loss_audit_2026-09.md), which
 records the state of the current losses and the fixes applied the same day.
 
 This supersedes an earlier draft (`SCALAR_VALUE_HEAD_HANDOFF.md`, deleted) that
@@ -240,7 +240,7 @@ contain many games, so this does not simply dilute its configured weight to
 - `config.py`: `ModelConfig` keeps `enable_value_head`, `value_loss_weight`,
   `moves_left_loss_weight`; the `[expert_iteration]` section is gone and an
   unknown top-level section now fails loudly.
-- `config/imba_chess_sf_finetune_low_lr.toml` is the full-stream continuation
+- [`config/imba_chess_sf_finetune_low_lr.toml`](https://github.com/viig99/imba-chess/blob/0997951a18984ebdf16a5e1097a9d28382075e00/config/imba_chess_sf_finetune_low_lr.toml) is the full-stream continuation
   recipe config
   (`checkpoint_dir = artifacts/stockfish_finetune/ckpt_winpercent_low_lr_8k`).
 - Tests: `test_stockfish_evals.py` checks the function against the scalachess

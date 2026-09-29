@@ -99,7 +99,7 @@ Focused verification:
 .venv/bin/python -m pytest -q \
   tests/test_self_play_regret.py tests/test_self_play_streaming.py \
   tests/test_self_play.py tests/test_self_play_schedule.py \
-  tests/test_search_config_migration.py tests/test_policy_surprise.py
+  tests/test_policy_surprise.py
 ```
 
 Tests cover hand-computed regret, identities and limits, sampling, eviction,

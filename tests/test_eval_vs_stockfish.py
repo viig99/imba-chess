@@ -35,23 +35,17 @@ def _load_eval_script_module():
 
 
 @pytest.mark.parametrize(
-    "coverage,q,concurrency,use_cli",
-    [
-        (True, 2, 1, False),
-        (False, 0, 2, False),
-        (False, 0, 1, True),
-        (True, 2, 2, True),
-    ],
+    "concurrency,use_cli",
+    [(1, False), (2, False), (1, True), (2, True)],
 )
-def test_tactical_config_cli_and_result_roundtrip(
-    tmp_path, monkeypatch, coverage, q, concurrency, use_cli
+def test_halving_config_cli_and_result_roundtrip(
+    tmp_path, monkeypatch, concurrency, use_cli
 ):
     module = _load_eval_script_module()
     config_path = tmp_path / "experiment.toml"
-    config_coverage = not coverage if use_cli else coverage
-    config_q = (0 if q else 2) if use_cli else q
+    depth = 7 if use_cli else 5
     config_path.write_text(
-        f'[eval_vs_stockfish]\nmodel_move_policy = "value_search_halving"\nsearch_tactical_coverage = {str(config_coverage).lower()}\nsearch_quiescence_plies = {config_q}\n',
+        '[eval_vs_stockfish]\nmodel_move_policy = "value_search_halving"\nsearch_max_depth = 5\n',
         encoding="utf-8",
     )
     output_path = tmp_path / "result.json"
@@ -77,13 +71,7 @@ def test_tactical_config_cli_and_result_roundtrip(
         str(output_path),
     ]
     if use_cli:
-        argv += [
-            "--search-tactical-coverage"
-            if coverage
-            else "--no-search-tactical-coverage",
-            "--search-quiescence-plies",
-            str(q),
-        ]
+        argv += ["--search-max-depth", str(depth)]
     monkeypatch.setattr(sys, "argv", argv)
     monkeypatch.setattr(
         module,
@@ -100,15 +88,14 @@ def test_tactical_config_cli_and_result_roundtrip(
     def run_segment(**kwargs):
         cfg = kwargs["halving_config"]
         observed.append(cfg)
-        assert cfg.tactical_coverage is coverage
-        assert cfg.quiescence_plies == q
+        assert cfg.max_depth == depth
         return module.EvalSummary(
             games=1,
             completed_games=1,
             draws=1,
             model_turns=2,
             model_selection_seconds=0.4,
-            search_stats={"evals_spent": 9, "quiescence_evals": q, "max_depth": 4 + q},
+            search_stats={"evals_spent": 9, "horizon_evals": 3, "max_depth": depth},
         )
 
     monkeypatch.setattr(module, "_run_segment", run_segment)
@@ -116,10 +103,9 @@ def test_tactical_config_cli_and_result_roundtrip(
     assert len(observed) == 1
     payload = json.loads(output_path.read_text())
     for result in (payload["segments"][0]["results"], payload["aggregate"]):
-        assert result["run_config"]["search"]["search_tactical_coverage"] is coverage
-        assert result["run_config"]["search"]["search_quiescence_plies"] == q
-        assert result["search_stats"]["quiescence_evals"] == q
-        assert result["search_stats"]["max_depth"] == 4 + q
+        assert result["run_config"]["search"]["search_max_depth"] == depth
+        assert result["search_stats"]["horizon_evals"] == 3
+        assert result["search_stats"]["max_depth"] == depth
         assert result["mean_model_selection_seconds"] == pytest.approx(0.2)
 
 
@@ -132,23 +118,6 @@ def test_search_stats_merge_sums_counts_but_takes_maximum_depth():
         ]
     )
     assert merged.search_stats == {"evals_spent": 16, "max_depth": 4}
-
-
-def test_negative_quiescence_rejected_before_loading_checkpoint(monkeypatch):
-    module = _load_eval_script_module()
-    monkeypatch.setattr(
-        sys,
-        "argv",
-        [
-            "eval_vs_stockfish.py",
-            "--checkpoint",
-            "unused.pt",
-            "--search-quiescence-plies",
-            "-1",
-        ],
-    )
-    with pytest.raises(ValueError, match="search-quiescence-plies"):
-        module.main()
 
 
 def _dummy_kv(total_tokens: int) -> list[tuple[torch.Tensor, torch.Tensor]]:

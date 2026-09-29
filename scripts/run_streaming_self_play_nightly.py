@@ -18,10 +18,6 @@ from imba_chess.data.self_play_store import atomic_json
 
 def command(args, now):
     cfg = load_config(args.config)
-    if cfg.streaming is None:
-        raise ValueError(
-            "nightly streaming launcher requires [streaming] configuration"
-        )
     until = args.until
     if until is None:
         morning = now.date() + timedelta(days=now.hour >= 8)

@@ -13,7 +13,6 @@ from imba_chess.eval.position_evaluator import (
     _SequenceHistory,
 )
 from imba_chess.eval.search import terminal_value_for_color
-from .seeds import stable_hash
 
 
 def terminal_outcome(board):
@@ -238,7 +237,6 @@ class CollectionMetrics:
 
 def collect(
     *,
-    seeds,
     runtime,
     config,
     actor_id,
@@ -252,29 +250,19 @@ def collect(
     skip_ids=(),
     metrics=None,
     concurrent_games=None,
-    start_sampler=None,
+    start_sampler,
 ):
     if concurrent_games is not None and concurrent_games < 1:
         raise ValueError("concurrent_games must be positive")
-    if config.regret is not None and start_sampler is None:
-        raise ValueError("regret collection requires a streaming start sampler")
     metrics = metrics or CollectionMetrics()
     skipped = set(skip_ids)
     active = {}
-    seed_order = list(seeds)
-    if not seed_order and start_sampler is None:
-        raise ValueError("collection requires at least one seed")
-    if start_sampler is not None:
-        if config.regret is None:
-            start_sampler.begin_phase(iteration, actor_id, skipped)
-        else:
-            start_sampler.begin_phase(
-                iteration, actor_id, store, max_positions=max_positions
-            )
-    if game_count is None:
-        # Sample sources uniformly without replacement in each iteration;
-        # fixed-size audits retain manifest order for comparable benchmarks.
-        random.Random(f"{config.run.seed}:{iteration}:sources").shuffle(seed_order)
+    if config.regret is None:
+        start_sampler.begin_phase(iteration, actor_id, skipped)
+    else:
+        start_sampler.begin_phase(
+            iteration, actor_id, store, max_positions=max_positions
+        )
 
     def factory():
         index = 0
@@ -285,16 +273,10 @@ def collect(
                 >= config.collection.fresh_positions
             ):
                 return
-            if start_sampler is None:
-                seed = seed_order[index % len(seed_order)]
-                gid = stable_hash(
-                    f"{config.run.seed}:{iteration}:{index}:{seed.seed_id}:{actor_id}"
-                )
-            else:
-                try:
-                    seed, gid = start_sampler.next_launch(iteration, actor_id)
-                except InterruptedError:
-                    return
+            try:
+                seed, gid = start_sampler.next_launch(iteration, actor_id)
+            except InterruptedError:
+                return
             index += 1
             if gid in skipped:
                 continue
@@ -309,9 +291,7 @@ def collect(
                 targets=[],
                 outcome_white=None,
             )
-            metadata = (
-                start_sampler.launch_metadata(gid) if start_sampler is not None else {}
-            )
+            metadata = start_sampler.launch_metadata(gid)
             active[gid].update(metadata)
             metrics.launched(metadata)
             yield (
@@ -355,18 +335,14 @@ def collect(
         game["iteration"] = iteration
         metrics.done(game)
         if game["status"] == "completed":
-            if start_sampler is not None and config.regret is not None:
+            if config.regret is not None:
                 from .regret import suffix_regrets
 
                 suffix_regrets(game)  # Fail explicitly before replay serialization.
             store.add(game)
-            if (
-                start_sampler is not None
-                and config.regret is not None
-                and gid in store.seen
-            ):
+            if config.regret is not None and gid in store.seen:
                 start_sampler.reconcile(store)
-        elif start_sampler is not None and game.get("termination") not in (
+        elif game.get("termination") not in (
             "interrupted",
             "error",
         ):
@@ -396,6 +372,5 @@ def collect(
     finally:
         getattr(runtime, "clear_caches", lambda: None)()
         store.flush()
-        if start_sampler is not None:
-            start_sampler.reconcile(store.seen if config.regret is None else store)
+        start_sampler.reconcile(store.seen if config.regret is None else store)
     return metrics

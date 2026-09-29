@@ -1,22 +1,16 @@
 # Configuration guide
 
-All eight TOMLs are retained. None was modified during the 2026-09-13 cleanup.
-
 | File | Use |
 |---|---|
-| `imba_chess_v4.toml` | Base architecture/data and historical ckpt34 evaluation settings. Use with v4 checkpoints. |
-| `self_play_laptop_fast.toml` | New laptop runs: 24 collection slots, 128 simulations, depth 32; compiled CUDA decoding is selected by runtime. |
-| `self_play_5090.toml` | Planned 32 GB pilot: 32 slots and larger training/replay settings. Remote soak remains unverified. |
-| `self_play.toml` | Original generic stage-2 recipe; retained for comparisons and compatible resumes. |
-| `self_play_laptop_pilot.toml` | Original two-hour laptop run; retained to resume its optimizer, replay and actor history. |
-| `imba_chess.toml` | Default stage-1/evaluation recipe; preserve for checkpoints and commands using it. |
-| `imba_chess_v3.toml` | Older architecture/training recipe; use only with the matching checkpoint. |
-| `imba_chess_sf_finetune_low_lr.toml` | Supervised low-LR fine-tuning recipe; this is separate from stage-2 outcome learning. |
+| `imba_chess_v4.toml` | Base architecture/data config and the ckpt34 SF2400 evaluation protocol. Default `--config` for training, Stockfish/model-pair evaluation and corpus scripts. |
+| `imba_chess_v4_laptop.toml` | Laptop supervised continuation from flattened ckpt34 at its saved learning rate, in a separate checkpoint directory. |
+| `eval_flatten_sf2400.toml` | Frozen SF2400 halving recipe for flattened checkpoints (ckpt34 r4/b2048 confirmation, seed 1042). |
+| `self_play_streaming.toml` | Laptop stage-2 run: 24 collection slots, 128 simulations, depth 32. |
+| `self_play_eval.toml` | 512-simulation stage-2 settings used for paired Gumbel evaluations. |
+| `self_play_5090.toml` | Planned 32 GB pilot: 32 slots and larger training/replay settings. Never soaked. |
 
-A model checkpoint needs compatible architecture, input encoding, vocabulary and head shapes. Stage-2 resume additionally verifies the settings and the SHA-256 of the base-config bytes. Reformatting or commenting the base config can change that identity even without changing numerical settings. Do not rewrite old recipes to deduplicate them while associated runs must remain resumable.
+Every stage-2 run streams its starting positions from the training corpus through `[streaming]`. The seed manifest passed with `--seeds` supplies only the held-out monitor openings used by strength screens.
 
-Execution controls can change without replacing training state: CUDA inference uses FP32 with TF32 disabled, and decoder choices follow the algorithm internally. The iteration/overnight runner's `--concurrent-games` overrides collection slots without altering search targets or the stored config identity, and records the override in run metrics/supervisor identity. Existing evaluation concurrency remains controlled by its config. It does not change training token batch size, LR, reuse or collection thresholds.
+A model checkpoint needs compatible architecture, input encoding, vocabulary and head shapes; only flattened checkpoints load. Stage-2 resume verifies a SHA-256 of every setting plus the base-config bytes, so any edit to either, including a comment, is a new run identity. Paired evaluation progress is keyed on the same identity. Runs and in-progress evaluations created before 2026-09-29 cannot be resumed by current code; runs launched from a source snapshot resume with that snapshot.
 
-The old pilot can therefore resume with 24 slots while preserving its optimizer and original config. A new run can use the fast laptop recipe directly. Changing learning settings is a separate experiment and must preserve explicit provenance rather than bypass resume validation.
-
-Search consolidation removes evaluation dtype/compile fields and renames `value_rerank_lambda` to `search_lambda` without changing its value. The exact shipped config migrations preserve existing self-play config identities; modifying other config bytes still invalidates resume. Checkpoint, replay, and optimizer serialization formats are unchanged. Evaluation resumes additionally require matching algorithm, budget, exploration, precision, and runtime revision. Historical reports and source snapshots retain their original options as records.
+Execution controls can change without replacing training state: CUDA inference uses FP32 with TF32 disabled, and decoder choices follow the algorithm internally. `run_self_play.py --concurrent-games` overrides collection slots without altering search targets or the stored config identity, and records the override in run metrics. Evaluation concurrency remains controlled by its config. None of these change training token batch size, LR, reuse or collection thresholds; changing learning settings is a separate experiment.

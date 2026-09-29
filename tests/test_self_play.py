@@ -404,23 +404,19 @@ def test_multiple_iterations_and_runner_resume(tmp_path, monkeypatch, failure_st
     source = "monitor"
     while source_split(source) != "monitor":
         source += "x"
-    seeds = [
-        Seed(
-            "train",
-            "train-source",
-            ["f2f3", "e7e5", "g2g4"],
-            3,
-            source_split("train-source"),
-            "c",
-        ),
-        Seed("monitor", source, ["f2f3", "e7e5", "g2g4"], 3, "monitor", "c"),
-    ]
-    assert seeds[0].split == "train"
+    monitor = [Seed("monitor", source, ["f2f3", "e7e5", "g2g4"], 3, "monitor", "c")]
     seed_path = tmp_path / "seeds.json"
     seed_path.write_text("test")
     monkeypatch.setattr(runner, "load_config", lambda path: cfg)
     monkeypatch.setattr(runner, "load_runtime", runtime)
-    monkeypatch.setattr(runner, "load_seeds", lambda path: seeds)
+    monkeypatch.setattr(runner, "load_seeds", lambda path, split: monitor)
+    monkeypatch.setattr(
+        runner,
+        "StreamingStarts",
+        lambda directory, config, should_stop: mate_starts(
+            directory, config, per_bucket=64, should_stop=should_stop
+        )[0],
+    )
     output = tmp_path / "run"
     base = [
         "run_self_play.py",
@@ -538,61 +534,88 @@ def test_hard_budget_exits_process():
     assert result.returncode == 124
 
 
-def test_collection_resume_and_executor_failure(tmp_path):
-    from dataclasses import replace
-    from imba_chess.self_play.collector import collect, CollectionMetrics
+def mate_starts(directory, cfg=None, *, per_bucket=4, **kwargs):
+    """Streamed starts whose human prefixes all lie on ScriptRuntime's mate line."""
+    from dataclasses import asdict
+    from imba_chess.data.self_play_store import atomic_json
     from imba_chess.self_play.config import SelfPlayConfig
+    from imba_chess.self_play.streaming import StreamingStarts
 
-    cfg = SelfPlayConfig()
-    cfg = replace(
-        cfg,
-        search=GumbelConfig(simulations=1, max_depth=1),
-        collection=replace(cfg.collection, concurrent_games=1),
+    cfg = cfg or SelfPlayConfig(search=GumbelConfig(simulations=1, max_depth=1))
+    starts = StreamingStarts(directory, cfg, start_worker=False, **kwargs)
+    block = starts.directory / "block-00000000.json"
+    if block.exists():  # A resumed run reuses its journaled block.
+        return starts, cfg
+    groups = []
+    for ply in (1, 2, 3):
+        group = []
+        for i in range(per_bucket):
+            source = f"mate-{ply}-{i}"
+            while source_split(source) != "train":
+                source += "x"
+            moves = ["f2f3", "e7e5", "g2g4"][:ply]
+            group.append(asdict(Seed(f"s{ply}{i}", source, moves, ply, "train", "c")))
+        groups.append(group)
+    atomic_json(
+        block, dict(identity=starts.identity, number=0, exhausted=True, groups=groups)
     )
-    seed = Seed("s", "train-source", ["f2f3", "e7e5"], 2, "train", "c")
+    return starts, cfg
+
+
+def test_collection_concurrency_invariance_and_executor_failure(tmp_path):
+    from imba_chess.self_play.collector import collect, CollectionMetrics
+
     runtime = ScriptRuntime()
     runtime.executors = {"tick": lambda ps: ps}
-    store = SelfPlayStore(tmp_path / "partial", flush_games=16)
-    stopped = []
-    common = dict(
-        seeds=[seed],
-        runtime=runtime,
-        config=cfg,
-        actor_id="actor",
-        max_positions=128,
-        game_count=3,
-    )
-    collect(
-        **common,
-        store=store,
-        should_launch=lambda: not stopped,
-        on_game=lambda game: stopped.append(game["game_id"]),
-    )
-    assert len(store.game_ids()) == 1
-    collect(**common, store=store, skip_ids=store.seen)
-    whole = SelfPlayStore(tmp_path / "whole")
-    collect(**common, store=whole, concurrent_games=3)
-    assert store.game_ids() == whole.game_ids()
-    assert [store.read_game(g) for g in store.game_ids()] == [
-        whole.read_game(g) for g in whole.game_ids()
+
+    def run(name, **kwargs):
+        starts, cfg = mate_starts(tmp_path / name / "stream")
+        store = SelfPlayStore(tmp_path / name / "replay", flush_games=16)
+        collect(
+            runtime=runtime,
+            config=cfg,
+            actor_id="actor",
+            store=store,
+            max_positions=128,
+            game_count=6,
+            start_sampler=starts,
+            **kwargs,
+        )
+        return store
+
+    sequential = run("sequential", concurrent_games=1)
+    concurrent = run("concurrent", concurrent_games=3)
+    ids = sorted(sequential.game_ids())
+    assert len(ids) == 6 and ids == sorted(concurrent.game_ids())
+    assert [sequential.read_game(g) for g in ids] == [
+        concurrent.read_game(g) for g in ids
     ]
 
     def fail(payloads):
         raise RuntimeError("inference failed")
 
     runtime.executors = {"tick": fail}
+    starts, cfg = mate_starts(tmp_path / "failed" / "stream")
     metrics = CollectionMetrics()
     unfinished = []
     with pytest.raises(RuntimeError, match="inference failed"):
         collect(
-            **common,
-            store=SelfPlayStore(tmp_path / "failed"),
+            runtime=runtime,
+            config=cfg,
+            actor_id="actor",
+            store=SelfPlayStore(tmp_path / "failed" / "replay"),
+            max_positions=128,
+            game_count=1,
+            concurrent_games=1,
+            start_sampler=starts,
             metrics=metrics,
             on_game=unfinished.append,
         )
     assert metrics.counts["unfinished_games"] == 1
-    assert unfinished[0]["seed_id"] == "s" and unfinished[0]["targets"] == []
+    assert unfinished[0]["targets"] == []
     assert "inference failed" in unfinished[0]["error"]
+    # A failed launch stays journaled for reissue with the same game ID.
+    assert unfinished[0]["game_id"] in starts.state["pending"]
 
 
 def test_read_only_replay_preserves_published_snapshot(tmp_path):

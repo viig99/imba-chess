@@ -268,7 +268,6 @@ class InferenceRuntime:
                 legal_moves=moves,
                 legal_log_priors=root.legal_log_priors,
                 config=config,
-                rng=rng,
             )
         del output, batch
         try:

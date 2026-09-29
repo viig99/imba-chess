@@ -34,3 +34,9 @@ reserve_minutes = 75.0
 drain_minutes = 15.0
 screen_pairs = 50
 confirmation_pairs = 250
+
+[streaming]
+block_rows = 10000
+prefetch_blocks = 2
+startup_timeout = 300.0
+shutdown_timeout = 5.0

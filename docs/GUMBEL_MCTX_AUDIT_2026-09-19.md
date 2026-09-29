@@ -131,7 +131,7 @@ retroactively change its already-generated checkpoints or a running process.
 
 ## Controlled evaluation follow-up
 
-`scripts/compare_gumbel_eval_noise.py` freezes the retained remote actors 73, 53,
+[`scripts/compare_gumbel_eval_noise.py`](https://github.com/viig99/imba-chess/blob/0997951a18984ebdf16a5e1097a9d28382075e00/scripts/compare_gumbel_eval_noise.py) freezes the retained remote actors 73, 53,
 and 33, ckpt34, the original config and the original monitoring openings. It
 reuses their completed noisy controls and reruns each actor against ckpt34 with
 zero noise. Both players change protocol together. Search stays at 512

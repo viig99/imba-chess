@@ -9,7 +9,7 @@ try:
 except ModuleNotFoundError:  # pragma: no cover
     import tomli as tomllib  # type: ignore[no-redef]
 
-DEFAULT_CONFIG_PATH = Path("config/imba_chess.toml")
+DEFAULT_CONFIG_PATH = Path("config/imba_chess_v4.toml")
 
 
 @dataclass(frozen=True)
@@ -161,8 +161,6 @@ class EvalVsStockfishConfig:
     search_refutation_top_r: int = 4
     search_expand_top: int = 3
     search_max_depth: int = 4
-    search_tactical_coverage: bool = False
-    search_quiescence_plies: int = 0
     opening_random_plies: int = 0
     debug_trace_games: int = 0
     debug_trace_max_plies: int = 80

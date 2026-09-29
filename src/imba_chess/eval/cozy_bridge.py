@@ -104,31 +104,6 @@ def cozy_move_to_uci(cozy_board: cc.Board, move: cc.Move) -> str:
     return uci
 
 
-def is_capture_cozy(cozy_board: cc.Board, move: cc.Move) -> bool:
-    """Does this LEGAL cozy move capture a piece? Mirrors python-chess's
-    Board.is_capture() (normal capture + en passant) without needing a
-    python-chess board.
-
-    Castling is excluded despite the destination square being occupied:
-    cozy represents castling as king-takes-own-rook (see module docstring),
-    which must not count as a capture. The en-passant case relies on
-    legality: a pawn can only move diagonally to an empty square via en
-    passant, so no explicit ep-square check is needed for moves drawn from
-    a legal-move generator.
-    """
-    moving_piece = cozy_board.piece_on(move.from_square)
-    if cozy_board.piece_on(move.to_square) is None:
-        return moving_piece == cc.Piece.Pawn and (
-            int(move.from_square) % 8 != int(move.to_square) % 8
-        )
-    if (
-        moving_piece == cc.Piece.King
-        and cozy_board.color_on(move.to_square) == cozy_board.side_to_move()
-    ):
-        return False  # castling: king "captures" its own rook
-    return True
-
-
 def _no_heavy_pieces(cozy_board: cc.Board) -> bool:
     return not (
         int(cozy_board.pieces(cc.Piece.Pawn))
@@ -340,7 +315,7 @@ def project_legal_moves(
     vocab-mapping and UCI-sort discipline has exactly one implementation.
     Everything below the call is Rust -- move generation, castling
     normalization, vocabulary lookup, and the sort happen in one FFI crossing
-    (2.90 vs 11.63 us/node, scripts/bench_native_move_projector.py).
+    (2.90 vs 11.63 us/node measured against the Python projection).
 
     Moves come back in raw generated form and stay playable; only the
     vocabulary sees a castle's normalized king-destination UCI. Unmapped moves

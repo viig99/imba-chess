@@ -22,6 +22,7 @@ from imba_chess.self_play.evaluation import (
 from imba_chess.eval.composed_runtime import ComposedRuntime
 from imba_chess.self_play.runtime import load_runtime, run_lock, StopBudget
 from imba_chess.self_play.seeds import file_hash, load_seeds
+from imba_chess.self_play.streaming import StreamingStarts
 from imba_chess.self_play.trainer import Stage2Trainer
 
 
@@ -114,15 +115,11 @@ def main():
             "--frozen-evaluator isolates policy learning and requires "
             "learning.value_weight = 0 and auxiliary_value_weight = 0; the learner's own value head must not train"
         )
-    seeds = load_seeds(args.seeds)
-    monitor = [s for s in seeds if s.split == "monitor"]
+    monitor = load_seeds(args.seeds, split="monitor")
     if len(monitor) < max(cfg.run.screen_pairs, cfg.run.confirmation_pairs):
         parser.error(
             "seed manifest needs enough distinct monitoring prefixes for screen and confirmation"
         )
-    train_seeds = [s for s in seeds if s.split == "train"]
-    if not train_seeds:
-        parser.error("seed manifest has no training prefixes")
     seconds = float("inf") if args.continuous else (
         cfg.run.hours * 3600
         if args.until is None
@@ -164,23 +161,17 @@ def main():
                 phase="collect",
                 halted=False,
             )
-        start_sampler = None
-        if cfg.streaming is not None:
-            from imba_chess.self_play.streaming import StreamingStarts
-
-            if args.resume and not (args.output / "stream" / "consumer.json").exists():
-                raise FileNotFoundError(
-                    "stream consumer state missing; refusing source rewind"
-                )
-            start_sampler = resources.enter_context(
-                StreamingStarts(
-                    args.output / "stream", cfg, should_stop=lambda: not budget.launch()
-                )
+        if args.resume and not (args.output / "stream" / "consumer.json").exists():
+            raise FileNotFoundError("stream consumer state missing; refusing source rewind")
+        start_sampler = resources.enter_context(
+            StreamingStarts(
+                args.output / "stream", cfg, should_stop=lambda: not budget.launch()
             )
-            if args.resume and state.get("stream_identity") != start_sampler.identity:
-                raise ValueError("run and stream identities disagree")
-            start_sampler.warm()
-            state["stream_identity"] = start_sampler.identity
+        )
+        if args.resume and state.get("stream_identity") != start_sampler.identity:
+            raise ValueError("run and stream identities disagree")
+        start_sampler.warm()
+        state["stream_identity"] = start_sampler.identity
         runtime, max_positions = load_runtime(cfg, checkpoint, args.device)
         frozen_evaluator = None
         if args.frozen_evaluator is not None:
@@ -332,7 +323,6 @@ def main():
                         )
 
                 metrics = collect(
-                    seeds=seeds if start_sampler is None else [],
                     runtime=actor_runtime,
                     config=cfg,
                     actor_id=state["actor_id"],
@@ -350,8 +340,7 @@ def main():
                     else {},
                 )
                 log(metrics.report())
-                if start_sampler is not None:
-                    log(start_sampler.report())
+                log(start_sampler.report())
                 if (
                     metrics.counts["training_positions"]
                     < cfg.collection.fresh_positions
@@ -359,8 +348,7 @@ def main():
                     publish_checkpoint()
                     break
                 trainer.begin_phase(store)
-                if start_sampler is not None:
-                    start_sampler.finish_phase()
+                start_sampler.finish_phase()
                 exposure_budget = int(
                     metrics.counts["training_positions"] * cfg.learning.reuse
                 )

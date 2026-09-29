@@ -2,7 +2,6 @@ from dataclasses import dataclass
 
 import torch
 import torch.nn.functional as F
-from typing import Literal
 from torch.nn.attention.flex_attention import BlockMask, flex_attention
 
 
@@ -205,7 +204,6 @@ class SequentialTransductionUnitJagged(torch.nn.Module):
         dropout_ratio: float,
         num_heads: int,
         max_seq_len: int = 2048,
-        relative_attention_bias_module: Literal["position"] = "position",
         epsilon: float = 1e-6,
     ) -> None:
         super().__init__()
@@ -215,7 +213,6 @@ class SequentialTransductionUnitJagged(torch.nn.Module):
         self._attention_dim = attention_dim
         self._dropout_ratio = dropout_ratio
         self._num_heads = num_heads
-        self._rel_attn_bias = relative_attention_bias_module
         self._eps = epsilon
         self._max_seq_len = max_seq_len
 

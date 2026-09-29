@@ -189,8 +189,7 @@ def _build_value_head(
 ) -> nn.Sequential:
     """Value readout: `dim` trunk features -> 3 WDL logits.
 
-    blocks=0 reproduces the original head module-for-module (same indices,
-    same parameter names), so pre-deep-head checkpoints load unchanged.
+    blocks=0 is the plain two-layer readout.
     """
     hidden = dim // 2 if width is None else int(width)
     if blocks == 0:
@@ -276,6 +275,8 @@ class HSTUChessModel(nn.Module):
     def __init__(self, config: HSTUChessConfig) -> None:
         super().__init__()
         self.config = config
+        if config.relative_attention_bias != "position":
+            raise ValueError('relative_attention_bias must be "position"')
         if not 0.0 <= float(config.label_smoothing) < 1.0:
             raise ValueError("label_smoothing must be in [0.0, 1.0)")
         if int(config.elo_weight_max_elo) <= int(config.elo_weight_min_elo):
@@ -329,7 +330,6 @@ class HSTUChessModel(nn.Module):
                     dropout_ratio=config.dropout,
                     num_heads=config.num_heads,
                     max_seq_len=config.max_position_embeddings,
-                    relative_attention_bias_module=config.relative_attention_bias,
                 )
                 for _ in range(config.num_layers)
             ]

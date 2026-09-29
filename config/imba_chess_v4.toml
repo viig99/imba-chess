@@ -21,9 +21,8 @@
 #      which is a capacity symptom. Blocks are zero-initialised so the head
 #      starts as the plain linear readout.
 #
-# Sized for a 32GB card (5090). [eval_vs_stockfish] is held in lockstep with
-# imba_chess.toml / the ckpt23 anchor protocol so v4 numbers land on the SAME
-# ruler: SF2400, 40000 nodes, budget 2048 / depth 8, fp32, no random opening.
+# Sized for a 32GB card (5090). [eval_vs_stockfish] is held on the ckpt23
+# anchor protocol so v4 numbers land on the SAME ruler: SF2400, 40000 nodes, budget 2048 / depth 8, fp32, no random opening.
 # The current anchor is ckpt34 with lambda=0.05 / 4 opponent replies:
 # 0.6593 (383/223/144 over 750 games; seed 1042).
 

@@ -38,7 +38,7 @@ Corrections to the handoff:
 | Frozen-model search vs greedy (ckpt34) | completed — `artifacts/eval/search-improvement-2026-09-20/REPORT.md` |
 | Policy/value source swap (actor54 × ckpt34) | completed — `artifacts/eval/policy-regression-2026-09-20/` |
 | Gumbel/mctx component audit | completed — `artifacts/gumbel_audit_2026-09-19/` |
-| Search-scale engine screen | completed — `docs/SEARCH_SCALE_SCREEN_2026-09-19.md` |
+| Search-scale engine screen | completed — [`docs/SEARCH_SCALE_SCREEN_2026-09-19.md`](https://github.com/viig99/imba-chess/blob/0997951a18984ebdf16a5e1097a9d28382075e00/docs/SEARCH_SCALE_SCREEN_2026-09-19.md) |
 | Stage-2 loss/gradient audit | completed — `artifacts/loss_audit_2026-09-19/` |
 | Self-play runs at scale 1.0 / 0.1 / 0.1-detached / 0.03 | completed (4 runs) |
 | Value-0 / frozen-evaluator control | **never started** |
@@ -207,7 +207,7 @@ search coroutines run in lockstep over identical composed predictions, taking le
 actions and priors from one complete network and the side-to-move value from another.
 Each coroutine owns its own network and its own KV tree; only prediction outputs cross
 the boundary. This is the composition the 2026-09-20 policy/value swap already used —
-promoted out of `scripts/audit_policy_regression.py` so there is one implementation.
+promoted out of [`scripts/audit_policy_regression.py`](https://github.com/viig99/imba-chess/blob/0997951a18984ebdf16a5e1097a9d28382075e00/scripts/audit_policy_regression.py) so there is one implementation.
 That script now subclasses it, pinning its recorded `options` block and its zero-noise
 requirement, and its tests still pass.
 

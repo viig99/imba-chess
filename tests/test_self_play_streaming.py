@@ -13,7 +13,7 @@ import pyarrow.parquet as pq
 import pytest
 
 from imba_chess.data.self_play_store import atomic_json
-from imba_chess.self_play.config import SelfPlayConfig, StreamingConfig, load_config
+from imba_chess.self_play.config import SelfPlayConfig, StreamingConfig
 from imba_chess.self_play.seeds import Seed, source_split
 from imba_chess.self_play.streaming import (
     BUCKETS,
@@ -229,30 +229,6 @@ def test_real_producer_restart_preserves_next_block(tmp_path, rows):
         )
         assert actual["groups"] == expected
         assert actual["source_rows"] == 12
-
-
-def test_legacy_configuration_identity_is_preserved():
-    import hashlib
-    from imba_chess.self_play.config import _base_config_identity
-
-    cfg = load_config("config/self_play_laptop_pilot.toml")
-    cfg = replace(cfg, learning=replace(cfg.learning, auxiliary_value_weight=0.0))
-    old_settings = asdict(cfg)
-    del old_settings["streaming"]
-    del old_settings["regret"]
-    for key in list(old_settings["learning"]):
-        if key.startswith(("policy_surprise_", "auxiliary_value_", "gradient_accumulation", "value_search_mix")):
-            del old_settings["learning"][key]
-    previous = hashlib.sha256(
-        json.dumps(
-            dict(
-                settings=old_settings,
-                base_sha256=_base_config_identity(cfg.base_config),
-            ),
-            sort_keys=True,
-        ).encode()
-    ).hexdigest()
-    assert cfg.identifier == previous
 
 
 def test_nightly_deadline_and_initialize_resume(tmp_path):

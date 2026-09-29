@@ -276,7 +276,7 @@ corrections remain. Do not infer successful learning transfer from these targets
 
 ### 3. Controlled policy/value source swap: strongest localization so far
 
-Read `docs/POLICY_REGRESSION_RESULTS_2026-09-20.md` and
+Read [`docs/POLICY_REGRESSION_RESULTS_2026-09-20.md`](https://github.com/viig99/imba-chess/blob/0997951a18984ebdf16a5e1097a9d28382075e00/docs/POLICY_REGRESSION_RESULTS_2026-09-20.md) and
 `artifacts/eval/policy-regression-2026-09-20/REPORT.md`.
 Old detached-value actor54 versus old ckpt34; 50 distinct monitor openings,
 color swaps, 100 games per arm, 512 simulations, scale .1,top-m 16,depth 32,zero noise,
@@ -380,7 +380,7 @@ Pinned mctx reference: `88f92056a420c2673bed282f5a0c00211f126e78`.
 - Our surprise method weights policy loss only, using stored actor priors and full
  game normalization; it is not an exact copy of KataGo's sampling pipeline.
 
-`docs/SEARCH_SCALE_SCREEN_2026-09-19.md`: exploratory engine-scored scale sweep,
+[`docs/SEARCH_SCALE_SCREEN_2026-09-19.md`](https://github.com/viig99/imba-chess/blob/0997951a18984ebdf16a5e1097a9d28382075e00/docs/SEARCH_SCALE_SCREEN_2026-09-19.md): exploratory engine-scored scale sweep,
 200 simulations, training noise, 20 pilot + 30 held-out human-prefix positions.
 Independent 30-position target gains: scale .01 +.83pp; .03 +2.07pp; .1 +2.34pp;
 .3 +1.46pp;1 −.05pp. The .1−.03 difference was inconclusive. Worst-position
@@ -485,12 +485,12 @@ Primary local reading list:
 - Native search selectors/backup and `tests/fixtures/gumbel/`
 - `src/imba_chess/model/{hstu_model,hstu_attention,checkpoint}.py`
 - `docs/GUMBEL_MCTX_AUDIT_2026-09-19.md`
-- `docs/POLICY_REGRESSION_RESULTS_2026-09-20.md`
+- [`docs/POLICY_REGRESSION_RESULTS_2026-09-20.md`](https://github.com/viig99/imba-chess/blob/0997951a18984ebdf16a5e1097a9d28382075e00/docs/POLICY_REGRESSION_RESULTS_2026-09-20.md)
 - `docs/SELF_PLAY_VALUE_AUDIT_2026-09-20.md`
-- `docs/SEARCH_SCALE_SCREEN_2026-09-19.md`
+- [`docs/SEARCH_SCALE_SCREEN_2026-09-19.md`](https://github.com/viig99/imba-chess/blob/0997951a18984ebdf16a5e1097a9d28382075e00/docs/SEARCH_SCALE_SCREEN_2026-09-19.md)
 - `docs/POLICY_SURPRISE_WEIGHTING.md`
 - `docs/SELF_PLAY_STREAMING_RUN_2026-09-17.md`
-- `docs/SELF_PLAY_STREAMING_ASSESSMENT_2026-09-18.md`
+- [`docs/SELF_PLAY_STREAMING_ASSESSMENT_2026-09-18.md`](https://github.com/viig99/imba-chess/blob/0997951a18984ebdf16a5e1097a9d28382075e00/docs/SELF_PLAY_STREAMING_ASSESSMENT_2026-09-18.md)
 - `docs/SELF_PLAY_READINESS_REVIEW_2026-09-11.md`
 - `docs/VALUE_TARGET_WINPERCENT_HANDOFF.md`
 - `docs/FLATTEN_BOARD_CONTINUATION.md`

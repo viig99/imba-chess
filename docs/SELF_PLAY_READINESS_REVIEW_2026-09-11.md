@@ -52,7 +52,7 @@ Artifacts: `artifacts/self_play_validation/speed_campaign/` and `decoder_campaig
 
 The decoder campaign reconstructed 440 completed games / 38,586 searched positions. Played trajectories, outcomes and root visit vectors matched their eager references. This does not prove identical interior search decisions. Maximum final compiled-only target probability difference was 4.38e-5. Compiled-SDPA had a 0.001105 outlier: identical root priors/WDL/visits but different backed-up Q for one action. Root-only diagnostics cannot prove its cause. The artifact `largest_sdpa_target_difference.json` retains it; no deeper tracing was done because that mode also failed the performance gate.
 
-Before maintenance reductions, full CPU checks passed 2,335 tests; final decoder checks passed 23 on CUDA. The first maintenance cleanup passed 2,280 default tests in 20.35 seconds, four extended CPU checks, 23 CUDA checks and 107 native binding tests. [The audit](TEST_MAINTENANCE_AUDIT_2026-09-12.md) explains removed redundancy and retained coverage. Offline-generator-only tests are now retired; the shared executor's adversarial device-placement test was preserved in the decoder suite. Latest cleanup passed 2,267 default tests in 20.84 seconds; executable Stockfish/model-match behavior and all eight config bytes are preserved. The maintenance review records details.
+Before maintenance reductions, full CPU checks passed 2,335 tests; final decoder checks passed 23 on CUDA. The first maintenance cleanup passed 2,280 default tests in 20.35 seconds, four extended CPU checks, 23 CUDA checks and 107 native binding tests. [The audit](https://github.com/viig99/imba-chess/blob/0997951a18984ebdf16a5e1097a9d28382075e00/docs/TEST_MAINTENANCE_AUDIT_2026-09-12.md) explains removed redundancy and retained coverage. Offline-generator-only tests are now retired; the shared executor's adversarial device-placement test was preserved in the decoder suite. Latest cleanup passed 2,267 default tests in 20.84 seconds; executable Stockfish/model-match behavior and all eight config bytes are preserved. The maintenance review records details.
 
 Full-forward → cached → grouped → optimized parity, mixed history/depth, immutable prefix/KV ownership, changed weights between phases, exact fake-evaluator search behavior, legal targets, independent chess terminal outcomes, replay recovery, finite gradients, tiny overfit and resume remain covered. Extended compiler/device/random checks run explicitly with `pytest -m extended` or `-m ''`.
 
@@ -104,10 +104,9 @@ A disposable actor-000002/replay training sweep measured 1,024-token batches at 
 
 ## Operation and reproduction
 
-- New laptop runs: `config/self_play_laptop_fast.toml` (24 slots). Existing pilot resume: retain `self_play_laptop_pilot.toml`, optionally use the logged execution-only `--concurrent-games 24` override. Learning settings are unchanged by that override.
-- `run_self_play.py --until <ISO timestamp with timezone>` uses an absolute deadline. Reserve/drain follow the saved config. For the pilot: stop starting new collect/train phases 15 minutes before deadline; drain up to 10 minutes; hard stop at deadline.
-- `run_self_play_overnight.py` resumes the run and queues three morning evaluations. Its progress and per-evaluation results are restartable. Each evaluation is bounded; incomplete results remain incomplete.
-- Benchmark: explicit config, checkpoint, seed manifest and fresh output directory are required. Use `--component training --replay <path>` for disposable training measurements; readers never publish replay state. Detailed flags are in `--help`.
+- New laptop runs: `config/self_play_streaming.toml` (24 slots, streamed starts). `--concurrent-games` is a logged execution-only override; learning settings are unchanged by it.
+- `run_self_play.py --until <ISO timestamp with timezone>` uses an absolute deadline. Reserve/drain follow the saved config: stop starting new collect/train phases before the reserve, drain, then hard stop at the deadline.
+- `run_streaming_self_play_nightly.py` starts or resumes a streamed run until the next 08:00 Toronto, screening every three hours. Evaluation progress is restartable; incomplete results remain incomplete.
 - No remote 5090 result or automatic external nightly schedule is established. Retain ~15% VRAM headroom in the actual soak workload and adopt optimizations only with repeated end-to-end gains or measured memory relief.
 
 ## Stockfish evaluator consolidation — September 13

@@ -5,7 +5,6 @@ use crate::bitboard::BitBoard;
 use crate::castle_rights::CastleRights;
 use crate::chess_move::ChessMove;
 use crate::enums::{Color, File, GameStatus, Piece, Square};
-use crate::piece_moves::PieceMoves;
 
 // ── Board ──────────────────────────────────────────────────────────────────
 
@@ -40,31 +39,6 @@ impl Board {
         s.parse::<cozy_chess::Board>()
             .map(Board)
             .map_err(|e| PyValueError::new_err(format!("{}", e)))
-    }
-
-    #[staticmethod]
-    fn chess960_startpos(scharnagl_number: u32) -> PyResult<Self> {
-        if scharnagl_number >= 960 {
-            return Err(PyValueError::new_err(
-                "Scharnagl number must be in range 0..960",
-            ));
-        }
-        Ok(Board(cozy_chess::Board::chess960_startpos(
-            scharnagl_number,
-        )))
-    }
-
-    #[staticmethod]
-    fn double_chess960_startpos(white_scharnagl: u32, black_scharnagl: u32) -> PyResult<Self> {
-        if white_scharnagl >= 960 || black_scharnagl >= 960 {
-            return Err(PyValueError::new_err(
-                "Scharnagl numbers must be in range 0..960",
-            ));
-        }
-        Ok(Board(cozy_chess::Board::double_chess960_startpos(
-            white_scharnagl,
-            black_scharnagl,
-        )))
     }
 
     // ── Query ──────────────────────────────────────────────────────────
@@ -179,10 +153,6 @@ impl Board {
         self.0.play_unchecked(mv.0);
     }
 
-    fn null_move(&self) -> Option<Self> {
-        self.0.null_move().map(Board)
-    }
-
     // ── Move generation ────────────────────────────────────────────────
 
     fn generate_moves(&self) -> Vec<ChessMove> {
@@ -192,33 +162,6 @@ impl Board {
             false
         });
         moves
-    }
-
-    fn generate_moves_for(&self, mask: &BitBoard) -> Vec<ChessMove> {
-        let mut moves = Vec::new();
-        self.0.generate_moves_for(mask.0, |piece_moves| {
-            moves.extend(piece_moves.into_iter().map(ChessMove));
-            false
-        });
-        moves
-    }
-
-    fn generate_piece_moves(&self) -> Vec<PieceMoves> {
-        let mut result = Vec::new();
-        self.0.generate_moves(|pm| {
-            result.push(PieceMoves(pm));
-            false
-        });
-        result
-    }
-
-    fn generate_piece_moves_for(&self, mask: &BitBoard) -> Vec<PieceMoves> {
-        let mut result = Vec::new();
-        self.0.generate_moves_for(mask.0, |pm| {
-            result.push(PieceMoves(pm));
-            false
-        });
-        result
     }
 
     // ── FEN ────────────────────────────────────────────────────────────

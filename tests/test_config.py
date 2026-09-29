@@ -133,10 +133,9 @@ def test_eval_vs_stockfish_search_knob_defaults():
 @pytest.mark.parametrize(
     "filename",
     (
-        "imba_chess.toml",
-        "imba_chess_v3.toml",
         "imba_chess_v4.toml",
-        "imba_chess_sf_finetune_low_lr.toml",
+        "imba_chess_v4_laptop.toml",
+        "eval_flatten_sf2400.toml",
     ),
 )
 def test_maintained_configs_parse(filename):

@@ -354,22 +354,12 @@ class TestBoard:
         b = imba_chess_native.Board()
         assert a.hash() == b.hash()
 
-    def test_null_move(self):
-        board = imba_chess_native.Board()
-        nm = board.null_move()
-        assert nm is not None
-        assert nm.side_to_move() == imba_chess_native.Color.Black
 
     def test_same_position(self):
         a = imba_chess_native.Board()
         b = imba_chess_native.Board()
         assert a.same_position(b)
 
-    def test_generate_moves_for(self):
-        board = imba_chess_native.Board()
-        knights = board.pieces(imba_chess_native.Piece.Knight)
-        knight_moves = board.generate_moves_for(knights)
-        assert len(knight_moves) == 4
 
     def test_kiwipete_moves(self):
         fen = "r3k2r/p1ppqpb1/bn2pnp1/3PN3/1p2P3/2N2Q1p/PPPBBPPP/R3K2R w KQkq - 0 1"
@@ -389,9 +379,6 @@ class TestBoard:
         board.play(imba_chess_native.Move.from_str("e2e4"))
         assert board != board2
 
-    def test_chess960(self):
-        board = imba_chess_native.Board.chess960_startpos(518)
-        assert board == imba_chess_native.Board()
 
     def test_pinned(self):
         board = imba_chess_native.Board()
@@ -422,34 +409,6 @@ class TestBoard:
         board = imba_chess_native.Board()
         board.set_fullmove_number(10)
         assert board.fullmove_number == 10
-
-    def test_generate_piece_moves(self):
-        board = imba_chess_native.Board()
-        piece_moves = board.generate_piece_moves()
-        total = sum(len(pm) for pm in piece_moves)
-        assert total == 20
-
-
-# ═══════════════════════════════════════════════════════════════════════════
-# PieceMoves Tests
-# ═══════════════════════════════════════════════════════════════════════════
-
-class TestPieceMoves:
-    def test_iteration(self):
-        board = imba_chess_native.Board()
-        piece_moves_list = board.generate_piece_moves()
-        for pm in piece_moves_list:
-            assert len(pm) > 0
-            for mv in pm:
-                assert isinstance(mv, imba_chess_native.Move)
-
-    def test_properties(self):
-        board = imba_chess_native.Board()
-        piece_moves_list = board.generate_piece_moves()
-        for pm in piece_moves_list:
-            assert isinstance(pm.piece, imba_chess_native.Piece)
-            assert isinstance(pm.from_square, imba_chess_native.Square)
-            assert isinstance(pm.to, imba_chess_native.BitBoard)
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -508,68 +467,6 @@ class TestBoardBuilder:
         assert builder.side_to_move == imba_chess_native.Color.White
         builder.set_side_to_move(imba_chess_native.Color.Black)
         assert builder.side_to_move == imba_chess_native.Color.Black
-
-
-# ═══════════════════════════════════════════════════════════════════════════
-# Free Functions Tests
-# ═══════════════════════════════════════════════════════════════════════════
-
-class TestFunctions:
-    def test_king_moves(self):
-        moves = imba_chess_native.get_king_moves(imba_chess_native.Square.E4)
-        assert len(moves) == 8
-
-    def test_king_moves_corner(self):
-        moves = imba_chess_native.get_king_moves(imba_chess_native.Square.A1)
-        assert len(moves) == 3
-
-    def test_knight_moves(self):
-        moves = imba_chess_native.get_knight_moves(imba_chess_native.Square.E4)
-        assert len(moves) == 8
-
-    def test_knight_moves_corner(self):
-        moves = imba_chess_native.get_knight_moves(imba_chess_native.Square.A1)
-        assert len(moves) == 2
-
-    def test_rook_moves_empty(self):
-        moves = imba_chess_native.get_rook_moves(imba_chess_native.Square.E4, imba_chess_native.BitBoard.EMPTY)
-        assert len(moves) == 14
-
-    def test_bishop_moves_empty(self):
-        moves = imba_chess_native.get_bishop_moves(imba_chess_native.Square.E4, imba_chess_native.BitBoard.EMPTY)
-        assert len(moves) == 13
-
-    def test_rook_rays(self):
-        rays = imba_chess_native.get_rook_rays(imba_chess_native.Square.E4)
-        assert len(rays) == 14
-
-    def test_bishop_rays(self):
-        rays = imba_chess_native.get_bishop_rays(imba_chess_native.Square.E4)
-        assert len(rays) == 13
-
-    def test_pawn_attacks(self):
-        attacks = imba_chess_native.get_pawn_attacks(imba_chess_native.Square.E4, imba_chess_native.Color.White)
-        assert len(attacks) == 2
-        assert attacks.has(imba_chess_native.Square.D5)
-        assert attacks.has(imba_chess_native.Square.F5)
-
-    def test_pawn_quiets(self):
-        # From starting position, E2 pawn can move to E3 and E4
-        quiets = imba_chess_native.get_pawn_quiets(
-            imba_chess_native.Square.E2,
-            imba_chess_native.Color.White,
-            imba_chess_native.BitBoard.EMPTY,
-        )
-        assert len(quiets) == 2
-
-    def test_between_rays(self):
-        between = imba_chess_native.get_between_rays(imba_chess_native.Square.A1, imba_chess_native.Square.H8)
-        # Should have the diagonal squares between
-        assert len(between) > 0
-
-    def test_line_rays(self):
-        line = imba_chess_native.get_line_rays(imba_chess_native.Square.A1, imba_chess_native.Square.H8)
-        assert len(line) > 0
 
 
 # ═══════════════════════════════════════════════════════════════════════════

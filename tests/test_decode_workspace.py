@@ -1,6 +1,7 @@
 """Cross-game workspace equivalence and ownership/lifetime regressions."""
 
 import gc
+import math
 import weakref
 
 import chess
@@ -219,6 +220,47 @@ def test_arena_growth_slot_reclamation_and_empty_projection(monkeypatch):
         ws.clear()
 
 
+class FixedStarts:
+    """Start sampler double: every launch replays one seed under a fresh game ID."""
+
+    def __init__(self, seed):
+        self.seed, self.launches = seed, 0
+
+    def begin_phase(self, iteration, actor_id, completed):
+        pass
+
+    def next_launch(self, iteration, actor_id):
+        self.launches += 1
+        return self.seed, f"{actor_id}:{iteration}:{self.launches}"
+
+    def launch_metadata(self, gid):
+        return {}
+
+    def retire(self, gid, reason):
+        pass
+
+    def reconcile(self, completed):
+        pass
+
+
+def compare_targets(reference, candidate, path="games"):
+    """Exact search decisions/counters, tight tolerances for stored float targets."""
+    if isinstance(reference, dict):
+        assert reference.keys() == candidate.keys(), path
+        for key in reference:
+            compare_targets(reference[key], candidate[key], f"{path}.{key}")
+    elif isinstance(reference, (list, tuple)):
+        assert len(reference) == len(candidate), path
+        for i, (a, b) in enumerate(zip(reference, candidate)):
+            compare_targets(a, b, f"{path}[{i}]")
+    elif isinstance(reference, float):
+        assert math.isclose(
+            reference, candidate, rel_tol=1e-06, abs_tol=1e-06
+        ), f"{path}: {reference!r} != {candidate!r}"
+    else:
+        assert reference == candidate, path
+
+
 def test_scratch_collect_update_collect_and_cancellation(tmp_path):
     from dataclasses import replace
     from imba_chess.data.self_play_store import SelfPlayStore
@@ -227,7 +269,6 @@ def test_scratch_collect_update_collect_and_cancellation(tmp_path):
     from imba_chess.self_play.config import SelfPlayConfig
     from imba_chess.self_play.seeds import Seed
     from imba_chess.self_play.trainer import Stage2Trainer
-    from scripts.profile_gumbel_pipeline import compare_targets
     from tests.test_self_play import tiny_model
 
     torch.set_num_threads(4)
@@ -262,14 +303,13 @@ def test_scratch_collect_update_collect_and_cancellation(tmp_path):
         collection=replace(cfg.collection, concurrent_games=3),
         learning=replace(cfg.learning, auxiliary_value_weight=0.0),
     )
-    seeds = [Seed("mate", "source", ["f2f3", "e7e5", "g2g4"], 3, "train", "test")]
+    seed = Seed("mate", "source", ["f2f3", "e7e5", "g2g4"], 3, "train", "test")
     for cycle in range(2):
         games = []
         for variant, runtime in enumerate(runtimes):
             store = SelfPlayStore(tmp_path / f"{cycle}-{variant}", flush_games=1)
             result = []
             collect(
-                seeds=seeds,
                 runtime=runtime,
                 config=cfg,
                 actor_id="scratch",
@@ -277,6 +317,7 @@ def test_scratch_collect_update_collect_and_cancellation(tmp_path):
                 max_positions=128,
                 game_count=4,
                 on_game=result.append,
+                start_sampler=FixedStarts(seed),
             )
             assert all(
                 g["status"] == "completed" and g["moves"] == ["d8h4"] for g in result
@@ -308,7 +349,6 @@ def test_scratch_collect_update_collect_and_cancellation(tmp_path):
 
     interrupted = []
     collect(
-        seeds=seeds,
         runtime=runtimes[1],
         config=cfg,
         actor_id="scratch",
@@ -317,6 +357,7 @@ def test_scratch_collect_update_collect_and_cancellation(tmp_path):
         game_count=4,
         should_stop=stop,
         on_game=interrupted.append,
+        start_sampler=FixedStarts(seed),
     )
     assert any(g["status"] == "unfinished" and not g["targets"] for g in interrupted)
 
@@ -349,22 +390,6 @@ def test_history_refresh_and_padding_shrink_without_owner_change():
         ws.clear()
         with pytest.raises(RuntimeError, match="ownership"):
             ws.prepare([payload(owner, parent)])
-
-
-def test_profile_compares_targets_only_within_identical_collection_sizes():
-    from scripts.profile_gumbel_pipeline import compare_workload_targets
-
-    references = {}
-    warmup = [{"id": "a", "targets": [{"value": 0.5, "visits": [1, 0]}]}]
-    measured = [
-        {"id": "a", "targets": [{"value": 0.50001, "visits": [0, 1]}]},
-        {"id": "b", "targets": []},
-    ]
-    compare_workload_targets(references, 1, warmup)
-    compare_workload_targets(references, 2, measured)
-    compare_workload_targets(references, 2, measured)
-    with pytest.raises(AssertionError):
-        compare_workload_targets(references, 2, warmup + measured[1:])
 
 
 def test_immutable_revision_and_stale_handles(monkeypatch):

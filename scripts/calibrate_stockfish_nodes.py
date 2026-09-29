@@ -329,8 +329,6 @@ def main() -> None:
         expand_top=int(eval_cfg.search_expand_top),
         max_depth=int(eval_cfg.search_max_depth),
         lam=float(eval_cfg.search_lambda),
-        tactical_coverage=eval_cfg.search_tactical_coverage,
-        quiescence_plies=eval_cfg.search_quiescence_plies,
     )
     print("Calibrating Stockfish node budget")
     print(f"  games={args.games}, stockfish_elo={args.stockfish_elo}")

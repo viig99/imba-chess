@@ -370,8 +370,6 @@ def test_config_validation(field, value):
 
 
 def test_enabled_configuration_and_resume_identity(tmp_path):
-    with pytest.raises(ValueError, match="require streaming"):
-        SelfPlayConfig(regret=RegretConfig())
     path = tmp_path / "config.toml"
     path.write_text(
         "[streaming]\n[regret]\ncapacity=256\ntemperature=0.1\nema_alpha=0.5\n"
@@ -508,7 +506,6 @@ def test_incomplete_collection_never_updates_regret(tmp_path, termination):
     before = deepcopy(starts.state["regret"])
     games = []
     collect(
-        seeds=[],
         runtime=runtime,
         config=cfg,
         actor_id="a",
@@ -535,7 +532,6 @@ def test_collector_observes_completion_flush_before_next_launch(tmp_path):
     runtime = ScriptRuntime()
     runtime.executors = {"tick": lambda ps: ps}
     metrics = collect(
-        seeds=[],
         runtime=runtime,
         config=cfg,
         actor_id="a",
@@ -571,7 +567,6 @@ def test_end_to_end_admit_restart_train_refresh_resume_and_unchanged_targets(tmp
     runtime.executors = {"tick": lambda ps: ps}
     next_bucket(starts, 0)
     common = dict(
-        seeds=[],
         runtime=runtime,
         config=cfg,
         actor_id="a",

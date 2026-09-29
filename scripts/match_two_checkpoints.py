@@ -12,9 +12,8 @@ Two variance reductions on top of that:
 1. **Paired openings with colour reversal.** Every opening is played twice --
    once with A as White, once with B as White. Opening imbalance and colour
    advantage cancel within the pair instead of being averaged over.
-2. **Real openings.** Both players run deterministic `value_search_halving`
-   (`gumbel_root_sampling=False`), so from the initial position every game
-   would be the SAME game. Openings are the first `--opening-plies` moves of
+2. **Real openings.** Both players run deterministic `value_search_halving`,
+   so from the initial position every game would be the SAME game. Openings are the first `--opening-plies` moves of
    real Lichess games, which are varied and roughly balanced -- unlike
    uniform-random legal plies, which reach lopsided junk positions.
 
@@ -226,9 +225,6 @@ def main() -> None:
             else eval_cfg.search_max_depth
         ),
         lam=float(eval_cfg.search_lambda),
-        gumbel_root_sampling=False,
-        tactical_coverage=eval_cfg.search_tactical_coverage,
-        quiescence_plies=eval_cfg.search_quiescence_plies,
     )
     if args.model_move_policy == "gumbel":
         halving_config = GumbelConfig(simulations=args.gumbel_simulations)
