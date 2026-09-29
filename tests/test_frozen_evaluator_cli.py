@@ -6,7 +6,7 @@ from pathlib import Path
 
 import pytest
 
-CONFIG = Path("config/self_play_5090.toml")
+CONFIG = Path("config/self_play_streaming.toml")
 
 
 def run(tmp_path, *extra, value_weight):

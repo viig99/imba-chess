@@ -66,7 +66,7 @@ Install project dependencies and native bindings with `uv sync --extra dev`. Dat
 
 Search inference uses CUDA FP32 with TF32 disabled. Gumbel uses the compiled decoder and reusable workspace (maximum depth 32); halving uses the grouped cached decoder with its configured depth. Runtime choices follow the selected algorithm. Ordinary model-component SDPA remains unchanged. Compilation adds first-use latency. Historical measurements remain in the [readiness report](docs/SELF_PLAY_READINESS_REVIEW_2026-09-11.md).
 
-Use [the config guide](docs/CONFIG_GUIDE.md) before changing an existing run. The 5090 recipe is a pilot configuration, not a measured performance promise.
+Use [the config guide](docs/CONFIG_GUIDE.md) before changing an existing run. The 5090 recipe reproduces the vmix run settings (auxiliary-value base config); it is not a measured performance promise.
 
 ## Evaluation and monitoring
 

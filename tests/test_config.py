@@ -135,6 +135,7 @@ def test_eval_vs_stockfish_search_knob_defaults():
     (
         "imba_chess_v4.toml",
         "imba_chess_v4_laptop.toml",
+        "imba_chess_v4_aux3.toml",
         "eval_flatten_sf2400.toml",
     ),
 )

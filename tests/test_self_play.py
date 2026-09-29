@@ -776,7 +776,7 @@ def test_policy_only_default_configs():
     assert LearningConfig().auxiliary_value_lambda == .95
     for path in Path('config').glob('self_play*.toml'):
         assert load_config(path).learning.value_weight == 1
-        assert load_config(path).learning.auxiliary_value_weight == 1
+        assert load_config(path).learning.auxiliary_value_weight > 0
 
 
 def test_joint_value_gradients_and_independent_clipping(tmp_path):
