@@ -24,6 +24,8 @@ from imba_chess.self_play.seeds import file_hash, load_seeds
 from imba_chess.self_play.streaming import StreamingStarts
 from imba_chess.self_play.trainer import Stage2Trainer
 
+# About 5 iterations (~347 completed games each), i.e. 3 hours, on the 5090 tactical recipe.
+DEFAULT_SCREEN_GAMES = 1500
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
@@ -55,7 +57,13 @@ def main():
     parser.add_argument(
         "--screen-seconds",
         type=int,
-        help="Screen at phase boundaries after this interval instead of every N actors",
+        help="Screen at phase boundaries after this interval instead of by completed games",
+    )
+    parser.add_argument(
+        "--screen-games",
+        type=int,
+        help=f"Screen at the first phase boundary after this many completed games "
+             f"(default {DEFAULT_SCREEN_GAMES}, about 3 hours of 5090 tactical Gumbel 512)",
     )
     parser.add_argument(
         "--concurrent-games",
@@ -88,6 +96,12 @@ def main():
         parser.error("--keep-recovery-checkpoints must be positive")
     if args.screen_seconds is not None and args.screen_seconds < 1:
         parser.error("--screen-seconds must be positive")
+    if args.screen_games is not None and args.screen_seconds is not None:
+        parser.error("--screen-games cannot be combined with --screen-seconds")
+    if args.screen_seconds is None and args.screen_games is None:
+        args.screen_games = DEFAULT_SCREEN_GAMES
+    if args.screen_games is not None and args.screen_games < 1:
+        parser.error("--screen-games must be positive")
     if args.until is not None and args.until.tzinfo is None:
         parser.error("--until needs an explicit timezone")
     if args.continuous and args.until is not None:
@@ -233,6 +247,7 @@ def main():
                 checkpoint_seconds=args.checkpoint_seconds,
                 keep_recovery_checkpoints=args.keep_recovery_checkpoints,
                 screen_seconds=args.screen_seconds,
+                screen_games=args.screen_games,
                 defer_confirmation=args.defer_confirmation,
                 observe_only_screen=args.observe_only_screen,
             )
@@ -304,6 +319,10 @@ def main():
                     break
                 trainer.begin_phase(store)
                 start_sampler.finish_phase()
+                # Counted once, persisted with the collect -> train transition.
+                state["games_since_screen"] = (
+                    state.get("games_since_screen", 0) + metrics.counts["completed_games"]
+                )
                 exposure_budget = int(
                     metrics.counts["training_positions"] * cfg.learning.reuse
                 )
@@ -353,13 +372,17 @@ def main():
             if state["phase"] == "evaluate":
                 screen_path = args.output / f"screen-{state['iteration']:06d}.json"
                 screen_deferred = (
-                    args.screen_seconds is not None and time.monotonic() < next_screen
+                    time.monotonic() < next_screen
+                    if args.screen_seconds is not None
+                    else state.get("games_since_screen", 0) < args.screen_games
                 )
                 if screen_deferred and (not screen_path.exists()):
                     log(
                         dict(
                             decision="screen_deferred",
                             screen_seconds=args.screen_seconds,
+                            screen_games=args.screen_games,
+                            games_since_screen=state.get("games_since_screen", 0),
                         )
                     )
                     finish_iteration()
@@ -433,6 +456,7 @@ def main():
                 if action == "promote":
                     state.update(best=state["actor"], best_id=state["actor_id"])
                 next_screen = time.monotonic() + (args.screen_seconds or 0)
+                state["games_since_screen"] = 0
                 finish_iteration()
         print(
             f"Stopped at iteration {state['iteration']}, phase {state['phase']}; "

@@ -73,7 +73,7 @@ Use [the config guide](docs/CONFIG_GUIDE.md) before changing an existing run. Th
 
 The old standalone Gumbel evaluation commands are retired. Select Gumbel explicitly on the common commands. Retired policies and inference optimization/dtype/compile switches are rejected; supervised-training controls remain separate.
 
-Stage-2 screens compare matched held-out prefixes with colors swapped. A completed 500-game confirmation with paired 95% confidence above 50% is required for best-checkpoint promotion. Incomplete evaluations do not establish a score. Keep full-strength fixed-node Stockfish results separate from historical Elo-limited SF2400 results.
+Stage-2 screens compare matched held-out prefixes with colors swapped. A run screens at the first phase boundary after `--screen-games` completed games (default 1,500, about 3 hours on the 5090 tactical recipe; the count persists across resumes), or after `--screen-seconds` of wall time instead. A completed 500-game confirmation with paired 95% confidence above 50% is required for best-checkpoint promotion. Incomplete evaluations do not establish a score. Keep full-strength fixed-node Stockfish results separate from historical Elo-limited SF2400 results.
 
 Track usable completed positions/hour, completion/discard rates, training positions/second, policy CE/entropy/KL, WDL CE/Brier, predicted versus observed draws, gradient norms, replay age/reuse, and paired strength scores. Lower training loss alone does not prove stronger chess.
 

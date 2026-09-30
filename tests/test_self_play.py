@@ -349,8 +349,8 @@ def test_corrupt_outcome_rejected():
 
 
 @pytest.mark.parametrize("failure_stage", ["screen", "confirmation"])
-@pytest.mark.parametrize("timed_screen", [False, True])
-def test_multiple_iterations_and_runner_resume(tmp_path, monkeypatch, failure_stage, timed_screen):
+@pytest.mark.parametrize("screen_mode", ["games", "seconds"])
+def test_multiple_iterations_and_runner_resume(tmp_path, monkeypatch, failure_stage, screen_mode):
     import sys
     import scripts.run_self_play as runner
     from imba_chess.self_play.config import (
@@ -429,10 +429,11 @@ def test_multiple_iterations_and_runner_resume(tmp_path, monkeypatch, failure_st
         "--device",
         "cpu",
     ]
+    every = ["--screen-games", "1"]
     monkeypatch.setattr(
         sys,
         "argv",
-        base + ["--initialize", str(tmp_path / "weights.pt"), "--max-iterations", "2"],
+        base + ["--initialize", str(tmp_path / "weights.pt"), "--max-iterations", "2"] + every,
     )
     runner.main()
     state = json.loads((output / "state.json").read_text())
@@ -440,7 +441,7 @@ def test_multiple_iterations_and_runner_resume(tmp_path, monkeypatch, failure_st
     checkpoint = torch.load(state["checkpoint"], weights_only=False)
     assert checkpoint["exposures"] >= 8
     assert len(list(output.glob("*.pt"))) <= 3
-    monkeypatch.setattr(sys, "argv", base + ["--resume", "--max-iterations", "3"])
+    monkeypatch.setattr(sys, "argv", base + ["--resume", "--max-iterations", "3"] + every)
     runner.main()
     state = json.loads((output / "state.json").read_text())
     assert state["iteration"] == 3 and not state["halted"]
@@ -448,6 +449,12 @@ def test_multiple_iterations_and_runner_resume(tmp_path, monkeypatch, failure_st
     assert sum(replay.index[g][1]["positions"] for g in replay.game_ids(None)) <= 20
 
     # Operational screen cadence changes must preserve optimizer/config resume.
+    per_iteration = [
+        row["completed_games"]
+        for row in map(json.loads, (output / "metrics.jsonl").read_text().splitlines())
+        if "completed_games" in row
+    ]
+    threshold = max(per_iteration) + 1  # never reached in a single iteration
     original_evaluate = runner.evaluate_pair_checkpoints
     calls = []
 
@@ -470,12 +477,22 @@ def test_multiple_iterations_and_runner_resume(tmp_path, monkeypatch, failure_st
             "--keep-recovery-checkpoints",
             "2",
             "--defer-confirmation",
-        ] + (["--screen-seconds", "10800"] if timed_screen else []),
+        ] + (["--screen-seconds", "10800"] if screen_mode == "seconds" else ["--screen-games", str(threshold)]),
     )
     runner.main()
     state = json.loads((output / "state.json").read_text())
     assert state["iteration"] == 6 and not state["halted"]
-    assert calls == ([] if timed_screen else [f"screen-{i:06d}.json" for i in (3, 4, 5)])
+    expected, since = [], 0
+    for row in map(json.loads, (output / "metrics.jsonl").read_text().splitlines()):
+        if "completed_games" in row and 3 <= row["iteration"] < 6:
+            since += row["completed_games"]
+            if since >= threshold:
+                expected.append(f"screen-{row['iteration']:06d}.json")
+                since = 0
+    assert calls == ([] if screen_mode == "seconds" else expected)
+    if screen_mode == "games":
+        assert 0 < len(expected) < 3  # the threshold spans iterations
+        assert state["games_since_screen"] == since
     assert len(list(output.glob("state-*.pt"))) == 2
     for key in ("actor", "best", "checkpoint"):
         assert Path(state[key]).exists()
@@ -488,7 +505,7 @@ def test_multiple_iterations_and_runner_resume(tmp_path, monkeypatch, failure_st
         )
         monkeypatch.setattr(sys, "argv", base + [
             "--resume", "--max-iterations", str(limit), "--observe-only-screen",
-        ])
+        ] + every)
         runner.main()
         state = json.loads((output / "state.json").read_text())
         assert state["iteration"] == limit and not state["halted"]
@@ -505,7 +522,7 @@ def test_multiple_iterations_and_runner_resume(tmp_path, monkeypatch, failure_st
         raise runner.EvaluationProtocolError("game_limit")
 
     monkeypatch.setattr(runner, "evaluate_pair_checkpoints", failed_evaluation)
-    monkeypatch.setattr(sys, "argv", base + ["--resume", "--max-iterations", "9"])
+    monkeypatch.setattr(sys, "argv", base + ["--resume", "--max-iterations", "9"] + every)
     runner.main()
     state = json.loads((output / "state.json").read_text())
     assert state["halted"] and state["halt_reason"] == "evaluation_protocol"
