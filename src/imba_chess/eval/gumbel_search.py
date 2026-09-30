@@ -35,21 +35,18 @@ class GumbelConfig:
     #   replies are visited first (highest prior first), so refutations are found.
     # minimax_weight: edge Q = (1 - w) * mean + w * negamax over the realized
     #   subtree, so one strong refutation counts fully instead of being averaged.
-    # forcing_prior: at opponent-to-move nodes, forcing replies' prior logits are
-    #   raised to the best sibling's, so refutations keep being explored deeper.
     # own_width: at our own interior nodes, only the top-k moves by prior are
     #   selectable (0 = no cap); the root keeps its own candidate set.
     root_forcing: bool = False
     forcing_floor: bool = False
     minimax_weight: float = 0.0
-    forcing_prior: bool = False
     own_width: int = 0
 
     def __post_init__(self):
         if min(self.simulations, self.top_m, self.max_depth) < 1:
             raise ValueError("simulations, top_m and max_depth must be positive")
-        if any(type(x) is not bool for x in (self.root_forcing, self.forcing_floor, self.forcing_prior)):
-            raise ValueError("root_forcing, forcing_floor and forcing_prior must be booleans")
+        if type(self.root_forcing) is not bool or type(self.forcing_floor) is not bool:
+            raise ValueError("root_forcing and forcing_floor must be booleans")
         if type(self.own_width) is not int or self.own_width < 0:
             raise ValueError("own_width must be a nonnegative integer")
         if not math.isfinite(self.minimax_weight) or not 0 <= self.minimax_weight <= 1:
@@ -171,9 +168,6 @@ class _Node:
             raise ValueError("nonfinite or invalid network evaluation")
         self.evaluation = evaluation
         priors = list(evaluation.legal_log_priors)
-        if config is not None and config.forcing_prior and role == "opponent":
-            best = max(priors)
-            priors = [max(p, best) if f else p for p, f in zip(priors, evaluation.legal_forcing)]
         if evaluation.wdl is not None:
             wdl = evaluation.wdl
             if (len(wdl) != 3 or any(not math.isfinite(p) or p < 0 for p in wdl)

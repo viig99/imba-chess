@@ -40,8 +40,8 @@ FENS = [
     "6k1/5ppp/8/8/8/8/5PPP/3R2K1 w - - 0 1",
 ]
 OPTIONS = [dict(), dict(root_forcing=True), dict(forcing_floor=True), dict(minimax_weight=0.5),
-           dict(minimax_weight=1.0), dict(forcing_prior=True), dict(own_width=3),
-           dict(root_forcing=True, forcing_floor=True, minimax_weight=1.0, forcing_prior=True, own_width=3)]
+           dict(minimax_weight=1.0), dict(own_width=3),
+           dict(root_forcing=True, forcing_floor=True, minimax_weight=1.0, own_width=3)]
 
 
 def _search(fen, config):
@@ -71,8 +71,6 @@ def test_config_validation():
         GumbelConfig(minimax_weight=1.5)
     with pytest.raises(ValueError, match="booleans"):
         GumbelConfig(forcing_floor=1)
-    with pytest.raises(ValueError, match="booleans"):
-        GumbelConfig(forcing_prior=1)
     with pytest.raises(ValueError, match="own_width"):
         GumbelConfig(own_width=-1)
     stats = cc.NodeStats(0.0, [0.0, -1.0], [0.6, 0.4])
@@ -127,17 +125,6 @@ def _node(role, config):
     node = gumbel_search._Node(cozy_bridge.board_to_cozy(board), [], None)
     node.initialize(evaluation, config, role)
     return node, evaluation
-
-
-def test_forcing_prior_raises_only_opponent_forcing_replies():
-    config = GumbelConfig(forcing_prior=True)
-    opponent, evaluation = _node("opponent", config)
-    best = max(evaluation.legal_log_priors)
-    assert any(evaluation.legal_forcing)
-    for raw, adjusted, forcing in zip(evaluation.legal_log_priors, opponent.priors, evaluation.legal_forcing):
-        assert adjusted == (max(raw, best) if forcing else raw)
-    for role in ("own", "root"):
-        assert _node(role, config)[0].priors == list(evaluation.legal_log_priors)
 
 
 def test_own_width_restricts_our_interior_nodes():
