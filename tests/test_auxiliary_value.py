@@ -8,7 +8,6 @@ import torch
 
 from imba_chess.data.self_play_store import SelfPlayStore, validate_game
 from imba_chess.eval.gumbel_search import GumbelConfig, select_gumbel
-from imba_chess.eval.composed_runtime import compose_nodes
 from imba_chess.model import HSTUChessModel, create_batch_dense_mask
 from imba_chess.self_play.config import LearningConfig
 from imba_chess.self_play.dataset import reconstruct, collate_self_play, smoothed_search_wdl
@@ -162,15 +161,6 @@ def test_auxiliary_trainer_exact_resume_and_config_rejection(tmp_path):
         trainer(replace(cfg, auxiliary_value_lambda=.8)).resume(tmp_path / "state.pt", store=store, config_id="aux")
     with pytest.raises(ValueError, match="configuration changed"):
         trainer(replace(cfg, auxiliary_value_weight=.25)).resume(tmp_path / "state.pt", store=store, config_id="aux")
-
-
-def test_composition_takes_wdl_from_value_network():
-    from imba_chess.eval.cozy_bridge import board_to_cozy
-    ev = WDLEvaluator(.5).evaluate([(None, board_to_cozy(chess.Board()))])[0]
-    other = ev._replace(value_stm=-.4, wdl=(.6, .2, .2))
-    result = compose_nodes([ev], [other])[0]
-    assert result.wdl == other.wdl
-    assert result.value_stm == other.value_stm
 
 
 def test_multi_horizon_auxiliary_heads(tmp_path):

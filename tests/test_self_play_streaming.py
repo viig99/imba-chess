@@ -229,30 +229,3 @@ def test_real_producer_restart_preserves_next_block(tmp_path, rows):
         )
         assert actual["groups"] == expected
         assert actual["source_rows"] == 12
-
-
-def test_nightly_deadline_and_initialize_resume(tmp_path):
-    from argparse import Namespace
-    from datetime import datetime
-    from zoneinfo import ZoneInfo
-    from scripts.run_streaming_self_play_nightly import command
-
-    args = Namespace(
-        config="config/self_play_streaming.toml",
-        run=tmp_path,
-        seeds="monitor.json",
-        initialize="ckpt34.pt",
-        until=None,
-    )
-    now = datetime(2026, 9, 17, 21, tzinfo=ZoneInfo("America/Toronto"))
-    argv = command(args, now)
-    assert argv[argv.index("--until") + 1] == "2026-09-18T08:00:00-04:00"
-    assert argv[argv.index("--initialize") + 1] == "ckpt34.pt"
-    args.initialize_optimizer = True
-    assert "--initialize-optimizer" in command(args, now)
-    (tmp_path / "state.json").write_text("{}")
-    assert "--resume" in command(args, now)
-    assert "--initialize-optimizer" not in command(args, now)
-    args.until = datetime(2026, 9, 18, 8)
-    with pytest.raises(ValueError, match="timezone"):
-        command(args, now)

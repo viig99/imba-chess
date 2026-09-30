@@ -465,8 +465,6 @@ def test_multiple_iterations_and_runner_resume(tmp_path, monkeypatch, failure_st
             "--resume",
             "--max-iterations",
             "6",
-            "--screen-every",
-            "3",
             "--checkpoint-seconds",
             "3600",
             "--keep-recovery-checkpoints",
@@ -477,7 +475,7 @@ def test_multiple_iterations_and_runner_resume(tmp_path, monkeypatch, failure_st
     runner.main()
     state = json.loads((output / "state.json").read_text())
     assert state["iteration"] == 6 and not state["halted"]
-    assert calls == ([] if timed_screen else ["screen-000005.json"])
+    assert calls == ([] if timed_screen else [f"screen-{i:06d}.json" for i in (3, 4, 5)])
     assert len(list(output.glob("state-*.pt"))) == 2
     for key in ("actor", "best", "checkpoint"):
         assert Path(state[key]).exists()

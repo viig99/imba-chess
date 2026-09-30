@@ -12,7 +12,6 @@ Chess sequence modeling, Gumbel self-play learning, and model evaluation against
 | Prepare the held-out monitor-opening manifest | `scripts/materialize_corpus.py`, `scripts/prepare_self_play_seeds.py` |
 | Train from stage-2 replay | `scripts/train_self_play.py` |
 | Alternate streamed collection, training and paired evaluation | `scripts/run_self_play.py` |
-| Start or resume a streamed run until 08:00 | `scripts/run_streaming_self_play_nightly.py` |
 | Gumbel model pairs or Gumbel versus Stockfish | `scripts/eval_self_play.py` |
 | Live TensorBoard metrics | `scripts/monitor_self_play.py` |
 
@@ -50,23 +49,23 @@ Install project dependencies and native bindings with `uv sync --extra dev`. Dat
 # Stage 1: use the config matching the intended architecture.
 .venv/bin/python scripts/train.py --config config/imba_chess_v4.toml
 
-# New laptop stage-2 run (requires a prepared monitor seed manifest).
+# New stage-2 run (requires a prepared monitor seed manifest).
 .venv/bin/python scripts/run_self_play.py \
-  --config config/self_play_streaming.toml \
+  --config config/self_play_5090.toml \
   --initialize artifacts/flatten-board-ckpt34/initial.pt \
   --seeds artifacts/corpus/v4_self_play_seeds_4096.json \
   --output artifacts/self_play/new-run --device cuda
 
 # Resume the same run/config with its optimizer and replay state.
 .venv/bin/python scripts/run_self_play.py \
-  --config config/self_play_streaming.toml \
+  --config config/self_play_5090.toml \
   --resume --seeds artifacts/corpus/v4_self_play_seeds_4096.json \
   --output artifacts/self_play/new-run --device cuda
 ```
 
 Search inference uses CUDA FP32 with TF32 disabled. Gumbel uses the compiled decoder and reusable workspace (maximum depth 32); halving uses the grouped cached decoder with its configured depth. Runtime choices follow the selected algorithm. Ordinary model-component SDPA remains unchanged. Compilation adds first-use latency. Historical measurements remain in the [readiness report](docs/SELF_PLAY_READINESS_REVIEW_2026-09-11.md).
 
-Use [the config guide](docs/CONFIG_GUIDE.md) before changing an existing run. The 5090 recipe reproduces the vmix run settings (auxiliary-value base config); it is not a measured performance promise.
+Use [the config guide](docs/CONFIG_GUIDE.md) before changing an existing run. The 5090 recipe reproduces the running tactical fork of the vmix run (auxiliary-value base config); it is not a measured performance promise.
 
 ## Evaluation and monitoring
 
