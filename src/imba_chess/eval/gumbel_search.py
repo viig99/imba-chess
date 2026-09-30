@@ -330,40 +330,5 @@ def gumbel_stepwise(
     )
 
 
-FINAL_MOVE_RULES = ("gumbel", "most_visited", "lcb")
-
-
-def final_move_index(
-    visits, qvalues, rule, *, lcb_z=1.96, lcb_min_visit_prop=0.15
-):
-    """Evaluation-only override of the played root move; None keeps Gumbel's choice.
-
-    Search, visits and policy targets are untouched. `most_visited` breaks visit
-    ties by root-perspective mean Q. `lcb` (KataGo-style) considers children with at
-    least `lcb_min_visit_prop` of the maximum visits and maximizes
-    q - z * sd / sqrt(n); the native stats keep no second moment, so sd is the
-    Bhatia-Davis bound sqrt(1 - q^2) for values in [-1, 1].
-    """
-    if rule not in FINAL_MOVE_RULES:
-        raise ValueError(f"unknown final move rule {rule!r}")
-    if len(visits) != len(qvalues) or not any(visits):
-        raise ValueError("final move rule needs matching, visited root statistics")
-    if rule == "gumbel":
-        return None
-    visited = [i for i, n in enumerate(visits) if n]
-    if rule == "most_visited":
-        return max(visited, key=lambda i: (visits[i], qvalues[i]))
-    if lcb_z < 0 or not 0 <= lcb_min_visit_prop <= 1:
-        raise ValueError("invalid LCB parameters")
-    floor = lcb_min_visit_prop * max(visits)
-    eligible = [i for i in visited if visits[i] >= floor]
-
-    def bound(i):
-        q = qvalues[i]
-        return q - lcb_z * math.sqrt(max(1.0 - q * q, 0.0) / visits[i])
-
-    return max(eligible, key=lambda i: (bound(i), visits[i]))
-
-
 def select_gumbel(*, evaluator, **kwargs):
     return _drive(gumbel_stepwise(extend=evaluator.extend, **kwargs), evaluator)
