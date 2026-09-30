@@ -40,6 +40,13 @@ def main():
     parser.add_argument("--seeds", type=Path, required=True)
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--device", default="cuda")
+    parser.add_argument(
+        "--cpu-threads",
+        type=int,
+        default=1,
+        help="torch intra-op CPU threads; overrides OMP_NUM_THREADS. Search CPU tensors are "
+             "tiny, and idle OpenMP workers spin on every core and slow the single search thread",
+    )
     parser.add_argument("--continuous", action="store_true", help="Run until interrupted; no time or default iteration cutoff")
     parser.add_argument("--max-iterations", type=int, default=100000)
     parser.add_argument(
@@ -90,6 +97,8 @@ def main():
         parser.error("--initialize-optimizer requires --initialize")
     if args.concurrent_games is not None and args.concurrent_games < 1:
         parser.error("--concurrent-games must be positive")
+    if args.cpu_threads < 1:
+        parser.error("--cpu-threads must be positive")
     if args.checkpoint_seconds < 1:
         parser.error("--checkpoint-seconds must be positive")
     if args.keep_recovery_checkpoints < 1:
@@ -106,6 +115,7 @@ def main():
         parser.error("--until needs an explicit timezone")
     if args.continuous and args.until is not None:
         parser.error("--continuous cannot be combined with --until")
+    torch.set_num_threads(args.cpu_threads)
     cfg = load_config(args.config)
     monitor = load_seeds(args.seeds, split="monitor")
     if len(monitor) < max(cfg.run.screen_pairs, cfg.run.confirmation_pairs):
@@ -242,6 +252,7 @@ def main():
                 concurrent_games=args.concurrent_games
                 or cfg.collection.concurrent_games,
                 inference_options=getattr(runtime, "options", {}),
+                cpu_threads=torch.get_num_threads(),
                 until=args.until.isoformat() if args.until else None,
                 continuous=args.continuous,
                 checkpoint_seconds=args.checkpoint_seconds,
