@@ -1,5 +1,7 @@
-# 5090 stage-2 recipe from the vmix run (flatten-53250-accum4-aux3-vmix): 200 simulations,
+# 5090 stage-2 recipe of the running tactical fork (flatten-53250-vmix-tactical-s512-mm05):
+# tactical Gumbel 512 (root forcing moves, opponent forcing floor, half-negamax edge Q),
 # accumulated updates, mixed search/outcome value labels, 3-horizon auxiliary value and regret restarts.
+# On gpu_remote it runs with --concurrent-games 256 and 12 CPU threads (see the run's remote.json).
 base_config = "config/imba_chess_v4_aux3.toml"
 # Regret restarts from supervised flattened update 53,250, stabilized learner.
 # Changes vs regret-t02: replay 50k->1M, reuse 2->1, 4-microbatch accumulation, lr 1e-4->2e-4, clip 1->2,
@@ -7,12 +9,15 @@ base_config = "config/imba_chess_v4_aux3.toml"
 # 0.75 x game result + 0.25 x this ply search WDL (Lc0-style q_ratio), value weight 1.
 
 [search]
-simulations = 200
+simulations = 512
 top_m = 16
 max_depth = 32
 maxvisit_init = 50.0
 value_scale = 0.1
 epsilon = 1e-8
+root_forcing = true
+forcing_floor = true
+minimax_weight = 0.5
 
 [collection]
 concurrent_games = 32
