@@ -56,6 +56,7 @@ fn completed(
     maxvisit_init: f64,
     value_scale: f64,
     epsilon: f64,
+    visit_cap: u64,
 ) -> PyResult<Vec<f64>> {
     if visits.is_empty()
         || visits.len() != qvalues.len()
@@ -101,7 +102,11 @@ fn completed(
         .collect();
     let low = values.iter().copied().fold(f64::INFINITY, f64::min);
     let high = values.iter().copied().fold(f64::NEG_INFINITY, f64::max);
-    let scale = (maxvisit_init + *visits.iter().max().unwrap() as f64) * value_scale;
+    // visit_cap > 0 bounds the visit term so larger budgets deepen search without
+    // growing the value bonus beyond its value at that visit count.
+    let top = *visits.iter().max().unwrap();
+    let top = if visit_cap > 0 { top.min(visit_cap) } else { top };
+    let scale = (maxvisit_init + top as f64) * value_scale;
     let denominator = (high - low).max(epsilon);
     for q in &mut values {
         *q = scale * (*q - low) / denominator;
@@ -127,6 +132,7 @@ fn gumbel_interior_action(
     value_scale: f64,
     epsilon: f64,
     candidates: &[bool],
+    visit_cap: u64,
 ) -> PyResult<usize> {
     validate_priors(&priors, visits.len())?;
     let q = completed(
@@ -137,6 +143,7 @@ fn gumbel_interior_action(
         maxvisit_init,
         value_scale,
         epsilon,
+        visit_cap,
     )?;
     let logits: Vec<f64> = priors.iter().zip(q).map(|(p, q)| p + q).collect();
     let maximum = logits.iter().copied().fold(f64::NEG_INFINITY, f64::max);
@@ -173,6 +180,7 @@ fn gumbel_root_action(
     eligible_visit: u64,
     max_prior: f64,
     candidates: &[bool],
+    visit_cap: u64,
 ) -> PyResult<usize> {
     validate_priors(&priors, visits.len())?;
     if noise.len() != visits.len() || noise.iter().any(|x| !x.is_finite()) || !max_prior.is_finite()
@@ -187,6 +195,7 @@ fn gumbel_root_action(
         maxvisit_init,
         value_scale,
         epsilon,
+        visit_cap,
     )?;
     let mut action = None;
     let mut best = f64::NEG_INFINITY;
@@ -312,13 +321,14 @@ impl NodeStats {
         Ok(())
     }
 
-    #[pyo3(signature = (maxvisit_init, value_scale, epsilon, forcing_floor=false))]
+    #[pyo3(signature = (maxvisit_init, value_scale, epsilon, forcing_floor=false, visit_cap=0))]
     fn interior(
         &self,
         maxvisit_init: f64,
         value_scale: f64,
         epsilon: f64,
         forcing_floor: bool,
+        visit_cap: u64,
     ) -> PyResult<usize> {
         if forcing_floor {
             if self.forcing.len() != self.priors.len() {
@@ -349,15 +359,18 @@ impl NodeStats {
             value_scale,
             epsilon,
             &self.candidates,
+            visit_cap,
         )
     }
 
+    #[pyo3(signature = (visit, maxvisit_init, value_scale, epsilon, visit_cap=0))]
     fn root(
         &self,
         visit: u64,
         maxvisit_init: f64,
         value_scale: f64,
         epsilon: f64,
+        visit_cap: u64,
     ) -> PyResult<usize> {
         let q = self.qvalues();
         gumbel_root_action(
@@ -373,6 +386,7 @@ impl NodeStats {
             visit,
             self.max_prior,
             &self.candidates,
+            visit_cap,
         )
     }
 
@@ -419,6 +433,8 @@ fn gumbel_backup(
 
 // Exposed for direct numerical parity tests; selectors never round-trip Q arrays.
 #[pyfunction]
+#[pyo3(signature = (value, visits, qvalues, prior_probs, maxvisit_init, value_scale, epsilon, visit_cap=0))]
+#[allow(clippy::too_many_arguments)]
 fn _gumbel_completed_q(
     value: f64,
     visits: Vec<u64>,
@@ -427,6 +443,7 @@ fn _gumbel_completed_q(
     maxvisit_init: f64,
     value_scale: f64,
     epsilon: f64,
+    visit_cap: u64,
 ) -> PyResult<Vec<f64>> {
     completed(
         value,
@@ -436,6 +453,7 @@ fn _gumbel_completed_q(
         maxvisit_init,
         value_scale,
         epsilon,
+        visit_cap,
     )
 }
 

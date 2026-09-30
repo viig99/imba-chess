@@ -146,6 +146,10 @@ def _parse_args() -> argparse.Namespace:
                         help="Blend weight of negamax into Gumbel edge Q (0 = mean backup).")
     parser.add_argument("--gumbel-own-width", type=int, default=0,
                         help="Cap our own interior nodes to the top-k moves by prior (0 = no cap).")
+    parser.add_argument("--gumbel-own-forcing-floor", action="store_true",
+                        help="Visit unvisited forcing moves first at our own interior nodes.")
+    parser.add_argument("--gumbel-visit-cap", type=int, default=0,
+                        help="Cap the visit term of Gumbel's value scale (0 = uncapped).")
     parser.add_argument("--search-budget", type=int, default=None)
     parser.add_argument("--search-top-m", type=int, default=None)
     parser.add_argument("--halving-rounds", type=int, default=None)
@@ -1090,7 +1094,7 @@ def main() -> None:
         raise ValueError("--gumbel-simulations applies only to gumbel")
     if args.model_move_policy != "gumbel" and (
         args.gumbel_root_forcing or args.gumbel_forcing_floor or args.gumbel_minimax_weight
-        or args.gumbel_own_width
+        or args.gumbel_own_width or args.gumbel_own_forcing_floor or args.gumbel_visit_cap
     ):
         raise ValueError("--gumbel-root-forcing/--gumbel-forcing-floor/--gumbel-minimax-weight apply only to gumbel")
     if args.model_move_policy != "gumbel" and args.gumbel_value_scale is not None:
@@ -1249,6 +1253,8 @@ def main() -> None:
                 forcing_floor=bool(args.gumbel_forcing_floor),
                 minimax_weight=float(args.gumbel_minimax_weight),
                 own_width=int(args.gumbel_own_width),
+                own_forcing_floor=bool(args.gumbel_own_forcing_floor),
+                visit_cap=int(args.gumbel_visit_cap),
             )
         segment_summary = _run_segment(
             stockfish_path=args.stockfish_path,
@@ -1304,6 +1310,8 @@ def main() -> None:
                 "gumbel_forcing_floor": bool(args.gumbel_forcing_floor),
                 "gumbel_minimax_weight": float(args.gumbel_minimax_weight),
                 "gumbel_own_width": int(args.gumbel_own_width),
+                "gumbel_own_forcing_floor": bool(args.gumbel_own_forcing_floor),
+                "gumbel_visit_cap": int(args.gumbel_visit_cap),
             },
         )
         _print_segment_summary(segment_name=spec.name, payload=segment_payload)
@@ -1353,6 +1361,8 @@ def main() -> None:
                 "gumbel_forcing_floor": bool(args.gumbel_forcing_floor),
                 "gumbel_minimax_weight": float(args.gumbel_minimax_weight),
                 "gumbel_own_width": int(args.gumbel_own_width),
+                "gumbel_own_forcing_floor": bool(args.gumbel_own_forcing_floor),
+                "gumbel_visit_cap": int(args.gumbel_visit_cap),
         },
     )
     _print_segment_summary(segment_name="aggregate", payload=aggregate_payload)

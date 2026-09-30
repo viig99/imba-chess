@@ -8,6 +8,8 @@ import imba_chess_native as cc
 import pytest
 
 from imba_chess.eval import cozy_bridge
+from dataclasses import replace
+
 from imba_chess.eval import gumbel_search
 from imba_chess.eval.gumbel_search import GumbelConfig, select_gumbel
 from tests.test_gumbel_search import FakeEvaluator
@@ -40,8 +42,9 @@ FENS = [
     "6k1/5ppp/8/8/8/8/5PPP/3R2K1 w - - 0 1",
 ]
 OPTIONS = [dict(), dict(root_forcing=True), dict(forcing_floor=True), dict(minimax_weight=0.5),
-           dict(minimax_weight=1.0), dict(own_width=3),
-           dict(root_forcing=True, forcing_floor=True, minimax_weight=1.0, own_width=3)]
+           dict(minimax_weight=1.0), dict(own_width=3), dict(own_forcing_floor=True), dict(visit_cap=16),
+           dict(root_forcing=True, forcing_floor=True, minimax_weight=1.0, own_width=3,
+                own_forcing_floor=True, visit_cap=16)]
 
 
 def _search(fen, config):
@@ -73,6 +76,10 @@ def test_config_validation():
         GumbelConfig(forcing_floor=1)
     with pytest.raises(ValueError, match="own_width"):
         GumbelConfig(own_width=-1)
+    with pytest.raises(ValueError, match="booleans"):
+        GumbelConfig(own_forcing_floor=1)
+    with pytest.raises(ValueError, match="visit_cap"):
+        GumbelConfig(visit_cap=-1)
     stats = cc.NodeStats(0.0, [0.0, -1.0], [0.6, 0.4])
     with pytest.raises(ValueError, match="forcing floor requires set_forcing"):
         stats.interior(50.0, 0.1, 1e-8, True)
@@ -143,3 +150,32 @@ def test_own_width_restricts_our_interior_nodes():
     assert spread(own) <= top3
     assert len(spread(_node("opponent", GumbelConfig(own_width=3))[0])) > 3  # opponent uncapped
     assert len(spread(_node("own", GumbelConfig())[0])) > 3  # no cap by default
+
+
+def test_visit_cap_bounds_value_scale_natively_and_in_targets():
+    from imba_chess.eval.gumbel_search import completed_q
+    visits, q, probs = [300, 40, 0], [0.4, -0.1, 0.0], [0.5, 0.3, 0.2]
+    for cap in (0, 64, 500):
+        config = GumbelConfig(visit_cap=cap)
+        native = cc._gumbel_completed_q(0.1, visits, q, probs, 50.0, 0.1, 1e-8, cap)
+        python = completed_q(0.1, [0.0, 0.0, 0.0], visits, q, config, probs)
+        assert native == pytest.approx(python, abs=1e-12)
+        top = min(300, cap) if cap else 300
+        assert max(native) == pytest.approx((50.0 + top) * 0.1)
+    assert cc._gumbel_completed_q(0.1, visits, q, probs, 50.0, 0.1, 1e-8) == \
+        cc._gumbel_completed_q(0.1, visits, q, probs, 50.0, 0.1, 1e-8, 0)
+
+
+def test_cap_above_reached_visits_leaves_search_unchanged():
+    for fen in FENS:
+        plain = _search(fen, GumbelConfig(simulations=64, top_m=8, max_depth=8))
+        capped = _search(fen, GumbelConfig(simulations=64, top_m=8, max_depth=8, visit_cap=10_000))
+        assert plain == replace(capped)
+
+
+def test_own_forcing_floor_applies_only_to_our_nodes():
+    own, evaluation = _node("own", GumbelConfig(own_forcing_floor=True))
+    forcing = [i for i, f in enumerate(evaluation.legal_forcing) if f]
+    assert forcing
+    first = own.stats.interior(50.0, 0.1, 1e-8, True)
+    assert first in forcing and own.priors[first] == max(own.priors[i] for i in forcing)

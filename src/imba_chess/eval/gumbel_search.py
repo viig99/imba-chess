@@ -35,18 +35,27 @@ class GumbelConfig:
     #   replies are visited first (highest prior first), so refutations are found.
     # minimax_weight: edge Q = (1 - w) * mean + w * negamax over the realized
     #   subtree, so one strong refutation counts fully instead of being averaged.
+    # own_forcing_floor: the same one-visit floor for our own forcing moves at our
+    #   interior nodes (the root already has root_forcing).
+    # visit_cap: caps the visit term of the completed-Q scale, (maxvisit_init +
+    #   min(max visits, cap)) * value_scale, so budgets above the cap search deeper
+    #   without trusting Q more (0 = uncapped).
     # own_width: at our own interior nodes, only the top-k moves by prior are
     #   selectable (0 = no cap); the root keeps its own candidate set.
     root_forcing: bool = False
     forcing_floor: bool = False
     minimax_weight: float = 0.0
     own_width: int = 0
+    own_forcing_floor: bool = False
+    visit_cap: int = 0
 
     def __post_init__(self):
         if min(self.simulations, self.top_m, self.max_depth) < 1:
             raise ValueError("simulations, top_m and max_depth must be positive")
-        if type(self.root_forcing) is not bool or type(self.forcing_floor) is not bool:
-            raise ValueError("root_forcing and forcing_floor must be booleans")
+        if any(type(x) is not bool for x in (self.root_forcing, self.forcing_floor, self.own_forcing_floor)):
+            raise ValueError("root_forcing, forcing_floor and own_forcing_floor must be booleans")
+        if type(self.visit_cap) is not int or self.visit_cap < 0:
+            raise ValueError("visit_cap must be a nonnegative integer")
         if type(self.own_width) is not int or self.own_width < 0:
             raise ValueError("own_width must be a nonnegative integer")
         if not math.isfinite(self.minimax_weight) or not 0 <= self.minimax_weight <= 1:
@@ -88,6 +97,7 @@ def softmax(logits):
 
 
 def completed_q(value, priors, visits, qvalues, config: GumbelConfig, prior_probs=None):
+    """Python mirror of the native completed-Q transform (used for policy targets)."""
     probs = (
         [max(x, 1.1754943508222875e-38) for x in softmax(priors)]
         if prior_probs is None
@@ -105,7 +115,10 @@ def completed_q(value, priors, visits, qvalues, config: GumbelConfig, prior_prob
     mixed = (value + count * weighted) / (count + 1)
     values = [q if n else mixed for q, n in zip(qvalues, visits)]
     low, high = (min(values), max(values))
-    scale = (config.maxvisit_init + max(visits)) * config.value_scale
+    top = max(visits)
+    if config.visit_cap:
+        top = min(top, config.visit_cap)
+    scale = (config.maxvisit_init + top) * config.value_scale
     denominator = max(high - low, config.epsilon)
     return [scale * (q - low) / denominator for q in values]
 
@@ -183,7 +196,7 @@ class _Node:
             self.stats = cc.NodeStats(self.value, priors, self.prior_probs)
         else:
             self.stats = cc.NodeStats(self.value, priors, self.prior_probs, config.minimax_weight)
-        if config is not None and config.forcing_floor:
+        if config is not None and (config.forcing_floor or config.own_forcing_floor):
             self.stats.set_forcing(list(evaluation.legal_forcing))
         if config is not None and config.own_width and role == "own" and n > config.own_width:
             keep = set(sorted(range(n), key=lambda i: (-priors[i], i))[: config.own_width])
@@ -245,7 +258,7 @@ def gumbel_stepwise(
 
     def root_action(visit):
         return root.stats.root(
-            visit, config.maxvisit_init, config.value_scale, config.epsilon
+            visit, config.maxvisit_init, config.value_scale, config.epsilon, config.visit_cap
         )
 
     for visit in considered_visits(considered, config.simulations):
@@ -285,14 +298,10 @@ def gumbel_stepwise(
                 cutoffs += 1
                 leaf = node
                 break
-            if config.forcing_floor and depth % 2 == 1:  # opponent to move
-                action = node.stats.interior(
-                    config.maxvisit_init, config.value_scale, config.epsilon, True
-                )
-            else:
-                action = node.stats.interior(
-                    config.maxvisit_init, config.value_scale, config.epsilon
-                )
+            floor = config.forcing_floor if depth % 2 == 1 else config.own_forcing_floor
+            action = node.stats.interior(
+                config.maxvisit_init, config.value_scale, config.epsilon, floor, config.visit_cap
+            )
             continue
         cc.gumbel_backup([(n.stats, a) for n, a in path], leaf.value)
         if leaf.evaluation is None:
