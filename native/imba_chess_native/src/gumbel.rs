@@ -168,6 +168,7 @@ fn gumbel_root_action(
     noise: &[f64],
     eligible_visit: u64,
     max_prior: f64,
+    candidates: &[bool],
 ) -> PyResult<usize> {
     validate_priors(&priors, visits.len())?;
     if noise.len() != visits.len() || noise.iter().any(|x| !x.is_finite()) || !max_prior.is_finite()
@@ -186,7 +187,7 @@ fn gumbel_root_action(
     let mut action = None;
     let mut best = f64::NEG_INFINITY;
     for i in 0..visits.len() {
-        if visits[i] == eligible_visit {
+        if visits[i] == eligible_visit && (candidates.is_empty() || candidates[i]) {
             let score = (-1e9f64).max(noise[i] + priors[i] - max_prior + q[i]);
             if score > best {
                 best = score;
@@ -207,12 +208,51 @@ struct NodeStats {
     means: Vec<f64>,
     noise: Vec<f64>,
     max_prior: f64,
+    // Halving-style options (all inert by default; see GumbelConfig).
+    minimax_weight: f64,
+    edge_minimax: Vec<f64>,
+    forcing: Vec<bool>,
+    candidates: Vec<bool>,
+}
+
+impl NodeStats {
+    /// Edge Q used for selection and reported to Python: the running mean, or
+    /// (1 - w) * mean + w * negamax for visited edges when minimax_weight > 0.
+    fn qvalues(&self) -> Vec<f64> {
+        let w = self.minimax_weight;
+        if w == 0.0 {
+            return self.means.clone();
+        }
+        self.means
+            .iter()
+            .zip(&self.edge_minimax)
+            .zip(&self.visits)
+            .map(|((m, mm), n)| if *n != 0 { (1.0 - w) * m + w * mm } else { *m })
+            .collect()
+    }
+
+    /// Side-to-move value of this node: best visited edge Q, else its own value.
+    fn side_to_move_value(&self) -> f64 {
+        let q = self.qvalues();
+        let mut best = f64::NEG_INFINITY;
+        for (value, n) in q.iter().zip(&self.visits) {
+            if *n != 0 && *value > best {
+                best = *value;
+            }
+        }
+        if best == f64::NEG_INFINITY {
+            self.value
+        } else {
+            best
+        }
+    }
 }
 
 #[pymethods]
 impl NodeStats {
     #[new]
-    fn new(value: f64, priors: Vec<f64>, probs: Vec<f64>) -> PyResult<Self> {
+    #[pyo3(signature = (value, priors, probs, minimax_weight=0.0))]
+    fn new(value: f64, priors: Vec<f64>, probs: Vec<f64>, minimax_weight: f64) -> PyResult<Self> {
         let n = priors.len();
         if n == 0
             || probs.len() != n
@@ -221,6 +261,9 @@ impl NodeStats {
             || probs.iter().any(|x| !x.is_finite() || *x < 0.0)
         {
             return Err(PyValueError::new_err("invalid node statistics"));
+        }
+        if !minimax_weight.is_finite() || !(0.0..=1.0).contains(&minimax_weight) {
+            return Err(PyValueError::new_err("minimax_weight must be in [0, 1]"));
         }
         let max_prior = priors.iter().copied().fold(f64::NEG_INFINITY, f64::max);
         Ok(Self {
@@ -232,7 +275,29 @@ impl NodeStats {
             means: vec![0.0; n],
             noise: Vec::new(),
             max_prior,
+            minimax_weight,
+            edge_minimax: vec![0.0; n],
+            forcing: Vec::new(),
+            candidates: Vec::new(),
         })
+    }
+
+    /// Forcing flags (capture, check, promotion) per legal move, for the floor.
+    fn set_forcing(&mut self, forcing: Vec<bool>) -> PyResult<()> {
+        if forcing.len() != self.priors.len() {
+            return Err(PyValueError::new_err("invalid forcing mask"));
+        }
+        self.forcing = forcing;
+        Ok(())
+    }
+
+    /// Root candidate mask for sequential halving; empty means every action.
+    fn set_candidates(&mut self, candidates: Vec<bool>) -> PyResult<()> {
+        if candidates.len() != self.priors.len() || !candidates.iter().any(|c| *c) {
+            return Err(PyValueError::new_err("invalid root candidate mask"));
+        }
+        self.candidates = candidates;
+        Ok(())
     }
 
     fn set_noise(&mut self, noise: Vec<f64>) -> PyResult<()> {
@@ -243,12 +308,38 @@ impl NodeStats {
         Ok(())
     }
 
-    fn interior(&self, maxvisit_init: f64, value_scale: f64, epsilon: f64) -> PyResult<usize> {
+    #[pyo3(signature = (maxvisit_init, value_scale, epsilon, forcing_floor=false))]
+    fn interior(
+        &self,
+        maxvisit_init: f64,
+        value_scale: f64,
+        epsilon: f64,
+        forcing_floor: bool,
+    ) -> PyResult<usize> {
+        if forcing_floor {
+            if self.forcing.len() != self.priors.len() {
+                return Err(PyValueError::new_err("forcing floor requires set_forcing"));
+            }
+            // Unvisited forcing replies first: highest prior, first index on ties.
+            let mut pick: Option<usize> = None;
+            for i in 0..self.priors.len() {
+                if self.forcing[i]
+                    && self.visits[i] == 0
+                    && pick.map_or(true, |j| self.priors[i] > self.priors[j])
+                {
+                    pick = Some(i);
+                }
+            }
+            if let Some(i) = pick {
+                return Ok(i);
+            }
+        }
+        let q = self.qvalues();
         gumbel_interior_action(
             self.value,
             &self.priors,
             &self.visits,
-            &self.means,
+            &q,
             &self.probs,
             maxvisit_init,
             value_scale,
@@ -263,11 +354,12 @@ impl NodeStats {
         value_scale: f64,
         epsilon: f64,
     ) -> PyResult<usize> {
+        let q = self.qvalues();
         gumbel_root_action(
             self.value,
             &self.priors,
             &self.visits,
-            &self.means,
+            &q,
             &self.probs,
             maxvisit_init,
             value_scale,
@@ -275,11 +367,12 @@ impl NodeStats {
             &self.noise,
             visit,
             self.max_prior,
+            &self.candidates,
         )
     }
 
     fn snapshot(&self) -> (Vec<u64>, Vec<f64>, Vec<f64>) {
-        (self.visits.clone(), self.sums.clone(), self.means.clone())
+        (self.visits.clone(), self.sums.clone(), self.qvalues())
     }
 }
 
@@ -304,12 +397,17 @@ fn gumbel_backup(
             return Err(PyValueError::new_err("invalid backup edge or overflow"));
         }
     }
+    // child_value: side-to-move value of the node below the current edge,
+    // starting from the leaf's own value; feeds the edge negamax values.
+    let mut child_value = value;
     for (node, edge) in path.iter().rev() {
         value = -value;
         let mut node = node.try_borrow_mut(py)?;
         node.visits[*edge] += 1;
         node.sums[*edge] += value;
         node.means[*edge] = node.sums[*edge] / node.visits[*edge] as f64;
+        node.edge_minimax[*edge] = -child_value;
+        child_value = node.side_to_move_value();
     }
     Ok(())
 }
