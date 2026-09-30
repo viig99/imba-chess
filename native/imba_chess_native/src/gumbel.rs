@@ -114,6 +114,43 @@ fn completed(
     Ok(values)
 }
 
+// CPython 3.12+ builtin sum() over floats (Neumaier compensation), for the
+// WDL normalization check to agree with the Python reference at its boundary.
+fn python_sum(values: &[f64]) -> f64 {
+    let (mut total, mut c) = (0.0f64, 0.0f64);
+    for &x in values {
+        let t = total + x;
+        if total.abs() >= x.abs() {
+            c += (total - t) + x;
+        } else {
+            c += (x - t) + total;
+        }
+        total = t;
+    }
+    if c != 0.0 && c.is_finite() {
+        total += c;
+    }
+    total
+}
+
+// gumbel_search.softmax clamped at FLT_MIN: max, exp(x - max), math.fsum, divide.
+fn clamped_softmax(logits: &[f64]) -> Vec<f64> {
+    let maximum = logits.iter().copied().fold(f64::NEG_INFINITY, f64::max);
+    let weights: Vec<f64> = logits.iter().map(|x| (x - maximum).exp()).collect();
+    let total = fsum(weights.iter().copied());
+    weights
+        .iter()
+        .map(|w| {
+            let p = w / total;
+            if f32::MIN_POSITIVE as f64 > p {
+                f32::MIN_POSITIVE as f64
+            } else {
+                p
+            }
+        })
+        .collect()
+}
+
 fn validate_priors(priors: &[f64], n: usize) -> PyResult<()> {
     if priors.len() != n || priors.iter().any(|p| !p.is_finite()) {
         return Err(PyValueError::new_err("invalid prior logits"));
@@ -293,6 +330,38 @@ impl NodeStats {
             forcing: Vec::new(),
             candidates: Vec::new(),
         })
+    }
+
+    /// A search node from one network evaluation: the validation and clamped
+    /// prior softmax of the Python _Node.initialize, bit-for-bit, in one call.
+    #[staticmethod]
+    #[pyo3(signature = (value, priors, wdl=None, minimax_weight=0.0))]
+    fn from_evaluation(
+        value: f64,
+        priors: Vec<f64>,
+        wdl: Option<Vec<f64>>,
+        minimax_weight: f64,
+    ) -> PyResult<Self> {
+        if !value.is_finite() || value.abs() > 1.000001 || priors.iter().any(|x| !x.is_finite()) {
+            return Err(PyValueError::new_err("nonfinite or invalid network evaluation"));
+        }
+        if let Some(wdl) = &wdl {
+            if wdl.len() != 3
+                || wdl.iter().any(|p| !p.is_finite() || *p < 0.0)
+                || (python_sum(wdl) - 1.0).abs() > 1e-5
+                || (wdl[2] - wdl[0] - value).abs() > 1e-5
+            {
+                return Err(PyValueError::new_err("invalid or inconsistent evaluation WDL"));
+            }
+        }
+        let probs = clamped_softmax(&priors);
+        Self::new(value, priors, probs, minimax_weight)
+    }
+
+    /// Clamped prior probabilities, as completed-Q expects them.
+    #[getter]
+    fn probs(&self) -> Vec<f64> {
+        self.probs.clone()
     }
 
     /// Forcing flags (capture, check, promotion) per legal move, for the floor.

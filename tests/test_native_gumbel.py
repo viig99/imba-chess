@@ -79,3 +79,59 @@ def test_native_rejects_malformed_inputs_and_ineligible_root():
         node.root(1, 50.0, 0.1, 1e-8)
     with pytest.raises(ValueError):
         cc.NodeStats(math.nan, [0.0], [1.0])
+
+
+def test_native_node_priors_match_python_softmax_exactly():
+    rng = random.Random(1311)
+    for case in range(3000):
+        n = rng.choice([1, 2, 3, 20, 67, 218])
+        scale = rng.choice([0.01, 2.0, 30.0, 800.0])
+        logits = [rng.gauss(0, scale) for _ in range(n)]
+        if case % 9 == 0:
+            logits = [rng.choice([-1.5, 0.0, 3.25]) for _ in range(n)]  # ties
+        m = max(logits)
+        lse = m + math.log(math.fsum(math.exp(x - m) for x in logits))
+        priors = [x - lse for x in logits]
+        stats = cc.NodeStats.from_evaluation(0.25, priors)
+        assert stats.probs == [max(p, 1.1754943508222875e-38) for p in softmax(priors)]
+
+
+
+INVALID_EVALUATION = "nonfinite or invalid network evaluation"
+INVALID_WDL = "invalid or inconsistent evaluation WDL"
+INVALID_PROJECTION = "nonterminal evaluation has invalid legal projection"
+
+
+@pytest.mark.parametrize(
+    "value, priors, wdl, forcing, expected",
+    [
+        (0.0, [0.0], None, [False], None),
+        (0.2, [0.0, -1.0], (0.2, 0.4, 0.4), [False, True], None),
+        (math.nan, [0.0], None, [False], INVALID_EVALUATION),
+        (1.00001, [0.0], None, [False], INVALID_EVALUATION),
+        (0.0, [0.0, math.inf], None, [False, False], INVALID_EVALUATION),
+        (0.0, [0.0], (0.5, 0.5), [False], INVALID_WDL),
+        (0.0, [0.0], (0.5, math.nan, 0.5), [False], INVALID_WDL),
+        (0.0, [0.0], (-0.1, 0.6, 0.5), [False], INVALID_WDL),
+        (0.0, [0.0], (0.4, 0.4, 0.4), [False], INVALID_WDL),
+        (0.3, [0.0], (0.2, 0.6, 0.2), [False], INVALID_WDL),
+        (0.0, [0.0], None, [], INVALID_PROJECTION),
+        # Evaluation errors take precedence over a malformed forcing mask.
+        (math.nan, [0.0], None, [], INVALID_EVALUATION),
+        (0.0, [0.0], (0.4, 0.4, 0.4), [], INVALID_WDL),
+    ],
+)
+def test_node_initialize_validates_evaluations(value, priors, wdl, forcing, expected):
+    from imba_chess.eval.gumbel_search import _Node
+    from imba_chess.eval.search import PositionEval
+
+    n = len(priors)
+    evaluation = PositionEval(value, [None] * n, ["a"] * n, priors, forcing, list(range(n)), wdl=wdl)
+    node = _Node(None, [], None)
+    if expected is None:
+        node.initialize(evaluation, GumbelConfig(forcing_floor=True, minimax_weight=0.5))
+        assert node.value == value and node.priors == priors
+        assert node.stats.probs == [max(p, 1.1754943508222875e-38) for p in softmax(priors)]
+    else:
+        with pytest.raises(ValueError, match=expected):
+            node.initialize(evaluation)
