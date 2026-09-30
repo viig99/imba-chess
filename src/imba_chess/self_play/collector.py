@@ -235,6 +235,131 @@ class CollectionMetrics:
         return report
 
 
+class CollectionPhase:
+    """Launch, completion and metrics bookkeeping for one collection phase.
+
+    Owned by the coordinating process in both the in-process collector and
+    the multi-worker one: streamed starts, regret state and replay writes stay
+    here; only game play runs elsewhere.
+    """
+
+    def __init__(
+        self,
+        *,
+        config,
+        actor_id,
+        store,
+        max_positions,
+        start_sampler,
+        game_count=None,
+        should_launch=lambda: True,
+        iteration=0,
+        on_game=lambda game: None,
+        skip_ids=(),
+        metrics=None,
+    ):
+        self.config, self.actor_id, self.store = config, actor_id, store
+        self.start_sampler, self.game_count = start_sampler, game_count
+        self.should_launch, self.iteration, self.on_game = should_launch, iteration, on_game
+        self.metrics = metrics or CollectionMetrics()
+        self.skipped = set(skip_ids)
+        self.active = {}
+        self.launches = 0
+        self.exhausted = False
+        if config.regret is None:
+            start_sampler.begin_phase(iteration, actor_id, self.skipped)
+        else:
+            start_sampler.begin_phase(
+                iteration, actor_id, store, max_positions=max_positions
+            )
+
+    def next_launch(self):
+        """(game_id, seed, metadata) for the next game; None once launching has ended."""
+        while not self.exhausted:
+            if not self.should_launch() or (
+                self.game_count is not None and self.launches >= self.game_count
+            ):
+                break
+            if (
+                self.game_count is None
+                and self.metrics.counts["training_positions"]
+                >= self.config.collection.fresh_positions
+            ):
+                break
+            try:
+                seed, gid = self.start_sampler.next_launch(self.iteration, self.actor_id)
+            except InterruptedError:
+                break
+            self.launches += 1
+            if gid in self.skipped:
+                continue
+            self.active[gid] = dict(
+                game_id=gid,
+                seed_id=seed.seed_id,
+                source_id=seed.source_id,
+                actor_id=self.actor_id,
+                status="unfinished",
+                termination="error",
+                moves=[],
+                targets=[],
+                outcome_white=None,
+            )
+            metadata = self.start_sampler.launch_metadata(gid)
+            self.active[gid].update(metadata)
+            self.metrics.launched(metadata)
+            return gid, seed, metadata
+        self.exhausted = True
+        return None
+
+    def done(self, gid, game):
+        config, store = self.config, self.store
+        metadata = self.active.pop(gid)
+        if game is None:
+            game = metadata
+        else:
+            game.update(
+                {
+                    k: metadata[k]
+                    for k in (
+                        "requested_bucket",
+                        "starting_bucket",
+                        "restart_parent",
+                        "exploration_seed",
+                    )
+                    if k in metadata
+                }
+            )
+        game["iteration"] = self.iteration
+        self.metrics.done(game)
+        if game["status"] == "completed":
+            if config.regret is not None:
+                from .regret import suffix_regrets
+
+                suffix_regrets(game)  # Fail explicitly before replay serialization.
+            store.add(game)
+            if config.regret is not None and gid in store.seen:
+                self.start_sampler.reconcile(store)
+        elif game.get("termination") not in (
+            "interrupted",
+            "error",
+        ):
+            self.start_sampler.retire(gid, game.get("termination", "unknown"))
+        self.on_game(game)
+
+    def abort(self, exc):
+        # A failed executor or worker aborts every still-live game. Keep their
+        # identities/reasons visible while leaving them completely unlabeled.
+        for gid in list(self.active):
+            self.active[gid]["error"] = f"{type(exc).__name__}: {exc}"
+            self.done(gid, self.active[gid])
+
+    def finish(self):
+        self.store.flush()
+        self.start_sampler.reconcile(
+            self.store.seen if self.config.regret is None else self.store
+        )
+
+
 def collect(
     *,
     runtime,
@@ -254,100 +379,36 @@ def collect(
 ):
     if concurrent_games is not None and concurrent_games < 1:
         raise ValueError("concurrent_games must be positive")
-    metrics = metrics or CollectionMetrics()
-    skipped = set(skip_ids)
-    active = {}
-    if config.regret is None:
-        start_sampler.begin_phase(iteration, actor_id, skipped)
-    else:
-        start_sampler.begin_phase(
-            iteration, actor_id, store, max_positions=max_positions
-        )
+    phase = CollectionPhase(
+        config=config,
+        actor_id=actor_id,
+        store=store,
+        max_positions=max_positions,
+        start_sampler=start_sampler,
+        game_count=game_count,
+        should_launch=should_launch,
+        iteration=iteration,
+        on_game=on_game,
+        skip_ids=skip_ids,
+        metrics=metrics,
+    )
 
     def factory():
-        index = 0
-        while should_launch() and (game_count is None or index < game_count):
-            if (
-                game_count is None
-                and metrics.counts["training_positions"]
-                >= config.collection.fresh_positions
-            ):
-                return
-            try:
-                seed, gid = start_sampler.next_launch(iteration, actor_id)
-            except InterruptedError:
-                return
-            index += 1
-            if gid in skipped:
-                continue
-            active[gid] = dict(
-                game_id=gid,
-                seed_id=seed.seed_id,
-                source_id=seed.source_id,
+        while (launch := phase.next_launch()) is not None:
+            gid, seed, metadata = launch
+            yield gid, launch_game(
+                runtime=runtime,
+                config=config,
+                config_id=config.identifier,
                 actor_id=actor_id,
-                status="unfinished",
-                termination="error",
-                moves=[],
-                targets=[],
-                outcome_white=None,
+                seed=seed,
+                game_id=gid,
+                max_positions=max_positions,
+                should_stop=should_stop,
+                on_position=lambda result, elapsed, bucket=metadata.get(
+                    "starting_bucket"
+                ): phase.metrics.position(result, elapsed, bucket),
             )
-            metadata = start_sampler.launch_metadata(gid)
-            active[gid].update(metadata)
-            metrics.launched(metadata)
-            yield (
-                gid,
-                play_game(
-                    seed=seed,
-                    game_id=gid,
-                    actor_id=actor_id,
-                    runtime=runtime,
-                    search_config=config.search,
-                    max_positions=max_positions,
-                    max_game_plies=config.collection.max_game_plies,
-                    run_seed=config.run.seed,
-                    config_id=config.identifier,
-                    should_stop=should_stop,
-                    on_position=lambda result,
-                    elapsed,
-                    bucket=metadata.get("starting_bucket"): metrics.position(
-                        result, elapsed, bucket
-                    ),
-                ),
-            )
-
-    def done(gid, game):
-        metadata = active.pop(gid)
-        if game is None:
-            game = metadata
-        else:
-            game.update(
-                {
-                    k: metadata[k]
-                    for k in (
-                        "requested_bucket",
-                        "starting_bucket",
-                        "restart_parent",
-                        "exploration_seed",
-                    )
-                    if k in metadata
-                }
-            )
-        game["iteration"] = iteration
-        metrics.done(game)
-        if game["status"] == "completed":
-            if config.regret is not None:
-                from .regret import suffix_regrets
-
-                suffix_regrets(game)  # Fail explicitly before replay serialization.
-            store.add(game)
-            if config.regret is not None and gid in store.seen:
-                start_sampler.reconcile(store)
-        elif game.get("termination") not in (
-            "interrupted",
-            "error",
-        ):
-            start_sampler.retire(gid, game.get("termination", "unknown"))
-        on_game(game)
 
     try:
         BatchScheduler(
@@ -358,19 +419,34 @@ def collect(
                 if concurrent_games is None
                 else concurrent_games
             ),
-            on_game_done=done,
+            on_game_done=phase.done,
             on_game_error=lambda gid, exc: None,
             completion_order=True,
         ).run()
     except Exception as exc:
-        # A failed merged executor aborts every still-live game. Keep their
-        # identities/reasons visible while leaving them completely unlabeled.
-        for gid in list(active):
-            active[gid]["error"] = f"{type(exc).__name__}: {exc}"
-            done(gid, active[gid])
+        phase.abort(exc)
         raise
     finally:
         getattr(runtime, "clear_caches", lambda: None)()
-        store.flush()
-        start_sampler.reconcile(store.seen if config.regret is None else store)
-    return metrics
+        phase.finish()
+    return phase.metrics
+
+
+def launch_game(
+    *, runtime, config, config_id, actor_id, seed, game_id, max_positions,
+    should_stop, on_position,
+):
+    """One self-play game coroutine with the run's search and collection limits."""
+    return play_game(
+        seed=seed,
+        game_id=game_id,
+        actor_id=actor_id,
+        runtime=runtime,
+        search_config=config.search,
+        max_positions=max_positions,
+        max_game_plies=config.collection.max_game_plies,
+        run_seed=config.run.seed,
+        config_id=config_id,
+        should_stop=should_stop,
+        on_position=on_position,
+    )

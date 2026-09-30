@@ -23,6 +23,7 @@ from imba_chess.self_play.runtime import load_runtime, run_lock, StopBudget
 from imba_chess.self_play.seeds import file_hash, load_seeds
 from imba_chess.self_play.streaming import StreamingStarts
 from imba_chess.self_play.trainer import Stage2Trainer
+from imba_chess.self_play.workers import CollectionWorkers, split_games
 
 # About 5 iterations (~347 completed games each), i.e. 3 hours, on the 5090 tactical recipe.
 DEFAULT_SCREEN_GAMES = 1500
@@ -73,6 +74,14 @@ def main():
              f"(default {DEFAULT_SCREEN_GAMES}, about 3 hours of 5090 tactical Gumbel 512)",
     )
     parser.add_argument(
+        "--collect-workers",
+        type=int,
+        default=1,
+        help="Collection processes sharing the GPU; --concurrent-games is split across them. "
+             "One search thread per process is the collection bottleneck (execution-only; "
+             "preserves resume config identity)",
+    )
+    parser.add_argument(
         "--concurrent-games",
         type=int,
         help="Collection slots; execution-only override preserves resume config identity",
@@ -97,6 +106,8 @@ def main():
         parser.error("--initialize-optimizer requires --initialize")
     if args.concurrent_games is not None and args.concurrent_games < 1:
         parser.error("--concurrent-games must be positive")
+    if args.collect_workers < 1:
+        parser.error("--collect-workers must be positive")
     if args.cpu_threads < 1:
         parser.error("--cpu-threads must be positive")
     if args.checkpoint_seconds < 1:
@@ -117,6 +128,11 @@ def main():
         parser.error("--continuous cannot be combined with --until")
     torch.set_num_threads(args.cpu_threads)
     cfg = load_config(args.config)
+    if args.collect_workers > 1:
+        try:
+            split_games(args.concurrent_games or cfg.collection.concurrent_games, args.collect_workers)
+        except ValueError as exc:
+            parser.error(str(exc))
     monitor = load_seeds(args.seeds, split="monitor")
     if len(monitor) < max(cfg.run.screen_pairs, cfg.run.confirmation_pairs):
         parser.error(
@@ -175,6 +191,18 @@ def main():
         start_sampler.warm()
         state["stream_identity"] = start_sampler.identity
         runtime, max_positions = load_runtime(cfg, checkpoint, args.device)
+        workers = None
+        if args.collect_workers > 1:
+            workers = resources.enter_context(
+                CollectionWorkers(
+                    count=args.collect_workers,
+                    config=cfg,
+                    checkpoint=checkpoint,
+                    device=args.device,
+                    directory=args.output / "collect-workers",
+                    cpu_threads=args.cpu_threads,
+                )
+            )
         if args.resume and state.get("frozen_evaluator_id"):
             raise ValueError("frozen-evaluator runs are no longer supported")
         store = SelfPlayStore(args.output / "replay", **asdict(cfg.replay))
@@ -253,6 +281,7 @@ def main():
                 or cfg.collection.concurrent_games,
                 inference_options=getattr(runtime, "options", {}),
                 cpu_threads=torch.get_num_threads(),
+                collect_workers=args.collect_workers,
                 until=args.until.isoformat() if args.until else None,
                 continuous=args.continuous,
                 checkpoint_seconds=args.checkpoint_seconds,
@@ -303,7 +332,7 @@ def main():
                             )
                         )
 
-                metrics = collect(
+                metrics = (workers.collect if workers else collect)(
                     runtime=runtime,
                     config=cfg,
                     actor_id=state["actor_id"],
