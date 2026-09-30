@@ -28,10 +28,25 @@ class GumbelConfig:
     maxvisit_init: float = 50.0
     value_scale: float = 0.1
     epsilon: float = 1e-08
+    # Halving-style tactics, all off by default (native statistics, unchanged
+    # search). Any of them switches to the pure-Python statistics below.
+    # root_forcing: every forcing root move (capture, check, promotion) joins the
+    #   top_m candidates of the root sequential halving.
+    # forcing_floor: at opponent-to-move interior nodes, unvisited forcing
+    #   replies are visited first (highest prior first), so refutations are found.
+    # minimax_weight: edge Q = (1 - w) * mean + w * negamax over the realized
+    #   subtree, so one strong refutation counts fully instead of being averaged.
+    root_forcing: bool = False
+    forcing_floor: bool = False
+    minimax_weight: float = 0.0
 
     def __post_init__(self):
         if min(self.simulations, self.top_m, self.max_depth) < 1:
             raise ValueError("simulations, top_m and max_depth must be positive")
+        if type(self.root_forcing) is not bool or type(self.forcing_floor) is not bool:
+            raise ValueError("root_forcing and forcing_floor must be booleans")
+        if not math.isfinite(self.minimax_weight) or not 0 <= self.minimax_weight <= 1:
+            raise ValueError("minimax_weight must be in [0, 1]")
         if (
             not all(
                 (
@@ -91,6 +106,95 @@ def completed_q(value, priors, visits, qvalues, config: GumbelConfig, prior_prob
     return [scale * (q - low) / denominator for q in values]
 
 
+def _uses_python_stats(config: GumbelConfig) -> bool:
+    return config.root_forcing or config.forcing_floor or config.minimax_weight > 0
+
+
+class _PyNodeStats:
+    """Pure-Python mirror of native NodeStats, plus the halving-style options.
+
+    With minimax_weight == 0 and no forcing candidates it selects the same
+    actions as the native statistics (see tests). Edge minimax values are the
+    negated side-to-move value of the child: its network/terminal value until
+    it has visited edges, then the max over those edges' blended values.
+    """
+
+    def __init__(self, value, priors, probs, minimax_weight):
+        n = len(priors)
+        if (not n or len(probs) != n or not math.isfinite(value)
+                or not all(math.isfinite(x) for x in priors)
+                or any(not math.isfinite(x) or x < 0 for x in probs)):
+            raise ValueError("invalid node statistics")
+        self.value, self.priors, self.probs = value, list(priors), list(probs)
+        self.visits, self.sums, self.means = [0] * n, [0.0] * n, [0.0] * n
+        self.edge_minimax = [0.0] * n
+        self.noise = []
+        self.max_prior = max(priors)
+        self.minimax_weight = minimax_weight
+
+    def set_noise(self, noise):
+        if len(noise) != len(self.priors) or not all(math.isfinite(x) for x in noise):
+            raise ValueError("invalid root noise")
+        self.noise = list(noise)
+
+    def qvalues(self):
+        w = self.minimax_weight
+        if not w:
+            return self.means
+        return [(1 - w) * m + w * mm if n else m
+                for m, mm, n in zip(self.means, self.edge_minimax, self.visits)]
+
+    def side_to_move_value(self):
+        visited = [q for q, n in zip(self.qvalues(), self.visits) if n]
+        return max(visited) if visited else self.value
+
+    def _completed(self, config):
+        return completed_q(self.value, self.priors, self.visits, self.qvalues(), config, self.probs)
+
+    def interior(self, config, forced=()):
+        if forced:
+            return max(forced, key=lambda i: (self.priors[i], -i))
+        q = self._completed(config)
+        weights = softmax([p + v for p, v in zip(self.priors, q)])
+        denominator = sum(self.visits) + 1
+        action, best = 0, -math.inf
+        for i, (weight, n) in enumerate(zip(weights, self.visits)):
+            score = weight - n / denominator
+            if score > best:  # strict: first index wins ties, as natively
+                action, best = i, score
+        return action
+
+    def root(self, visit, config, candidates=None):
+        q = self._completed(config)
+        action, best = None, -math.inf
+        for i, n in enumerate(self.visits):
+            if n == visit and (candidates is None or i in candidates):
+                score = max(-1e9, self.noise[i] + self.priors[i] - self.max_prior + q[i])
+                if score > best:
+                    action, best = i, score
+        if action is None:
+            raise ValueError("no eligible root action")
+        return action
+
+    def snapshot(self):
+        return list(self.visits), list(self.sums), list(self.qvalues())
+
+
+def _python_backup(edges, value):
+    """Native gumbel_backup semantics plus edge minimax refresh, leaf upward."""
+    if not math.isfinite(value) or abs(value) > 1.000001:
+        raise ValueError("invalid backup value")
+    for node, action in reversed(edges):
+        value = -value
+        stats = node.stats
+        stats.visits[action] += 1
+        stats.sums[action] += value
+        stats.means[action] = stats.sums[action] / stats.visits[action]
+        child = node.children[action]
+        child_value = child.value if child.stats is None else child.stats.side_to_move_value()
+        stats.edge_minimax[action] = -child_value
+
+
 @dataclass(frozen=True)
 class GumbelResult:
     move_uci: str
@@ -127,7 +231,7 @@ class _Node:
     children: dict[int, Any] = field(default_factory=dict)
     stats: Any = None
 
-    def initialize(self, evaluation):
+    def initialize(self, evaluation, config=None):
         n = len(evaluation.legal_ids)
         if not n or not all(
             (
@@ -157,9 +261,15 @@ class _Node:
         self.prior_probs = [
             max(p, 1.1754943508222875e-38) for p in softmax(evaluation.legal_log_priors)
         ]
-        self.stats = cc.NodeStats(
-            self.value, evaluation.legal_log_priors, self.prior_probs
-        )
+        if len(evaluation.legal_forcing) != n:
+            raise ValueError("nonterminal evaluation has invalid legal projection")
+        if config is not None and _uses_python_stats(config):
+            self.stats = _PyNodeStats(self.value, evaluation.legal_log_priors,
+                                      self.prior_probs, config.minimax_weight)
+        else:
+            self.stats = cc.NodeStats(
+                self.value, evaluation.legal_log_priors, self.prior_probs
+            )
 
     def qs(self):
         return self.means
@@ -192,7 +302,8 @@ def gumbel_stepwise(
         raise ValueError("cannot search terminal root")
     if root_eval is None:
         (root_eval,) = yield EvalRequest([(root_handle, root.board)])
-    root.initialize(root_eval)
+    python_stats = _uses_python_stats(config)
+    root.initialize(root_eval, config)
     n = len(root_eval.legal_ids)
     if noise is None:
         rng = rng or random.Random()
@@ -206,19 +317,28 @@ def gumbel_stepwise(
     wdl_sums = [0.0, 0.0, 0.0]
     wdl_available = True
 
+    candidates = None
+    considered = min(config.top_m, n, config.simulations)
+    if config.root_forcing:
+        # Root halving over the usual top_m (by noise + prior) plus every forcing move.
+        order = sorted(range(n), key=lambda i: (-(noise[i] + priors[i]), i))
+        candidates = set(order[: min(config.top_m, n)])
+        candidates.update(i for i, forcing in enumerate(root_eval.legal_forcing) if forcing)
+        considered = min(len(candidates), config.simulations)
+
     def root_action(visit):
+        if python_stats:
+            return root.stats.root(visit, config, candidates)
         return root.stats.root(
             visit, config.maxvisit_init, config.value_scale, config.epsilon
         )
 
-    for visit in considered_visits(
-        min(config.top_m, n, config.simulations), config.simulations
-    ):
+    for visit in considered_visits(considered, config.simulations):
         if should_stop():
             raise InterruptedError("search cancelled")
         node, action, depth, path = (root, root_action(visit), 0, [])
         while True:
-            path.append((node.stats, action))
+            path.append((node, action))
             depth += 1
             deepest = max(deepest, depth)
             if action not in node.children:
@@ -233,7 +353,7 @@ def gumbel_stepwise(
                         node.handle, ev.legal_ucis[action], ev.legal_ids[action]
                     )
                     (evaluation,) = yield EvalRequest([(child.handle, child.board)])
-                    child.initialize(evaluation)
+                    child.initialize(evaluation, config)
                     evaluations += 1
                 leaf = child
                 if terminal is not None:
@@ -250,11 +370,21 @@ def gumbel_stepwise(
                 cutoffs += 1
                 leaf = node
                 break
-            action = node.stats.interior(
-                config.maxvisit_init, config.value_scale, config.epsilon
-            )
+            if python_stats:
+                forced = ()
+                if config.forcing_floor and depth % 2 == 1:  # opponent to move
+                    forced = [i for i, forcing in enumerate(node.evaluation.legal_forcing)
+                              if forcing and node.stats.visits[i] == 0]
+                action = node.stats.interior(config, forced)
+            else:
+                action = node.stats.interior(
+                    config.maxvisit_init, config.value_scale, config.epsilon
+                )
             continue
-        cc.gumbel_backup(path, leaf.value)
+        if python_stats:
+            _python_backup(path, leaf.value)
+        else:
+            cc.gumbel_backup([(n.stats, a) for n, a in path], leaf.value)
         if leaf.evaluation is None:
             leaf_wdl = (float(leaf.value == -1), float(leaf.value == 0), float(leaf.value == 1))
         else:

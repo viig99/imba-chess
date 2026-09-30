@@ -146,6 +146,12 @@ def _parse_args() -> argparse.Namespace:
         help="Gumbel c_scale for the completed-Q transform (default: GumbelConfig's 0.1)",
     )
     parser.add_argument("--lcb-min-visit-prop", type=float, default=0.15)
+    parser.add_argument("--gumbel-root-forcing", action="store_true",
+                        help="Add every forcing root move to Gumbel's top-m candidates.")
+    parser.add_argument("--gumbel-forcing-floor", action="store_true",
+                        help="Visit unvisited forcing replies first at opponent-to-move nodes.")
+    parser.add_argument("--gumbel-minimax-weight", type=float, default=0.0,
+                        help="Blend weight of negamax into Gumbel edge Q (0 = mean backup).")
     parser.add_argument("--search-budget", type=int, default=None)
     parser.add_argument("--search-top-m", type=int, default=None)
     parser.add_argument("--halving-rounds", type=int, default=None)
@@ -1113,6 +1119,10 @@ def main() -> None:
         raise ValueError("--gumbel-simulations applies only to gumbel")
     if args.model_move_policy != "gumbel" and args.gumbel_final_move != "gumbel":
         raise ValueError("--gumbel-final-move applies only to gumbel")
+    if args.model_move_policy != "gumbel" and (
+        args.gumbel_root_forcing or args.gumbel_forcing_floor or args.gumbel_minimax_weight
+    ):
+        raise ValueError("--gumbel-root-forcing/--gumbel-forcing-floor/--gumbel-minimax-weight apply only to gumbel")
     if args.model_move_policy != "gumbel" and args.gumbel_value_scale is not None:
         raise ValueError("--gumbel-value-scale applies only to gumbel")
     args.gumbel_value_scale = float(
@@ -1265,6 +1275,9 @@ def main() -> None:
             halving_config = GumbelConfig(
                 simulations=args.gumbel_simulations,
                 value_scale=args.gumbel_value_scale,
+                root_forcing=bool(args.gumbel_root_forcing),
+                forcing_floor=bool(args.gumbel_forcing_floor),
+                minimax_weight=float(args.gumbel_minimax_weight),
             )
         final_move = (
             None
@@ -1327,6 +1340,9 @@ def main() -> None:
                 "search_max_depth": int(args.search_max_depth),
                 "gumbel_final_move": str(args.gumbel_final_move),
                 "gumbel_value_scale": float(args.gumbel_value_scale),
+                "gumbel_root_forcing": bool(args.gumbel_root_forcing),
+                "gumbel_forcing_floor": bool(args.gumbel_forcing_floor),
+                "gumbel_minimax_weight": float(args.gumbel_minimax_weight),
                 "lcb_z": float(args.lcb_z),
                 "lcb_min_visit_prop": float(args.lcb_min_visit_prop),
             },
@@ -1375,6 +1391,9 @@ def main() -> None:
             "search_max_depth": int(args.search_max_depth),
             "gumbel_final_move": str(args.gumbel_final_move),
             "gumbel_value_scale": float(args.gumbel_value_scale),
+                "gumbel_root_forcing": bool(args.gumbel_root_forcing),
+                "gumbel_forcing_floor": bool(args.gumbel_forcing_floor),
+                "gumbel_minimax_weight": float(args.gumbel_minimax_weight),
             "lcb_z": float(args.lcb_z),
             "lcb_min_visit_prop": float(args.lcb_min_visit_prop),
         },
