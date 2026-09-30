@@ -126,6 +126,7 @@ fn gumbel_interior_action(
     maxvisit_init: f64,
     value_scale: f64,
     epsilon: f64,
+    candidates: &[bool],
 ) -> PyResult<usize> {
     validate_priors(&priors, visits.len())?;
     let q = completed(
@@ -145,6 +146,9 @@ fn gumbel_interior_action(
     let mut action = 0;
     let mut best = f64::NEG_INFINITY;
     for (i, (weight, n)) in weights.iter().zip(visits).enumerate() {
+        if !candidates.is_empty() && !candidates[i] {
+            continue;
+        }
         let score = weight / total - *n as f64 / denominator;
         if score > best {
             // Strict comparison preserves first-index ties.
@@ -291,10 +295,10 @@ impl NodeStats {
         Ok(())
     }
 
-    /// Root candidate mask for sequential halving; empty means every action.
+    /// Selectable actions: root halving candidates, or an interior width cap. Empty = all.
     fn set_candidates(&mut self, candidates: Vec<bool>) -> PyResult<()> {
         if candidates.len() != self.priors.len() || !candidates.iter().any(|c| *c) {
-            return Err(PyValueError::new_err("invalid root candidate mask"));
+            return Err(PyValueError::new_err("invalid candidate mask"));
         }
         self.candidates = candidates;
         Ok(())
@@ -344,6 +348,7 @@ impl NodeStats {
             maxvisit_init,
             value_scale,
             epsilon,
+            &self.candidates,
         )
     }
 

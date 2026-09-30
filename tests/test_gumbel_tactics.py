@@ -8,6 +8,7 @@ import imba_chess_native as cc
 import pytest
 
 from imba_chess.eval import cozy_bridge
+from imba_chess.eval import gumbel_search
 from imba_chess.eval.gumbel_search import GumbelConfig, select_gumbel
 from tests.test_gumbel_search import FakeEvaluator
 
@@ -39,7 +40,8 @@ FENS = [
     "6k1/5ppp/8/8/8/8/5PPP/3R2K1 w - - 0 1",
 ]
 OPTIONS = [dict(), dict(root_forcing=True), dict(forcing_floor=True), dict(minimax_weight=0.5),
-           dict(minimax_weight=1.0), dict(root_forcing=True, forcing_floor=True, minimax_weight=1.0)]
+           dict(minimax_weight=1.0), dict(forcing_prior=True), dict(own_width=3),
+           dict(root_forcing=True, forcing_floor=True, minimax_weight=1.0, forcing_prior=True, own_width=3)]
 
 
 def _search(fen, config):
@@ -69,6 +71,10 @@ def test_config_validation():
         GumbelConfig(minimax_weight=1.5)
     with pytest.raises(ValueError, match="booleans"):
         GumbelConfig(forcing_floor=1)
+    with pytest.raises(ValueError, match="booleans"):
+        GumbelConfig(forcing_prior=1)
+    with pytest.raises(ValueError, match="own_width"):
+        GumbelConfig(own_width=-1)
     stats = cc.NodeStats(0.0, [0.0, -1.0], [0.6, 0.4])
     with pytest.raises(ValueError, match="forcing floor requires set_forcing"):
         stats.interior(50.0, 0.1, 1e-8, True)
@@ -113,3 +119,40 @@ def test_minimax_backup_counts_refutation_fully():
     cc.gumbel_backup([(plain, 0), (plain_reply, 0)], 0.2)
     cc.gumbel_backup([(plain, 0), (plain_reply, 1)], -0.9)
     assert plain.snapshot()[2][0] == pytest.approx(-0.35)
+
+
+def _node(role, config):
+    board = chess.Board(FENS[1])
+    evaluation = VariedEvaluator().evaluate([(("x",), cozy_bridge.board_to_cozy(board))])[0]
+    node = gumbel_search._Node(cozy_bridge.board_to_cozy(board), [], None)
+    node.initialize(evaluation, config, role)
+    return node, evaluation
+
+
+def test_forcing_prior_raises_only_opponent_forcing_replies():
+    config = GumbelConfig(forcing_prior=True)
+    opponent, evaluation = _node("opponent", config)
+    best = max(evaluation.legal_log_priors)
+    assert any(evaluation.legal_forcing)
+    for raw, adjusted, forcing in zip(evaluation.legal_log_priors, opponent.priors, evaluation.legal_forcing):
+        assert adjusted == (max(raw, best) if forcing else raw)
+    for role in ("own", "root"):
+        assert _node(role, config)[0].priors == list(evaluation.legal_log_priors)
+
+
+def test_own_width_restricts_our_interior_nodes():
+    def spread(node, visits=12):
+        # Back each visit up at the node's own value, so only the visit deficit
+        # moves selection; uncapped nodes then fan out across many moves.
+        seen = set()
+        for _ in range(visits):
+            action = node.stats.interior(50.0, 0.1, 1e-8)
+            seen.add(action)
+            cc.gumbel_backup([(node.stats, action)], -node.value)
+        return seen
+
+    own, _ = _node("own", GumbelConfig(own_width=3))
+    top3 = set(sorted(range(len(own.priors)), key=lambda i: (-own.priors[i], i))[:3])
+    assert spread(own) <= top3
+    assert len(spread(_node("opponent", GumbelConfig(own_width=3))[0])) > 3  # opponent uncapped
+    assert len(spread(_node("own", GumbelConfig())[0])) > 3  # no cap by default

@@ -152,6 +152,10 @@ def _parse_args() -> argparse.Namespace:
                         help="Visit unvisited forcing replies first at opponent-to-move nodes.")
     parser.add_argument("--gumbel-minimax-weight", type=float, default=0.0,
                         help="Blend weight of negamax into Gumbel edge Q (0 = mean backup).")
+    parser.add_argument("--gumbel-forcing-prior", action="store_true",
+                        help="Raise opponent forcing replies' prior to the best sibling's.")
+    parser.add_argument("--gumbel-own-width", type=int, default=0,
+                        help="Cap our own interior nodes to the top-k moves by prior (0 = no cap).")
     parser.add_argument("--search-budget", type=int, default=None)
     parser.add_argument("--search-top-m", type=int, default=None)
     parser.add_argument("--halving-rounds", type=int, default=None)
@@ -1121,6 +1125,7 @@ def main() -> None:
         raise ValueError("--gumbel-final-move applies only to gumbel")
     if args.model_move_policy != "gumbel" and (
         args.gumbel_root_forcing or args.gumbel_forcing_floor or args.gumbel_minimax_weight
+        or args.gumbel_forcing_prior or args.gumbel_own_width
     ):
         raise ValueError("--gumbel-root-forcing/--gumbel-forcing-floor/--gumbel-minimax-weight apply only to gumbel")
     if args.model_move_policy != "gumbel" and args.gumbel_value_scale is not None:
@@ -1278,6 +1283,8 @@ def main() -> None:
                 root_forcing=bool(args.gumbel_root_forcing),
                 forcing_floor=bool(args.gumbel_forcing_floor),
                 minimax_weight=float(args.gumbel_minimax_weight),
+                forcing_prior=bool(args.gumbel_forcing_prior),
+                own_width=int(args.gumbel_own_width),
             )
         final_move = (
             None
@@ -1343,6 +1350,8 @@ def main() -> None:
                 "gumbel_root_forcing": bool(args.gumbel_root_forcing),
                 "gumbel_forcing_floor": bool(args.gumbel_forcing_floor),
                 "gumbel_minimax_weight": float(args.gumbel_minimax_weight),
+                "gumbel_forcing_prior": bool(args.gumbel_forcing_prior),
+                "gumbel_own_width": int(args.gumbel_own_width),
                 "lcb_z": float(args.lcb_z),
                 "lcb_min_visit_prop": float(args.lcb_min_visit_prop),
             },
@@ -1394,6 +1403,8 @@ def main() -> None:
                 "gumbel_root_forcing": bool(args.gumbel_root_forcing),
                 "gumbel_forcing_floor": bool(args.gumbel_forcing_floor),
                 "gumbel_minimax_weight": float(args.gumbel_minimax_weight),
+                "gumbel_forcing_prior": bool(args.gumbel_forcing_prior),
+                "gumbel_own_width": int(args.gumbel_own_width),
             "lcb_z": float(args.lcb_z),
             "lcb_min_visit_prop": float(args.lcb_min_visit_prop),
         },
