@@ -299,9 +299,16 @@ class NodeStats:
         epsilon: float,
         forcing_floor: bool = False,
         visit_cap: int = 0,
+        rescale_values: bool = False,
     ) -> int: ...
     def root(
-        self, visit: int, maxvisit_init: float, value_scale: float, epsilon: float, visit_cap: int = 0
+        self,
+        visit: int,
+        maxvisit_init: float,
+        value_scale: float,
+        epsilon: float,
+        visit_cap: int = 0,
+        rescale_values: bool = False,
     ) -> int: ...
     def snapshot(self) -> tuple[list[int], list[float], list[float]]: ...
 

@@ -43,7 +43,7 @@ def run_synthetic(*, k, seed, budget, top_m, depth, terminal, scale, noise):
     ):
         return select_gumbel(evaluator=Evaluator(), board=None, noise=noise,
                              config=GumbelConfig(simulations=budget, top_m=top_m,
-                                                 max_depth=depth, value_scale=scale))
+                                                 max_depth=depth, value_scale=scale, rescale_values=True))
 
 
 @pytest.mark.parametrize('case', json.loads(FIXTURE.read_text())['cases'])
@@ -61,7 +61,7 @@ def test_sparse_q_range_differs_from_upstream_with_masked_action_padding():
     # Upstream includes unvisited masked actions' mixed values in its Q extrema.
     # Production uses only legal moves: do not silently assume these are equal.
     from imba_chess.eval.gumbel_search import completed_q, softmax
-    cfg = GumbelConfig(value_scale=1.)
+    cfg = GumbelConfig(value_scale=1., rescale_values=True)
     compact = completed_q(-.5, [0., 0.], [1, 1], [.1, .1001], cfg)
     padded = completed_q(-.5, [0., 0., -10000.], [1, 1, 0], [.1, .1001, 0.], cfg)
     assert compact == pytest.approx([0., 51.])

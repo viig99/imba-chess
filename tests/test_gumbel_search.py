@@ -57,7 +57,7 @@ def test_exact_budgets(budget, candidates):
         evaluator=evaluator,
         board=chess.Board(),
         rng=random.Random(42),
-        config=GumbelConfig(simulations=budget, top_m=candidates, max_depth=2),
+        config=GumbelConfig(simulations=budget, top_m=candidates, max_depth=2, rescale_values=True, value_scale=0.1),
     )
     assert sum(result.visits) == result.simulations == budget
     assert result.neural_evaluations == len(evaluator.calls)
@@ -83,7 +83,7 @@ def test_mate_and_terminal_revisits():
         board=board,
         root_eval=root,
         noise=noise,
-        config=GumbelConfig(simulations=16, top_m=1),
+        config=GumbelConfig(simulations=16, top_m=1, rescale_values=True, value_scale=0.1),
     )
     assert result.move_uci == "f7g7"
     assert result.qvalues[root.legal_ucis.index("f7g7")] == 1
@@ -97,7 +97,7 @@ def test_depth_reuse_and_signs():
         evaluator=ev,
         board=chess.Board(),
         noise=[0] * 20,
-        config=GumbelConfig(simulations=8, top_m=1, max_depth=1),
+        config=GumbelConfig(simulations=8, top_m=1, max_depth=1, rescale_values=True, value_scale=0.1),
     )
     assert result.qvalues[0] == -0.5
     assert result.neural_evaluations == 2
@@ -107,7 +107,7 @@ def test_depth_reuse_and_signs():
         evaluator=ev,
         board=chess.Board(),
         noise=[0] * 20,
-        config=GumbelConfig(simulations=2, top_m=1, max_depth=2),
+        config=GumbelConfig(simulations=2, top_m=1, max_depth=2, rescale_values=True, value_scale=0.1),
     )
     assert result.qvalues[0] == 0  # (-.5 + .5) / 2
 
@@ -117,20 +117,20 @@ def test_noise_not_added_to_target():
         evaluator=FakeEvaluator(),
         board=chess.Board(),
         noise=[0] * 20,
-        config=GumbelConfig(simulations=1),
+        config=GumbelConfig(simulations=1, rescale_values=True, value_scale=0.1),
     )
     b = select_gumbel(
         evaluator=FakeEvaluator(),
         board=chess.Board(),
         noise=list(range(20)),
-        config=GumbelConfig(simulations=1),
+        config=GumbelConfig(simulations=1, rescale_values=True, value_scale=0.1),
     )
     assert a.move_id != b.move_id
     assert a.policy == b.policy == pytest.approx([0.05] * 20)
 
 
 def test_completed_q_and_deficit():
-    cfg = GumbelConfig()
+    cfg = GumbelConfig(rescale_values=True, value_scale=0.1)
     assert completed_q(0.8, [0, 0], [0, 0], [0, 0], cfg) == [0, 0]
     assert completed_q(0.2, [0, 0, 0], [2, 0, 1], [1, 0, -1], cfg) == pytest.approx(
         [5.2, 2.73, 0]
@@ -154,7 +154,7 @@ def test_upstream_q_fixtures():
     assert fixture["revision"] == REFERENCE_REVISION
     for row in fixture["cases"]:
         assert completed_q(
-            row["value"], row["priors"], row["visits"], row["qvalues"], GumbelConfig()
+            row["value"], row["priors"], row["visits"], row["qvalues"], GumbelConfig(rescale_values=True, value_scale=0.1)
         ) == pytest.approx(row["expected"], abs=2e-5)
 
 
@@ -185,8 +185,7 @@ def test_fixed_noise_upstream_search_fixtures():
             root_eval=root,
             noise=fixture["noise"],
             config=GumbelConfig(
-                simulations=row["budget"], top_m=row["top_m"], max_depth=1
-            ),
+                simulations=row["budget"], top_m=row["top_m"], max_depth=1, rescale_values=True, value_scale=0.1),
         )
         assert result.visits == row["visits"]
         assert result.move_uci == root.legal_ucis[row["action"]]

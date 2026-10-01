@@ -26,8 +26,13 @@ class GumbelConfig:
     top_m: int = 16
     max_depth: int = 32
     maxvisit_init: float = 50.0
-    value_scale: float = 0.1
+    value_scale: float = 0.5
     epsilon: float = 1e-08
+    # rescale_values (mctx semantics): True min-max normalizes completed Q per node
+    #   to [0, 1] (epsilon floors the range); False uses raw Q in [-1, 1]. Min-max
+    #   stretches near-ties into noise and squashes real gaps when one move blunders;
+    #   raw Q at value_scale 0.5 keeps the mean target sharpness of min-max at 0.1.
+    rescale_values: bool = False
     # Halving-style tactics, all off by default (then the search is unchanged).
     # root_forcing: every forcing root move (capture, check, promotion) joins the
     #   top_m candidates of the root sequential halving.
@@ -52,8 +57,8 @@ class GumbelConfig:
     def __post_init__(self):
         if min(self.simulations, self.top_m, self.max_depth) < 1:
             raise ValueError("simulations, top_m and max_depth must be positive")
-        if any(type(x) is not bool for x in (self.root_forcing, self.forcing_floor, self.own_forcing_floor)):
-            raise ValueError("root_forcing, forcing_floor and own_forcing_floor must be booleans")
+        if any(type(x) is not bool for x in (self.root_forcing, self.forcing_floor, self.own_forcing_floor, self.rescale_values)):
+            raise ValueError("root_forcing, forcing_floor, own_forcing_floor and rescale_values must be booleans")
         if type(self.visit_cap) is not int or self.visit_cap < 0:
             raise ValueError("visit_cap must be a nonnegative integer")
         if type(self.own_width) is not int or self.own_width < 0:
@@ -114,13 +119,15 @@ def completed_q(value, priors, visits, qvalues, config: GumbelConfig, prior_prob
     count = sum(visits)
     mixed = (value + count * weighted) / (count + 1)
     values = [q if n else mixed for q, n in zip(qvalues, visits)]
-    low, high = (min(values), max(values))
     top = max(visits)
     if config.visit_cap:
         top = min(top, config.visit_cap)
     scale = (config.maxvisit_init + top) * config.value_scale
-    denominator = max(high - low, config.epsilon)
-    return [scale * (q - low) / denominator for q in values]
+    if config.rescale_values:
+        low, high = (min(values), max(values))
+        denominator = max(high - low, config.epsilon)
+        values = [(q - low) / denominator for q in values]
+    return [scale * q for q in values]
 
 
 @dataclass(frozen=True)
@@ -245,7 +252,8 @@ def gumbel_stepwise(
 
     def root_action(visit):
         return root.stats.root(
-            visit, config.maxvisit_init, config.value_scale, config.epsilon, config.visit_cap
+            visit, config.maxvisit_init, config.value_scale, config.epsilon, config.visit_cap,
+            config.rescale_values,
         )
 
     for visit in considered_visits(considered, config.simulations):
@@ -287,7 +295,8 @@ def gumbel_stepwise(
                 break
             floor = config.forcing_floor if depth % 2 == 1 else config.own_forcing_floor
             action = node.stats.interior(
-                config.maxvisit_init, config.value_scale, config.epsilon, floor, config.visit_cap
+                config.maxvisit_init, config.value_scale, config.epsilon, floor, config.visit_cap,
+                config.rescale_values,
             )
             continue
         cc.gumbel_backup([(n.stats, a) for n, a in path], leaf.value)

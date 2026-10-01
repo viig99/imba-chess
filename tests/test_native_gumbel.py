@@ -16,7 +16,8 @@ from imba_chess.eval.gumbel_search import (
 from tests.test_gumbel_search import FakeEvaluator
 
 
-def test_native_q_matches_python_exactly():
+@pytest.mark.parametrize("rescale", [True, False])
+def test_native_q_matches_python_exactly(rescale):
     from imba_chess_native.imba_chess_native import _gumbel_completed_q
 
     rng = random.Random(721)
@@ -32,11 +33,29 @@ def test_native_q_matches_python_exactly():
         value = rng.uniform(-1, 1)
         probs = [max(p, 1.1754943508222875e-38) for p in softmax(priors)]
         cfg = GumbelConfig(
-            value_scale=rng.choice([0.0, 0.1, 1.0]), epsilon=rng.choice([1e-8, 1e-14])
-        )
+            value_scale=rng.choice([0.0, 0.1, 1.0]), epsilon=rng.choice([1e-8, 1e-14]), rescale_values=rescale)
         constants = (cfg.maxvisit_init, cfg.value_scale, cfg.epsilon)
         expected = completed_q(value, priors, visits, qs, cfg, probs)
-        assert _gumbel_completed_q(value, visits, qs, probs, *constants) == expected
+        assert _gumbel_completed_q(value, visits, qs, probs, *constants, rescale_values=rescale) == expected
+
+
+def test_raw_q_is_default_and_skips_min_max():
+    from imba_chess_native.imba_chess_native import _gumbel_completed_q
+
+    cfg = GumbelConfig()
+    assert (cfg.rescale_values, cfg.value_scale) == (False, 0.5)
+    # Visited Q stays raw (no min-max), scaled by (maxvisit_init + max visits) * value_scale;
+    # the unvisited move takes the prior-weighted mixed value.
+    visits, qs, probs = [3, 1, 0], [0.12, 0.10, 0.0], [0.5, 0.3, 0.2]
+    mixed = (0.0 + 4 * (0.5 * 0.12 + 0.3 * 0.10) / 0.8) / 5
+    expected = [53 * 0.5 * q for q in (0.12, 0.10, mixed)]
+    assert completed_q(0.0, [0.0] * 3, visits, qs, cfg, probs) == pytest.approx(expected)
+    assert _gumbel_completed_q(0.0, visits, qs, probs, 50.0, 0.5, 1e-8) == pytest.approx(expected)
+    # A near-tie keeps its small gap instead of being stretched to the full range.
+    rescaled = completed_q(0.0, [0.0] * 3, visits, qs, GumbelConfig(rescale_values=True), probs)
+    assert expected[0] - expected[1] < 1 < rescaled[0] - rescaled[1]
+    with pytest.raises(ValueError):
+        GumbelConfig(rescale_values=1)
 
 
 @pytest.mark.parametrize("budget", [1, 3, 128])
@@ -59,7 +78,7 @@ def test_native_search_keeps_rng_visits_targets_and_counters(fen, budget):
     result = select_gumbel(
         evaluator=FakeEvaluator(0.25),
         board=chess.Board(fen),
-        config=GumbelConfig(simulations=budget),
+        config=GumbelConfig(simulations=budget, rescale_values=True, value_scale=0.1),
         rng=random.Random(42),
     )
     actual = json.loads(json.dumps(asdict(result)))
@@ -76,7 +95,7 @@ def test_native_rejects_malformed_inputs_and_ineligible_root():
     node = cc.NodeStats(0.0, [0.0], [1.0])
     node.set_noise([0.0])
     with pytest.raises(ValueError, match="eligible"):
-        node.root(1, 50.0, 0.1, 1e-8)
+        node.root(1, 50.0, 0.1, 1e-8, rescale_values=True)
     with pytest.raises(ValueError):
         cc.NodeStats(math.nan, [0.0], [1.0])
 
@@ -129,7 +148,7 @@ def test_node_initialize_validates_evaluations(value, priors, wdl, forcing, expe
     evaluation = PositionEval(value, [None] * n, ["a"] * n, priors, forcing, list(range(n)), wdl=wdl)
     node = _Node(None, [], None)
     if expected is None:
-        node.initialize(evaluation, GumbelConfig(forcing_floor=True, minimax_weight=0.5))
+        node.initialize(evaluation, GumbelConfig(forcing_floor=True, minimax_weight=0.5, rescale_values=True, value_scale=0.1))
         assert node.value == value and node.priors == priors
         assert node.stats.probs == [max(p, 1.1754943508222875e-38) for p in softmax(priors)]
     else:

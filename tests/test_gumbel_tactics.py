@@ -55,7 +55,7 @@ def _search(fen, config):
 @pytest.mark.parametrize("fen", FENS)
 @pytest.mark.parametrize("options", OPTIONS)
 def test_tactical_options_complete_exact_budgets(fen, options):
-    result = _search(fen, GumbelConfig(simulations=64, top_m=8, max_depth=8, **options))
+    result = _search(fen, GumbelConfig(simulations=64, top_m=8, max_depth=8, **options, rescale_values=True, value_scale=0.1))
     assert sum(result.visits) == 64
     assert sum(result.policy) == pytest.approx(1.0)
     assert all(math.isfinite(q) and abs(q) <= 1 for q in result.qvalues)
@@ -63,9 +63,9 @@ def test_tactical_options_complete_exact_budgets(fen, options):
 
 def test_default_options_keep_plain_search():
     for fen in FENS:
-        plain = _search(fen, GumbelConfig(simulations=64, top_m=8, max_depth=8))
+        plain = _search(fen, GumbelConfig(simulations=64, top_m=8, max_depth=8, rescale_values=True, value_scale=0.1))
         explicit = _search(fen, GumbelConfig(simulations=64, top_m=8, max_depth=8, root_forcing=False,
-                                             forcing_floor=False, minimax_weight=0.0))
+                                             forcing_floor=False, minimax_weight=0.0, rescale_values=True, value_scale=0.1))
         assert plain == explicit
 
 
@@ -82,7 +82,7 @@ def test_config_validation():
         GumbelConfig(visit_cap=-1)
     stats = cc.NodeStats(0.0, [0.0, -1.0], [0.6, 0.4])
     with pytest.raises(ValueError, match="forcing floor requires set_forcing"):
-        stats.interior(50.0, 0.1, 1e-8, True)
+        stats.interior(50.0, 0.1, 1e-8, True, rescale_values=True)
     with pytest.raises(ValueError, match="candidate mask"):
         stats.set_candidates([False, False])
     with pytest.raises(ValueError, match="minimax_weight"):
@@ -95,8 +95,8 @@ def test_root_forcing_adds_candidates():
     projected = cozy_bridge.project_legal_moves(cozy_bridge.board_to_cozy(board), FakeEvaluator().vocab)
     forcing = {uci for uci, flag in zip(projected[2], projected[3]) if flag}
     assert forcing
-    plain = _search(fen, GumbelConfig(simulations=32, top_m=1, max_depth=4))
-    tactical = _search(fen, GumbelConfig(simulations=32, top_m=1, max_depth=4, root_forcing=True))
+    plain = _search(fen, GumbelConfig(simulations=32, top_m=1, max_depth=4, rescale_values=True, value_scale=0.1))
+    tactical = _search(fen, GumbelConfig(simulations=32, top_m=1, max_depth=4, root_forcing=True, rescale_values=True, value_scale=0.1))
     assert sum(1 for n in plain.visits if n) == 1
     assert forcing <= {u for u, n in zip(projected[2], tactical.visits) if n}
 
@@ -104,8 +104,8 @@ def test_root_forcing_adds_candidates():
 def test_forcing_floor_prefers_unvisited_forcing_by_prior():
     stats = cc.NodeStats(0.0, [-1.0, -3.0, -2.0, -0.5], [0.3, 0.1, 0.2, 0.4])
     stats.set_forcing([False, True, True, False])
-    assert stats.interior(50.0, 0.1, 1e-8, True) == 2
-    assert stats.interior(50.0, 0.1, 1e-8) == stats.interior(50.0, 0.1, 1e-8, False)
+    assert stats.interior(50.0, 0.1, 1e-8, True, rescale_values=True) == 2
+    assert stats.interior(50.0, 0.1, 1e-8, rescale_values=True) == stats.interior(50.0, 0.1, 1e-8, False, rescale_values=True)
 
 
 def test_minimax_backup_counts_refutation_fully():
@@ -140,42 +140,42 @@ def test_own_width_restricts_our_interior_nodes():
         # moves selection; uncapped nodes then fan out across many moves.
         seen = set()
         for _ in range(visits):
-            action = node.stats.interior(50.0, 0.1, 1e-8)
+            action = node.stats.interior(50.0, 0.1, 1e-8, rescale_values=True)
             seen.add(action)
             cc.gumbel_backup([(node.stats, action)], -node.value)
         return seen
 
-    own, _ = _node("own", GumbelConfig(own_width=3))
+    own, _ = _node("own", GumbelConfig(own_width=3, rescale_values=True, value_scale=0.1))
     top3 = set(sorted(range(len(own.priors)), key=lambda i: (-own.priors[i], i))[:3])
     assert spread(own) <= top3
-    assert len(spread(_node("opponent", GumbelConfig(own_width=3))[0])) > 3  # opponent uncapped
-    assert len(spread(_node("own", GumbelConfig())[0])) > 3  # no cap by default
+    assert len(spread(_node("opponent", GumbelConfig(own_width=3, rescale_values=True, value_scale=0.1))[0])) > 3  # opponent uncapped
+    assert len(spread(_node("own", GumbelConfig(rescale_values=True, value_scale=0.1))[0])) > 3  # no cap by default
 
 
 def test_visit_cap_bounds_value_scale_natively_and_in_targets():
     from imba_chess.eval.gumbel_search import completed_q
     visits, q, probs = [300, 40, 0], [0.4, -0.1, 0.0], [0.5, 0.3, 0.2]
     for cap in (0, 64, 500):
-        config = GumbelConfig(visit_cap=cap)
-        native = cc._gumbel_completed_q(0.1, visits, q, probs, 50.0, 0.1, 1e-8, cap)
+        config = GumbelConfig(visit_cap=cap, rescale_values=True, value_scale=0.1)
+        native = cc._gumbel_completed_q(0.1, visits, q, probs, 50.0, 0.1, 1e-8, cap, rescale_values=True)
         python = completed_q(0.1, [0.0, 0.0, 0.0], visits, q, config, probs)
         assert native == pytest.approx(python, abs=1e-12)
         top = min(300, cap) if cap else 300
         assert max(native) == pytest.approx((50.0 + top) * 0.1)
-    assert cc._gumbel_completed_q(0.1, visits, q, probs, 50.0, 0.1, 1e-8) == \
-        cc._gumbel_completed_q(0.1, visits, q, probs, 50.0, 0.1, 1e-8, 0)
+    assert cc._gumbel_completed_q(0.1, visits, q, probs, 50.0, 0.1, 1e-8, rescale_values=True) == \
+        cc._gumbel_completed_q(0.1, visits, q, probs, 50.0, 0.1, 1e-8, 0, rescale_values=True)
 
 
 def test_cap_above_reached_visits_leaves_search_unchanged():
     for fen in FENS:
-        plain = _search(fen, GumbelConfig(simulations=64, top_m=8, max_depth=8))
-        capped = _search(fen, GumbelConfig(simulations=64, top_m=8, max_depth=8, visit_cap=10_000))
+        plain = _search(fen, GumbelConfig(simulations=64, top_m=8, max_depth=8, rescale_values=True, value_scale=0.1))
+        capped = _search(fen, GumbelConfig(simulations=64, top_m=8, max_depth=8, visit_cap=10_000, rescale_values=True, value_scale=0.1))
         assert plain == replace(capped)
 
 
 def test_own_forcing_floor_applies_only_to_our_nodes():
-    own, evaluation = _node("own", GumbelConfig(own_forcing_floor=True))
+    own, evaluation = _node("own", GumbelConfig(own_forcing_floor=True, rescale_values=True, value_scale=0.1))
     forcing = [i for i, f in enumerate(evaluation.legal_forcing) if f]
     assert forcing
-    first = own.stats.interior(50.0, 0.1, 1e-8, True)
+    first = own.stats.interior(50.0, 0.1, 1e-8, True, rescale_values=True)
     assert first in forcing and own.priors[first] == max(own.priors[i] for i in forcing)

@@ -12,7 +12,7 @@ its exit code. Search options after "--" are passed through unchanged, e.g.
       --gumbel-minimax-weight 0.5
 
 Defaults are the SF2600 protocol used for the self-play evals: UCI_Elo 2600,
-40k nodes (5 s cap), 1 thread, 64 MiB hash, Gumbel with value_scale 0.1,
+40k nodes (5 s cap), 1 thread, 64 MiB hash, Gumbel with raw Q at value_scale 0.5,
 8 concurrent games, no random opening plies.
 """
 import argparse
@@ -41,7 +41,7 @@ def eval_arguments(args, batch, out, extra):
             "--stockfish-limit-strength", "--stockfish-elo", str(args.elo),
             "--stockfish-path", args.stockfish, "--stockfish-time-sec", "5",
             "--stockfish-nodes", str(args.nodes), "--stockfish-threads", "1", "--stockfish-hash-mb", "64",
-            "--device", "cuda", "--model-move-policy", "gumbel", "--gumbel-value-scale", "0.1",
+            "--device", "cuda", "--model-move-policy", "gumbel", "--gumbel-value-scale", "0.5",
             "--concurrent-games", str(args.concurrent_games), "--max-plies", "512",
             "--opening-random-plies", "0", "--seed", str(args.seed_base + batch),
             "--save-games", "--save-games-dir", str(out / "games"),

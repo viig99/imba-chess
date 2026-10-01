@@ -100,3 +100,38 @@ Set `value_weight = 0` for the frozen-value-head ablation. Stage-1 training is
 unaffected. Checkpoints from the detached-feature or legacy global-clipping experiments are incompatible
 with this training mode and must not be silently resumed. Their running remote
 process and evaluation artifacts are retained independently.
+
+## Completed-Q normalization (2026-10-01)
+
+Gumbel search now defaults to `rescale_values = false, value_scale = 0.5`:
+completed Q is used raw (values are bounded in [-1, 1]) and scaled by
+`(maxvisit_init + max visits) * value_scale`. Before, it followed the mctx
+defaults `rescale_values = true, value_scale = 0.1`, which min-max normalize the
+completed Q of each node to [0, 1]. `epsilon` only floors that min-max range and
+is unused when rescaling is off.
+
+Min-max rescaling made surprise run backwards. In an offline recomputation of
+176,501 stored root targets (2,000 vmix games, plain Gumbel at 200 simulations;
+the recomputed targets matched the stored ones exactly), mean KL(target || prior)
+by root Q range was:
+
+| Root Q range | Share | Min-max 0.1 | Raw 0.5 |
+|---|---|---|---|
+| < 0.02 | 9.1% | 1.08 | 0.03 |
+| 0.02-0.05 | 7.7% | 1.09 | 0.18 |
+| 0.05-0.1 | 6.6% | 1.01 | 0.40 |
+| 0.1-0.2 | 12.6% | 0.88 | 0.66 |
+| 0.2-0.5 | 32.5% | 0.72 | 1.07 |
+| > 0.5 | 29.0% | 0.53 | 1.16 |
+
+(Exact ties, 2.5% of positions, have zero surprise in both.) Min-max stretches
+noise-level gaps between near-tied moves into the full value bonus, and one
+blundering move squashes the real gaps among the others. Raw Q at 0.5 keeps the
+mean target entropy of min-max 0.1 (0.803 vs 0.800), so the change is in which
+positions are sharp, not in overall sharpness. Raw `value_scale = 1.0` is about twice as
+sharp (entropy 0.57). These are target statistics only: search strength under
+the new default has not been evaluated.
+
+mctx parity tests pin `rescale_values = true, value_scale = 0.1`. Reproduce the
+old search with `--gumbel-rescale-values --gumbel-value-scale 0.1` in
+`scripts/eval_vs_stockfish.py`. SF2600 results before 2026-10-01 used min-max 0.1.

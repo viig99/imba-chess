@@ -39,26 +39,26 @@ def test_native_stats_selections_and_backup_match_reference_exactly():
                 means[i][edge] = sums[i][edge] / visits[i][edge]
                 node = nodes[i]
                 assert node.snapshot() == (visits[i], sums[i], means[i])
-                assert node.interior(*constants) == interior_action(
-                    value, priors, visits[i], means[i], GumbelConfig(), probs
+                assert node.interior(*constants, rescale_values=True) == interior_action(
+                    value, priors, visits[i], means[i], GumbelConfig(rescale_values=True, value_scale=0.1), probs
                 )
                 eligible = visits[i][rng.randrange(n)]
                 q = completed_q(
-                    value, priors, visits[i], means[i], GumbelConfig(), probs
+                    value, priors, visits[i], means[i], GumbelConfig(rescale_values=True, value_scale=0.1), probs
                 )
                 expected = max(
                     (j for j in range(n) if visits[i][j] == eligible),
                     key=lambda j: max(-1e9, noise[j] + priors[j] - max(priors) + q[j]),
                 )
-                assert node.root(eligible, *constants) == expected
+                assert node.root(eligible, *constants, rescale_values=True) == expected
 
 
 def test_native_stats_ties_and_atomic_validation():
     node = NodeStats(0.0, [0.0, 0.0], [0.5, 0.5])
     other = NodeStats(0.0, [0.0], [1.0])
     node.set_noise([0.0, 0.0])
-    assert node.interior(50, 0.1, 1e-8) == 0
-    assert node.root(0, 50, 0.1, 1e-8) == 0
+    assert node.interior(50, 0.1, 1e-8, rescale_values=True) == 0
+    assert node.root(0, 50, 0.1, 1e-8, rescale_values=True) == 0
     before = node.snapshot()
     for path in ([(node, 0), (other, 2)], [(node, 0), (node, 1)]):
         with pytest.raises(ValueError):

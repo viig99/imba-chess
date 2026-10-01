@@ -1,5 +1,6 @@
 # 5090 stage-2 recipe of the running tactical fork (flatten-53250-vmix-tactical-s512-mm05):
-# tactical Gumbel 512 (root forcing moves, opponent forcing floor, half-negamax edge Q),
+# tactical Gumbel 512 (root forcing moves, opponent forcing floor, half-negamax edge Q, raw Q at
+# value_scale 0.5 instead of min-max 0.1, see docs/POLICY_SURPRISE_WEIGHTING.md),
 # accumulated updates, mixed search/outcome value labels, 3-horizon auxiliary value and regret restarts.
 # On gpu_remote it runs with 12 CPU threads (OMP/MKL; see the run's remote.json).
 base_config = "config/imba_chess_v4_aux3.toml"
@@ -13,8 +14,9 @@ simulations = 512
 top_m = 16
 max_depth = 32
 maxvisit_init = 50.0
-value_scale = 0.1
+value_scale = 0.5
 epsilon = 1e-8
+rescale_values = false
 root_forcing = true
 forcing_floor = true
 minimax_weight = 0.5
