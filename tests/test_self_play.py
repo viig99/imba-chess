@@ -878,3 +878,23 @@ def test_gradient_accumulation_matches_single_step_and_resumes(tmp_path):
         cfg, learning=replace(cfg.learning, gradient_accumulation=1)).identifier
     assert cfg.identifier != replace(
         cfg, learning=replace(cfg.learning, gradient_accumulation=16)).identifier
+
+
+def test_inference_dtype_identity_and_validation(tmp_path):
+    from dataclasses import replace
+    from imba_chess.self_play.config import SelfPlayConfig, load_config
+
+    cfg = SelfPlayConfig()
+    bf16 = replace(cfg, collection=replace(cfg.collection, inference_dtype="bfloat16"))
+    # Default float32 keeps the identity runs had before the option existed.
+    assert cfg.identifier == replace(
+        cfg, collection=replace(cfg.collection, inference_dtype="float32")).identifier
+    assert cfg.identifier != bf16.identifier
+    base = tmp_path / "model.toml"
+    base.write_text("")
+    path = tmp_path / "self_play.toml"
+    path.write_text(f'base_config = "{base}"\n[collection]\ninference_dtype = "float16"\n')
+    with pytest.raises(ValueError, match="inference_dtype"):
+        load_config(path)
+    path.write_text(f'base_config = "{base}"\n[collection]\ninference_dtype = "bfloat16"\n')
+    assert load_config(path).collection.inference_dtype == "bfloat16"

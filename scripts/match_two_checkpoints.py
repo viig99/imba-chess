@@ -23,7 +23,7 @@ yields one merged forward per model per tick with no scheduler changes.
 """
 
 from __future__ import annotations
-from imba_chess.eval.inference_runtime import load_runtime
+from imba_chess.eval.inference_runtime import INFERENCE_DTYPES, load_runtime
 from imba_chess.eval.gumbel_search import GumbelConfig
 
 import argparse
@@ -152,6 +152,8 @@ def _parse_args() -> argparse.Namespace:
     p.add_argument("--config", type=Path, default=DEFAULT_CONFIG_PATH)
     p.add_argument("--checkpoint-a", type=Path, required=True)
     p.add_argument("--checkpoint-b", type=Path, required=True)
+    p.add_argument("--inference-dtype-a", choices=sorted(INFERENCE_DTYPES), default="float32")
+    p.add_argument("--inference-dtype-b", choices=sorted(INFERENCE_DTYPES), default="float32")
     p.add_argument("--label-a", type=str, default="A")
     p.add_argument("--label-b", type=str, default="B")
     p.add_argument(
@@ -199,12 +201,16 @@ def main() -> None:
     device = torch.device(device_arg)
     dtype = torch.float32
     models = {}
-    for side, checkpoint in (("A", args.checkpoint_a), ("B", args.checkpoint_b)):
+    for side, checkpoint, side_dtype in (
+        ("A", args.checkpoint_a, args.inference_dtype_a),
+        ("B", args.checkpoint_b, args.inference_dtype_b),
+    ):
         models[side], _ = load_runtime(
             repo_config=repo_config,
             checkpoint=checkpoint,
             device=device,
             algorithm=args.model_move_policy,
+            dtype=INFERENCE_DTYPES[side_dtype],
         )
     move_vocab = models["A"].move_vocab
     board_state_encoder = models["A"].encoder
@@ -332,6 +338,8 @@ def main() -> None:
         "label_b": args.label_b,
         "checkpoint_a": str(args.checkpoint_a),
         "checkpoint_b": str(args.checkpoint_b),
+        "inference_dtype_a": args.inference_dtype_a,
+        "inference_dtype_b": args.inference_dtype_b,
         "games_completed": n,
         "games_requested": len(openings) * 2,
         "errors": errors,

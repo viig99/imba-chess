@@ -1,5 +1,5 @@
 from __future__ import annotations
-from imba_chess.eval.inference_runtime import load_runtime
+from imba_chess.eval.inference_runtime import INFERENCE_DTYPES, load_runtime
 from imba_chess.eval.gumbel_search import GumbelConfig
 import argparse
 import json
@@ -124,6 +124,12 @@ def _parse_args() -> argparse.Namespace:
         choices=["gumbel", "value_search_halving"],
         default=None,
         help="Model move selection on legal moves.",
+    )
+    parser.add_argument(
+        "--inference-dtype",
+        choices=sorted(INFERENCE_DTYPES),
+        default="float32",
+        help="Search inference precision (model weights cast once at load).",
     )
     parser.add_argument(
         "--search-lambda",
@@ -1206,7 +1212,7 @@ def main() -> None:
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(args.seed)
     device = _resolve_device(args.device)
-    dtype = torch.float32
+    dtype = INFERENCE_DTYPES[args.inference_dtype]
     if device.type == "cuda" and (not torch.cuda.is_available()):
         raise RuntimeError("CUDA device requested but not available.")
     runtime, _ = load_runtime(
@@ -1214,6 +1220,7 @@ def main() -> None:
         checkpoint=args.checkpoint,
         device=device,
         algorithm=args.model_move_policy,
+        dtype=dtype,
     )
     model, move_vocab, board_state_encoder = (
         runtime.model,

@@ -45,7 +45,7 @@ def InferenceRuntime(
         encoder,
         torch.device("cpu"),
     )
-    runtime.algorithm = algorithm
+    runtime.algorithm, runtime.dtype = algorithm, torch.float32
     runtime._cache_token = object()
     runtime.options = dict(
         algorithm="gumbel",

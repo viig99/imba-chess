@@ -13,8 +13,11 @@ import torch
 from imba_chess.config import load_repo_config
 
 
-def load_runtime(config, checkpoint, device, *, stats=None):
-    from imba_chess.eval.inference_runtime import load_runtime as load_search_runtime
+def load_runtime(config, checkpoint, device, *, stats=None, dtype="float32"):
+    from imba_chess.eval.inference_runtime import (
+        INFERENCE_DTYPES,
+        load_runtime as load_search_runtime,
+    )
 
     random.seed(config.run.seed)
     torch.manual_seed(config.run.seed)
@@ -25,6 +28,7 @@ def load_runtime(config, checkpoint, device, *, stats=None):
         algorithm="gumbel",
         root_batch_tokens=config.collection.root_batch_tokens,
         stats=stats,
+        dtype=INFERENCE_DTYPES[dtype],
     )
 
 

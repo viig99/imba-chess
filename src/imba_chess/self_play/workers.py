@@ -38,7 +38,9 @@ POSITION_COUNTERS = ("neural_evaluations", "simulations", "terminal_hits", "dept
 def default_runtime_loader(config, checkpoint, device):
     from .runtime import load_runtime
 
-    return load_runtime(config, checkpoint, device)
+    return load_runtime(
+        config, checkpoint, device, dtype=config.collection.inference_dtype
+    )
 
 
 class WorkerFailed(RuntimeError):

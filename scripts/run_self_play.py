@@ -133,7 +133,10 @@ def main():
             split_games(args.concurrent_games or cfg.collection.concurrent_games, args.collect_workers)
         except ValueError as exc:
             parser.error(str(exc))
-    monitor = load_seeds(args.seeds, split="monitor")
+    elif cfg.collection.inference_dtype != "float32":
+        # The in-process runtime is also the FP32 training model.
+        parser.error("collection.inference_dtype other than float32 needs --collect-workers > 1")
+    monitor =load_seeds(args.seeds, split="monitor")
     if len(monitor) < max(cfg.run.screen_pairs, cfg.run.confirmation_pairs):
         parser.error(
             "seed manifest needs enough distinct monitoring prefixes for screen and confirmation"

@@ -216,3 +216,31 @@ def test_leaf_cache_rejects_foreign_and_stale_owners(monkeypatch):
     first.clear_caches()
     with pytest.raises(RuntimeError, match="stale"):
         execute(payload)
+
+
+def test_inference_dtype_must_match_weights(monkeypatch):
+    built = []
+    monkeypatch.setattr(torch.cuda, "current_device", lambda: 0)
+
+    def factory(**kwargs):
+        built.append(kwargs["dtype"])
+        return lambda payloads: payloads
+
+    monkeypatch.setattr(runtime, "_make_root_eval_executor", factory)
+    monkeypatch.setattr(runtime, "_make_decode_wave_executor", factory)
+
+    def build(weights, dtype):
+        parameter = SimpleNamespace(dtype=weights, device=torch.device("cuda", 0))
+        model = SimpleNamespace(training=False, parameters=lambda: iter([parameter]))
+        return runtime.InferenceRuntime(
+            model=model, move_vocab=VOCAB, encoder=ENCODER, device="cuda", dtype=dtype
+        )
+
+    assert build(torch.float32, torch.float32).options["dtype"] == "float32"
+    instance = build(torch.bfloat16, torch.bfloat16)
+    assert instance.options["dtype"] == "bfloat16"
+    assert built[-2:] == [torch.bfloat16, torch.bfloat16]
+    with pytest.raises(ValueError, match="weights"):
+        build(torch.float32, torch.bfloat16)
+    with pytest.raises(ValueError, match="float32 or bfloat16"):
+        build(torch.float16, torch.float16)

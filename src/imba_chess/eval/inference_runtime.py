@@ -1,4 +1,4 @@
-"""Shared CUDA FP32 search inference and per-model cache ownership."""
+"""Shared CUDA search inference (FP32 or BF16 weights) and per-model cache ownership."""
 
 from collections import Counter
 from dataclasses import dataclass
@@ -15,6 +15,9 @@ from .position_evaluator import CachedPositionEvaluator, _project_legal_logits
 from .search import PositionEval, HalvingConfig
 
 
+INFERENCE_DTYPES = dict(float32=torch.float32, bfloat16=torch.bfloat16)
+
+
 @dataclass(frozen=True)
 class HalvingResult:
     move_uci: str
@@ -29,6 +32,7 @@ def load_runtime(
     algorithm="gumbel",
     root_batch_tokens=1024,
     stats=None,
+    dtype=torch.float32,
 ):
     from imba_chess.data.board_state import BoardStateEncoder
     from imba_chess.data.move_vocab import MoveVocab
@@ -48,6 +52,7 @@ def load_runtime(
         compile_model=False,
         require_value_head=True,
     )
+    model.to(dtype)
     runtime = InferenceRuntime(
         model=model,
         move_vocab=vocab,
@@ -56,6 +61,7 @@ def load_runtime(
         algorithm=algorithm,
         root_batch_tokens=root_batch_tokens,
         stats=stats,
+        dtype=dtype,
     )
     return runtime, model.config.max_position_embeddings
 
@@ -71,6 +77,7 @@ class InferenceRuntime:
         root_batch_tokens=1024,
         algorithm="gumbel",
         stats=None,
+        dtype=torch.float32,
     ):
         if algorithm not in ("gumbel", "value_search_halving"):
             raise ValueError("unsupported search algorithm")
@@ -81,10 +88,10 @@ class InferenceRuntime:
             device = torch.device("cuda", torch.cuda.current_device())
         if model.training:
             raise ValueError("search requires an evaluation-mode model")
-        if any(
-            p.dtype != torch.float32 or p.device != device for p in model.parameters()
-        ):
-            raise ValueError("search requires FP32 weights on the runtime device")
+        if dtype not in INFERENCE_DTYPES.values():
+            raise ValueError("search runs in float32 or bfloat16")
+        if any(p.dtype != dtype or p.device != device for p in model.parameters()):
+            raise ValueError(f"search requires {dtype} weights on the runtime device")
         torch.backends.cuda.matmul.allow_tf32 = False
         torch.backends.cudnn.allow_tf32 = False
         self.model, self.move_vocab, self.encoder, self.device = (
@@ -93,11 +100,11 @@ class InferenceRuntime:
             encoder,
             device,
         )
-        self.algorithm = algorithm
+        self.algorithm, self.dtype = algorithm, dtype
         self._cache_token = object()
         self.options = dict(
             algorithm=algorithm,
-            dtype="float32",
+            dtype=str(dtype).removeprefix("torch."),
             tf32=False,
             runtime_revision="shared-search-v1",
         )
@@ -109,14 +116,14 @@ class InferenceRuntime:
             root_eval=_make_root_eval_executor(
                 model=model,
                 device=device,
-                dtype=torch.float32,
+                dtype=dtype,
                 stats=stats,
                 max_tokens=root_batch_tokens,
             ),
             decode_wave=_make_decode_wave_executor(
                 model=model,
                 device=device,
-                dtype=torch.float32,
+                dtype=dtype,
                 stats=stats,
                 algorithm=algorithm,
             ),
@@ -241,7 +248,7 @@ class InferenceRuntime:
             move_vocab=self.move_vocab,
             board_state_encoder=self.encoder,
             device=self.device,
-            dtype=torch.float32,
+            dtype=self.dtype,
             prefix_kv=output["kv_caches"],
             prefix_len=batch["total_tokens"],
             immutable_prefix=True,

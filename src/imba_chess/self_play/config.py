@@ -18,6 +18,8 @@ class CollectionConfig:
     root_batch_tokens: int = 1024
     max_game_plies: int = 512
     fresh_positions: int = 4096
+    # Collection-worker search precision; training always keeps FP32 weights.
+    inference_dtype: str = "float32"
 
 
 @dataclass(frozen=True)
@@ -125,10 +127,14 @@ class SelfPlayConfig:
 
     @cached_property
     def identifier(self):
+        settings = asdict(self)
+        if self.collection.inference_dtype == "float32":
+            # Runs started before the option existed keep their identity.
+            del settings["collection"]["inference_dtype"]
         return hashlib.sha256(
             json.dumps(
                 dict(
-                    settings=asdict(self),
+                    settings=settings,
                     base_sha256=hashlib.sha256(
                         Path(self.base_config).read_bytes()
                     ).hexdigest(),
@@ -152,8 +158,10 @@ def load_config(path):
     cfg = SelfPlayConfig(
         **{k: constructors[k](**v) if k in constructors else v for k, v in raw.items()}
     )
+    if cfg.collection.inference_dtype not in ("float32", "bfloat16"):
+        raise ValueError("collection.inference_dtype must be float32 or bfloat16")
     for section in (cfg.collection, cfg.replay, cfg.learning):
-        if any(not math.isfinite(v) or v <= 0 for k, v in asdict(section).items() if not k.startswith(("policy_surprise_", "auxiliary_value_")) and k not in ("value_weight", "value_search_mix")):
+        if any(not math.isfinite(v) or v <= 0 for k, v in asdict(section).items() if not k.startswith(("policy_surprise_", "auxiliary_value_")) and k not in ("value_weight", "value_search_mix", "inference_dtype")):
             raise ValueError("stage-2 sizes and learning settings must be positive")
     if not all(math.isfinite(v) for v in asdict(cfg.run).values()):
         raise ValueError("run settings must be finite")
