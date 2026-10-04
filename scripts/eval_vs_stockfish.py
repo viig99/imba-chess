@@ -1,5 +1,5 @@
 from __future__ import annotations
-from imba_chess.eval.inference_runtime import INFERENCE_DTYPES, load_runtime
+from imba_chess.eval.inference_runtime import INFERENCE_DTYPES, RUNTIME_REVISION, load_runtime
 from imba_chess.eval.gumbel_search import GumbelConfig
 import argparse
 import json
@@ -448,7 +448,7 @@ def _summary_to_payload(
             "exploration": "zero_noise"
             if model_move_policy == "gumbel"
             else "deterministic",
-            "runtime_revision": "shared-search-v1",
+            "runtime_revision": RUNTIME_REVISION,
             "budget": search_knobs["gumbel_simulations"]
             if model_move_policy == "gumbel"
             else search_knobs["search_budget"],

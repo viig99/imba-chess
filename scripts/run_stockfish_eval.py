@@ -24,6 +24,8 @@ import signal
 import subprocess
 import sys
 
+from imba_chess.eval.inference_runtime import RUNTIME_REVISION
+
 ROOT = Path(__file__).resolve().parents[1]
 
 
@@ -73,6 +75,7 @@ def main():
                     games=args.games, batch_games=args.batch_games, seed_base=args.seed_base,
                     stockfish_elo=args.elo, stockfish_nodes=args.nodes,
                     concurrent_games=args.concurrent_games, search_args=extra,
+                    runtime_revision=RUNTIME_REVISION,
                     git_head=subprocess.run(["git", "-C", str(ROOT), "rev-parse", "HEAD"],
                                             capture_output=True, text=True).stdout.strip())
     manifest_path = args.out / "manifest.json"
@@ -102,8 +105,12 @@ def main():
             path = args.out / f"batch-{i:02d}/results.json"
             if path.exists():
                 data = json.loads(path.read_text())
-                assert data["segments"][0]["stockfish"]["elo"] == args.elo
                 aggregate = data["aggregate"]
+                payloads = [aggregate, *(s.get("results", {}) for s in data["segments"])]
+                if any(p.get("run_config", {}).get("runtime_revision") != RUNTIME_REVISION
+                       for p in payloads):
+                    raise SystemExit(f"refusing to reuse batch from a different runtime: {path}")
+                assert data["segments"][0]["stockfish"]["elo"] == args.elo
                 assert aggregate["games"] == args.batch_games and aggregate["incomplete_games"] == 0
                 rows.append(aggregate)
         totals = {k: sum(r[k] for r in rows) for k in ("games", "wins", "draws", "losses")}

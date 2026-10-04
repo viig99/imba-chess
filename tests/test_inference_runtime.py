@@ -204,6 +204,43 @@ def test_refresh_rejects_pending_root(monkeypatch):
         gen.send((("a", "b"), {}))
 
 
+def test_root_forcing_reaches_low_prior_capture_through_shared_runtime(monkeypatch):
+    from imba_chess.eval.gumbel_search import select_gumbel
+
+    instance, _ = make_runtime(monkeypatch, "gumbel")
+    evaluator = UniformEvaluator(VOCAB)
+    monkeypatch.setattr(runtime, "CachedPositionEvaluator", lambda **kwargs: evaluator)
+    board = chess.Board("r1bqkbnr/pppp1ppp/2n5/4p3/4P3/5N2/PPPP1PPP/RNBQKB1R w KQkq - 2 3")
+    config = GumbelConfig(simulations=32, top_m=1, max_depth=1, root_forcing=True)
+    logits = torch.zeros(1, len(VOCAB))
+    logits[0, VOCAB.encode("f3e5")] = -100.0
+    root = dict(logits=logits, value_logits=torch.zeros(1, 3), kv_caches=[])
+    owner = ("actor", "game")
+    gen = instance.search_batch(board=board, batch={"total_tokens": 1},
+                                owner=owner, config=config, noise=0.0)
+    request = next(gen)
+    try:
+        while True:
+            if request.kind == "root_eval":
+                answer = root
+            else:
+                ev, batch = request.payload[1]
+                answer = ev.evaluate(batch)
+            request = gen.send((owner, answer))
+    except StopIteration as stop:
+        actual = stop.value
+    root_eval = evaluator.evaluate([(None, cozy_bridge.board_to_cozy(board))])[0]
+    priors = torch.log_softmax(logits[0, root_eval.legal_ids], 0).tolist()
+    root_eval = root_eval._replace(legal_log_priors=priors, wdl=(1/3, 1/3, 1/3))
+    expected = select_gumbel(evaluator=evaluator, board=board, config=config,
+                            root_eval=root_eval, noise=[0.0] * len(priors))
+    capture = actual.legal_ids.index(VOCAB.encode("f3e5"))
+    assert actual.visits[capture] > 0
+    assert actual.visits == expected.visits
+    assert actual.move_uci == expected.move_uci
+    assert actual.policy == pytest.approx(expected.policy)
+
+
 def test_leaf_cache_rejects_foreign_and_stale_owners(monkeypatch):
     first, _ = make_runtime(monkeypatch, "value_search_halving")
     second, _ = make_runtime(monkeypatch, "value_search_halving")

@@ -16,6 +16,7 @@ from .search import PositionEval, HalvingConfig
 
 
 INFERENCE_DTYPES = dict(float32=torch.float32, bfloat16=torch.bfloat16)
+RUNTIME_REVISION = "shared-search-v2"
 
 
 @dataclass(frozen=True)
@@ -106,7 +107,7 @@ class InferenceRuntime:
             algorithm=algorithm,
             dtype=str(dtype).removeprefix("torch."),
             tf32=False,
-            runtime_revision="shared-search-v1",
+            runtime_revision=RUNTIME_REVISION,
         )
         self.waves = dict(root_eval=Counter(), decode_wave=Counter())
         self.seconds = Counter()
@@ -239,7 +240,8 @@ class InferenceRuntime:
             [cozy_bridge.py_move_to_cozy(board, m) for m in moves],
             [m.uci() for m in moves],
             torch.log_softmax(logits.float(), 0).tolist(),
-            [False] * len(moves),
+            [board.is_capture(m) or bool(m.promotion) or board.gives_check(m)
+             for m in moves],
             [self.move_vocab.encode(m.uci()) for m in moves],
             wdl=wdl,
         )

@@ -126,6 +126,21 @@ def test_minimax_backup_counts_refutation_fully():
     assert plain.snapshot()[2][0] == pytest.approx(-0.35)
 
 
+@pytest.mark.parametrize("depth", [2, 3, 4, 5, 6])
+@pytest.mark.parametrize("weight", [0.0, 0.25, 0.5, 1.0])
+def test_minimax_blends_once_independently_of_tactic_depth(depth, weight):
+    # A single path ends in a choice between two opposite terminal values.
+    # Mean is zero at each ancestor; pure negamax alternates +/-1 up the path.
+    ancestors = [cc.NodeStats(0.0, [0.0], [1.0], weight) for _ in range(depth - 1)]
+    fork = cc.NodeStats(0.0, [0.0, 0.0], [0.5, 0.5], weight)
+    path = [(node, 0) for node in ancestors]
+    cc.gumbel_backup(path + [(fork, 0)], 1.0)
+    cc.gumbel_backup(path + [(fork, 1)], -1.0)
+    visits, sums, qs = ancestors[0].snapshot()
+    assert visits == [2] and sums == [0.0]
+    assert qs == pytest.approx([weight * (-1) ** (depth - 1)])
+
+
 def _node(role, config):
     board = chess.Board(FENS[1])
     evaluation = VariedEvaluator().evaluate([(("x",), cozy_bridge.board_to_cozy(board))])[0]

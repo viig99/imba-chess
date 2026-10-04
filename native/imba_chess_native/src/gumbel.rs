@@ -104,7 +104,11 @@ fn completed(
     // visit_cap > 0 bounds the visit term so larger budgets deepen search without
     // growing the value bonus beyond its value at that visit count.
     let top = *visits.iter().max().unwrap();
-    let top = if visit_cap > 0 { top.min(visit_cap) } else { top };
+    let top = if visit_cap > 0 {
+        top.min(visit_cap)
+    } else {
+        top
+    };
     let scale = (maxvisit_init + top as f64) * value_scale;
     // mctx rescale_values: min-max normalize per node; otherwise use raw Q.
     if rescale_values {
@@ -292,11 +296,11 @@ impl NodeStats {
             .collect()
     }
 
-    /// Side-to-move value of this node: best visited edge Q, else its own value.
+    /// Pure negamax value of this node, independent of the selection blend.
+    /// Blending here as well would attenuate tactical evidence at every ply.
     fn side_to_move_value(&self) -> f64 {
-        let q = self.qvalues();
         let mut best = f64::NEG_INFINITY;
-        for (value, n) in q.iter().zip(&self.visits) {
+        for (value, n) in self.edge_minimax.iter().zip(&self.visits) {
             if *n != 0 && *value > best {
                 best = *value;
             }
@@ -354,7 +358,9 @@ impl NodeStats {
         minimax_weight: f64,
     ) -> PyResult<Self> {
         if !value.is_finite() || value.abs() > 1.000001 || priors.iter().any(|x| !x.is_finite()) {
-            return Err(PyValueError::new_err("nonfinite or invalid network evaluation"));
+            return Err(PyValueError::new_err(
+                "nonfinite or invalid network evaluation",
+            ));
         }
         if let Some(wdl) = &wdl {
             if wdl.len() != 3
@@ -362,7 +368,9 @@ impl NodeStats {
                 || (python_sum(wdl) - 1.0).abs() > 1e-5
                 || (wdl[2] - wdl[0] - value).abs() > 1e-5
             {
-                return Err(PyValueError::new_err("invalid or inconsistent evaluation WDL"));
+                return Err(PyValueError::new_err(
+                    "invalid or inconsistent evaluation WDL",
+                ));
             }
         }
         let probs = clamped_softmax(&priors);
