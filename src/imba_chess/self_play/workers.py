@@ -19,18 +19,21 @@ Any worker failure or exit aborts the phase and raises in the coordinator.
 """
 
 import ctypes
-from multiprocessing.connection import wait
 import multiprocessing
 import os
 from pathlib import Path
+import queue
 import signal
+import sys
+import threading
+import time
 import traceback
 from types import SimpleNamespace
 
 import torch
 
 from imba_chess.eval.batch_scheduler import BatchScheduler
-from .collector import CollectionPhase, launch_game
+from .collector import CollectionPhase, launch_game, raise_game_error
 
 POSITION_COUNTERS = ("neural_evaluations", "simulations", "terminal_hits", "depth_cutoffs")
 
@@ -72,16 +75,27 @@ class CollectionWorkers:
         directory,
         cpu_threads=1,
         runtime_loader=default_runtime_loader,
+        startup_timeout=900.0,
+        progress_timeout=300.0,
+        shutdown_timeout=5.0,
+        should_stop=lambda: False,
     ):
         if count < 2:
             raise ValueError("multi-worker collection needs at least two workers")
         self.count, self.config = count, config
+        if any(not 0 < value < float("inf") for value in
+               (startup_timeout, progress_timeout, shutdown_timeout)):
+            raise ValueError("worker timeouts must be finite and positive")
+        self.progress_timeout, self.shutdown_timeout = progress_timeout, shutdown_timeout
         self.directory = Path(directory)
         self.directory.mkdir(parents=True, exist_ok=True)
         self.weights_path = self.directory / "weights.pt"
         context = multiprocessing.get_context("spawn")
         self.stop = context.RawValue(ctypes.c_bool, False)
         self.processes, self.connections = [], []
+        self._messages = queue.Queue(maxsize=count)
+        self._reader_stop = threading.Event()
+        self._readers = []
         try:
             for index in range(count):
                 parent, child = context.Pipe()
@@ -95,9 +109,36 @@ class CollectionWorkers:
                 child.close()
                 self.processes.append(process)
                 self.connections.append(parent)
-            limits = {self._expect(i, "ready")[0] for i in range(count)}
+            # Pipe readiness only promises some bytes, not a complete frame.
+            # Receive off the coordinator thread so partial messages cannot
+            # block startup, progress or stop deadlines. Bound buffered games.
+            for index, connection in enumerate(self.connections):
+                reader = threading.Thread(target=self._read_messages,
+                                          args=(index, connection), daemon=True)
+                reader.start()
+                self._readers.append(reader)
+            # Wait for every worker under one deadline, detecting failures in
+            # any process even when an earlier worker is still loading.
+            deadline = time.monotonic() + startup_timeout
+            pending, limits = set(range(count)), set()
+            while pending:
+                if should_stop():
+                    raise InterruptedError("stopped while loading collection workers")
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise WorkerFailed(f"collection worker startup timed out: {sorted(pending)}")
+                received = self._receive(timeout=min(0.5, remaining))
+                if received is None:
+                    continue
+                index, message = received
+                if message[0] == "error":
+                    raise WorkerFailed(f"collection worker {index} failed:\n{message[1]}")
+                if index not in pending or message[0] != "ready":
+                    raise WorkerFailed(f"collection worker {index} sent unexpected startup message")
+                limits.add(message[1])
+                pending.remove(index)
         except BaseException:
-            self.close()
+            self.close(force=True)
             raise
         if len(limits) != 1:
             self.close()
@@ -110,23 +151,33 @@ class CollectionWorkers:
     def __exit__(self, *exc):
         self.close()
 
-    def _receive(self, index):
+    def _read_messages(self, index, connection):
+        while not self._reader_stop.is_set():
+            try:
+                message, error = connection.recv(), None
+            except Exception as exc:
+                message, error = None, exc
+            while not self._reader_stop.is_set():
+                try:
+                    self._messages.put((index, message, error), timeout=0.1)
+                    break
+                except queue.Full:
+                    continue
+            if error is not None:
+                return
+
+    def _receive(self, *, timeout):
         try:
-            return self.connections[index].recv()
-        except (EOFError, OSError) as exc:
+            index, message, error = self._messages.get(timeout=timeout)
+        except queue.Empty:
+            return None
+        if error is not None:
             process = self.processes[index]
-            process.join(timeout=5)
+            process.join(timeout=min(0.5, self.shutdown_timeout))
             raise WorkerFailed(
                 f"collection worker {index} exited (exit code {process.exitcode})"
-            ) from exc
-
-    def _expect(self, index, kind):
-        message = self._receive(index)
-        if message[0] == "error":
-            raise WorkerFailed(f"collection worker {index} failed:\n{message[1]}")
-        if message[0] != kind:
-            raise WorkerFailed(f"collection worker {index} sent {message[0]!r}, expected {kind!r}")
-        return message[1:]
+            ) from error
+        return index, message
 
     def _publish_weights(self, model):
         temporary = self.weights_path.with_suffix(".tmp")
@@ -167,7 +218,7 @@ class CollectionWorkers:
             max_positions=max_positions,
             start_sampler=start_sampler,
             game_count=game_count,
-            should_launch=should_launch,
+            should_launch=lambda: not self.stop.value and not should_stop() and should_launch(),
             iteration=iteration,
             on_game=on_game,
             skip_ids=skip_ids,
@@ -188,14 +239,27 @@ class CollectionWorkers:
                     concurrent_games=count,
                 )))
             running = set(range(self.count))
+            last_progress = dict.fromkeys(running, time.monotonic())
+            stop_deadline = None
             while running:
+                now = time.monotonic()
                 if not self.stop.value and should_stop():
                     self.stop.value = True
-                ready = wait([self.connections[i] for i in running], timeout=0.5)
-                for connection in ready:
-                    index = self.connections.index(connection)
-                    message = self._receive(index)
+                    stop_deadline = now + self.shutdown_timeout
+                if stop_deadline is not None and now >= stop_deadline:
+                    raise WorkerFailed(f"collection workers did not stop: {sorted(running)}")
+                stalled = [i for i in running if now - last_progress[i] >= self.progress_timeout]
+                if stalled:
+                    raise WorkerFailed(f"collection worker progress timed out: {sorted(stalled)}")
+                deadline = min(last_progress[i] + self.progress_timeout for i in running)
+                if stop_deadline is not None:
+                    deadline = min(deadline, stop_deadline)
+                received = self._receive(timeout=min(0.5, max(0.0, deadline - now)))
+                if received is not None:
+                    index, message = received
+                    connection = self.connections[index]
                     kind = message[0]
+                    handling_started = time.monotonic()
                     if kind == "launch":
                         connection.send(phase.next_launch())
                     elif kind == "position":
@@ -209,37 +273,59 @@ class CollectionWorkers:
                         raise WorkerFailed(f"collection worker {index} failed:\n{message[1]}")
                     else:
                         raise WorkerFailed(f"collection worker {index} sent {kind!r}")
+                    # Stream reads and replay publication may block the
+                    # coordinator. Workers waiting on it are not stalled.
+                    handled = time.monotonic()
+                    for other in running:
+                        last_progress[other] += handled - handling_started
+                    last_progress[index] = handled
         except BaseException as exc:
             # Workers may be mid-phase; there is no partial recovery.
-            self.close()
+            self.close(force=True)
             phase.abort(exc)
             raise
         finally:
             phase.finish()
         return phase.metrics
 
-    def close(self):
-        for connection in self.connections:
-            try:
-                connection.send(("exit",))
-            except (BrokenPipeError, OSError):
-                pass
+    def close(self, *, force=False):
+        self.stop.value = True
+        self._reader_stop.set()
+        if not force:
+            for connection in self.connections:
+                try:
+                    connection.send(("exit",))
+                except (BrokenPipeError, OSError):
+                    pass
+        deadline = time.monotonic() + (0.0 if force else self.shutdown_timeout)
         for process in self.processes:
-            process.join(timeout=30)
+            process.join(timeout=max(0.0, deadline - time.monotonic()))
             if process.is_alive():
                 process.kill()  # Workers ignore SIGTERM; the coordinator drains them.
                 process.join()
         for connection in self.connections:
             connection.close()
+        for reader in self._readers:
+            reader.join(timeout=0.5)
+        self._readers = []
         self.processes, self.connections = [], []
 
 
 def _worker_main(connection, config, checkpoint, device, cpu_threads, runtime_loader, stop):
     # The coordinator owns shutdown (its StopBudget drains on SIGINT/SIGTERM and
     # sets `stop`); a service-wide signal must not kill games mid-write.
-    signal.signal(signal.SIGINT, signal.SIG_IGN)
-    signal.signal(signal.SIGTERM, signal.SIG_IGN)
     try:
+        if sys.platform == "linux":
+            # Hard coordinator deadlines bypass cleanup. A stuck GPU worker
+            # must still die with its parent; SIGTERM is ignored below.
+            parent = os.getppid()
+            libc = ctypes.CDLL(None, use_errno=True)
+            if libc.prctl(1, signal.SIGKILL) != 0:  # PR_SET_PDEATHSIG
+                raise OSError(ctypes.get_errno(), "cannot set worker parent-death signal")
+            if os.getppid() != parent or parent == 1:
+                return
+        signal.signal(signal.SIGINT, signal.SIG_IGN)
+        signal.signal(signal.SIGTERM, signal.SIG_IGN)
         torch.set_num_threads(cpu_threads)
         runtime, max_positions = runtime_loader(config, Path(checkpoint), device)
         connection.send(("ready", max_positions))
@@ -268,7 +354,7 @@ def _worker_main(connection, config, checkpoint, device, cpu_threads, runtime_lo
 
 def _play_phase(connection, runtime, config, max_positions, job, stop):
     def factory():
-        while True:
+        while not stop.value:
             connection.send(("launch",))
             launch = connection.recv()
             if launch is None:
@@ -296,6 +382,6 @@ def _play_phase(connection, runtime, config, max_positions, job, stop):
         executors=runtime.executors,
         concurrent_games=job["concurrent_games"],
         on_game_done=lambda gid, game: connection.send(("game", gid, game)),
-        on_game_error=lambda gid, exc: None,
+        on_game_error=raise_game_error,
         completion_order=True,
     ).run()

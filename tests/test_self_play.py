@@ -633,6 +633,105 @@ def test_collection_concurrency_invariance_and_executor_failure(tmp_path):
     assert unfinished[0]["game_id"] in starts.state["pending"]
 
 
+@pytest.mark.parametrize("where", ["search", "before_game_loop"])
+def test_collection_stops_on_game_errors_and_retries_original_launches(tmp_path, monkeypatch, where):
+    from imba_chess.self_play import collector
+
+    runtime = ScriptRuntime()
+    runtime.executors = {"tick": lambda ps: ps}
+    starts, cfg = mate_starts(tmp_path / "stream")
+    store = SelfPlayStore(tmp_path / "replay")
+    metrics, games = collector.CollectionMetrics(), []
+
+    def fail(*args, **kwargs):
+        raise ValueError("invalid evaluation WDL")
+
+    with monkeypatch.context() as patch:
+        if where == "search":
+            patch.setattr(runtime, "search", fail)
+        else:
+            patch.setattr(collector, "_SequenceHistory", fail)
+        with pytest.raises((ValueError, collector.CollectionError), match="invalid evaluation WDL"):
+            collector.collect(runtime=runtime, config=cfg, actor_id="actor", store=store,
+                              max_positions=128, concurrent_games=3, start_sampler=starts,
+                              metrics=metrics, on_game=games.append)
+    assert len(games) == len(starts.state["pending"]) == 3
+    assert metrics.counts["training_positions"] == 0 and not store.seen
+    assert all(g["targets"] == [] and g["outcome_white"] is None for g in games)
+    assert all("invalid evaluation WDL" in g["error"] for g in games)
+    pending = set(starts.state["pending"])
+    collector.collect(runtime=runtime, config=cfg, actor_id="actor", store=store,
+                      max_positions=128, concurrent_games=3, game_count=3, start_sampler=starts)
+    assert store.seen == pending and not starts.state["pending"]
+
+
+def test_phase_recovery_uses_indexed_summaries_including_evicted_games(tmp_path, monkeypatch):
+    from imba_chess.self_play.collector import CollectionMetrics
+    from imba_chess.data import self_play_store
+
+    store = SelfPlayStore(tmp_path, window_positions=4, flush_games=2)
+    expected = CollectionMetrics()
+    for number in range(5):
+        game = mate_game(str(number))
+        game.update(iteration=0 if number == 0 else 1, starting_bucket=number % 4)
+        store.add(game)
+        if number:
+            expected.done(game)
+    store.flush()
+    recovered = SelfPlayStore(tmp_path, window_positions=4)
+
+    def no_read(*args, **kwargs):
+        pytest.fail("phase recovery must not read trajectories with indexed summaries")
+
+    monkeypatch.setattr(recovered, "read_game", no_read)
+    monkeypatch.setattr(self_play_store.pq, "ParquetFile", no_read)
+    metrics = CollectionMetrics()
+    for summary in recovered.phase_summaries(iteration=1, actor_id="a"):
+        metrics.done(summary)
+    assert metrics.counts == expected.counts
+    assert metrics.terminations == expected.terminations
+    assert metrics.buckets == expected.buckets
+    assert metrics.counts["completed_games"] == 4
+    assert recovered.phase_summaries(iteration=1, actor_id="other") == []
+
+
+def test_legacy_phase_summary_migration_reads_each_shard_once(tmp_path, monkeypatch):
+    from imba_chess.data import self_play_store
+
+    store = SelfPlayStore(tmp_path, flush_games=2)
+    for number in range(4):
+        game = mate_game(str(number))
+        game["iteration"] = 7
+        store.add(game)
+    path = tmp_path / "manifest.json"
+    manifest = json.loads(path.read_text())
+    for shard in manifest["shards"]:
+        for entry in shard["games"]:
+            for key in list(entry):
+                if key not in ("id", "positions", "split"):
+                    del entry[key]
+    path.write_text(json.dumps(manifest))
+    before = path.read_bytes()
+    reader = SelfPlayStore(tmp_path, read_only=True)
+    assert len(reader.phase_summaries(iteration=7, actor_id="a")) == 4
+    assert path.read_bytes() == before
+    writer = SelfPlayStore(tmp_path)
+    opened = []
+    parquet_file = self_play_store.pq.ParquetFile
+
+    def counted(filename):
+        opened.append(filename)
+        return parquet_file(filename)
+
+    monkeypatch.setattr(self_play_store.pq, "ParquetFile", counted)
+    assert len(writer.phase_summaries(iteration=7, actor_id="a")) == 4
+    assert len(writer.phase_summaries(iteration=7, actor_id="a")) == 4
+    assert len(opened) == 2
+    reloaded = SelfPlayStore(tmp_path, read_only=True)
+    assert len(reloaded.phase_summaries(iteration=7, actor_id="a")) == 4
+    assert len(opened) == 2
+
+
 def test_read_only_replay_preserves_published_snapshot(tmp_path):
     writer = SelfPlayStore(tmp_path, flush_games=1)
     writer.add(mate_game("first"))

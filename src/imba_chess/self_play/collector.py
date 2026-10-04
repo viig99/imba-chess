@@ -15,6 +15,16 @@ from imba_chess.eval.position_evaluator import (
 from imba_chess.eval.search import terminal_value_for_color
 
 
+class CollectionError(RuntimeError):
+    """A gameplay failure aborts collection instead of generating more launches."""
+
+
+def raise_game_error(gid, exc):
+    # BatchScheduler normally isolates generator failures. Self-play must fail
+    # the phase, including failures before play_game's error-recording block.
+    raise exc
+
+
 def terminal_outcome(board):
     value = terminal_value_for_color(board, color=board.turn)
     if value is None:
@@ -168,6 +178,7 @@ class CollectionMetrics:
             counts["search_seconds"] += elapsed
 
     def done(self, game):
+        length = game.get("positions", len(game.get("moves", ())))
         self.counts[game["status"] + "_games"] += 1
         self.terminations[game["termination"]] += 1
         if "starting_bucket" in game:
@@ -178,7 +189,6 @@ class CollectionMetrics:
                 "context_limit",
                 "game_limit",
             )
-            length = len(game["moves"])
             counts["continuation_plies"] += length
             counts["max_continuation_plies"] = max(
                 counts["max_continuation_plies"], length
@@ -186,10 +196,10 @@ class CollectionMetrics:
             if game["status"] == "completed":
                 counts["completed_continuation_plies"] += length
         if game["status"] == "completed":
-            self.counts["completed_positions"] += len(game["moves"])
+            self.counts["completed_positions"] += length
             if game["split"] == "train":
-                self.counts["usable_positions"] += len(game["moves"])
-                self.counts["training_positions"] += len(game["moves"])
+                self.counts["usable_positions"] += length
+                self.counts["training_positions"] += length
 
     def report(self):
         elapsed = max(time.perf_counter() - self.start, 1e-9)
@@ -311,7 +321,7 @@ class CollectionPhase:
         self.exhausted = True
         return None
 
-    def done(self, gid, game):
+    def done(self, gid, game, *, aborted=False):
         config, store = self.config, self.store
         metadata = self.active.pop(gid)
         if game is None:
@@ -345,13 +355,17 @@ class CollectionPhase:
         ):
             self.start_sampler.retire(gid, game.get("termination", "unknown"))
         self.on_game(game)
+        if game.get("termination") == "error" and not aborted:
+            raise CollectionError(
+                f"self-play game {gid} failed: {game.get('error', 'unknown gameplay error')}"
+            )
 
     def abort(self, exc):
         # A failed executor or worker aborts every still-live game. Keep their
         # identities/reasons visible while leaving them completely unlabeled.
         for gid in list(self.active):
             self.active[gid]["error"] = f"{type(exc).__name__}: {exc}"
-            self.done(gid, self.active[gid])
+            self.done(gid, self.active[gid], aborted=True)
 
     def finish(self):
         self.store.flush()
@@ -386,7 +400,7 @@ def collect(
         max_positions=max_positions,
         start_sampler=start_sampler,
         game_count=game_count,
-        should_launch=should_launch,
+        should_launch=lambda: not should_stop() and should_launch(),
         iteration=iteration,
         on_game=on_game,
         skip_ids=skip_ids,
@@ -420,7 +434,7 @@ def collect(
                 else concurrent_games
             ),
             on_game_done=phase.done,
-            on_game_error=lambda gid, exc: None,
+            on_game_error=raise_game_error,
             completion_order=True,
         ).run()
     except Exception as exc:

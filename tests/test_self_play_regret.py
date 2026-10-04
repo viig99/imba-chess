@@ -1,4 +1,5 @@
 from copy import deepcopy
+from contextlib import nullcontext
 from dataclasses import asdict, replace
 import hashlib
 import json
@@ -10,7 +11,7 @@ import torch
 
 from imba_chess.data.self_play_store import SelfPlayStore, atomic_json
 from imba_chess.eval.gumbel_search import GumbelConfig
-from imba_chess.self_play.collector import collect
+from imba_chess.self_play.collector import collect, CollectionError
 from imba_chess.self_play.config import (
     LearningConfig,
     RegretConfig,
@@ -505,18 +506,28 @@ def test_incomplete_collection_never_updates_regret(tmp_path, termination):
         runtime.search = fail
     before = deepcopy(starts.state["regret"])
     games = []
-    collect(
-        runtime=runtime,
-        config=cfg,
-        actor_id="a",
-        store=store,
-        max_positions=positions,
-        game_count=1,
-        concurrent_games=1,
-        start_sampler=starts,
-        should_stop=lambda: termination == "interrupted",
-        on_game=games.append,
-    )
+    stop_checks = 0
+
+    def should_stop():
+        nonlocal stop_checks
+        stop_checks += 1
+        # Permit the journaled launch, then interrupt its active game.
+        return termination == "interrupted" and stop_checks > 1
+
+    with (pytest.raises(CollectionError, match="search failure")
+          if termination == "error" else nullcontext()):
+        collect(
+            runtime=runtime,
+            config=cfg,
+            actor_id="a",
+            store=store,
+            max_positions=positions,
+            game_count=1,
+            concurrent_games=1,
+            start_sampler=starts,
+            should_stop=should_stop,
+            on_game=games.append,
+        )
     assert games[0]["termination"] == termination
     assert not store.seen and starts.state["regret"] == before
     assert (gid in starts.state["pending"]) == (termination in ("interrupted", "error"))

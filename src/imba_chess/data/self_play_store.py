@@ -74,6 +74,17 @@ def validate_game(game):
             raise ValueError("policy must be normalized")
 
 
+def game_summary(game):
+    """Small durable collection record; no policies or inherited histories."""
+    summary = dict(id=game["game_id"], positions=len(game["moves"]),
+                   split=game["split"], status=game["status"],
+                   actor_id=game["actor_id"], iteration=game.get("iteration"),
+                   termination=game["termination"])
+    if "starting_bucket" in game:
+        summary["starting_bucket"] = game["starting_bucket"]
+    return summary
+
+
 class SelfPlayStore:
     """Single-writer store; the run lock is owned by the orchestrator.
 
@@ -136,7 +147,7 @@ class SelfPlayStore:
                 if gid in self.seen:
                     continue
                 self.seen.add(gid)
-                entry = dict(id=gid, positions=len(game["moves"]), split=game["split"])
+                entry = game_summary(game)
                 entries.append(entry)
                 self.index[gid] = (path.name, entry)
                 self.manifest["active"].append(gid)
@@ -217,6 +228,37 @@ class SelfPlayStore:
             for g in self.manifest["active"]
             if split is None or self.index[g][1]["split"] == split
         ]
+
+    def phase_summaries(self, *, iteration, actor_id):
+        """Restore collection counts from metadata, including evicted games.
+
+        Legacy manifests are enriched once, reading each surviving legacy shard
+        once. Read-only readers never publish or modify the manifest.
+        """
+        required = {"actor_id", "iteration", "termination", "status"}
+        summaries, changed = [], False
+        for shard in self.manifest["shards"]:
+            legacy = {entry["id"]: entry for entry in shard["games"]
+                      if not required <= entry.keys()}
+            recovered = {}
+            if legacy:
+                path = self.directory / shard["file"]
+                if path.exists():
+                    for batch in pq.ParquetFile(path).iter_batches(batch_size=16):
+                        for row in batch.to_pylist():
+                            if row["game_id"] in legacy:
+                                summary = game_summary(json.loads(row["trajectory"]))
+                                recovered[summary["id"]] = summary
+                                if not self.read_only:
+                                    legacy[summary["id"]].update(summary)
+                                    changed = True
+            for entry in shard["games"]:
+                summary = recovered.get(entry["id"], entry)
+                if summary.get("iteration") == iteration and summary.get("actor_id") == actor_id:
+                    summaries.append(summary)
+        if changed:
+            self._publish()
+        return summaries
 
     def read_game(self, gid):
         filename, _ = self.index[gid]

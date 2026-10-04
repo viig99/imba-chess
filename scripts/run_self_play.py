@@ -8,6 +8,7 @@ from contextlib import ExitStack
 from dataclasses import asdict
 from datetime import datetime
 import json
+import math
 from pathlib import Path
 import time
 import torch
@@ -86,6 +87,12 @@ def main():
         type=int,
         help="Collection slots; execution-only override preserves resume config identity",
     )
+    parser.add_argument("--worker-startup-timeout", type=float, default=900.0,
+                        help="Seconds allowed for collection workers to load (execution-only)")
+    parser.add_argument("--worker-progress-timeout", type=float, default=300.0,
+                        help="Maximum seconds without worker progress (execution-only)")
+    parser.add_argument("--worker-shutdown-timeout", type=float, default=5.0,
+                        help="Seconds to stop workers cooperatively before killing them (execution-only)")
     parser.add_argument(
         "--until",
         type=datetime.fromisoformat,
@@ -108,6 +115,9 @@ def main():
         parser.error("--concurrent-games must be positive")
     if args.collect_workers < 1:
         parser.error("--collect-workers must be positive")
+    if any(not math.isfinite(value) or value <= 0 for value in
+           (args.worker_startup_timeout, args.worker_progress_timeout, args.worker_shutdown_timeout)):
+        parser.error("worker timeouts must be finite and positive")
     if args.cpu_threads < 1:
         parser.error("--cpu-threads must be positive")
     if args.checkpoint_seconds < 1:
@@ -204,6 +214,10 @@ def main():
                     device=args.device,
                     directory=args.output / "collect-workers",
                     cpu_threads=args.cpu_threads,
+                    startup_timeout=args.worker_startup_timeout,
+                    progress_timeout=args.worker_progress_timeout,
+                    shutdown_timeout=args.worker_shutdown_timeout,
+                    should_stop=budget.stop,
                 )
             )
         if args.resume and state.get("frozen_evaluator_id"):
@@ -285,6 +299,9 @@ def main():
                 inference_options=getattr(runtime, "options", {}),
                 cpu_threads=torch.get_num_threads(),
                 collect_workers=args.collect_workers,
+                worker_startup_timeout=args.worker_startup_timeout,
+                worker_progress_timeout=args.worker_progress_timeout,
+                worker_shutdown_timeout=args.worker_shutdown_timeout,
                 until=args.until.isoformat() if args.until else None,
                 continuous=args.continuous,
                 checkpoint_seconds=args.checkpoint_seconds,
@@ -312,16 +329,10 @@ def main():
                 if not budget.launch():
                     break
                 metrics = CollectionMetrics()
-                for shard in store.manifest["shards"]:
-                    if not (store.directory / shard["file"]).exists():
-                        continue
-                    for entry in shard["games"]:
-                        game = store.read_game(entry["id"])
-                        if (
-                            game.get("iteration") == state["iteration"]
-                            and game["actor_id"] == state["actor_id"]
-                        ):
-                            metrics.done(game)
+                for summary in store.phase_summaries(
+                    iteration=state["iteration"], actor_id=state["actor_id"]
+                ):
+                    metrics.done(summary)
 
                 def record_game(game):
                     if game["status"] != "completed":
