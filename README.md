@@ -65,6 +65,8 @@ Install project dependencies and native bindings with `uv sync --extra dev`. Dat
 
 Collection is limited by its single search thread, not the GPU. `--collect-workers N` splits `--concurrent-games` across N processes sharing the GPU. The main process keeps replay, streamed starts, regret state and training, and workers load its weights at every collect phase. On the 8 GB laptop, 2 workers × 32 games collected 24% faster than one process with 64 games; 4 × 16 saturated the GPU. `--cpu-threads` (default 1) stops idle OpenMP workers from spinning on every core. Both flags are execution-only and keep the resume config identity.
 
+`--initialize-optimizer` carries the supervised optimizer and remaining OneCycleLR schedule into self-play. After that schedule ends, learning continues at each parameter group's terminal minimum rate. This behavior and the schedule clock survive stage-2 checkpoints.
+
 Search inference uses CUDA FP32 with TF32 disabled. Gumbel uses the compiled decoder and reusable workspace (maximum depth 32); halving uses the grouped cached decoder with its configured depth. Runtime choices follow the selected algorithm. Ordinary model-component SDPA remains unchanged. Compilation adds first-use latency. Historical measurements remain in the [readiness report](docs/SELF_PLAY_READINESS_REVIEW_2026-09-11.md).
 
 Use [the config guide](docs/CONFIG_GUIDE.md) before changing an existing run. The 5090 recipe reproduces the running tactical fork of the vmix run (auxiliary-value base config); it is not a measured performance promise.

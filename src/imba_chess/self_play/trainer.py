@@ -17,6 +17,15 @@ from .config import LearningConfig
 from .losses import self_play_loss
 
 
+class ContinuedOneCycleLR(torch.optim.lr_scheduler.OneCycleLR):
+    """Finish an imported schedule, then hold each group's terminal minimum LR."""
+
+    def get_lr(self):
+        if self.last_epoch >= self.total_steps:
+            return [group["min_lr"] for group in self.optimizer.param_groups]
+        return super().get_lr()
+
+
 def _model_loss(model, batch, mask, value_weight, auxiliary_value_weight=1.0):
     output = model(batch, block_mask=mask, return_loss=False)
     return self_play_loss(output, batch, value_weight=value_weight,
@@ -108,12 +117,12 @@ class Stage2Trainer:
     def _restore_optimization(self, state):
         schedule = state["scheduler"]
         kind = state.get("scheduler_type", "LambdaLR")
-        if kind == "OneCycleLR":
+        if kind in ("OneCycleLR", "ContinuedOneCycleLR"):
             # Construction changes optimizer rates; restore its saved state after
             # constructing the correct scheduler, then restore the schedule clock.
             if schedule.get("cycle_momentum", False):
                 raise ValueError("momentum-cycling schedules are not supported")
-            self.scheduler = torch.optim.lr_scheduler.OneCycleLR(
+            self.scheduler = ContinuedOneCycleLR(
                 self.optimizer,
                 max_lr=[g["max_lr"] for g in state["optimizer"]["param_groups"]],
                 total_steps=schedule["total_steps"],
@@ -123,6 +132,10 @@ class Stage2Trainer:
             raise ValueError(f"unsupported scheduler: {kind}")
         self.optimizer.load_state_dict(state["optimizer"])
         self.scheduler.load_state_dict(schedule)
+        if isinstance(self.scheduler, ContinuedOneCycleLR) and self.scheduler.last_epoch >= self.scheduler.total_steps:
+            for group in self.optimizer.param_groups:
+                group["lr"] = group["min_lr"]
+            self.scheduler._last_lr = [group["lr"] for group in self.optimizer.param_groups]
 
     def initialize_optimization(self, path):
         """Carry supervised optimizer/schedule into a fresh self-play dataset."""
