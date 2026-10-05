@@ -437,3 +437,28 @@ def test_prune_snapshots_keeps_newest(tmp_path):
     ]
     prune_snapshots(tmp_path, None)
     assert len(list(tmp_path.glob("actor-*.pt"))) == 5
+
+
+def test_frozen_value_head_never_changes():
+    model = tiny_model()
+    games, _ = _play(model, slots=2, positions=2 * 24, max_plies=6, bootstrap="value")
+    before = {k: v.clone() for k, v in model.state_dict().items()
+              if k.startswith(("value_head.", "action_value_head."))}
+    trainer = KlentTrainer(model, device=torch.device("cpu"), start_id=VOCAB.start_id,
+                           batch_tokens=64, grad_clip=1.0, compile_model=False,
+                           freeze_value_head=True)
+    for warmup in (True, False):
+        trainer.set_phase(warmup=warmup, lr=1e-2, weight_decay=0.0)
+        trainer.train_epoch(games, np.random.default_rng(0), policy_weight=0.0 if warmup else 1.0,
+                            value_weight=0.0)
+    after = model.state_dict()
+    assert all(torch.equal(after[k], v) for k, v in before.items() if k.startswith("value_head."))
+    assert not torch.equal(after["action_value_head.weight"], before["action_value_head.weight"])
+
+
+def test_freeze_value_head_config_rules():
+    KlentConfig(init="some.pt", freeze_value_head=True, value_weight=0.0)
+    with pytest.raises(ValueError, match="value_weight"):
+        KlentConfig(init="some.pt", freeze_value_head=True)
+    with pytest.raises(ValueError, match="checkpoint"):
+        KlentConfig(freeze_value_head=True, value_weight=0.0)

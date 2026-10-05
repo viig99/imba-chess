@@ -35,6 +35,8 @@ class KlentConfig:
     q_warmup_iterations: int = 0
     warmup_lr: float = 1e-3
     value_weight: float = 1.0
+    # Keep the value head at its initial weights (no gradient, no value loss).
+    freeze_value_head: bool = False
     bootstrap: str = "q"
     inference_dtype: str = "bfloat16"
     # Training autocast, as in supervised training; master weights stay fp32.
@@ -55,6 +57,10 @@ class KlentConfig:
             raise ValueError(f"{positive} must be positive")
         if self.q_warmup_iterations < 0 or self.value_weight < 0 or self.weight_decay < 0:
             raise ValueError("q_warmup_iterations, value_weight and weight_decay must be >= 0")
+        if self.freeze_value_head and self.value_weight != 0:
+            raise ValueError("freeze_value_head requires value_weight = 0")
+        if self.freeze_value_head and self.init == "scratch":
+            raise ValueError("freeze_value_head needs a trained value head (init from a checkpoint)")
         if self.batch_tokens <= self.max_plies:
             raise ValueError("batch_tokens must hold one full game (max_plies + BOS)")
 

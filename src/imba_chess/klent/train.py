@@ -137,8 +137,9 @@ class KlentTrainer:
     """
 
     def __init__(self, model, *, device, start_id, batch_tokens, grad_clip, compile_model,
-                 train_dtype="float32"):
+                 train_dtype="float32", freeze_value_head=False):
         self.model, self.device, self.start_id = model, device, start_id
+        self.freeze_value_head = freeze_value_head
         self.batch_tokens, self.grad_clip = batch_tokens, grad_clip
         cuda = device.type == "cuda"
         self.forward_loss = (
@@ -157,7 +158,10 @@ class KlentTrainer:
 
         A checkpoint's value head may be badly calibrated for self-play (the
         supervised 53250 head never predicts draws), so it is fitted alongside
-        the fresh Q head before any gradient reaches the shared trunk.
+        the fresh Q head before any gradient reaches the shared trunk. With
+        freeze_value_head the value head never trains in either phase: fitting
+        it to draw-heavy self-play outcomes erases its ability to tell
+        positions apart, which the bootstrap and search rely on.
         """
         if self.warmup == warmup:
             # Runtime overrides must preserve the accumulated optimizer moments.
@@ -170,7 +174,7 @@ class KlentTrainer:
         for parameter in self.model.parameters():
             parameter.requires_grad_(not warmup)
         self.model.action_value_head.requires_grad_(True)
-        self.model.value_head.requires_grad_(True)
+        self.model.value_head.requires_grad_(not self.freeze_value_head)
         self.optimizer = StableAdamW(
             build_decay_param_groups(self.model, weight_decay=weight_decay),
             lr=lr,

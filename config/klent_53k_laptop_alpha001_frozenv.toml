@@ -1,0 +1,23 @@
+# 53k KLENT, third attempt: alpha 0.01 with the 53250 value head frozen.
+# Q-spread diagnostic (top-1 vs top-2 Q gap per position): alpha 0.03 runs reached ~0.012, so the
+# target preferred the better move only e^(0.012/0.03) ~ 1.5x and the policy flattened; alpha 0.003
+# reached ~0.034, e^11 ~ deterministic, and the policy sharpened toward collapse. alpha 0.01 gives
+# ~e^3 ~ 30x. Training the value head on draw-heavy self-play outcomes shrank its one-ply move spread
+# from 0.157 (53250) to 0.04-0.075, so it stays frozen: no value loss, no gradient.
+# Warm-up (2 iterations) trains only the new action-value head with the frozen value-head bootstrap.
+base_config = "config/imba_chess_v4.toml"
+init = "artifacts/checkpoints_keep/flatten53250_supervised_last_checkpoint.pt"
+alpha = 0.01
+beta = 0.1
+tau = 8.0
+positions_per_iteration = 2097152
+total_positions = 419430400
+batch_tokens = 4096
+slots = 256
+q_warmup_iterations = 2
+warmup_lr = 1e-3
+lr = 1e-4
+value_weight = 0.0
+freeze_value_head = true
+bootstrap = "q"
+inference_dtype = "bfloat16"

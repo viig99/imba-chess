@@ -94,6 +94,7 @@ class KlentRun:
             grad_clip=cfg.grad_clip,
             compile_model=cfg.compile,
             train_dtype=cfg.train_dtype,
+            freeze_value_head=cfg.freeze_value_head,
         )
         self.iteration = self.positions = 0
         if resume_state is not None:
