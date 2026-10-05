@@ -1,0 +1,14 @@
+# KLENT from scratch with the reference hyperparameters (laptop 3070 Ti, 8 GB).
+base_config = "config/imba_chess_v4.toml"
+init = "scratch"
+alpha = 0.03
+beta = 0.1
+tau = 8.0
+positions_per_iteration = 2097152
+total_positions = 75000000
+batch_tokens = 4096
+slots = 256
+lr = 1e-3
+value_weight = 1.0
+bootstrap = "q"
+inference_dtype = "bfloat16"

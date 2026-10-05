@@ -154,6 +154,13 @@ def load_hstu_checkpoint(
             f"(checkpoint_has_value_head={checkpoint_has_value_head})."
         )
         model_cfg = replace(model_cfg, enable_value_head=checkpoint_has_value_head)
+    # KLENT checkpoints carry an action-value head; the repo config never does.
+    model_cfg = replace(
+        model_cfg,
+        enable_action_value_head=any(
+            key.startswith("action_value_head.") for key in normalized_state_dict
+        ),
+    )
 
     model: torch.nn.Module = HSTUChessModel(model_cfg).to(device)
     load_initial_weights(model, {"model": normalized_state_dict})

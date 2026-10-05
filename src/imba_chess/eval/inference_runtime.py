@@ -25,6 +25,17 @@ class HalvingResult:
     candidates: list[dict]
 
 
+@dataclass(frozen=True)
+class PolicyResult:
+    """Greedy policy move (argmax legal logit), no search -- KLENT's eval."""
+
+    move_uci: str
+    simulations: int = 0
+    neural_evaluations: int = 1
+    terminal_hits: int = 0
+    depth_cutoffs: int = 0
+
+
 def load_runtime(
     *,
     repo_config,
@@ -80,7 +91,7 @@ class InferenceRuntime:
         stats=None,
         dtype=torch.float32,
     ):
-        if algorithm not in ("gumbel", "value_search_halving"):
+        if algorithm not in ("gumbel", "value_search_halving", "policy"):
             raise ValueError("unsupported search algorithm")
         device = torch.device(device)
         if device.type != "cuda":
@@ -121,13 +132,13 @@ class InferenceRuntime:
                 stats=stats,
                 max_tokens=root_batch_tokens,
             ),
-            decode_wave=_make_decode_wave_executor(
+            **({} if algorithm == "policy" else dict(decode_wave=_make_decode_wave_executor(
                 model=model,
                 device=device,
                 dtype=dtype,
                 stats=stats,
                 algorithm=algorithm,
-            ),
+            ))),
         ).items():
             self.executors[kind] = self._identified(kind, executor)
 
@@ -211,7 +222,7 @@ class InferenceRuntime:
         if self.model.training:
             raise ValueError("search requires an evaluation-mode model")
         expected = GumbelConfig if self.algorithm == "gumbel" else HalvingConfig
-        if not isinstance(config, expected):
+        if self.algorithm != "policy" and not isinstance(config, expected):
             raise ValueError("search config does not match runtime algorithm")
         if isinstance(config, GumbelConfig) and config.max_depth > 32:
             raise ValueError("Gumbel workspace supports depth <= 32")
@@ -232,6 +243,8 @@ class InferenceRuntime:
             raise ValueError("cannot search a position without legal moves")
         if root_observer is not None:
             root_observer(moves, logits)
+        if self.algorithm == "policy":
+            return PolicyResult(moves[int(torch.argmax(logits))].uci())
         if noise == 0.0:
             noise = [0.0] * len(moves)
         wdl = tuple(torch.softmax(output["value_logits"][-1].float(), -1).tolist())

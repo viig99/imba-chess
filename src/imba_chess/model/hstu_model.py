@@ -49,6 +49,8 @@ class HSTUChessConfig:
     value_head_blocks: int = 0
     value_head_expansion: int = 2
     moves_left_loss_weight: float = 0.05
+    # KLENT action-value readout: tanh(Linear(d, vocab)) per move, zero-init.
+    enable_action_value_head: bool = False
 
 
 def build_hstu_chess_config(
@@ -376,6 +378,15 @@ class HSTUChessModel(nn.Module):
         if self.auxiliary_value_head is not None:
             nn.init.zeros_(self.auxiliary_value_head.weight)
             nn.init.zeros_(self.auxiliary_value_head.bias)
+        # Zero-init so a fresh head predicts Q = 0 for every move, as in the
+        # KLENT reference; untied from the policy matrix.
+        self.action_value_head = (
+            nn.Linear(d, config.move_vocab_size)
+            if config.enable_action_value_head else None
+        )
+        if self.action_value_head is not None:
+            nn.init.zeros_(self.action_value_head.weight)
+            nn.init.zeros_(self.action_value_head.bias)
 
         self.register_buffer(
             "square_ids", torch.arange(64, dtype=torch.long), persistent=False
@@ -505,6 +516,8 @@ class HSTUChessModel(nn.Module):
             else:
                 value_logits = self.value_head(x)
             output["value_logits"] = value_logits
+        if self.action_value_head is not None:
+            output["q"] = torch.tanh(self.action_value_head(x))
 
         if return_loss:
             target_move_id = batch["target_move_id"].to(
@@ -655,6 +668,8 @@ class HSTUChessModel(nn.Module):
         }
         if self.value_head is not None:
             output["value_logits"] = self.value_head(x)
+        if self.action_value_head is not None:
+            output["q"] = torch.tanh(self.action_value_head(x))
         return output
 
     def forward_decode_grouped(
@@ -851,4 +866,6 @@ class HSTUChessModel(nn.Module):
         }
         if self.value_head is not None:
             output["value_logits"] = self.value_head(x)
+        if self.action_value_head is not None:
+            output["q"] = torch.tanh(self.action_value_head(x))
         return output

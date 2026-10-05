@@ -1,0 +1,19 @@
+# KLENT from the flattened supervised 53250 checkpoint (5090, 32 GB).
+# Reference hyperparameters except: warm-up trains only the new action-value
+# head and the (draw-blind) supervised value head with the value-head
+# bootstrap, then all weights at a resumed-run lr.
+base_config = "config/imba_chess_v4.toml"
+init = "artifacts/checkpoints_keep/flatten53250_supervised_last_checkpoint.pt"
+alpha = 0.03
+beta = 0.1
+tau = 8.0
+positions_per_iteration = 2097152
+total_positions = 75000000
+batch_tokens = 4096
+slots = 1024
+q_warmup_iterations = 2
+warmup_lr = 1e-3
+lr = 1e-4
+value_weight = 1.0
+bootstrap = "q"
+inference_dtype = "bfloat16"

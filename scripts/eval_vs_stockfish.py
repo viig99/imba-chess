@@ -121,9 +121,9 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--device", choices=["auto", "cpu", "cuda"], default=None)
     parser.add_argument(
         "--model-move-policy",
-        choices=["gumbel", "value_search_halving"],
+        choices=["gumbel", "value_search_halving", "policy"],
         default=None,
-        help="Model move selection on legal moves.",
+        help="Model move selection on legal moves (policy: greedy, no search).",
     )
     parser.add_argument(
         "--inference-dtype",
@@ -1189,7 +1189,7 @@ def main() -> None:
         raise ValueError("--opening-random-plies must be >= 0")
     if float(args.search_lambda) < 0.0:
         raise ValueError("--search-lambda must be >= 0")
-    if args.model_move_policy not in {"gumbel", "value_search_halving"}:
+    if args.model_move_policy not in {"gumbel", "value_search_halving", "policy"}:
         raise ValueError("unsupported search algorithm")
     if args.search_budget < 1:
         raise ValueError("--search-budget must be >= 1")

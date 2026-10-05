@@ -281,3 +281,18 @@ def test_inference_dtype_must_match_weights(monkeypatch):
         build(torch.float32, torch.bfloat16)
     with pytest.raises(ValueError, match="float32 or bfloat16"):
         build(torch.float16, torch.float16)
+
+
+def test_policy_algorithm_plays_argmax_legal_move_without_search(monkeypatch):
+    instance, options = make_runtime(monkeypatch, "policy")
+    assert set(instance.executors) == {"root_eval"}
+    board = chess.Board()
+    logits = torch.zeros(len(VOCAB))
+    logits[VOCAB.encode("g1f3")] = 5.0
+    logits[VOCAB.encode("e2e5")] = 9.0  # illegal: never chosen
+    gen = instance.search_batch(board=board, batch={}, owner=("m", "g"), config=None)
+    assert next(gen).kind == "root_eval"
+    with pytest.raises(StopIteration) as stop:
+        gen.send((("m", "g"), {"logits": logits[None]}))
+    assert stop.value.value.move_uci == "g1f3"
+    assert stop.value.value.simulations == 0
