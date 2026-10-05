@@ -959,14 +959,15 @@ def _run_segment(
             scheduler = BatchScheduler(
                 game_factory=_game_factory(),
                 executors={
-                    "root_eval": _record_inference(
-                        runtime.executors["root_eval"], summary.inference_stats, "root"
-                    ),
-                    "decode_wave": _record_inference(
-                        runtime.executors["decode_wave"],
-                        summary.inference_stats,
-                        "decode",
-                    ),
+                    # Greedy "policy" runtimes have no decode_wave executor.
+                    **{
+                        kind: _record_inference(
+                            execute,
+                            summary.inference_stats,
+                            "root" if kind == "root_eval" else "decode",
+                        )
+                        for kind, execute in runtime.executors.items()
+                    },
                     "sf_move": make_sf_move_executor(pool_threads=concurrent_games),
                 },
                 concurrent_games=concurrent_games,

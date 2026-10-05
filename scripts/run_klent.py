@@ -14,9 +14,11 @@ def main():
     parser.add_argument("--device", default="cuda")
     parser.add_argument("--save-every", type=int, default=5,
                         help="Write an eval-loadable actor snapshot every N iterations.")
+    parser.add_argument("--keep-snapshots", type=int, default=None,
+                        help="Keep only the newest N actor snapshots (default: all).")
     args = parser.parse_args()
     run(load_klent_config(args.config), output=args.output, device=args.device,
-        save_every=args.save_every)
+        save_every=args.save_every, keep_snapshots=args.keep_snapshots)
 
 
 if __name__ == "__main__":

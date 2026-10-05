@@ -180,7 +180,15 @@ class KlentRun:
         self.trainer.load_state_dict(state["trainer"], lr=lr, weight_decay=self.cfg.weight_decay)
 
 
-def run(cfg, *, output, device, save_every=5):
+def prune_snapshots(output, keep):
+    """Delete all but the newest `keep` actor snapshots (None keeps every one)."""
+    if keep is None:
+        return
+    for old in sorted(Path(output).glob("actor-*.pt"))[:-keep]:
+        old.unlink()
+
+
+def run(cfg, *, output, device, save_every=5, keep_snapshots=None):
     output = Path(output)
     with run_lock(output):
         state_path = output / "checkpoint.pt"
@@ -201,6 +209,7 @@ def run(cfg, *, output, device, save_every=5):
                     output / f"actor-{klent.iteration:04d}.pt",
                     dict(model=klent.model.state_dict(), model_config=asdict(klent.model.config)),
                 )
+                prune_snapshots(output, keep_snapshots)
             line = json.dumps(metrics, allow_nan=False, sort_keys=True)
             print(line, flush=True)
             with (output / "metrics.jsonl").open("a") as stream:

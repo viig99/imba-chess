@@ -422,3 +422,18 @@ def test_nonfinite_loss_fails_at_epoch_end(monkeypatch):
     with pytest.raises(FloatingPointError):
         trainer.train_epoch(games, np.random.default_rng(0), policy_weight=1.0, value_weight=1.0)
     assert len(calls) > 1  # the epoch kept running; the check is deferred
+
+
+def test_prune_snapshots_keeps_newest(tmp_path):
+    from imba_chess.klent.run import prune_snapshots
+
+    for iteration in (10, 20, 30, 40, 50, 60, 70):
+        (tmp_path / f"actor-{iteration:04d}.pt").write_bytes(b"x")
+    (tmp_path / "checkpoint.pt").write_bytes(b"x")
+    prune_snapshots(tmp_path, 5)
+    assert sorted(p.name for p in tmp_path.glob("*.pt")) == [
+        "actor-0030.pt", "actor-0040.pt", "actor-0050.pt", "actor-0060.pt",
+        "actor-0070.pt", "checkpoint.pt",
+    ]
+    prune_snapshots(tmp_path, None)
+    assert len(list(tmp_path.glob("actor-*.pt"))) == 5
