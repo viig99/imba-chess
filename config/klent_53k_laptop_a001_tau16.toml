@@ -1,0 +1,21 @@
+# Branch of the alpha 0.01 frozen-value run at iteration 91 with tau 8 -> 16 (lambda e^-1/8 -> e^-1/16,
+# the paper's sweep range). Chess self-play games average ~115 plies; at tau 8 a game result's weight
+# falls to ~8% within 20 plies, so most Q targets come from Q's own bootstrap. tau 16 carries the
+# result about twice as far. Q is already trained and the value head stays frozen, so no warm-up.
+# 120 iterations (snapshots and SF2600/head-to-head evals at 40/80/120; keep/actor-0000.pt is the
+# branch point).
+base_config = "config/imba_chess_v4.toml"
+init = "artifacts/klent/53k-laptop-a001-tau16-2026-10-05/init-a001-it91.pt"
+alpha = 0.01
+beta = 0.1
+tau = 16.0
+positions_per_iteration = 2097152
+total_positions = 251658240
+batch_tokens = 4096
+slots = 256
+q_warmup_iterations = 0
+lr = 1e-4
+value_weight = 0.0
+freeze_value_head = true
+bootstrap = "q"
+inference_dtype = "bfloat16"

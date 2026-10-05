@@ -51,6 +51,8 @@ MODES = {
 
 
 def positions_at(run, iteration):
+    if iteration == 0:
+        return 0  # keep/actor-0000.pt: the weights a branched run started from
     for line in (run / "metrics.jsonl").read_text().splitlines():
         row = json.loads(line)
         if row["iteration"] == iteration:
