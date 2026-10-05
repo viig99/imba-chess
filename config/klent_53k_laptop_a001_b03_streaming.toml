@@ -1,0 +1,22 @@
+# Diverse starting positions for the alpha 0.01 frozen-value linear-Q recipe: games start from the Gumbel
+# pipeline's StreamingStarts mixture (25% initial position, 75% real Lichess training prefixes taken over at
+# plies 1-30 / 31-70 / 71-120), played as forced, unsupervised plies. Aims at the measured weakness that Q
+# learns little beyond the policy: more varied, more decisive positions to learn move values from.
+# beta 0.3 variant (used if beta 0.3 wins the equal-iteration match against beta 0.1).
+base_config = "config/imba_chess_v4.toml"
+init = "artifacts/checkpoints_keep/flatten53250_supervised_last_checkpoint.pt"
+alpha = 0.01
+beta = 0.3
+tau = 8.0
+positions_per_iteration = 2097152
+total_positions = 419430400
+batch_tokens = 4096
+slots = 256
+q_warmup_iterations = 2
+warmup_lr = 1e-3
+lr = 1e-4
+value_weight = 0.0
+freeze_value_head = true
+bootstrap = "q"
+inference_dtype = "bfloat16"
+starts = "streaming"
