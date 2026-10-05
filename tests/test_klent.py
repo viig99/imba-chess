@@ -95,7 +95,7 @@ def test_mate_reward_sign():
     assert value == -1
 
 
-def _play(model, *, slots, positions, max_plies, bootstrap="q"):
+def _play(model, *, slots, positions, max_plies, bootstrap="q", advantage=False):
     engine = SlotEngine(model, slots=slots, start_id=VOCAB.start_id, device="cpu", dtype=torch.float32)
     selfplay = SelfPlay(
         engine,
@@ -106,6 +106,7 @@ def _play(model, *, slots, positions, max_plies, bootstrap="q"):
         max_plies=max_plies,
         start_id=VOCAB.start_id,
         generator=torch.Generator().manual_seed(0),
+        advantage=advantage,
     )
     return selfplay.collect(positions, bootstrap=bootstrap)
 
@@ -535,3 +536,55 @@ def test_resume_config_accepts_settings_added_after_the_checkpoint():
     with pytest.raises(ValueError, match="q_head_blocks"):
         _validate_resume_config(KlentConfig(init="some.pt", freeze_value_head=True, value_weight=0.0,
                                             q_head_blocks=2), dict(config=legacy))
+
+
+def test_advantage_loss_subtracts_the_value_head():
+    torch.manual_seed(0)
+    positions, vocab_size = 4, len(VOCAB)
+    output = dict(
+        logits=torch.zeros(6, vocab_size),
+        q=torch.rand(6, vocab_size) - 0.5,
+        value_logits=torch.randn(6, 3),
+    )
+    batch = dict(
+        supervised_indices=torch.tensor([1, 2, 4, 5]),
+        legal_ids=torch.tensor([[3, 4]] * positions),
+        legal_mask=torch.ones(positions, 2, dtype=torch.bool),
+        policy=torch.full((positions, 2), 0.5),
+        move_id=torch.tensor([3, 4, 3, 4]),
+        returns=torch.tensor([1.0, -0.5, 0.0, 0.25]),
+        outcome=torch.tensor([2, 0, 1, 1]),
+    )
+    plain = klent_loss(output, batch, policy_weight=1.0, value_weight=0.0)
+    adv = klent_loss(output, batch, policy_weight=1.0, value_weight=0.0, advantage=True)
+    idx = batch["supervised_indices"]
+    a = output["q"][idx].gather(1, batch["move_id"][:, None]).squeeze(1)
+    wdl = torch.softmax(output["value_logits"][idx], -1)
+    v = wdl[:, 2] - wdl[:, 0]
+    torch.testing.assert_close(adv["q_loss"], ((a - (batch["returns"] - v)) ** 2).mean())
+    torch.testing.assert_close(plain["q_loss"], ((a - batch["returns"]) ** 2).mean())
+
+
+def test_advantage_bootstrap_adds_the_value_head_back():
+    """Returns must bootstrap from Q = V + sum(pi' * A), recomputed here from one
+    jagged forward over a finished game."""
+    model = tiny_model()
+    games, _ = _play(model, slots=2, positions=2 * 14, max_plies=7, advantage=True)
+    game = games[0]
+    batch = build_batch([game], VOCAB.start_id)
+    with torch.no_grad():
+        out = model(batch, block_mask=create_batch_dense_mask(batch["seq_offsets"], total_tokens=batch["total_tokens"]),
+                    return_loss=False)
+    idx, legal, mask = batch["supervised_indices"], batch["legal_ids"], batch["legal_mask"]
+    a = out["q"][idx].gather(1, legal)
+    wdl = torch.softmax(out["value_logits"][idx], -1)
+    values = (wdl[:, 2] - wdl[:, 0]) + (batch["policy"] * a.masked_fill(~mask, 0)).sum(-1)
+    final = float(game["outcome"][-1])
+    expected = lambda_returns(final, values.numpy(), lambda_from_tau(8.0))
+    np.testing.assert_allclose(game["returns"], expected, atol=1e-5)
+
+
+def test_advantage_mode_requires_a_frozen_value_head():
+    KlentConfig(init="some.pt", freeze_value_head=True, value_weight=0.0, q_mode="advantage")
+    with pytest.raises(ValueError, match="freeze_value_head"):
+        KlentConfig(init="some.pt", q_mode="advantage")

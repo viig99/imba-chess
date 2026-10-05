@@ -37,6 +37,9 @@ class KlentConfig:
     value_weight: float = 1.0
     # Keep the value head at its initial weights (no gradient, no value loss).
     freeze_value_head: bool = False
+    # "q": the action-value head predicts Q (reference). "advantage": it predicts
+    # A with Q = V + A, V the frozen value head; the target subtracts V(s).
+    q_mode: str = "q"
     # Private MLP for the Q head (0 = single linear readout, as before).
     q_head_blocks: int = 0
     q_head_width: int = 512
@@ -48,6 +51,10 @@ class KlentConfig:
     seed: int = 0
 
     def __post_init__(self):
+        if self.q_mode not in ("q", "advantage"):
+            raise ValueError("q_mode must be 'q' or 'advantage'")
+        if self.q_mode == "advantage" and not self.freeze_value_head:
+            raise ValueError("q_mode 'advantage' needs freeze_value_head (a fixed baseline)")
         if self.bootstrap not in ("q", "value"):
             raise ValueError("bootstrap must be 'q' or 'value'")
         if self.inference_dtype not in ("float32", "bfloat16"):

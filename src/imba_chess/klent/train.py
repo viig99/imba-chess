@@ -89,7 +89,11 @@ def build_batch(games, start_id):
     return batch
 
 
-def klent_loss(output, batch, *, policy_weight, value_weight):
+def klent_loss(output, batch, *, policy_weight, value_weight, advantage=False):
+    """advantage=True reads the action-value head as A(s, a) with
+    Q(s, a) = V(s) + A(s, a), V the (frozen) value head's W-L, and fits the
+    played move's A to G - V(s): the position value is subtracted from the
+    target, so the head only has to learn how moves differ."""
     device = output["logits"].device
     indices = batch["supervised_indices"].to(device)
     legal = batch["legal_ids"].to(device)
@@ -101,7 +105,11 @@ def klent_loss(output, batch, *, policy_weight, value_weight):
     policy_loss = -(batch["policy"].to(device) * log_probs).sum(-1).mean()
     q = output["q"].index_select(0, indices).float()
     q_played = q.gather(1, batch["move_id"].to(device)[:, None]).squeeze(1)
-    q_loss = (q_played - batch["returns"].to(device)).square().mean()
+    target = batch["returns"].to(device)
+    if advantage:
+        wdl = torch.softmax(output["value_logits"].index_select(0, indices).float(), -1)
+        target = target - (wdl[:, 2] - wdl[:, 0]).detach()
+    q_loss = (q_played - target).square().mean()
     loss = policy_weight * policy_loss + q_loss
     metrics = dict(policy_loss=policy_loss, q_loss=q_loss)
     if value_weight > 0:
@@ -113,9 +121,10 @@ def klent_loss(output, batch, *, policy_weight, value_weight):
     return metrics
 
 
-def _forward_loss(model, batch, block_mask, policy_weight, value_weight):
+def _forward_loss(model, batch, block_mask, policy_weight, value_weight, advantage):
     output = model(batch, block_mask=block_mask, return_loss=False)
-    return klent_loss(output, batch, policy_weight=policy_weight, value_weight=value_weight)
+    return klent_loss(output, batch, policy_weight=policy_weight, value_weight=value_weight,
+                      advantage=advantage)
 
 
 def _prepare(games, start_id, pin):
@@ -170,9 +179,11 @@ class KlentTrainer:
     """
 
     def __init__(self, model, *, device, start_id, batch_tokens, grad_clip, compile_model,
-                 train_dtype="float32", freeze_value_head=False, probe_every=64):
+                 train_dtype="float32", freeze_value_head=False, probe_every=64,
+                 advantage=False):
         self.model, self.device, self.start_id = model, device, start_id
         self.freeze_value_head = freeze_value_head
+        self.advantage = advantage
         # Every probe_every-th step also measures per-loss trunk gradients.
         self.probe_every = probe_every
         self.batch_tokens, self.grad_clip = batch_tokens, grad_clip
@@ -256,7 +267,8 @@ class KlentTrainer:
                     self.optimizer.zero_grad(set_to_none=True)
                     with self._autocast():
                         losses = self.forward_loss(
-                            self.model, batch, self._mask(batch), policy_weight, value_weight
+                            self.model, batch, self._mask(batch), policy_weight, value_weight,
+                            self.advantage,
                         )
                     if trunk and self.probe_every and step % self.probe_every == 0:
                         for key, value in trunk_gradient_probe(losses, loss_weights, trunk).items():

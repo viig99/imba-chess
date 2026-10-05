@@ -109,7 +109,12 @@ def _finish(game, final_reward, *, lam, bootstrap, termination):
 
 
 class SelfPlay:
-    def __init__(self, engine, codec, *, alpha, beta, lam, max_plies, start_id, generator):
+    def __init__(self, engine, codec, *, alpha, beta, lam, max_plies, start_id, generator,
+                 advantage=False):
+        # advantage: the action-value head outputs A(s, a), Q = V(s) + A(s, a).
+        # V is constant across a position's moves, so pi' uses A unchanged;
+        # only the bootstrap value needs V added back.
+        self.advantage = advantage
         self.engine, self.codec = engine, codec
         self.alpha, self.beta, self.lam = alpha, beta, lam
         self.max_plies, self.start_id, self.generator = max_plies, start_id, generator
@@ -152,6 +157,8 @@ class SelfPlay:
                 -(policy * log_policy).masked_fill(~mask, 0).sum(),
             ]).double()
             value_head = _wdl_value(out["value_logits"]) if "value_logits" in out else value_q
+            if self.advantage:
+                value_q = value_q + value_head
             host = torch.cat([
                 choice[:, None].float(), value_q[:, None], value_head[:, None], policy
             ], 1).cpu().numpy()

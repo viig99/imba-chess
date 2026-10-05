@@ -103,6 +103,7 @@ class KlentRun:
             compile_model=cfg.compile,
             train_dtype=cfg.train_dtype,
             freeze_value_head=cfg.freeze_value_head,
+            advantage=cfg.q_mode == "advantage",
         )
         self.iteration = self.positions = 0
         if resume_state is not None:
@@ -135,6 +136,7 @@ class KlentRun:
             max_plies=self.cfg.max_plies,
             start_id=self.vocab.start_id,
             generator=generator,
+            advantage=self.cfg.q_mode == "advantage",
         )
         try:
             return selfplay.collect(positions, bootstrap=bootstrap)
