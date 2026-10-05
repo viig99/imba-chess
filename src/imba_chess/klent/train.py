@@ -6,6 +6,8 @@ cross-entropy to the stored improved policy + (Q(s, a_played) - G)^2, plus our
 value head's outcome-WDL cross-entropy.
 """
 
+from concurrent.futures import ThreadPoolExecutor
+import contextlib
 import time
 
 import numpy as np
@@ -111,14 +113,41 @@ def klent_loss(output, batch, *, policy_weight, value_weight):
     return metrics
 
 
-class KlentTrainer:
-    """Owns the fp32 training model, its (optionally compiled) forward and optimizer."""
+def _forward_loss(model, batch, block_mask, policy_weight, value_weight):
+    output = model(batch, block_mask=block_mask, return_loss=False)
+    return klent_loss(output, batch, policy_weight=policy_weight, value_weight=value_weight)
 
-    def __init__(self, model, *, device, start_id, batch_tokens, grad_clip, compile_model):
+
+def _prepare(games, start_id, pin):
+    """Background-thread half of a step: build the jagged batch on the CPU."""
+    batch = build_batch(games, start_id)
+    if pin:
+        batch = {k: v.pin_memory() if torch.is_tensor(v) else v for k, v in batch.items()}
+    return batch
+
+
+class KlentTrainer:
+    """Owns the fp32 master weights, the compiled forward+loss and the optimizer.
+
+    Mirrors supervised training (scripts/train.py): bf16 autocast with TF32
+    matmuls, the loss inside the compiled graph, and the triton optimizer. The
+    next batch is built and pinned on a background thread, and no step reads a
+    value back from the GPU: losses accumulate on the device and are checked
+    for finiteness once per epoch, which always precedes the checkpoint write.
+    """
+
+    def __init__(self, model, *, device, start_id, batch_tokens, grad_clip, compile_model,
+                 train_dtype="float32"):
         self.model, self.device, self.start_id = model, device, start_id
         self.batch_tokens, self.grad_clip = batch_tokens, grad_clip
-        compiled = compile_model and device.type == "cuda"
-        self.forward = torch.compile(model, dynamic=True, fullgraph=True) if compiled else model
+        cuda = device.type == "cuda"
+        self.forward_loss = (
+            torch.compile(_forward_loss, dynamic=True, fullgraph=True)
+            if compile_model and cuda else _forward_loss
+        )
+        self.autocast_dtype = {"float32": None, "bfloat16": torch.bfloat16}[train_dtype]
+        if cuda:
+            torch.set_float32_matmul_precision("high")
         self.optimizer = None
         self.warmup = None
 
@@ -145,7 +174,7 @@ class KlentTrainer:
         self.optimizer = StableAdamW(
             build_decay_param_groups(self.model, weight_decay=weight_decay),
             lr=lr,
-            triton=False,
+            triton=self.device.type == "cuda",
             kahan_sum=True,
         )
 
@@ -153,41 +182,58 @@ class KlentTrainer:
         factory = create_batch_block_mask if self.device.type == "cuda" else create_batch_dense_mask
         with torch.no_grad():
             return factory(
-                batch["seq_offsets"].to(self.device),
-                total_tokens=batch["total_tokens"],
-                device=self.device,
+                batch["seq_offsets"], total_tokens=batch["total_tokens"], device=self.device
             )
+
+    def _autocast(self):
+        if self.autocast_dtype is None or self.device.type != "cuda":
+            return contextlib.nullcontext()
+        return torch.autocast("cuda", dtype=self.autocast_dtype)
 
     def train_epoch(self, games, rng, *, policy_weight, value_weight):
         lengths = [len(g["move_id"]) for g in games]
-        sums, steps, tokens, start = {}, 0, 0, time.perf_counter()
+        plan = pack(lengths, self.batch_tokens, rng)
+        sums, tokens, start = {}, 0, time.perf_counter()
         parameters = [p for p in self.model.parameters() if p.requires_grad]
+        pin = self.device.type == "cuda"
         self.model.train()
-        try:
-            for indices in pack(lengths, self.batch_tokens, rng):
-                batch = build_batch([games[i] for i in indices], self.start_id)
+        with ThreadPoolExecutor(max_workers=1) as pool:
+            submit = lambda i: pool.submit(_prepare, [games[j] for j in plan[i]], self.start_id, pin)
+            pending = submit(0) if plan else None
+            try:
+                for step in range(len(plan)):
+                    batch = pending.result()
+                    pending = submit(step + 1) if step + 1 < len(plan) else None
+                    tokens += batch["total_tokens"]
+                    batch = {k: v.to(self.device, non_blocking=True) if torch.is_tensor(v) else v
+                             for k, v in batch.items()}
+                    self.optimizer.zero_grad(set_to_none=True)
+                    with self._autocast():
+                        losses = self.forward_loss(
+                            self.model, batch, self._mask(batch), policy_weight, value_weight
+                        )
+                    losses["loss"].backward()
+                    losses["gradient_norm"] = torch.nn.utils.clip_grad_norm_(
+                        parameters, self.grad_clip
+                    )
+                    self.optimizer.step()
+                    for key, value in losses.items():
+                        value = value.detach().float()
+                        sums[key] = sums[key] + value if key in sums else value
+            finally:
+                if pending is not None:
+                    pending.cancel()
                 self.optimizer.zero_grad(set_to_none=True)
-                output = self.forward(batch, block_mask=self._mask(batch), return_loss=False)
-                losses = klent_loss(
-                    output, batch, policy_weight=policy_weight, value_weight=value_weight
-                )
-                if not torch.isfinite(losses["loss"]):
-                    raise FloatingPointError("nonfinite KLENT loss")
-                losses["loss"].backward()
-                norm = torch.nn.utils.clip_grad_norm_(
-                    parameters, self.grad_clip, error_if_nonfinite=True
-                )
-                self.optimizer.step()
-                losses["gradient_norm"] = norm
-                for key, value in losses.items():
-                    sums[key] = sums.get(key, 0.0) + float(value.detach())
-                steps += 1
-                tokens += batch["total_tokens"]
-        finally:
-            self.optimizer.zero_grad(set_to_none=True)
-            self.model.eval()
+                self.model.eval()
+        steps = len(plan)
+        # One device->host read per epoch. A non-finite loss or gradient norm
+        # anywhere in the epoch makes its sum non-finite, and this raises before
+        # the caller can write a checkpoint.
+        values = torch.stack(list(sums.values())).tolist() if sums else []
+        if not all(np.isfinite(values)):
+            raise FloatingPointError("nonfinite KLENT loss or gradient norm in this epoch")
         elapsed = time.perf_counter() - start
-        metrics = {f"train/{k}": v / max(steps, 1) for k, v in sums.items()}
+        metrics = {f"train/{k}": v / max(steps, 1) for k, v in zip(sums, values)}
         metrics.update({
             "train/steps": steps,
             "train/tokens": tokens,

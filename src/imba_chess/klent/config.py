@@ -37,6 +37,8 @@ class KlentConfig:
     value_weight: float = 1.0
     bootstrap: str = "q"
     inference_dtype: str = "bfloat16"
+    # Training autocast, as in supervised training; master weights stay fp32.
+    train_dtype: str = "bfloat16"
     compile: bool = True
     seed: int = 0
 
@@ -45,6 +47,8 @@ class KlentConfig:
             raise ValueError("bootstrap must be 'q' or 'value'")
         if self.inference_dtype not in ("float32", "bfloat16"):
             raise ValueError("inference_dtype must be float32 or bfloat16")
+        if self.train_dtype not in ("float32", "bfloat16"):
+            raise ValueError("train_dtype must be float32 or bfloat16")
         positive = ("alpha", "beta", "tau", "positions_per_iteration", "total_positions",
                     "batch_tokens", "lr", "grad_clip", "slots", "max_plies", "warmup_lr")
         if any(not math.isfinite(getattr(self, k)) or getattr(self, k) <= 0 for k in positive):

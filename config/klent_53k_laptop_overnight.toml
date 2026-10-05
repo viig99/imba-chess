@@ -1,4 +1,4 @@
-# Overnight 53k KLENT run (laptop 3070 Ti): same as klent_53k_laptop.toml but 200M positions.
+# Overnight 53k KLENT run (laptop 3070 Ti): klent_53k_laptop.toml settings for exactly 200 iterations (200 x 2^21 positions).
 # Reference hyperparameters except: warm-up trains only the new action-value
 # head and the (draw-blind) supervised value head with the value-head
 # bootstrap, then all weights at a resumed-run lr.
@@ -8,7 +8,7 @@ alpha = 0.03
 beta = 0.1
 tau = 8.0
 positions_per_iteration = 2097152
-total_positions = 200000000
+total_positions = 419430400
 batch_tokens = 4096
 slots = 256
 q_warmup_iterations = 2

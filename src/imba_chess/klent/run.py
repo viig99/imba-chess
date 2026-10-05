@@ -30,7 +30,7 @@ from .train import KlentTrainer
 # model weights or changing the return/policy target definitions.
 _RESUME_OVERRIDES = frozenset({
     "init", "total_positions", "batch_tokens", "slots", "compile",
-    "inference_dtype", "lr", "warmup_lr", "weight_decay", "grad_clip",
+    "inference_dtype", "train_dtype", "lr", "warmup_lr", "weight_decay", "grad_clip",
 })
 
 
@@ -93,6 +93,7 @@ class KlentRun:
             batch_tokens=cfg.batch_tokens,
             grad_clip=cfg.grad_clip,
             compile_model=cfg.compile,
+            train_dtype=cfg.train_dtype,
         )
         self.iteration = self.positions = 0
         if resume_state is not None:

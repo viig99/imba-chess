@@ -396,3 +396,29 @@ def test_resume_rejects_changed_model_architecture(small_run):
     state["model_config"]["dropout"] = .1
     with pytest.raises(ValueError, match="model architecture"):
         KlentRun(cfg, device="cpu", resume_state=state)
+
+
+def test_nonfinite_loss_fails_at_epoch_end(monkeypatch):
+    """Per-step sync checks are gone; one NaN anywhere still fails the epoch
+    loudly, before the caller can write a checkpoint."""
+    import imba_chess.klent.train as train_module
+
+    model = tiny_model()
+    games, _ = _play(model, slots=2, positions=2 * 24, max_plies=6)
+    real = train_module.klent_loss
+    calls = []
+
+    def poisoned(*args, **kwargs):
+        losses = real(*args, **kwargs)
+        calls.append(1)
+        if len(calls) == 1:
+            losses["loss"] = losses["loss"] * float("nan")
+        return losses
+
+    monkeypatch.setattr(train_module, "klent_loss", poisoned)
+    trainer = KlentTrainer(model, device=torch.device("cpu"), start_id=VOCAB.start_id,
+                           batch_tokens=16, grad_clip=1.0, compile_model=False)
+    trainer.set_phase(warmup=False, lr=1e-3, weight_decay=0.0)
+    with pytest.raises(FloatingPointError):
+        trainer.train_epoch(games, np.random.default_rng(0), policy_weight=1.0, value_weight=1.0)
+    assert len(calls) > 1  # the epoch kept running; the check is deferred
