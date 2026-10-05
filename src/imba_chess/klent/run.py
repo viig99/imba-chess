@@ -83,8 +83,21 @@ def build_model(cfg, repo, vocab, *, resume_state=None):
 
 
 class KlentRun:
-    def __init__(self, cfg, *, device, resume_state=None):
+    def __init__(self, cfg, *, device, resume_state=None, starts_dir=None):
         self.cfg, self.device = cfg, torch.device(device)
+        self.starts = None
+        if cfg.starts == "streaming":
+            if starts_dir is None:
+                raise ValueError("streaming starts need a directory for their stream state")
+            from types import SimpleNamespace
+            from imba_chess.self_play.config import StreamingConfig
+            from imba_chess.self_play.streaming import StreamingStarts
+            stream_config = SimpleNamespace(
+                base_config=cfg.base_config, streaming=StreamingConfig(),
+                run=SimpleNamespace(seed=cfg.seed), regret=None,
+            )
+            # One state save per iteration (reconcile), not one fsync per launch.
+            self.starts = StreamingStarts(starts_dir, stream_config, durable_launches=False)
         if resume_state is not None:
             _validate_resume_config(cfg, resume_state)
         self.repo = load_repo_config(cfg.base_config)
@@ -108,6 +121,23 @@ class KlentRun:
         self.iteration = self.positions = 0
         if resume_state is not None:
             self.load_state_dict(resume_state)
+
+    def _start_source(self):
+        if self.starts is None:
+            return None
+        self.starts.begin_phase(self.iteration, "klent", set())
+        self._launched = []
+
+        def next_start():
+            seed, gid = self.starts.next_launch(self.iteration, "klent")
+            self._launched.append(gid)
+            return seed.prefix_moves
+
+        return next_start
+
+    def close(self):
+        if self.starts is not None:
+            self.starts.close()
 
     def _phase(self):
         warmup = self.iteration < self.cfg.q_warmup_iterations
@@ -137,9 +167,17 @@ class KlentRun:
             start_id=self.vocab.start_id,
             generator=generator,
             advantage=self.cfg.q_mode == "advantage",
+            starts=self._start_source(),
         )
         try:
-            return selfplay.collect(positions, bootstrap=bootstrap)
+            games, metrics = selfplay.collect(positions, bootstrap=bootstrap)
+            if self.starts is not None:
+                # Every launch this iteration is consumed (finished or dropped);
+                # an interrupted iteration leaves them pending for a resume to reissue.
+                self.starts.reconcile(set(self._launched))
+                metrics.update({f"starts/launched_bucket{i}": n
+                                for i, n in enumerate(self.starts.state["launched"])})
+            return games, metrics
         finally:
             del engine, selfplay
             if self.device.type == "cuda":
@@ -207,21 +245,24 @@ def run(cfg, *, output, device, save_every=5, keep_snapshots=None):
             torch.load(state_path, map_location="cpu", weights_only=False)
             if state_path.exists() else None
         )
-        klent = KlentRun(cfg, device=device, resume_state=state)
+        klent = KlentRun(cfg, device=device, resume_state=state, starts_dir=output / "starts")
         if state is not None:
             print(f"resumed at iteration {klent.iteration}, positions {klent.positions}")
         del state
-        while klent.positions < cfg.total_positions:
-            metrics = klent.run_iteration()
-            atomic_checkpoint(state_path, klent.state_dict())
-            if klent.iteration % save_every == 0 or klent.positions >= cfg.total_positions:
-                # Model-only snapshot in the format the eval scripts load.
-                atomic_checkpoint(
-                    output / f"actor-{klent.iteration:04d}.pt",
-                    dict(model=klent.model.state_dict(), model_config=asdict(klent.model.config)),
-                )
-                prune_snapshots(output, keep_snapshots)
-            line = json.dumps(metrics, allow_nan=False, sort_keys=True)
-            print(line, flush=True)
-            with (output / "metrics.jsonl").open("a") as stream:
-                stream.write(line + "\n")
+        try:
+            while klent.positions < cfg.total_positions:
+                metrics = klent.run_iteration()
+                atomic_checkpoint(state_path, klent.state_dict())
+                if klent.iteration % save_every == 0 or klent.positions >= cfg.total_positions:
+                    # Model-only snapshot in the format the eval scripts load.
+                    atomic_checkpoint(
+                        output / f"actor-{klent.iteration:04d}.pt",
+                        dict(model=klent.model.state_dict(), model_config=asdict(klent.model.config)),
+                    )
+                    prune_snapshots(output, keep_snapshots)
+                line = json.dumps(metrics, allow_nan=False, sort_keys=True)
+                print(line, flush=True)
+                with (output / "metrics.jsonl").open("a") as stream:
+                    stream.write(line + "\n")
+        finally:
+            klent.close()  # stops the stream producer, if any

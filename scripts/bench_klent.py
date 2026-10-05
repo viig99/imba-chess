@@ -56,7 +56,7 @@ def main():
             run.trainer.train_epoch(sample, rng, policy_weight=1.0, value_weight=cfg.value_weight)
             train = run.trainer.train_epoch(sample, rng, policy_weight=1.0,
                                             value_weight=cfg.value_weight)
-            tokens_per_position = train["train/tokens"] / sum(len(g["move_id"]) for g in sample)
+            tokens_per_position = train["train/tokens"] / sum(len(g["move_id"]) for g in sample)  # per supervised position
             train_positions_per_second = train["train/tokens_per_second"] / tokens_per_position
             hours_selfplay = args.budget / positions_per_second / 3600
             hours_train = args.budget / train_positions_per_second / 3600

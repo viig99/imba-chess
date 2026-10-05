@@ -188,8 +188,14 @@ def produce(directory):
 
 class StreamingStarts:
     def __init__(
-        self, directory, config, *, should_stop=lambda: False, start_worker=True
+        self, directory, config, *, should_stop=lambda: False, start_worker=True,
+        durable_launches=True,
     ):
+        # durable_launches=False skips the per-launch fsync; the caller saves
+        # (or reconciles) once per batch of launches. KLENT launches ~15k games
+        # per iteration and re-seeds every iteration, so it needs no per-launch
+        # crash journal.
+        self.durable_launches = durable_launches
         self.directory = Path(directory)
         self.directory.mkdir(parents=True, exist_ok=True)
         self.config = config
@@ -467,7 +473,8 @@ class StreamingStarts:
                     game_id=restart["parent_game_id"],
                     ply=restart["parent_ply"],
                 )
-        self.save()  # Durable before the collector launches the game.
+        if self.durable_launches:
+            self.save()  # Durable before the collector launches the game.
         return seed, gid
 
     def launch_metadata(self, gid):

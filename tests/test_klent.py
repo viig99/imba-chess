@@ -95,7 +95,7 @@ def test_mate_reward_sign():
     assert value == -1
 
 
-def _play(model, *, slots, positions, max_plies, bootstrap="q", advantage=False):
+def _play(model, *, slots, positions, max_plies, bootstrap="q", advantage=False, starts=None):
     engine = SlotEngine(model, slots=slots, start_id=VOCAB.start_id, device="cpu", dtype=torch.float32)
     selfplay = SelfPlay(
         engine,
@@ -107,6 +107,7 @@ def _play(model, *, slots, positions, max_plies, bootstrap="q", advantage=False)
         start_id=VOCAB.start_id,
         generator=torch.Generator().manual_seed(0),
         advantage=advantage,
+        starts=starts,
     )
     return selfplay.collect(positions, bootstrap=bootstrap)
 
@@ -588,3 +589,68 @@ def test_advantage_mode_requires_a_frozen_value_head():
     KlentConfig(init="some.pt", freeze_value_head=True, value_weight=0.0, q_mode="advantage")
     with pytest.raises(ValueError, match="freeze_value_head"):
         KlentConfig(init="some.pt", q_mode="advantage")
+
+
+CASTLING_PREFIX = ["e2e4", "e7e5", "g1f3", "b8c6", "f1c4", "g8f6", "e1g1"]
+
+
+def _cycling_starts():
+    prefixes = [CASTLING_PREFIX, [], ["d2d4", "d7d5"]]
+    state = {"n": 0}
+
+    def starts():
+        prefix = prefixes[state["n"] % len(prefixes)]
+        state["n"] += 1
+        return prefix
+    return starts
+
+
+def test_prefix_games_decode_like_a_full_forward_and_supervise_only_the_tail():
+    torch.set_num_threads(1)
+    model = tiny_model()
+    games, metrics = _play(model, slots=3, positions=3 * 30, max_plies=14, starts=_cycling_starts())
+    prefixed = [g for g in games if not g["supervised"].all()]
+    assert prefixed and metrics["selfplay/mean_prefix_plies"] > 0
+    for g in games:
+        plies, supervised = len(g["prev_move_id"]), int(g["supervised"].sum())
+        assert len(g["move_id"]) == len(g["returns"]) == len(g["outcome"]) == supervised
+        assert len(g["legal_offsets"]) == supervised + 1
+        assert g["piece_ids"].shape == (plies, 64)
+        # Prefix plies come first, then only self-played plies.
+        assert not g["supervised"][: plies - supervised].any() and g["supervised"][plies - supervised:].all()
+    batch = build_batch(games, VOCAB.start_id)
+    assert len(batch["supervised_indices"]) == sum(len(g["move_id"]) for g in games)
+    with torch.no_grad():
+        out = model(batch, block_mask=create_batch_dense_mask(batch["seq_offsets"], total_tokens=batch["total_tokens"]),
+                    return_loss=False)
+    index, legal, mask = batch["supervised_indices"], batch["legal_ids"], batch["legal_mask"]
+    policy = improved_policy(out["logits"][index].gather(1, legal), out["q"][index].gather(1, legal),
+                             mask, alpha=0.03, beta=0.1)
+    torch.testing.assert_close(policy, batch["policy"], atol=1e-5, rtol=1e-4)
+
+
+def test_prefix_game_tokens_match_python_chess_history():
+    model = tiny_model()
+    games, _ = _play(model, slots=1, positions=20, max_plies=12, starts=lambda: CASTLING_PREFIX)
+    game = games[0]
+    moves = [VOCAB.decode(int(m)) for m in game["prev_move_id"][1:]] + [VOCAB.decode(int(game["move_id"][-1]))]
+    assert moves[: len(CASTLING_PREFIX)] == CASTLING_PREFIX
+    history = _SequenceHistory(move_vocab=VOCAB, board_state_encoder=BoardStateEncoder(BOARD))
+    board = chess.Board()
+    for uci in moves:
+        history.append_observed_position(board)
+        history.record_played_move(uci)
+        board.push_uci(uci)
+    sample = {key: getattr(history, key) for key in (
+        "seq_token_id", "piece_ids", "turn_id", "castle_id", "ep_file_id",
+        "halfmove_bucket_id", "fullmove_bucket_id", "prev_move_id",
+        "target_move_id", "played_by_elo")}
+    sample.update(game_id="g", game_result_white=0, value_target=[[0.0] * 3] * len(sample["seq_token_id"]),
+                  has_value_target=[False] * len(sample["seq_token_id"]))
+    expected = collate_jagged_batch([sample])
+    actual = build_batch([game], VOCAB.start_id)
+    for key in ("seq_token_id", "piece_ids", "turn_id", "castle_id", "ep_file_id",
+                "halfmove_bucket_id", "fullmove_bucket_id", "prev_move_id", "seq_offsets"):
+        assert torch.equal(actual[key].long(), expected[key].long()), key
+    # Supervision starts exactly at the takeover ply.
+    assert actual["supervised_indices"][0] == 1 + len(CASTLING_PREFIX)

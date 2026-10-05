@@ -4,6 +4,10 @@ Mirrors the reference's auto-reset rollout: `positions` steps-by-slots are
 played with fixed weights, games still running at the end are dropped (their
 lambda-returns would need a bootstrap past the cut), and every played position
 counts toward the simulator-evaluation budget.
+
+A game may start from a human prefix (`starts`): its plies are played as forced
+moves through the same decode, so the model sees the real history, but only
+the plies after the takeover are supervised (policy target, Q return).
 """
 
 from collections import Counter
@@ -26,8 +30,10 @@ _EP_MODES = {"fen": 0, "legal": 1, "xfen": 2}
 class _Game:
     board: "cc.Board"
     prev_move_id: int
+    forced: list = field(default_factory=list)  # remaining human prefix moves (UCI)
     history: list = field(default_factory=list)
     tokens: list = field(default_factory=list)  # per ply: (piece bytes, 6 ints)
+    supervised: list = field(default_factory=list)  # per ply: False for prefix plies
     legal: list = field(default_factory=list)
     policy: list = field(default_factory=list)
     move_ids: list = field(default_factory=list)
@@ -88,13 +94,18 @@ def _wdl_value(value_logits):
 
 def _finish(game, final_reward, *, lam, bootstrap, termination):
     values = game.value_q if bootstrap == "q" else game.value_head
+    # Supervised plies are the self-played tail of the game (after any prefix).
     plies = len(game.move_ids)
-    # Mover at ply t is the last mover iff (plies - 1 - t) is even.
+    # Mover at supervised ply t is the last mover iff (plies - 1 - t) is even.
     sign = np.where((plies - 1 - np.arange(plies)) % 2 == 0, 1.0, -1.0)
     offsets = np.zeros(plies + 1, dtype=np.int64)
     offsets[1:] = np.cumsum([len(ids) for ids in game.legal])
     return dict(
-        piece_ids=np.frombuffer(b"".join(t[0] for t in game.tokens), np.uint8).reshape(plies, 64),
+        # Token fields cover every ply, prefix included.
+        piece_ids=np.frombuffer(b"".join(t[0] for t in game.tokens), np.uint8).reshape(
+            len(game.tokens), 64
+        ),
+        supervised=np.asarray(game.supervised, dtype=bool),
         # TOKEN_KEYS[1:-1] columns, then prev_move_id.
         scalars=np.array([t[1:6] for t in game.tokens], dtype=np.int16),
         prev_move_id=np.array([t[6] for t in game.tokens], dtype=np.int16),
@@ -110,7 +121,10 @@ def _finish(game, final_reward, *, lam, bootstrap, termination):
 
 class SelfPlay:
     def __init__(self, engine, codec, *, alpha, beta, lam, max_plies, start_id, generator,
-                 advantage=False):
+                 advantage=False, starts=None):
+        # starts: callable returning a list of UCI prefix moves for a new game
+        # (empty = the initial position); None plays every game from move one.
+        self.starts = starts
         # advantage: the action-value head outputs A(s, a), Q = V(s) + A(s, a).
         # V is constant across a position's moves, so pi' uses A unchanged;
         # only the bootstrap value needs V added back.
@@ -120,7 +134,8 @@ class SelfPlay:
         self.max_plies, self.start_id, self.generator = max_plies, start_id, generator
 
     def _new_game(self):
-        return _Game(board=cc.Board.startpos(), prev_move_id=self.start_id)
+        prefix = list(self.starts()) if self.starts is not None else []
+        return _Game(board=cc.Board.startpos(), prev_move_id=self.start_id, forced=prefix)
 
     def collect(self, positions, *, bootstrap):
         engine, device = self.engine, self.engine.device
@@ -168,9 +183,22 @@ class SelfPlay:
             reset = []
             for slot, game in enumerate(games):
                 ids, moves = legal[slot]
-                pick = int(host[slot, 0])
                 state = states[slot]
                 game.tokens.append((*state, game.prev_move_id))
+                if game.forced:
+                    # Human prefix ply: decoded for the history, not supervised.
+                    uci = game.forced.pop(0)
+                    pick = ids.index(self.codec.move_vocab.encode(uci))
+                    game.supervised.append(False)
+                    child, history, value = cc.push_and_classify(
+                        game.board, moves[pick], game.history, True
+                    )
+                    if value is not None:
+                        raise ValueError(f"start prefix reaches a terminal position at {uci}")
+                    game.board, game.history, game.prev_move_id = child, history, ids[pick]
+                    continue
+                pick = int(host[slot, 0])
+                game.supervised.append(True)
                 game.legal.append(ids)
                 game.policy.append(host[slot, 3 : 3 + len(ids)].copy())
                 game.move_ids.append(ids[pick])
@@ -179,7 +207,8 @@ class SelfPlay:
                 child, history, value = cc.push_and_classify(
                     game.board, moves[pick], game.history, True
                 )
-                if value is not None or len(game.move_ids) >= self.max_plies:
+                # The cap counts every ply (prefix included): it bounds the context.
+                if value is not None or len(game.tokens) >= self.max_plies:
                     # value is from the child's side to move; the mover gets -value.
                     reward = 0.0 if value is None else -float(value)
                     termination = "game_limit" if value is None else (
@@ -202,11 +231,13 @@ class SelfPlay:
         metrics = {f"selfplay/{n}": v / played for n, v in zip(names, stats.tolist())}
         metrics.update({f"selfplay/termination_{k}": v for k, v in terminations.items()})
         kept = sum(len(g["move_id"]) for g in finished)
+        prefix = sum(int((~g["supervised"]).sum()) for g in finished)
         metrics.update({
             "selfplay/positions_played": played,
             "selfplay/positions_kept": kept,
             "selfplay/games": len(finished),
             "selfplay/mean_plies": kept / max(len(finished), 1),
+            "selfplay/mean_prefix_plies": prefix / max(len(finished), 1),
             **{f"time/{k}": v for k, v in timing.items()},
         })
         return finished, metrics

@@ -40,6 +40,11 @@ class KlentConfig:
     # "q": the action-value head predicts Q (reference). "advantage": it predicts
     # A with Q = V + A, V the frozen value head; the target subtracts V(s).
     q_mode: str = "q"
+    # "initial": every game starts at move one (reference). "streaming": the
+    # Gumbel pipeline's StreamingStarts mixture (25% initial position, 75% real
+    # Lichess training prefixes taken over at plies 1-30 / 31-70 / 71-120),
+    # played as forced, unsupervised plies.
+    starts: str = "initial"
     # Private MLP for the Q head (0 = single linear readout, as before).
     q_head_blocks: int = 0
     q_head_width: int = 512
@@ -51,6 +56,8 @@ class KlentConfig:
     seed: int = 0
 
     def __post_init__(self):
+        if self.starts not in ("initial", "streaming"):
+            raise ValueError("starts must be 'initial' or 'streaming'")
         if self.q_mode not in ("q", "advantage"):
             raise ValueError("q_mode must be 'q' or 'advantage'")
         if self.q_mode == "advantage" and not self.freeze_value_head:

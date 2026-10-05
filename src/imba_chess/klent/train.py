@@ -40,7 +40,9 @@ def pack(lengths, batch_tokens, rng):
 
 
 def build_batch(games, start_id):
-    plies = np.array([len(g["move_id"]) for g in games])
+    # Token fields cover every ply (human prefix included); targets exist only
+    # for supervised plies, so they map to a subset of the event tokens.
+    plies = np.array([len(g["prev_move_id"]) for g in games])
     tokens = plies + 1
     offsets = np.concatenate([[0], np.cumsum(tokens)])
     total = int(offsets[-1])
@@ -77,7 +79,10 @@ def build_batch(games, start_id):
     mask = np.zeros((positions, width), dtype=bool)
     mask[rows, cols] = True
     batch.update(
-        supervised_indices=torch.from_numpy(np.flatnonzero(events)),
+        supervised_indices=torch.from_numpy(np.concatenate([
+            start + 1 + np.flatnonzero(g.get("supervised", np.ones(n, dtype=bool)))
+            for start, n, g in zip(offsets[:-1], plies, games)
+        ])),
         legal_ids=torch.from_numpy(legal),
         legal_mask=torch.from_numpy(mask),
         policy=torch.from_numpy(policy),
@@ -245,7 +250,7 @@ class KlentTrainer:
         return torch.autocast("cuda", dtype=self.autocast_dtype)
 
     def train_epoch(self, games, rng, *, policy_weight, value_weight):
-        lengths = [len(g["move_id"]) for g in games]
+        lengths = [len(g["prev_move_id"]) for g in games]
         plan = pack(lengths, self.batch_tokens, rng)
         sums, tokens, start = {}, 0, time.perf_counter()
         probes, probe_count = {}, 0
