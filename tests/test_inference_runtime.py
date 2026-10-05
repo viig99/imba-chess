@@ -296,3 +296,52 @@ def test_policy_algorithm_plays_argmax_legal_move_without_search(monkeypatch):
         gen.send((("m", "g"), {"logits": logits[None]}))
     assert stop.value.value.move_uci == "g1f3"
     assert stop.value.value.simulations == 0
+
+
+def test_policy_q_lets_the_action_value_head_overturn_a_close_policy(monkeypatch):
+    instance, _ = make_runtime(monkeypatch, "policy_q")
+    assert set(instance.executors) == {"root_eval"}
+    board = chess.Board()
+    logits = torch.zeros(len(VOCAB))
+    q = torch.zeros(len(VOCAB))
+    logits[VOCAB.encode("g1f3")] = 5.0
+    logits[VOCAB.encode("e2e4")] = 4.9  # beta * 0.1 gap = 0.01
+    q[VOCAB.encode("g1f3")] = -0.5
+    q[VOCAB.encode("e2e4")] = 0.5
+    q[VOCAB.encode("e2e5")] = 9.0  # illegal: never chosen
+    gen = instance.search_batch(board=board, batch={}, owner=("m", "g"), config=None)
+    next(gen)
+    with pytest.raises(StopIteration) as stop:
+        gen.send((("m", "g"), {"logits": logits[None], "q": q[None]}))
+    assert stop.value.value.move_uci == "e2e4"
+    # Without Q the same logits play the policy's choice.
+    plain, _ = make_runtime(monkeypatch, "policy")
+    gen = plain.search_batch(board=board, batch={}, owner=("m", "g"), config=None)
+    next(gen)
+    with pytest.raises(StopIteration) as stop:
+        gen.send((("m", "g"), {"logits": logits[None], "q": q[None]}))
+    assert stop.value.value.move_uci == "g1f3"
+
+
+def test_policy_q_requires_an_action_value_head(monkeypatch):
+    instance, _ = make_runtime(monkeypatch, "policy_q")
+    gen = instance.search_batch(board=chess.Board(), batch={}, owner=("m", "g"), config=None)
+    next(gen)
+    with pytest.raises(ValueError, match="action-value head"):
+        gen.send((("m", "g"), {"logits": torch.zeros(1, len(VOCAB))}))
+
+
+def test_split_root_output_carries_action_values():
+    from imba_chess.eval.merged_executors import _split_root_output
+
+    output = dict(
+        logits=torch.arange(10.0)[:, None],
+        value_logits=torch.zeros(10, 3),
+        q=torch.arange(10.0)[:, None] * -1,
+        kv_caches=[(torch.zeros(1, 10, 2), torch.zeros(1, 10, 2))],
+    )
+    first, second = _split_root_output(output, [dict(total_tokens=4), dict(total_tokens=6)])
+    assert torch.equal(first["q"], -torch.arange(4.0)[:, None])
+    assert torch.equal(second["q"], -torch.arange(4.0, 10.0)[:, None])
+    plain = {k: v for k, v in output.items() if k != "q"}
+    assert "q" not in _split_root_output(plain, [dict(total_tokens=4), dict(total_tokens=6)])[0]

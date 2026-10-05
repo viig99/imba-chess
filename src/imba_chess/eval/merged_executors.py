@@ -110,16 +110,17 @@ def _split_root_output(
     start = 0
     for payload in payloads:
         end = start + int(payload["total_tokens"])
-        results.append(
-            {
-                "logits": output["logits"][start:end],
-                "value_logits": output["value_logits"][start:end],
-                "kv_caches": [
-                    (k[:, start:end, :], v[:, start:end, :])
-                    for k, v in output["kv_caches"]
-                ],
-            }
-        )
+        result = {
+            "logits": output["logits"][start:end],
+            "value_logits": output["value_logits"][start:end],
+            "kv_caches": [
+                (k[:, start:end, :], v[:, start:end, :])
+                for k, v in output["kv_caches"]
+            ],
+        }
+        if "q" in output:  # KLENT action-value head
+            result["q"] = output["q"][start:end]
+        results.append(result)
         start = end
     return results
 

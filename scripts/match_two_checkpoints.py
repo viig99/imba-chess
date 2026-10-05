@@ -169,7 +169,7 @@ def _parse_args() -> argparse.Namespace:
     p.add_argument("--device", type=str, default=None)
     p.add_argument(
         "--model-move-policy",
-        choices=["gumbel", "value_search_halving", "policy"],
+        choices=["gumbel", "value_search_halving", "policy", "policy_q"],
         default="value_search_halving",
     )
     p.add_argument("--gumbel-simulations", type=int, default=None)

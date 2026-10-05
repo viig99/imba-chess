@@ -1,16 +1,27 @@
-"""Evaluate each KLENT actor snapshot against Stockfish 2600 as it appears.
+"""Evaluate a KLENT run's snapshots against Stockfish 2600, beside training.
 
-Runs beside training and never touches it: waits for actor-NNNN.pt files
-(written atomically every --save-every iterations), plays the greedy policy
-(no search) against limited-strength Stockfish with the same settings as the
-standing SF2600 ruler, and records the score in <run>/sf2600/ and in
-TensorBoard at the snapshot's position count. Restartable: snapshots that
-already have a result are skipped.
+Never touches the training process. For every actor snapshot whose iteration
+is a multiple of --every:
+  1. copy it to <run>/keep/ (the run's rolling --keep-snapshots pruning only
+     looks at the run directory, so kept copies survive);
+  2. play greedy "policy" (argmax pi, the KLENT paper's eval) and greedy
+     "policy_q" (argmax of KLENT's improved policy pi', uses the Q head).
+Greedy evals are light enough to share the GPU with training. Once the final
+snapshot (--final-iteration) is kept, training is over and the GPU is free,
+so it runs Gumbel 512 (the best 512-budget search: raw Q, root forcing,
+forcing floor, minimax 0.5) on the --baseline checkpoint and every kept
+snapshot.
+
+Scores go to <run>/sf2600/summary.jsonl and TensorBoard (<run>/tb_sf2600),
+at the snapshot's position count (0 for the baseline). Restartable: any
+evaluation whose result JSON exists is skipped.
 """
 
 import argparse
 import json
+import os
 from pathlib import Path
+import shutil
 import subprocess
 import sys
 import time
@@ -26,6 +37,14 @@ STOCKFISH_ARGS = [
     "--stockfish-path", "/usr/bin/stockfish", "--stockfish-time-sec", "5",
     "--stockfish-nodes", "40000", "--stockfish-threads", "1", "--stockfish-hash-mb", "64",
 ]
+MODES = {
+    "policy": ["--model-move-policy", "policy"],
+    "policy_q": ["--model-move-policy", "policy_q"],
+    "gumbel512": [
+        "--model-move-policy", "gumbel", "--gumbel-simulations", "512",
+        "--gumbel-root-forcing", "--gumbel-forcing-floor", "--gumbel-minimax-weight", "0.5",
+    ],
+}
 
 
 def positions_at(run, iteration):
@@ -36,30 +55,32 @@ def positions_at(run, iteration):
     raise ValueError(f"no metrics row for iteration {iteration}")
 
 
-def evaluate(run, snapshot, args):
-    out = run / "sf2600" / f"{snapshot.stem}-policy.json"
+def evaluate(run, checkpoint, name, mode, args):
+    """Play one evaluation; returns a summary row, or None if already done."""
+    out = run / "sf2600" / f"{name}-{mode}.json"
     if out.exists():
         return None
     command = [
         sys.executable, "scripts/eval_vs_stockfish.py",
-        "--config", str(args.config), "--checkpoint", str(snapshot),
-        "--model-move-policy", "policy", "--inference-dtype", "bfloat16",
+        "--config", str(args.config), "--checkpoint", str(checkpoint),
+        *MODES[mode], "--inference-dtype", "bfloat16",
         "--ladder-games-per-segment", str(args.games),
         "--concurrent-games", str(args.concurrent_games),
         *STOCKFISH_ARGS, "--output-json", str(out),
     ]
     start = time.perf_counter()
     subprocess.run(command, check=True, stdout=subprocess.DEVNULL)
-    result = json.loads(out.read_text())
     # Segmented (ladder) output nests the totals under "aggregate".
+    result = json.loads(out.read_text())
     result = result.get("aggregate", result)
     if result["rate_denominator_games"] != args.games:
         raise ValueError(f"expected {args.games} games, eval played {result['rate_denominator_games']}")
-    iteration = int(snapshot.stem.split("-")[1])
+    iteration = 0 if name == "baseline" else int(name.split("-")[1])
     row = dict(
-        snapshot=snapshot.name,
+        name=name,
+        mode=mode,
         iteration=iteration,
-        positions=positions_at(run, iteration),
+        positions=0 if name == "baseline" else positions_at(run, iteration),
         games=args.games,
         score_rate=result["score_rate"],
         win_rate=result["win_rate"],
@@ -72,6 +93,19 @@ def evaluate(run, snapshot, args):
     return row
 
 
+def keep_snapshots(run, every):
+    """Copy every multiple-of-`every` snapshot into <run>/keep/ (atomically)."""
+    keep = run / "keep"
+    keep.mkdir(exist_ok=True)
+    for snapshot in sorted(run.glob("actor-*.pt")):
+        if int(snapshot.stem.split("-")[1]) % every or (keep / snapshot.name).exists():
+            continue
+        tmp = keep / (snapshot.name + ".tmp")
+        shutil.copy2(snapshot, tmp)
+        os.replace(tmp, keep / snapshot.name)
+    return sorted(keep.glob("actor-*.pt"))
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("run", type=Path, help="KLENT output directory")
@@ -80,20 +114,35 @@ def main():
     parser.add_argument("--concurrent-games", type=int, default=8)
     parser.add_argument("--every", type=int, default=40,
                         help="Evaluate only snapshots whose iteration is a multiple of this.")
+    parser.add_argument("--final-iteration", type=int, default=200,
+                        help="Gumbel evals start once this snapshot exists (training is done).")
+    parser.add_argument("--baseline", type=Path,
+                        default=Path("artifacts/checkpoints_keep/flatten53250_supervised_last_checkpoint.pt"))
     parser.add_argument("--follow", action="store_true")
     args = parser.parse_args()
     (args.run / "sf2600").mkdir(exist_ok=True)
     writer = SummaryWriter(args.run / "tb_sf2600")
+
+    def record(row):
+        if row is None:
+            return
+        print(json.dumps(row), flush=True)
+        for key in ("score_rate", "win_rate", "draw_rate", "loss_rate"):
+            writer.add_scalar(f"sf2600_{row['mode']}/{key}", row[key], row["positions"])
+        writer.flush()
+
+    # The baseline has no Q head, so it gets the greedy-policy eval only.
+    record(evaluate(args.run, args.baseline, "baseline", "policy", args))
     while True:
-        for snapshot in sorted(args.run.glob("actor-*.pt")):
-            if int(snapshot.stem.split("-")[1]) % args.every:
-                continue
-            row = evaluate(args.run, snapshot, args)
-            if row is not None:
-                print(json.dumps(row), flush=True)
-                for key in ("score_rate", "win_rate", "draw_rate", "loss_rate"):
-                    writer.add_scalar(f"sf2600_policy/{key}", row[key], row["positions"])
-                writer.flush()
+        kept = keep_snapshots(args.run, args.every)
+        for snapshot in kept:
+            for mode in ("policy", "policy_q"):
+                record(evaluate(args.run, snapshot, snapshot.stem, mode, args))
+        if any(int(s.stem.split("-")[1]) == args.final_iteration for s in kept):
+            record(evaluate(args.run, args.baseline, "baseline", "gumbel512", args))
+            for snapshot in kept:
+                record(evaluate(args.run, snapshot, snapshot.stem, "gumbel512", args))
+            break
         if not args.follow:
             break
         time.sleep(60)

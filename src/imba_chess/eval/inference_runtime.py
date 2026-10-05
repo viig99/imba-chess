@@ -25,9 +25,16 @@ class HalvingResult:
     candidates: list[dict]
 
 
+# KLENT's improved policy pi' ∝ exp((beta * logit + q) / (alpha + beta)); its
+# argmax depends only on beta * logit + q. Reference beta (KazukiOhta/klent).
+POLICY_Q_BETA = 0.1
+
+
 @dataclass(frozen=True)
 class PolicyResult:
-    """Greedy policy move (argmax legal logit), no search -- KLENT's eval."""
+    """Greedy move with no search: argmax of the legal policy logits
+    ("policy", the KLENT paper's eval) or of KLENT's improved policy pi',
+    beta * logit + q ("policy_q", uses the action-value head)."""
 
     move_uci: str
     simulations: int = 0
@@ -91,7 +98,7 @@ class InferenceRuntime:
         stats=None,
         dtype=torch.float32,
     ):
-        if algorithm not in ("gumbel", "value_search_halving", "policy"):
+        if algorithm not in ("gumbel", "value_search_halving", "policy", "policy_q"):
             raise ValueError("unsupported search algorithm")
         device = torch.device(device)
         if device.type != "cuda":
@@ -132,7 +139,7 @@ class InferenceRuntime:
                 stats=stats,
                 max_tokens=root_batch_tokens,
             ),
-            **({} if algorithm == "policy" else dict(decode_wave=_make_decode_wave_executor(
+            **({} if algorithm in ("policy", "policy_q") else dict(decode_wave=_make_decode_wave_executor(
                 model=model,
                 device=device,
                 dtype=dtype,
@@ -222,7 +229,7 @@ class InferenceRuntime:
         if self.model.training:
             raise ValueError("search requires an evaluation-mode model")
         expected = GumbelConfig if self.algorithm == "gumbel" else HalvingConfig
-        if self.algorithm != "policy" and not isinstance(config, expected):
+        if self.algorithm not in ("policy", "policy_q") and not isinstance(config, expected):
             raise ValueError("search config does not match runtime algorithm")
         if isinstance(config, GumbelConfig) and config.max_depth > 32:
             raise ValueError("Gumbel workspace supports depth <= 32")
@@ -245,6 +252,16 @@ class InferenceRuntime:
             root_observer(moves, logits)
         if self.algorithm == "policy":
             return PolicyResult(moves[int(torch.argmax(logits))].uci())
+        if self.algorithm == "policy_q":
+            if "q" not in output:
+                raise ValueError("policy_q requires a checkpoint with an action-value head")
+            q, q_moves, _, _ = _project_legal_logits(
+                logits=output["q"][-1], board=board, move_vocab=self.move_vocab
+            )
+            if q_moves != moves:
+                raise RuntimeError("policy and action-value legal moves are misaligned")
+            scores = POLICY_Q_BETA * logits.float() + q.float()
+            return PolicyResult(moves[int(torch.argmax(scores))].uci())
         if noise == 0.0:
             noise = [0.0] * len(moves)
         wdl = tuple(torch.softmax(output["value_logits"][-1].float(), -1).tolist())
