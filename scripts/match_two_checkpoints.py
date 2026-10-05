@@ -172,6 +172,16 @@ def _parse_args() -> argparse.Namespace:
         choices=["gumbel", "value_search_halving", "policy", "policy_q"],
         default="value_search_halving",
     )
+    # Greedy modes need no search config, so each side may pick its own; e.g.
+    # a KLENT checkpoint can play policy_q (uses its Q head) against a
+    # Q-less baseline playing policy.
+    for side in ("a", "b"):
+        p.add_argument(
+            f"--model-move-policy-{side}",
+            choices=["policy", "policy_q"],
+            default=None,
+            help=f"Greedy move choice for side {side.upper()} (default: --model-move-policy).",
+        )
     p.add_argument("--gumbel-simulations", type=int, default=None)
     p.add_argument("--search-budget", type=int, default=None)
     p.add_argument("--search-max-depth", type=int, default=None)
@@ -201,6 +211,12 @@ def main() -> None:
     device = torch.device(device_arg)
     dtype = torch.float32
     models = {}
+    side_policies = {
+        "A": args.model_move_policy_a or args.model_move_policy,
+        "B": args.model_move_policy_b or args.model_move_policy,
+    }
+    if len(set(side_policies.values())) > 1 and not set(side_policies.values()) <= {"policy", "policy_q"}:
+        raise ValueError("per-side move policies must both be greedy (policy or policy_q)")
     for side, checkpoint, side_dtype in (
         ("A", args.checkpoint_a, args.inference_dtype_a),
         ("B", args.checkpoint_b, args.inference_dtype_b),
@@ -209,7 +225,7 @@ def main() -> None:
             repo_config=repo_config,
             checkpoint=checkpoint,
             device=device,
-            algorithm=args.model_move_policy,
+            algorithm=side_policies[side],
             dtype=INFERENCE_DTYPES[side_dtype],
         )
     move_vocab = models["A"].move_vocab
@@ -350,6 +366,8 @@ def main() -> None:
         "a_score_se": se,
         "adjudicated_draws": sum(1 for r in results if r["adjudicated"]),
         "algorithm": args.model_move_policy,
+        "algorithm_a": side_policies["A"],
+        "algorithm_b": side_policies["B"],
         "budget": halving_config.simulations
         if args.model_move_policy == "gumbel"
         else halving_config.budget,
