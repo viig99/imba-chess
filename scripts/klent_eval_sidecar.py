@@ -17,8 +17,11 @@ import time
 
 from torch.utils.tensorboard import SummaryWriter
 
+# The repo configs set ladder mode ([eval_vs_stockfish] ladder_elos), which
+# overrides --stockfish-elo and --games, so the Elo and game count go through
+# the ladder flags.
 STOCKFISH_ARGS = [
-    "--stockfish-limit-strength", "--stockfish-elo", "2600",
+    "--stockfish-limit-strength", "--ladder-elos", "2600",
     "--stockfish-path", "/usr/bin/stockfish", "--stockfish-time-sec", "5",
     "--stockfish-nodes", "40000", "--stockfish-threads", "1", "--stockfish-hash-mb", "64",
 ]
@@ -40,12 +43,17 @@ def evaluate(run, snapshot, args):
         sys.executable, "scripts/eval_vs_stockfish.py",
         "--config", str(args.config), "--checkpoint", str(snapshot),
         "--model-move-policy", "policy", "--inference-dtype", "bfloat16",
-        "--games", str(args.games), "--concurrent-games", str(args.concurrent_games),
+        "--ladder-games-per-segment", str(args.games),
+        "--concurrent-games", str(args.concurrent_games),
         *STOCKFISH_ARGS, "--output-json", str(out),
     ]
     start = time.perf_counter()
     subprocess.run(command, check=True, stdout=subprocess.DEVNULL)
     result = json.loads(out.read_text())
+    # Segmented (ladder) output nests the totals under "aggregate".
+    result = result.get("aggregate", result)
+    if result["rate_denominator_games"] != args.games:
+        raise ValueError(f"expected {args.games} games, eval played {result['rate_denominator_games']}")
     iteration = int(snapshot.stem.split("-")[1])
     row = dict(
         snapshot=snapshot.name,
@@ -67,7 +75,7 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("run", type=Path, help="KLENT output directory")
     parser.add_argument("--config", type=Path, default=Path("config/imba_chess_v4.toml"))
-    parser.add_argument("--games", type=int, default=100)
+    parser.add_argument("--games", type=int, default=200)
     parser.add_argument("--concurrent-games", type=int, default=8)
     parser.add_argument("--every", type=int, default=40,
                         help="Evaluate only snapshots whose iteration is a multiple of this.")
