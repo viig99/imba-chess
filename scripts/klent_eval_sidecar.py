@@ -19,9 +19,10 @@ from torch.utils.tensorboard import SummaryWriter
 
 # The repo configs set ladder mode ([eval_vs_stockfish] ladder_elos), which
 # overrides --stockfish-elo and --games, so the Elo and game count go through
-# the ladder flags.
+# the ladder flags. Ladder segments set UCI_LimitStrength and UCI_Elo
+# themselves (--stockfish-limit-strength would demand --stockfish-elo).
 STOCKFISH_ARGS = [
-    "--stockfish-limit-strength", "--ladder-elos", "2600",
+    "--ladder-elos", "2600",
     "--stockfish-path", "/usr/bin/stockfish", "--stockfish-time-sec", "5",
     "--stockfish-nodes", "40000", "--stockfish-threads", "1", "--stockfish-hash-mb", "64",
 ]
