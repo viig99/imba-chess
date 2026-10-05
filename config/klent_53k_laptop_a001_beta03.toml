@@ -1,0 +1,22 @@
+# beta 0.3 ablation of the alpha 0.01 frozen-value run (klent_53k_laptop_alpha001_frozenv.toml): identical
+# except beta 0.1 -> 0.3, from the same 53250 start, for an equal-iteration head-to-head. In the paper's
+# 9x9 Go sensitivity sweep (Fig. 13, lambda e^-1/8), alpha 0.01 scored 72 at beta 0.1 and 88 at beta 0.3:
+# beta sets the step (Q multiplier 1/(alpha+beta): 9.1 -> 3.2, prior power 0.91 -> 0.97), not the fixed
+# point pi ∝ exp(Q/alpha).
+# Warm-up (2 iterations) trains only the new action-value head with the frozen value-head bootstrap.
+base_config = "config/imba_chess_v4.toml"
+init = "artifacts/checkpoints_keep/flatten53250_supervised_last_checkpoint.pt"
+alpha = 0.01
+beta = 0.3
+tau = 8.0
+positions_per_iteration = 2097152
+total_positions = 419430400
+batch_tokens = 4096
+slots = 256
+q_warmup_iterations = 2
+warmup_lr = 1e-3
+lr = 1e-4
+value_weight = 0.0
+freeze_value_head = true
+bootstrap = "q"
+inference_dtype = "bfloat16"
