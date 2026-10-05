@@ -523,3 +523,15 @@ def test_resume_accepts_checkpoints_written_before_new_model_fields(tmp_path):
     legacy["tie_policy_embeddings"] = True
     model = build_model(cfg, repo, VOCAB, resume_state=dict(model_config=legacy))
     assert model.config.action_value_head_blocks == 0
+
+
+def test_resume_config_accepts_settings_added_after_the_checkpoint():
+    from dataclasses import asdict
+    from imba_chess.klent.run import _validate_resume_config
+
+    cfg = KlentConfig(init="some.pt", freeze_value_head=True, value_weight=0.0)
+    legacy = {k: v for k, v in asdict(cfg).items() if k not in ("q_head_blocks", "q_head_width")}
+    _validate_resume_config(cfg, dict(config=legacy))  # defaults fill the gap
+    with pytest.raises(ValueError, match="q_head_blocks"):
+        _validate_resume_config(KlentConfig(init="some.pt", freeze_value_head=True, value_weight=0.0,
+                                            q_head_blocks=2), dict(config=legacy))

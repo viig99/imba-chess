@@ -20,6 +20,7 @@ from imba_chess.model.checkpoint import load_initial_weights
 from imba_chess.self_play.runtime import run_lock
 from imba_chess.self_play.trainer import atomic_checkpoint
 
+from .config import KlentConfig
 from .engine import SlotEngine
 from .selfplay import BoardCodec, SelfPlay
 from .targets import lambda_from_tau
@@ -35,7 +36,9 @@ _RESUME_OVERRIDES = frozenset({
 
 
 def _validate_resume_config(cfg, state):
-    current, saved = asdict(cfg), state["config"]
+    # Settings added after a checkpoint was written take their defaults.
+    defaults = {f.name: f.default for f in fields(KlentConfig) if f.default is not MISSING}
+    current, saved = asdict(cfg), {**defaults, **state["config"]}
     changed = sorted(
         key for key in current.keys() | saved.keys()
         if key not in _RESUME_OVERRIDES and current.get(key) != saved.get(key)
