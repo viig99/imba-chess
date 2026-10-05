@@ -51,6 +51,8 @@ class HSTUChessConfig:
     moves_left_loss_weight: float = 0.05
     # KLENT action-value readout: tanh(Linear(d, vocab)) per move, zero-init.
     enable_action_value_head: bool = False
+    # KLENT scratch runs use an independent, zero-initialized policy readout.
+    tie_policy_embeddings: bool = True
 
 
 def build_hstu_chess_config(
@@ -341,7 +343,8 @@ class HSTUChessModel(nn.Module):
         self.prediction_head = nn.Linear(d, config.move_vocab_size, bias=False)
         # Same move vocab on the input and output side; sharing the matrix
         # saves ~1M params and regularizes both representations.
-        self.prediction_head.weight = self.prev_move_embedding.weight
+        if config.tie_policy_embeddings:
+            self.prediction_head.weight = self.prev_move_embedding.weight
         # Small private MLP: trunk features are dominated by the policy
         # objective, so the value head needs its own capacity.
         self.value_head = (

@@ -1,4 +1,7 @@
 import math
+from dataclasses import asdict, replace
+import importlib
+import io
 
 import chess
 import imba_chess_native as cc
@@ -6,13 +9,14 @@ import numpy as np
 import pytest
 import torch
 
-from imba_chess.config import BoardStateConfig
+from imba_chess.config import BoardStateConfig, ModelConfig, RepoConfig
 from imba_chess.data.board_state import BoardStateEncoder
 from imba_chess.data.collate import collate_jagged_batch
 from imba_chess.data.move_vocab import MoveVocab
-from imba_chess.eval.position_evaluator import _SequenceHistory
+from imba_chess.eval.position_evaluator import _SequenceHistory, load_hstu_checkpoint
 from imba_chess.klent.config import KlentConfig
 from imba_chess.klent.engine import SlotEngine
+from imba_chess.klent.run import KlentRun, build_model, run
 from imba_chess.klent.selfplay import BoardCodec, SelfPlay
 from imba_chess.klent.targets import improved_policy, lambda_from_tau, lambda_returns
 from imba_chess.klent.train import KlentTrainer, build_batch, klent_loss
@@ -104,12 +108,13 @@ def _play(model, *, slots, positions, max_plies, bootstrap="q"):
     return selfplay.collect(positions, bootstrap=bootstrap)
 
 
-def test_incremental_decode_matches_full_forward():
+@pytest.mark.parametrize("tied", [True, False])
+def test_incremental_decode_matches_full_forward(tied):
     """Stored pi' and values come from one-token decodes over slot caches with
     resets; recomputing them from one jagged forward over the finished games
     must agree, which checks the engine, BOS prefill, resets and batch building."""
     torch.set_num_threads(1)
-    model = tiny_model()
+    model = tiny_model(tie_policy_embeddings=tied)
     games, metrics = _play(model, slots=3, positions=3 * 23, max_plies=7)
     assert len(games) >= 6 and metrics["selfplay/positions_kept"] > 0
     batch = build_batch(games, VOCAB.start_id)
@@ -211,3 +216,183 @@ def test_config_defaults_follow_reference():
     assert cfg.positions_per_iteration == 1024 * 2048
     with pytest.raises(ValueError):
         KlentConfig(bootstrap="mc")
+
+
+@pytest.fixture
+def small_run(monkeypatch):
+    torch.set_num_threads(1)
+    repo = RepoConfig(model=ModelConfig(
+        model_dim=16, linear_hidden_dim=4, attention_dim=4, num_heads=2,
+        num_layers=2, dropout=0.0, max_position_embeddings=64,
+        enable_value_head=True, value_head_width=8,
+    ))
+    monkeypatch.setattr(importlib.import_module("imba_chess.klent.run"),
+                        "load_repo_config", lambda path: repo)
+    cfg = KlentConfig(slots=2, positions_per_iteration=24, total_positions=48,
+                      batch_tokens=64, max_plies=6, compile=False)
+    return cfg, repo
+
+
+def test_scratch_starts_uniform_preserves_move_embeddings_and_learns(small_run):
+    cfg, repo = small_run
+    model = build_model(cfg, repo, VOCAB).eval()
+    assert model.prediction_head.weight is not model.prev_move_embedding.weight
+    assert torch.count_nonzero(model.prev_move_embedding.weight) > 0
+    games, _ = _play(model, slots=2, positions=24, max_plies=6)
+    for game in games:
+        for start, end in zip(game["legal_offsets"][:-1], game["legal_offsets"][1:]):
+            np.testing.assert_allclose(game["policy"][start:end], 1.0 / (end - start))
+    trainer = KlentTrainer(model, device=torch.device("cpu"), start_id=VOCAB.start_id,
+                           batch_tokens=64, grad_clip=1.0, compile_model=False)
+    trainer.set_phase(warmup=False, lr=1e-3, weight_decay=0.0)
+    trainer.train_epoch(games, np.random.default_rng(0), policy_weight=1.0, value_weight=1.0)
+    assert torch.count_nonzero(model.prediction_head.weight) > 0
+
+
+def test_pretrained_initialization_preserves_weights_and_policy_tying(small_run, tmp_path):
+    cfg, repo = small_run
+    config = replace(build_model(cfg, repo, VOCAB).config,
+                     enable_action_value_head=False, tie_policy_embeddings=True)
+    plain = HSTUChessModel(config)
+    initial = tmp_path / "initial.pt"
+    torch.save(dict(model=plain.state_dict()), initial)
+    model = build_model(replace(cfg, init=str(initial)), repo, VOCAB)
+    assert model.prediction_head.weight is model.prev_move_embedding.weight
+    for key, value in plain.state_dict().items():
+        torch.testing.assert_close(value, model.state_dict()[key], rtol=0, atol=0)
+    assert torch.count_nonzero(model.action_value_head.weight) == 0
+
+
+def test_policy_loss_matches_full_vocabulary_ce_and_suppresses_illegal_logits():
+    logits = torch.tensor([[1., 0., 9., -1.], [2., 3., -2., 8.]], requires_grad=True)
+    q = torch.tensor([[.1, .2, .3, .4], [.4, .3, .2, .1]], requires_grad=True)
+    batch = dict(
+        supervised_indices=torch.tensor([0, 1]),
+        legal_ids=torch.tensor([[0, 1, 0], [1, 2, 0]]),
+        legal_mask=torch.tensor([[True, True, False], [True, True, False]]),
+        policy=torch.tensor([[.8, .2, 0.], [.25, .75, 0.]]),
+        move_id=torch.tensor([0, 2]), returns=torch.tensor([-.2, .5]),
+        outcome=torch.tensor([0, 2]),
+    )
+    wdl = torch.tensor([[0., 1., 2.], [2., 1., 0.]], requires_grad=True)
+    losses = klent_loss(dict(logits=logits, q=q, value_logits=wdl), batch,
+                        policy_weight=1.0, value_weight=1.0)
+    dense_target = torch.tensor([[.8, .2, 0., 0.], [0., .25, .75, 0.]])
+    expected = -(dense_target * torch.log_softmax(logits, -1)).sum(-1).mean()
+    torch.testing.assert_close(losses["policy_loss"], expected)
+    torch.testing.assert_close(losses["q_loss"], torch.tensor(.09))
+    torch.testing.assert_close(losses["loss"], expected + losses["q_loss"]
+                               + torch.nn.functional.cross_entropy(wdl, batch["outcome"]))
+    losses["loss"].backward()
+    assert logits.grad[0, 2] > 0 and logits.grad[1, 3] > 0
+    assert q.grad[0, 1:].count_nonzero() == 0
+    assert q.grad[1, [0, 1, 3]].count_nonzero() == 0
+
+
+def _assert_optimizer_state_equal(a, b):
+    assert a.keys() == b.keys()
+    for index, values in a.items():
+        assert values.keys() == b[index].keys()
+        for key, value in values.items():
+            if isinstance(value, torch.Tensor):
+                torch.testing.assert_close(value, b[index][key], rtol=0, atol=0)
+            else:
+                assert value == b[index][key]
+
+
+@pytest.mark.parametrize("warmup_iterations", [0, 1, 2])
+def test_resume_preserves_next_update_and_optimizer_state(small_run, warmup_iterations):
+    cfg, _ = small_run
+    cfg = replace(cfg, q_warmup_iterations=warmup_iterations)
+    original = KlentRun(cfg, device="cpu")
+    original.run_iteration()
+    # Serialize before either model advances: state_dict otherwise aliases tensors.
+    buffer = io.BytesIO()
+    torch.save(original.state_dict(), buffer)
+    buffer.seek(0)
+    state = torch.load(buffer, weights_only=False)
+    resumed = KlentRun(cfg, device="cpu", resume_state=state)
+    _assert_optimizer_state_equal(original.trainer.optimizer.state_dict()["state"],
+                                  resumed.trainer.optimizer.state_dict()["state"])
+    original.run_iteration()
+    resumed.run_iteration()
+    for key, value in original.model.state_dict().items():
+        torch.testing.assert_close(value, resumed.model.state_dict()[key], rtol=0, atol=0)
+    _assert_optimizer_state_equal(original.trainer.optimizer.state_dict()["state"],
+                                  resumed.trainer.optimizer.state_dict()["state"])
+    assert original.positions == resumed.positions and original.iteration == resumed.iteration
+
+
+@pytest.mark.parametrize("warmup_iterations", [0, 2])
+def test_resume_runtime_overrides_preserve_moments_and_apply_optimizer_settings(small_run, warmup_iterations):
+    cfg, _ = small_run
+    cfg = replace(cfg, q_warmup_iterations=warmup_iterations)
+    original = KlentRun(cfg, device="cpu")
+    original.run_iteration()
+    state = original.state_dict()
+    changed = replace(cfg, init="no-longer-needed.pt", total_positions=96,
+                      batch_tokens=32, slots=3, compile=True, inference_dtype="float32",
+                      lr=2e-4, warmup_lr=4e-4, weight_decay=.02, grad_clip=.5)
+    resumed = KlentRun(changed, device="cpu", resume_state=state)
+    resumed._phase()
+    groups = resumed.trainer.optimizer.param_groups
+    lr = changed.warmup_lr if warmup_iterations else changed.lr
+    assert [g["lr"] for g in groups] == [lr, lr]
+    assert [g["weight_decay"] for g in groups] == [changed.weight_decay, 0.0]
+    _assert_optimizer_state_equal(state["trainer"]["optimizer"]["state"],
+                                  resumed.trainer.optimizer.state_dict()["state"])
+    for key, value in state["model"].items():
+        torch.testing.assert_close(value, resumed.model.state_dict()[key], rtol=0, atol=0)
+    assert not resumed.model.config.tie_policy_embeddings
+    resumed.run_iteration()
+
+
+@pytest.mark.parametrize("key,value", [("alpha", .1), ("tau", 4.),
+                                       ("seed", 1), ("q_warmup_iterations", 1)])
+def test_resume_rejects_algorithm_changes(small_run, key, value):
+    cfg, _ = small_run
+    original = KlentRun(cfg, device="cpu")
+    original._phase()
+    with pytest.raises(ValueError, match=key):
+        KlentRun(replace(cfg, **{key: value}), device="cpu", resume_state=original.state_dict())
+
+
+def test_legacy_resume_needs_no_initial_checkpoint_and_keeps_weight_tying(small_run, tmp_path):
+    cfg, repo = small_run
+    cfg = replace(cfg, init=str(tmp_path / "missing-53k.pt"))
+    model = HSTUChessModel(replace(build_model(replace(cfg, init="scratch"), repo, VOCAB).config,
+                                   tie_policy_embeddings=True))
+    trainer = KlentTrainer(model, device=torch.device("cpu"), start_id=VOCAB.start_id,
+                           batch_tokens=64, grad_clip=1.0, compile_model=False)
+    trainer.set_phase(warmup=False, lr=cfg.lr, weight_decay=0.0)
+    state = dict(model=model.state_dict(), trainer=trainer.state_dict(), iteration=1,
+                 positions=24, config=asdict(cfg))  # Old checkpoint format: no model metadata.
+    torch.save(state, tmp_path / "checkpoint.pt")
+    run(replace(cfg, total_positions=48), output=tmp_path, device="cpu", save_every=1)
+    saved = torch.load(tmp_path / "checkpoint.pt", weights_only=False)
+    assert saved["iteration"] == 2 and saved["positions"] == 48
+    assert saved["model_config"]["tie_policy_embeddings"]
+    assert (tmp_path / "actor-0002.pt").exists()
+
+
+def test_scratch_actor_and_training_checkpoint_load_for_eval_without_retying(small_run, tmp_path):
+    cfg, repo = small_run
+    run(replace(cfg, total_positions=24), output=tmp_path, device="cpu", save_every=1)
+    for name in ("actor-0001.pt", "checkpoint.pt"):
+        saved = torch.load(tmp_path / name, weights_only=False)
+        model, _ = load_hstu_checkpoint(checkpoint_path=tmp_path / name, repo_config=repo,
+                                       move_vocab=VOCAB, device=torch.device("cpu"),
+                                       compile_model=False)
+        assert model.prediction_head.weight is not model.prev_move_embedding.weight
+        for key, value in saved["model"].items():
+            torch.testing.assert_close(value, model.state_dict()[key], rtol=0, atol=0)
+
+
+def test_resume_rejects_changed_model_architecture(small_run):
+    cfg, _ = small_run
+    original = KlentRun(cfg, device="cpu")
+    original._phase()
+    state = original.state_dict()
+    state["model_config"]["dropout"] = .1
+    with pytest.raises(ValueError, match="model architecture"):
+        KlentRun(cfg, device="cpu", resume_state=state)

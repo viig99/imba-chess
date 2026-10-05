@@ -14,7 +14,7 @@ except ModuleNotFoundError:  # Python 3.10
 class KlentConfig:
     # Model architecture, vocab and board encoding come from the repo config.
     base_config: str = "config/imba_chess_v4.toml"
-    # "scratch" or a checkpoint path whose weights initialize the model.
+    # "scratch" or initial weights; ignored when a run checkpoint already exists.
     init: str = "scratch"
     # Reference hyperparameters (KazukiOhta/klent main.py).
     alpha: float = 0.03

@@ -92,8 +92,10 @@ def klent_loss(output, batch, *, policy_weight, value_weight):
     indices = batch["supervised_indices"].to(device)
     legal = batch["legal_ids"].to(device)
     mask = batch["legal_mask"].to(device)
-    logits = output["logits"].index_select(0, indices).float().gather(1, legal)
-    log_probs = F.log_softmax(logits.masked_fill(~mask, -torch.inf), -1).masked_fill(~mask, 0.0)
+    logits = output["logits"].index_select(0, indices).float()
+    # Normalize over the entire move vocabulary, as in the reference. Targets
+    # have mass only on legal moves, so illegal logits receive downward gradients.
+    log_probs = F.log_softmax(logits, -1).gather(1, legal).masked_fill(~mask, 0.0)
     policy_loss = -(batch["policy"].to(device) * log_probs).sum(-1).mean()
     q = output["q"].index_select(0, indices).float()
     q_played = q.gather(1, batch["move_id"].to(device)[:, None]).squeeze(1)
@@ -129,6 +131,11 @@ class KlentTrainer:
         the fresh Q head before any gradient reaches the shared trunk.
         """
         if self.warmup == warmup:
+            # Runtime overrides must preserve the accumulated optimizer moments.
+            groups = build_decay_param_groups(self.model, weight_decay=weight_decay)
+            for group, configured in zip(self.optimizer.param_groups, groups):
+                group["lr"] = lr
+                group["weight_decay"] = configured["weight_decay"]
             return
         self.warmup = warmup
         for parameter in self.model.parameters():
@@ -195,3 +202,5 @@ class KlentTrainer:
     def load_state_dict(self, state, *, lr, weight_decay):
         self.set_phase(warmup=state["warmup"], lr=lr, weight_decay=weight_decay)
         self.optimizer.load_state_dict(state["optimizer"])
+        # load_state_dict also restores old group settings; apply current overrides.
+        self.set_phase(warmup=state["warmup"], lr=lr, weight_decay=weight_decay)

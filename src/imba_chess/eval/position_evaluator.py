@@ -160,6 +160,9 @@ def load_hstu_checkpoint(
         enable_action_value_head=any(
             key.startswith("action_value_head.") for key in normalized_state_dict
         ),
+        # New scratch KLENT snapshots use an independent policy readout.
+        # Earlier checkpoints share policy/input weights and lack this metadata.
+        tie_policy_embeddings=checkpoint.get("model_config", {}).get("tie_policy_embeddings", True),
     )
 
     model: torch.nn.Module = HSTUChessModel(model_cfg).to(device)
