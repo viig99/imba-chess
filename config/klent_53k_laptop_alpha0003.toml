@@ -1,0 +1,21 @@
+# 53k KLENT, second attempt: alpha 0.03 -> 0.003 (entropy weight). The reference alpha flattened the
+# 53250 policy to ~2.7 nats and cut greedy SF2600 score from ~8% to ~1% (run 53k-laptop-overnight-fullce-2026-10-04);
+# with beta 0.1 the per-iteration prior power becomes 0.97 instead of 0.77. Everything else as klent_53k_laptop_overnight.toml.
+# Reference hyperparameters except: warm-up trains only the new action-value
+# head and the (draw-blind) supervised value head with the value-head
+# bootstrap, then all weights at a resumed-run lr.
+base_config = "config/imba_chess_v4.toml"
+init = "artifacts/checkpoints_keep/flatten53250_supervised_last_checkpoint.pt"
+alpha = 0.003
+beta = 0.1
+tau = 8.0
+positions_per_iteration = 2097152
+total_positions = 419430400
+batch_tokens = 4096
+slots = 256
+q_warmup_iterations = 2
+warmup_lr = 1e-3
+lr = 1e-4
+value_weight = 1.0
+bootstrap = "q"
+inference_dtype = "bfloat16"
