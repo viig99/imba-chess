@@ -1,0 +1,21 @@
+# 53k KLENT with the paper's universal hyperparameters (alpha 0.03, beta 0.1, lambda e^-1/8: used
+# unchanged for Animal Shogi, Gardner Chess, 9x9/19x19 Go, Hex and Othello) and the 53250 value
+# head frozen (no value loss, no gradient). Ablation of the frozen-value alpha 0.01 run: was the
+# fix the frozen value head or the lower alpha? The value head only supplies the warm-up
+# bootstrap; afterwards Q bootstraps itself as in the reference.
+base_config = "config/imba_chess_v4.toml"
+init = "artifacts/checkpoints_keep/flatten53250_supervised_last_checkpoint.pt"
+alpha = 0.03
+beta = 0.1
+tau = 8.0
+positions_per_iteration = 2097152
+total_positions = 419430400
+batch_tokens = 4096
+slots = 256
+q_warmup_iterations = 2
+warmup_lr = 1e-3
+lr = 1e-4
+value_weight = 0.0
+freeze_value_head = true
+bootstrap = "q"
+inference_dtype = "bfloat16"

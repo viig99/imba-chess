@@ -6,6 +6,9 @@ is a multiple of --every:
      looks at the run directory, so kept copies survive);
   2. play greedy "policy" (argmax pi, the KLENT paper's eval) and greedy
      "policy_q" (argmax of KLENT's improved policy pi', uses the Q head).
+  3. play it head-to-head against the previous kept snapshot, both sides
+     greedy policy_q, with paired openings and colour reversal ("h2h_prev":
+     a working self-play loop should keep beating its own earlier versions).
 Greedy evals are light enough to share the GPU with training. Once the final
 snapshot (--final-iteration) is kept, training is over and the GPU is free,
 so it runs Gumbel 512 (the best 512-budget search: raw Q, root forcing,
@@ -93,6 +96,46 @@ def evaluate(run, checkpoint, name, mode, args):
     return row
 
 
+def head_to_head(run, snapshot, previous, args):
+    """Snapshot vs the previous kept snapshot; returns a summary row or None."""
+    out = run / "sf2600" / f"{snapshot.stem}-vs-{previous.stem}-h2h.json"
+    if out.exists():
+        return None
+    command = [
+        sys.executable, "scripts/match_two_checkpoints.py",
+        "--config", str(args.config),
+        "--checkpoint-a", str(snapshot), "--label-a", snapshot.stem,
+        "--checkpoint-b", str(previous), "--label-b", previous.stem,
+        "--inference-dtype-a", "bfloat16", "--inference-dtype-b", "bfloat16",
+        "--model-move-policy", "policy_q",
+        "--games", str(args.h2h_games), "--concurrent-games", str(args.concurrent_games),
+        "--output-json", str(out),
+    ]
+    start = time.perf_counter()
+    subprocess.run(command, check=True, stdout=subprocess.DEVNULL)
+    result = json.loads(out.read_text())
+    games = result["a_wins"] + result["a_draws"] + result["a_losses"]
+    if games != args.h2h_games:
+        raise ValueError(f"expected {args.h2h_games} games, match played {games}")
+    iteration = int(snapshot.stem.split("-")[1])
+    row = dict(
+        name=f"{snapshot.stem}-vs-{previous.stem}",
+        mode="h2h_prev",
+        iteration=iteration,
+        positions=positions_at(run, iteration),
+        games=games,
+        score_rate=result["a_score_rate"],
+        win_rate=result["a_wins"] / games,
+        draw_rate=result["a_draws"] / games,
+        loss_rate=result["a_losses"] / games,
+        score_se=result["a_score_se"],
+        seconds=round(time.perf_counter() - start, 1),
+    )
+    with (run / "sf2600" / "summary.jsonl").open("a") as stream:
+        stream.write(json.dumps(row) + "\n")
+    return row
+
+
 def keep_snapshots(run, every):
     """Copy every multiple-of-`every` snapshot into <run>/keep/ (atomically)."""
     keep = run / "keep"
@@ -111,6 +154,8 @@ def main():
     parser.add_argument("run", type=Path, help="KLENT output directory")
     parser.add_argument("--config", type=Path, default=Path("config/imba_chess_v4.toml"))
     parser.add_argument("--games", type=int, default=200)
+    parser.add_argument("--h2h-games", type=int, default=400,
+                        help="Games per snapshot-vs-previous match (paired openings).")
     parser.add_argument("--concurrent-games", type=int, default=8)
     parser.add_argument("--every", type=int, default=40,
                         help="Evaluate only snapshots whose iteration is a multiple of this.")
@@ -135,9 +180,11 @@ def main():
     record(evaluate(args.run, args.baseline, "baseline", "policy", args))
     while True:
         kept = keep_snapshots(args.run, args.every)
-        for snapshot in kept:
+        for index, snapshot in enumerate(kept):
             for mode in ("policy", "policy_q"):
                 record(evaluate(args.run, snapshot, snapshot.stem, mode, args))
+            if index > 0:
+                record(head_to_head(args.run, snapshot, kept[index - 1], args))
         if any(int(s.stem.split("-")[1]) == args.final_iteration for s in kept):
             record(evaluate(args.run, args.baseline, "baseline", "gumbel512", args))
             for snapshot in kept:
