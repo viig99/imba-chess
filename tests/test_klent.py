@@ -654,3 +654,42 @@ def test_prefix_game_tokens_match_python_chess_history():
         assert torch.equal(actual[key].long(), expected[key].long()), key
     # Supervision starts exactly at the takeover ply.
     assert actual["supervised_indices"][0] == 1 + len(CASTLING_PREFIX)
+
+
+def test_gradient_accumulation_takes_fewer_optimizer_steps_and_still_learns():
+    torch.manual_seed(0)
+    model = tiny_model()
+    games, _ = _play(model, slots=2, positions=2 * 30, max_plies=6)
+    trainer = KlentTrainer(model, device=torch.device("cpu"), start_id=VOCAB.start_id,
+                           batch_tokens=16, grad_clip=1.0, compile_model=False,
+                           gradient_accumulation=3)
+    trainer.set_phase(warmup=False, lr=3e-3, weight_decay=0.0)
+    rng = np.random.default_rng(0)
+    first = trainer.train_epoch(games, rng, policy_weight=1.0, value_weight=1.0)
+    micro = first["train/microbatches"]
+    assert micro > 3 and first["train/steps"] == -(-micro // 3)
+    assert np.isfinite(first["train/gradient_norm"])
+    for _ in range(40):
+        last = trainer.train_epoch(games, rng, policy_weight=1.0, value_weight=1.0)
+    assert last["train/loss"] < first["train/loss"]
+
+
+def test_accumulating_two_identical_microbatches_matches_one():
+    """Averaging the same microbatch twice gives the same gradient as once."""
+    torch.manual_seed(0)
+    model = tiny_model()
+    games, _ = _play(model, slots=1, positions=8, max_plies=6)
+    single = games[:1]
+    a, b = tiny_model(), tiny_model()
+    a.load_state_dict(model.state_dict()); b.load_state_dict(model.state_dict())
+    ta = KlentTrainer(a, device=torch.device("cpu"), start_id=VOCAB.start_id, batch_tokens=64,
+                      grad_clip=1e9, compile_model=False, gradient_accumulation=1, probe_every=0)
+    tb = KlentTrainer(b, device=torch.device("cpu"), start_id=VOCAB.start_id, batch_tokens=len(single[0]["prev_move_id"]) + 1,
+                      grad_clip=1e9, compile_model=False, gradient_accumulation=2, probe_every=0)
+    for t in (ta, tb):
+        t.set_phase(warmup=False, lr=1e-2, weight_decay=0.0)
+    ta.train_epoch(single, np.random.default_rng(0), policy_weight=1.0, value_weight=1.0)
+    out = tb.train_epoch(single * 2, np.random.default_rng(0), policy_weight=1.0, value_weight=1.0)
+    assert out["train/steps"] == 1 and out["train/microbatches"] == 2
+    for (name, x), y in zip(a.state_dict().items(), b.state_dict().values()):
+        torch.testing.assert_close(x, y, atol=1e-6, rtol=1e-5, msg=name)

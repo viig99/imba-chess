@@ -23,6 +23,8 @@ class KlentConfig:
     positions_per_iteration: int = 2**21
     total_positions: int = 75_000_000
     batch_tokens: int = 4096
+    # Packed microbatches per optimizer step (~35 games each at 4096 tokens).
+    gradient_accumulation: int = 1
     lr: float = 1e-3
     weight_decay: float = 0.0
     # Ours: transformer safety (the reference ResNet runs unclipped).
@@ -56,6 +58,8 @@ class KlentConfig:
     seed: int = 0
 
     def __post_init__(self):
+        if type(self.gradient_accumulation) is not int or self.gradient_accumulation < 1:
+            raise ValueError("gradient_accumulation must be a positive integer")
         if self.starts not in ("initial", "streaming"):
             raise ValueError("starts must be 'initial' or 'streaming'")
         if self.q_mode not in ("q", "advantage"):

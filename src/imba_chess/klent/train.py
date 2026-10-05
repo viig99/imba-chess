@@ -185,10 +185,14 @@ class KlentTrainer:
 
     def __init__(self, model, *, device, start_id, batch_tokens, grad_clip, compile_model,
                  train_dtype="float32", freeze_value_head=False, probe_every=64,
-                 advantage=False):
+                 advantage=False, gradient_accumulation=1):
         self.model, self.device, self.start_id = model, device, start_id
         self.freeze_value_head = freeze_value_head
         self.advantage = advantage
+        # Microbatches per optimizer step: more games per update without the
+        # memory of a larger packed batch (Q's targets come from game results,
+        # so a step's Q signal scales with the number of games, not positions).
+        self.accumulation = gradient_accumulation
         # Every probe_every-th step also measures per-loss trunk gradients.
         self.probe_every = probe_every
         self.batch_tokens, self.grad_clip = batch_tokens, grad_clip
@@ -254,6 +258,7 @@ class KlentTrainer:
         plan = pack(lengths, self.batch_tokens, rng)
         sums, tokens, start = {}, 0, time.perf_counter()
         probes, probe_count = {}, 0
+        norm_sum, optimizer_steps = None, 0
         parameters = [p for p in self.model.parameters() if p.requires_grad]
         trunk = trunk_parameters(self.model)
         loss_weights = dict(policy_loss=policy_weight, q_loss=1.0, value_loss=value_weight)
@@ -263,36 +268,45 @@ class KlentTrainer:
             submit = lambda i: pool.submit(_prepare, [games[j] for j in plan[i]], self.start_id, pin)
             pending = submit(0) if plan else None
             try:
-                for step in range(len(plan)):
+                micro, acc = len(plan), self.accumulation
+                for index in range(micro):
                     batch = pending.result()
-                    pending = submit(step + 1) if step + 1 < len(plan) else None
+                    pending = submit(index + 1) if index + 1 < micro else None
                     tokens += batch["total_tokens"]
                     batch = {k: v.to(self.device, non_blocking=True) if torch.is_tensor(v) else v
                              for k, v in batch.items()}
-                    self.optimizer.zero_grad(set_to_none=True)
+                    group_start = index - index % acc
+                    group_size = min(acc, micro - group_start)
+                    first, last = index == group_start, index == group_start + group_size - 1
+                    if first:
+                        self.optimizer.zero_grad(set_to_none=True)
                     with self._autocast():
                         losses = self.forward_loss(
                             self.model, batch, self._mask(batch), policy_weight, value_weight,
                             self.advantage,
                         )
-                    if trunk and self.probe_every and step % self.probe_every == 0:
+                    if (trunk and self.probe_every and first
+                            and (group_start // acc) % self.probe_every == 0):
                         for key, value in trunk_gradient_probe(losses, loss_weights, trunk).items():
                             probes[key] = probes[key] + value.detach() if key in probes else value.detach()
                         probe_count += 1
-                    losses["loss"].backward()
-                    losses["gradient_norm"] = torch.nn.utils.clip_grad_norm_(
-                        parameters, self.grad_clip
-                    )
-                    self.optimizer.step()
+                    (losses["loss"] / group_size).backward()
                     for key, value in losses.items():
                         value = value.detach().float()
                         sums[key] = sums[key] + value if key in sums else value
+                    if last:
+                        norm = torch.nn.utils.clip_grad_norm_(parameters, self.grad_clip).detach().float()
+                        self.optimizer.step()
+                        norm_sum = norm_sum + norm if norm_sum is not None else norm
+                        optimizer_steps += 1
             finally:
                 if pending is not None:
                     pending.cancel()
                 self.optimizer.zero_grad(set_to_none=True)
                 self.model.eval()
-        steps = len(plan)
+        steps = len(plan)  # microbatches
+        if norm_sum is not None:
+            sums["gradient_norm"] = norm_sum * steps / optimizer_steps  # mean per optimizer step
         # One device->host read per epoch. A non-finite loss or gradient norm
         # anywhere in the epoch makes its sum non-finite, and this raises before
         # the caller can write a checkpoint.
@@ -305,7 +319,8 @@ class KlentTrainer:
             probe_values = torch.stack([v.float() for v in probes.values()]).tolist()
             metrics.update({f"train/{k}": v / probe_count for k, v in zip(probes, probe_values)})
         metrics.update({
-            "train/steps": steps,
+            "train/steps": optimizer_steps,
+            "train/microbatches": steps,
             "train/tokens": tokens,
             "time/train": elapsed,
             "train/tokens_per_second": tokens / elapsed,

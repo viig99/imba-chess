@@ -11,10 +11,13 @@ tau = 8.0
 positions_per_iteration = 2097152
 total_positions = 419430400
 batch_tokens = 4096
+# ~35 games per microbatch; x4 gives ~140 game results per update (Q's targets come from
+# game outcomes). lr 1e-4 -> 2e-4 (sqrt scaling) for the 4x fewer optimizer steps.
+gradient_accumulation = 4
 slots = 256
 q_warmup_iterations = 2
 warmup_lr = 1e-3
-lr = 1e-4
+lr = 2e-4
 value_weight = 0.0
 freeze_value_head = true
 bootstrap = "q"

@@ -32,6 +32,7 @@ from .train import KlentTrainer
 _RESUME_OVERRIDES = frozenset({
     "init", "total_positions", "batch_tokens", "slots", "compile",
     "inference_dtype", "train_dtype", "lr", "warmup_lr", "weight_decay", "grad_clip",
+    "gradient_accumulation",
 })
 
 
@@ -117,6 +118,7 @@ class KlentRun:
             train_dtype=cfg.train_dtype,
             freeze_value_head=cfg.freeze_value_head,
             advantage=cfg.q_mode == "advantage",
+            gradient_accumulation=cfg.gradient_accumulation,
         )
         self.iteration = self.positions = 0
         if resume_state is not None:
