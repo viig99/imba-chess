@@ -193,8 +193,12 @@ class SelfPlay:
                     child, history, value = cc.push_and_classify(
                         game.board, moves[pick], game.history, True
                     )
-                    if value is not None:
-                        raise ValueError(f"start prefix reaches a terminal position at {uci}")
+                    # Mid-prefix positions may be claimable draws under our
+                    # terminal rules (repetition / 50-move claims); the human game
+                    # played on, so only the takeover position must be live. The
+                    # stream already rejects terminal or claimable takeovers.
+                    if value is not None and not game.forced:
+                        raise ValueError(f"start prefix ends in a terminal position at {uci}")
                     game.board, game.history, game.prev_move_id = child, history, ids[pick]
                     continue
                 pick = int(host[slot, 0])

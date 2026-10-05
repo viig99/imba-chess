@@ -693,3 +693,19 @@ def test_accumulating_two_identical_microbatches_matches_one():
     assert out["train/steps"] == 1 and out["train/microbatches"] == 2
     for (name, x), y in zip(a.state_dict().items(), b.state_dict().values()):
         torch.testing.assert_close(x, y, atol=1e-6, rtol=1e-5, msg=name)
+
+
+def test_prefix_may_pass_through_a_claimable_draw():
+    """Knights shuffle until Black could claim threefold (our rules call that
+    terminal), then the human game plays on; only the takeover must be live."""
+    shuffle = ["g1f3", "g8f6", "f3g1", "f6g8", "g1f3", "g8f6", "f3g1"]
+    board, history, claimable = cc.Board.startpos(), [], False
+    ids_moves = BoardCodec(VOCAB, BOARD)
+    for uci in shuffle:
+        ids, moves = ids_moves.legal(board)
+        board, history, value = cc.push_and_classify(board, moves[ids.index(VOCAB.encode(uci))], history, True)
+        claimable |= value is not None
+    assert claimable  # the prefix really passes through a "terminal" position
+    prefix = shuffle + ["e7e5", "e2e4"]
+    games, metrics = _play(tiny_model(), slots=1, positions=30, max_plies=20, starts=lambda: prefix)
+    assert games and int((~games[0]["supervised"]).sum()) == len(prefix)
