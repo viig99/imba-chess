@@ -49,8 +49,12 @@ class HSTUChessConfig:
     value_head_blocks: int = 0
     value_head_expansion: int = 2
     moves_left_loss_weight: float = 0.05
-    # KLENT action-value readout: tanh(Linear(d, vocab)) per move, zero-init.
+    # KLENT action-value readout: tanh(head(d) -> vocab) per move, zero-init.
     enable_action_value_head: bool = False
+    # 0 keeps the single linear readout (earlier KLENT checkpoints); > 0 gives
+    # Q a private MLP shaped like the value head (width defaults to d // 2).
+    action_value_head_blocks: int = 0
+    action_value_head_width: int | None = None
     # KLENT scratch runs use an independent, zero-initialized policy readout.
     tie_policy_embeddings: bool = True
 
@@ -189,9 +193,10 @@ class _ValueBlock(nn.Module):
 
 
 def _build_value_head(
-    *, dim: int, width: int | None, blocks: int, expansion: int
+    *, dim: int, width: int | None, blocks: int, expansion: int, out_dim: int = 3
 ) -> nn.Sequential:
-    """Value readout: `dim` trunk features -> 3 WDL logits.
+    """Value readout: `dim` trunk features -> `out_dim` outputs (3 WDL logits
+    for the value head; one per move for KLENT's action-value MLP).
 
     blocks=0 is the plain two-layer readout.
     """
@@ -200,7 +205,7 @@ def _build_value_head(
         return nn.Sequential(
             nn.Linear(dim, hidden),
             nn.SiLU(),
-            nn.Linear(hidden, 3),
+            nn.Linear(hidden, out_dim),
         )
     return nn.Sequential(
         nn.Linear(dim, hidden),
@@ -208,7 +213,7 @@ def _build_value_head(
         # Pre-norm blocks leave the residual stream unnormalised; this is
         # required, not cosmetic.
         nn.LayerNorm(hidden),
-        nn.Linear(hidden, 3),
+        nn.Linear(hidden, out_dim),
     )
 
 
@@ -383,13 +388,28 @@ class HSTUChessModel(nn.Module):
             nn.init.zeros_(self.auxiliary_value_head.bias)
         # Zero-init so a fresh head predicts Q = 0 for every move, as in the
         # KLENT reference; untied from the policy matrix.
-        self.action_value_head = (
-            nn.Linear(d, config.move_vocab_size)
-            if config.enable_action_value_head else None
-        )
+        if not config.enable_action_value_head:
+            self.action_value_head = None
+        elif int(config.action_value_head_blocks) == 0:
+            self.action_value_head = nn.Linear(d, config.move_vocab_size)
+        else:
+            # Private features for Q: the shared trunk is shaped mostly by the
+            # policy objective (KLENT paper App. H: a fully shared output fails).
+            self.action_value_head = _build_value_head(
+                dim=d,
+                width=config.action_value_head_width,
+                blocks=int(config.action_value_head_blocks),
+                expansion=int(config.value_head_expansion),
+                out_dim=config.move_vocab_size,
+            )
         if self.action_value_head is not None:
-            nn.init.zeros_(self.action_value_head.weight)
-            nn.init.zeros_(self.action_value_head.bias)
+            readout = (
+                self.action_value_head
+                if isinstance(self.action_value_head, nn.Linear)
+                else self.action_value_head[-1]
+            )
+            nn.init.zeros_(readout.weight)
+            nn.init.zeros_(readout.bias)
 
         self.register_buffer(
             "square_ids", torch.arange(64, dtype=torch.long), persistent=False

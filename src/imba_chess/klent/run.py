@@ -4,7 +4,7 @@ Resumable at iteration boundaries; rollout sampling and batch packing are
 reseeded from (seed, iteration). Execution and fitting settings may be overridden.
 """
 
-from dataclasses import asdict, replace
+from dataclasses import MISSING, asdict, fields, replace
 import json
 from pathlib import Path
 import time
@@ -15,7 +15,7 @@ import torch
 from imba_chess.config import load_repo_config
 from imba_chess.data.move_vocab import MoveVocab
 from imba_chess.eval.inference_runtime import INFERENCE_DTYPES
-from imba_chess.model import HSTUChessModel, build_hstu_chess_config
+from imba_chess.model import HSTUChessConfig, HSTUChessModel, build_hstu_chess_config
 from imba_chess.model.checkpoint import load_initial_weights
 from imba_chess.self_play.runtime import run_lock
 from imba_chess.self_play.trainer import atomic_checkpoint
@@ -51,6 +51,8 @@ def build_model(cfg, repo, vocab, *, resume_state=None):
         enable_auxiliary_value_head=False,
         enable_action_value_head=True,
         tie_policy_embeddings=cfg.init != "scratch",
+        action_value_head_blocks=cfg.q_head_blocks,
+        action_value_head_width=cfg.q_head_width if cfg.q_head_blocks else None,
     )
     if resume_state is not None:
         # Legacy KLENT checkpoints always used tied policy/input weights.
@@ -61,8 +63,11 @@ def build_model(cfg, repo, vocab, *, resume_state=None):
                 saved_config.get("tie_policy_embeddings", True) if saved_config else True
             ),
         )
-        if saved_config is not None and saved_config != asdict(model_config):
-            raise ValueError("checkpoint model architecture does not match the base config")
+        if saved_config is not None:
+            # Fields added after a checkpoint was written take their defaults.
+            defaults = {f.name: f.default for f in fields(HSTUChessConfig) if f.default is not MISSING}
+            if {**defaults, **saved_config} != asdict(model_config):
+                raise ValueError("checkpoint model architecture does not match the base config")
     model = HSTUChessModel(model_config)
     if resume_state is None and cfg.init == "scratch":
         # Untying first keeps the previous-move embeddings informative while

@@ -43,8 +43,10 @@ def tiny_model(seed=0, **overrides):
     )
     model = HSTUChessModel(HSTUChessConfig(**{**config, **overrides}))
     # The head is zero-initialized; randomize it so Q-dependent paths are exercised.
-    if model.action_value_head is not None:
-        torch.nn.init.normal_(model.action_value_head.weight, std=0.5)
+    head = model.action_value_head
+    if head is not None:
+        readout = head if isinstance(head, torch.nn.Linear) else head[-1]
+        torch.nn.init.normal_(readout.weight, std=0.5)
     return model.eval()
 
 
@@ -462,3 +464,62 @@ def test_freeze_value_head_config_rules():
         KlentConfig(init="some.pt", freeze_value_head=True)
     with pytest.raises(ValueError, match="checkpoint"):
         KlentConfig(freeze_value_head=True, value_weight=0.0)
+
+
+def test_trunk_gradient_probe_logs_per_loss_norms():
+    from imba_chess.klent.train import trunk_parameters
+
+    model = tiny_model()
+    games, _ = _play(model, slots=2, positions=2 * 24, max_plies=6)
+    trunk_ids = {id(p) for p in trunk_parameters(model)}
+    assert id(model.prev_move_embedding.weight) not in trunk_ids  # tied policy matrix
+    assert not trunk_ids & {id(p) for p in model.action_value_head.parameters()}
+    trainer = KlentTrainer(model, device=torch.device("cpu"), start_id=VOCAB.start_id,
+                           batch_tokens=16, grad_clip=1.0, compile_model=False, probe_every=2)
+    trainer.set_phase(warmup=False, lr=1e-3, weight_decay=0.0)
+    metrics = trainer.train_epoch(games, np.random.default_rng(0), policy_weight=1.0, value_weight=1.0)
+    for key in ("grad_trunk_policy", "grad_trunk_q", "grad_trunk_value",
+                "grad_trunk_cos_policy_q", "grad_trunk_ratio_policy_q"):
+        assert np.isfinite(metrics[f"train/{key}"]), key
+    assert -1.0 <= metrics["train/grad_trunk_cos_policy_q"] <= 1.0
+    # Warm-up freezes the trunk, so there is nothing to probe.
+    trainer.set_phase(warmup=True, lr=1e-3, weight_decay=0.0)
+    warm = trainer.train_epoch(games, np.random.default_rng(0), policy_weight=0.0, value_weight=0.0)
+    assert not any(k.startswith("train/grad_trunk") for k in warm)
+
+
+def test_private_q_mlp_starts_at_zero_and_matches_incremental_decode():
+    model = tiny_model(action_value_head_blocks=2, action_value_head_width=8)  # random readout
+    assert isinstance(model.action_value_head, torch.nn.Sequential)
+    fresh = HSTUChessModel(model.config).eval()
+    games, _ = _play(fresh, slots=2, positions=2 * 6, max_plies=6)
+    batch = build_batch(games, VOCAB.start_id)
+    with torch.no_grad():
+        q = fresh(batch, block_mask=create_batch_dense_mask(batch["seq_offsets"], total_tokens=batch["total_tokens"]),
+                  return_loss=False)["q"]
+    assert torch.count_nonzero(q) == 0  # zero-initialised readout: Q = 0, as in the reference
+    # With a non-zero readout, step-by-step decode still matches one jagged forward.
+    games, _ = _play(model, slots=3, positions=3 * 15, max_plies=6)
+    batch = build_batch(games, VOCAB.start_id)
+    with torch.no_grad():
+        out = model(batch, block_mask=create_batch_dense_mask(batch["seq_offsets"], total_tokens=batch["total_tokens"]),
+                    return_loss=False)
+    index, legal, mask = batch["supervised_indices"], batch["legal_ids"], batch["legal_mask"]
+    policy = improved_policy(out["logits"][index].gather(1, legal), out["q"][index].gather(1, legal),
+                             mask, alpha=0.03, beta=0.1)
+    torch.testing.assert_close(policy, batch["policy"], atol=1e-5, rtol=1e-4)
+
+
+def test_resume_accepts_checkpoints_written_before_new_model_fields(tmp_path):
+    from dataclasses import asdict
+    from imba_chess.klent.run import build_model
+    from imba_chess.config import load_repo_config
+
+    cfg = KlentConfig(init="unused.pt")
+    repo = load_repo_config("config/imba_chess_v4.toml")
+    current = asdict(build_model(KlentConfig(), repo, VOCAB).config)
+    legacy = {k: v for k, v in current.items()
+              if k not in ("action_value_head_blocks", "action_value_head_width")}
+    legacy["tie_policy_embeddings"] = True
+    model = build_model(cfg, repo, VOCAB, resume_state=dict(model_config=legacy))
+    assert model.config.action_value_head_blocks == 0

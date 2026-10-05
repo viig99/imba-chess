@@ -126,6 +126,39 @@ def _prepare(games, start_id, pin):
     return batch
 
 
+def trunk_parameters(model):
+    """Trainable parameters shared by every head (excludes the head modules and
+    the policy matrix tied to the previous-move embedding)."""
+    heads = {
+        id(p)
+        for head in (model.prediction_head, model.value_head, model.action_value_head,
+                     model.moves_left_head, getattr(model, "auxiliary_value_head", None))
+        if head is not None
+        for p in head.parameters()
+    }
+    return [p for p in model.parameters() if p.requires_grad and id(p) not in heads]
+
+
+def trunk_gradient_probe(losses, weights, trunk):
+    """Each weighted loss's gradient norm on the shared trunk, plus the policy/Q
+    cosine: how strongly each objective shapes the shared features."""
+    grads = {}
+    for name, weight in weights.items():
+        if weight > 0:
+            grads[name] = torch.autograd.grad(
+                weight * losses[name], trunk, retain_graph=True, allow_unused=True
+            )
+    sq = lambda g: sum((x.float() ** 2).sum() for x in g if x is not None)
+    norms = {name: sq(g).sqrt() for name, g in grads.items()}
+    probe = {f"grad_trunk_{name.removesuffix('_loss')}": n for name, n in norms.items()}
+    if "policy_loss" in grads and "q_loss" in grads:
+        dot = sum((a.float() * b.float()).sum() for a, b in zip(grads["policy_loss"], grads["q_loss"])
+                  if a is not None and b is not None)
+        probe["grad_trunk_cos_policy_q"] = dot / (norms["policy_loss"] * norms["q_loss"]).clamp_min(1e-30)
+        probe["grad_trunk_ratio_policy_q"] = norms["policy_loss"] / norms["q_loss"].clamp_min(1e-30)
+    return probe
+
+
 class KlentTrainer:
     """Owns the fp32 master weights, the compiled forward+loss and the optimizer.
 
@@ -137,11 +170,17 @@ class KlentTrainer:
     """
 
     def __init__(self, model, *, device, start_id, batch_tokens, grad_clip, compile_model,
-                 train_dtype="float32", freeze_value_head=False):
+                 train_dtype="float32", freeze_value_head=False, probe_every=64):
         self.model, self.device, self.start_id = model, device, start_id
         self.freeze_value_head = freeze_value_head
+        # Every probe_every-th step also measures per-loss trunk gradients.
+        self.probe_every = probe_every
         self.batch_tokens, self.grad_clip = batch_tokens, grad_clip
         cuda = device.type == "cuda"
+        if compile_model and cuda and probe_every:
+            # The gradient probe differentiates the compiled graph once per loss
+            # (retain_graph=True), which donated backward buffers forbid.
+            torch._functorch.config.donated_buffer = False
         self.forward_loss = (
             torch.compile(_forward_loss, dynamic=True, fullgraph=True)
             if compile_model and cuda else _forward_loss
@@ -198,7 +237,10 @@ class KlentTrainer:
         lengths = [len(g["move_id"]) for g in games]
         plan = pack(lengths, self.batch_tokens, rng)
         sums, tokens, start = {}, 0, time.perf_counter()
+        probes, probe_count = {}, 0
         parameters = [p for p in self.model.parameters() if p.requires_grad]
+        trunk = trunk_parameters(self.model)
+        loss_weights = dict(policy_loss=policy_weight, q_loss=1.0, value_loss=value_weight)
         pin = self.device.type == "cuda"
         self.model.train()
         with ThreadPoolExecutor(max_workers=1) as pool:
@@ -216,6 +258,10 @@ class KlentTrainer:
                         losses = self.forward_loss(
                             self.model, batch, self._mask(batch), policy_weight, value_weight
                         )
+                    if trunk and self.probe_every and step % self.probe_every == 0:
+                        for key, value in trunk_gradient_probe(losses, loss_weights, trunk).items():
+                            probes[key] = probes[key] + value.detach() if key in probes else value.detach()
+                        probe_count += 1
                     losses["loss"].backward()
                     losses["gradient_norm"] = torch.nn.utils.clip_grad_norm_(
                         parameters, self.grad_clip
@@ -238,6 +284,9 @@ class KlentTrainer:
             raise FloatingPointError("nonfinite KLENT loss or gradient norm in this epoch")
         elapsed = time.perf_counter() - start
         metrics = {f"train/{k}": v / max(steps, 1) for k, v in zip(sums, values)}
+        if probes:
+            probe_values = torch.stack([v.float() for v in probes.values()]).tolist()
+            metrics.update({f"train/{k}": v / probe_count for k, v in zip(probes, probe_values)})
         metrics.update({
             "train/steps": steps,
             "train/tokens": tokens,

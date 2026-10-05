@@ -37,6 +37,9 @@ class KlentConfig:
     value_weight: float = 1.0
     # Keep the value head at its initial weights (no gradient, no value loss).
     freeze_value_head: bool = False
+    # Private MLP for the Q head (0 = single linear readout, as before).
+    q_head_blocks: int = 0
+    q_head_width: int = 512
     bootstrap: str = "q"
     inference_dtype: str = "bfloat16"
     # Training autocast, as in supervised training; master weights stay fp32.
