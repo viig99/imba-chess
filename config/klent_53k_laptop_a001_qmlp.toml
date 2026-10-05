@@ -1,0 +1,23 @@
+# alpha 0.01, beta 0.1, frozen 53250 value head, private Q-head MLP (2 blocks, width 512). Fallback from
+# the beta 0.3 Q-MLP run if beta 0.3's small steps let the policy flatten before Q's move gaps grow:
+# keeps the Q MLP (paper App. H) at the step size that learned with the linear Q head
+# (klent_53k_laptop_alpha001_frozenv.toml: +67 Elo from iteration 40 to 80).
+# Warm-up (2 iterations) trains only the new action-value head with the frozen value-head bootstrap.
+base_config = "config/imba_chess_v4.toml"
+init = "artifacts/checkpoints_keep/flatten53250_supervised_last_checkpoint.pt"
+alpha = 0.01
+beta = 0.1
+tau = 8.0
+positions_per_iteration = 2097152
+total_positions = 419430400
+batch_tokens = 4096
+slots = 256
+q_warmup_iterations = 2
+warmup_lr = 1e-3
+lr = 1e-4
+value_weight = 0.0
+freeze_value_head = true
+bootstrap = "q"
+inference_dtype = "bfloat16"
+q_head_blocks = 2
+q_head_width = 512
