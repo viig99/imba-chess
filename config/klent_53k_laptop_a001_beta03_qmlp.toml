@@ -1,0 +1,24 @@
+# alpha 0.01, beta 0.3, frozen 53250 value head, and a private Q-head MLP (2 blocks, width 512, like the
+# value head). Paper Fig. 13 (9x9 Go): alpha 0.01 scores 88 at beta 0.3 vs 72 at beta 0.1. Paper App. H:
+# policy and Q need separate representations; our linear Q head read features shaped mostly by the policy.
+# Compared against the beta 0.1 linear-Q run (klent_53k_laptop_alpha001_frozenv.toml) at equal iterations.
+# train/grad_trunk_* logs each loss's gradient on the shared trunk (baseline: policy/Q ratio 3.1x, cos ~0).
+# Warm-up (2 iterations) trains only the new action-value head with the frozen value-head bootstrap.
+base_config = "config/imba_chess_v4.toml"
+init = "artifacts/checkpoints_keep/flatten53250_supervised_last_checkpoint.pt"
+alpha = 0.01
+beta = 0.3
+tau = 8.0
+positions_per_iteration = 2097152
+total_positions = 419430400
+batch_tokens = 4096
+slots = 256
+q_warmup_iterations = 2
+warmup_lr = 1e-3
+lr = 1e-4
+value_weight = 0.0
+freeze_value_head = true
+bootstrap = "q"
+inference_dtype = "bfloat16"
+q_head_blocks = 2
+q_head_width = 512
