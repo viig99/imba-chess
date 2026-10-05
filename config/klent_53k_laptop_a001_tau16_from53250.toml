@@ -1,0 +1,21 @@
+# tau 16 ablation of the alpha 0.01 frozen-value run (klent_53k_laptop_alpha001_frozenv.toml): identical
+# except tau 8 -> 16 (lambda e^-1/8 -> e^-1/16, the paper's sweep range), from the same 53250 start, so
+# snapshots can be matched against that run's at equal iterations. Chess self-play games average ~115
+# plies; at tau 8 a game result's weight falls to ~8% within 20 plies.
+# Warm-up (2 iterations) trains only the new action-value head with the frozen value-head bootstrap.
+base_config = "config/imba_chess_v4.toml"
+init = "artifacts/checkpoints_keep/flatten53250_supervised_last_checkpoint.pt"
+alpha = 0.01
+beta = 0.1
+tau = 16.0
+positions_per_iteration = 2097152
+total_positions = 419430400
+batch_tokens = 4096
+slots = 256
+q_warmup_iterations = 2
+warmup_lr = 1e-3
+lr = 1e-4
+value_weight = 0.0
+freeze_value_head = true
+bootstrap = "q"
+inference_dtype = "bfloat16"
