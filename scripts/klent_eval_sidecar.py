@@ -12,8 +12,9 @@ is a multiple of --every:
 Greedy evals are light enough to share the GPU with training. Once the final
 snapshot (--final-iteration) is kept, training is over and the GPU is free,
 so it runs Gumbel 512 (the best 512-budget search: raw Q, root forcing,
-forcing floor, minimax 0.5) on the --baseline checkpoint and every kept
-snapshot.
+forcing floor, minimax 0.5) on the final snapshot (each run takes ~1 h); with
+--gumbel-all-snapshots also on every kept snapshot, and with --gumbel-baseline
+also on the --baseline checkpoint.
 
 Scores go to <run>/sf2600/summary.jsonl and TensorBoard (<run>/tb_sf2600),
 at the snapshot's position count (0 for the baseline). Restartable: any
@@ -165,6 +166,10 @@ def main():
                         help="Gumbel evals start once this snapshot exists (training is done).")
     parser.add_argument("--baseline", type=Path,
                         default=Path("artifacts/checkpoints_keep/flatten53250_supervised_last_checkpoint.pt"))
+    parser.add_argument("--gumbel-all-snapshots", action="store_true",
+                        help="Gumbel-evaluate every kept snapshot, not only the final one.")
+    parser.add_argument("--gumbel-baseline", action="store_true",
+                        help="Also Gumbel-evaluate the --baseline checkpoint.")
     parser.add_argument("--follow", action="store_true")
     args = parser.parse_args()
     (args.run / "sf2600").mkdir(exist_ok=True)
@@ -187,9 +192,11 @@ def main():
                 record(evaluate(args.run, snapshot, snapshot.stem, mode, args))
             if index > 0:
                 record(head_to_head(args.run, snapshot, kept[index - 1], args))
-        if any(int(s.stem.split("-")[1]) == args.final_iteration for s in kept):
-            record(evaluate(args.run, args.baseline, "baseline", "gumbel512", args))
-            for snapshot in kept:
+        final = [s for s in kept if int(s.stem.split("-")[1]) == args.final_iteration]
+        if final:
+            if args.gumbel_baseline:
+                record(evaluate(args.run, args.baseline, "baseline", "gumbel512", args))
+            for snapshot in kept if args.gumbel_all_snapshots else final:
                 record(evaluate(args.run, snapshot, snapshot.stem, "gumbel512", args))
             break
         if not args.follow:
