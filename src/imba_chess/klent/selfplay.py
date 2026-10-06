@@ -144,6 +144,7 @@ class SelfPlay:
         engine.reset(range(slots))
         finished, terminations = [], Counter()
         stats = torch.zeros(5, dtype=torch.float64, device=device)
+        supervised_rows = torch.zeros((), dtype=torch.float64, device=device)
         timing = Counter()
         steps = -(-positions // slots)
         for _ in range(steps):
@@ -164,13 +165,19 @@ class SelfPlay:
             log_prior = torch.log(prior.clamp_min(1e-30))
             log_policy = torch.log(policy.clamp_min(1e-30))
             value_q = (policy * q).sum(-1)
+            # Statistics cover supervised rows only; forced prefix plies are
+            # human moves, not the policy's, and get no targets.
+            active = torch.tensor([not g.forced for g in games], dtype=torch.float32).to(
+                device, non_blocking=True
+            )
             stats += torch.stack([
-                (prior * q).sum(-1).sum(),
-                value_q.sum(),
-                (policy * (log_policy - log_prior)).masked_fill(~mask, 0).sum(),
-                -(prior * log_prior).masked_fill(~mask, 0).sum(),
-                -(policy * log_policy).masked_fill(~mask, 0).sum(),
+                ((prior * q).sum(-1) * active).sum(),
+                (value_q * active).sum(),
+                ((policy * (log_policy - log_prior)).masked_fill(~mask, 0).sum(-1) * active).sum(),
+                (-(prior * log_prior).masked_fill(~mask, 0).sum(-1) * active).sum(),
+                (-(policy * log_policy).masked_fill(~mask, 0).sum(-1) * active).sum(),
             ]).double()
+            supervised_rows += active.sum().double()
             value_head = _wdl_value(out["value_logits"]) if "value_logits" in out else value_q
             if self.advantage:
                 value_q = value_q + value_head
@@ -232,7 +239,8 @@ class SelfPlay:
             timing["cpu_apply"] += time.perf_counter() - start
         played = steps * slots
         names = ("return_0", "return_1", "kl_1", "ent_0", "ent_1")
-        metrics = {f"selfplay/{n}": v / played for n, v in zip(names, stats.tolist())}
+        rows = max(float(supervised_rows), 1.0)
+        metrics = {f"selfplay/{n}": v / rows for n, v in zip(names, stats.tolist())}
         metrics.update({f"selfplay/termination_{k}": v for k, v in terminations.items()})
         kept = sum(len(g["move_id"]) for g in finished)
         prefix = sum(int((~g["supervised"]).sum()) for g in finished)

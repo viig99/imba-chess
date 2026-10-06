@@ -709,3 +709,18 @@ def test_prefix_may_pass_through_a_claimable_draw():
     prefix = shuffle + ["e7e5", "e2e4"]
     games, metrics = _play(tiny_model(), slots=1, positions=30, max_plies=20, starts=lambda: prefix)
     assert games and int((~games[0]["supervised"]).sum()) == len(prefix)
+
+
+def test_selfplay_stats_cover_only_supervised_rows():
+    """One game that runs to the ply cap: every decode row belongs to it, so the
+    reported pi' entropy must equal the mean over its supervised plies only."""
+    prefix = ["e2e4", "e7e5", "g1f3", "b8c6"]
+    games, metrics = _play(tiny_model(), slots=1, positions=10, max_plies=10, starts=lambda: prefix)
+    assert len(games) == 1 and games[0]["termination"] == "game_limit"
+    game = games[0]
+    entropies = []
+    for start, end in zip(game["legal_offsets"][:-1], game["legal_offsets"][1:]):
+        p = game["policy"][start:end].astype(np.float64)
+        entropies.append(-(p * np.log(np.clip(p, 1e-30, None))).sum())
+    assert len(entropies) == 10 - len(prefix)
+    np.testing.assert_allclose(metrics["selfplay/ent_1"], np.mean(entropies), rtol=1e-4)
