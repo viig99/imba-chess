@@ -15,7 +15,7 @@ from imba_chess.data.collate import collate_jagged_batch
 from imba_chess.data.move_vocab import MoveVocab
 from imba_chess.eval.position_evaluator import _SequenceHistory, load_hstu_checkpoint
 from imba_chess.klent.config import KlentConfig
-from imba_chess.klent.engine import SlotEngine
+from imba_chess.klent.engine import SlotEngine, TOKEN_KEYS
 from imba_chess.klent.run import KlentRun, build_model, run
 from imba_chess.klent.selfplay import BoardCodec, SelfPlay
 from imba_chess.klent.targets import improved_policy, lambda_from_tau, lambda_returns
@@ -724,3 +724,32 @@ def test_selfplay_stats_cover_only_supervised_rows():
         entropies.append(-(p * np.log(np.clip(p, 1e-30, None))).sum())
     assert len(entropies) == 10 - len(prefix)
     np.testing.assert_allclose(metrics["selfplay/ent_1"], np.mean(entropies), rtol=1e-4)
+
+
+def test_pi_q_value_source_is_policy_weighted_q_on_every_path():
+    model = tiny_model()
+    model.value_source = "pi_q"
+    games, _ = _play(model, slots=1, positions=8, max_plies=8)
+    batch = build_batch(games[:1], VOCAB.start_id)
+    mask = create_batch_dense_mask(batch["seq_offsets"], total_tokens=batch["total_tokens"])
+    with torch.no_grad():
+        out = model(batch, block_mask=mask, return_loss=False, return_kv=True)
+    wdl = torch.softmax(out["value_logits"].float(), -1)
+    expected = (torch.softmax(out["logits"].float(), -1) * out["q"].float()).sum(-1)
+    torch.testing.assert_close(wdl[:, 2] - wdl[:, 0], expected, atol=1e-4, rtol=1e-4)
+    # Incremental decode of the last token against the cached prefix (the
+    # search's leaf path) gives the same derived value as the full forward.
+    last = batch["total_tokens"] - 1
+    with torch.no_grad():
+        dec = model.forward_decode(
+            new_token_batch={k: batch[k][last:last + 1] for k in TOKEN_KEYS + ("seq_token_id",)},
+            positions=torch.tensor([last]),
+            prefix_kv=[(k[:, :last], v[:, :last]) for k, v in out["kv_caches"]],
+        )
+    torch.testing.assert_close(dec["value_logits"][0], out["value_logits"][last], atol=1e-4, rtol=1e-4)
+    # The value head is untouched when the source is "head".
+    model.value_source = "head"
+    with torch.no_grad():
+        head = model(batch, block_mask=mask, return_loss=False)["value_logits"]
+    assert head.shape == out["value_logits"].shape
+    assert not torch.allclose(head, out["value_logits"])

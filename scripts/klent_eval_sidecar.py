@@ -48,6 +48,12 @@ MODES = {
         "--model-move-policy", "gumbel", "--gumbel-simulations", "512",
         "--gumbel-root-forcing", "--gumbel-forcing-floor", "--gumbel-minimax-weight", "0.5",
     ],
+    # Same search with leaf/root values V = sum pi * Q (KLENT paper App. M).
+    "gumbel512_piq": [
+        "--model-move-policy", "gumbel", "--gumbel-simulations", "512",
+        "--gumbel-root-forcing", "--gumbel-forcing-floor", "--gumbel-minimax-weight", "0.5",
+        "--value-source", "pi_q",
+    ],
 }
 
 
@@ -169,7 +175,9 @@ def main():
     parser.add_argument("--gumbel-all-snapshots", action="store_true",
                         help="Gumbel-evaluate every kept snapshot, not only the final one.")
     parser.add_argument("--gumbel-baseline", action="store_true",
-                        help="Also Gumbel-evaluate the --baseline checkpoint.")
+                        help="Also Gumbel-evaluate the --baseline checkpoint (value head).")
+    parser.add_argument("--gumbel-mode", choices=["gumbel512", "gumbel512_piq"], default="gumbel512_piq",
+                        help="Search value for snapshots: value head, or V = sum pi * Q (default).")
     parser.add_argument("--follow", action="store_true")
     args = parser.parse_args()
     (args.run / "sf2600").mkdir(exist_ok=True)
@@ -197,7 +205,7 @@ def main():
             if args.gumbel_baseline:
                 record(evaluate(args.run, args.baseline, "baseline", "gumbel512", args))
             for snapshot in kept if args.gumbel_all_snapshots else final:
-                record(evaluate(args.run, snapshot, snapshot.stem, "gumbel512", args))
+                record(evaluate(args.run, snapshot, snapshot.stem, args.gumbel_mode, args))
             break
         if not args.follow:
             break

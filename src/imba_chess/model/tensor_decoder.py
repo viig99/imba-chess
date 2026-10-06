@@ -73,7 +73,7 @@ class TensorDecoder(torch.nn.Module):
         x = model.final_norm(x)
         output = {"logits": model.prediction_head(x), "kv": new_kv}
         if model.value_head is not None:
-            output["value_logits"] = model.value_head(x)
+            output["value_logits"] = model.value_logits(x, output["logits"])
         return output
 
 

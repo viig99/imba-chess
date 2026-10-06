@@ -126,6 +126,13 @@ def _parse_args() -> argparse.Namespace:
         help="Model move selection on legal moves (policy: greedy argmax pi, no search; policy_q: greedy argmax of KLENT pi' using the Q head).",
     )
     parser.add_argument(
+        "--value-source",
+        choices=["head", "pi_q"],
+        default="head",
+        help="Search value: the value head, or V = sum pi * Q from the policy and "
+        "action-value heads (KLENT paper App. M; needs a KLENT checkpoint).",
+    )
+    parser.add_argument(
         "--inference-dtype",
         choices=sorted(INFERENCE_DTYPES),
         default="float32",
@@ -1231,6 +1238,7 @@ def main() -> None:
         device=device,
         algorithm=args.model_move_policy,
         dtype=dtype,
+        value_source=args.value_source,
     )
     model, move_vocab, board_state_encoder = (
         runtime.model,

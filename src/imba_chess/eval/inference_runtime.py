@@ -52,6 +52,7 @@ def load_runtime(
     root_batch_tokens=1024,
     stats=None,
     dtype=torch.float32,
+    value_source="head",
 ):
     from imba_chess.data.board_state import BoardStateEncoder
     from imba_chess.data.move_vocab import MoveVocab
@@ -72,6 +73,12 @@ def load_runtime(
         require_value_head=True,
     )
     model.to(dtype)
+    if value_source not in ("head", "pi_q"):
+        raise ValueError("value_source must be 'head' or 'pi_q'")
+    if value_source == "pi_q" and getattr(model, "action_value_head", None) is None:
+        raise ValueError("value_source 'pi_q' needs a checkpoint with an action-value head")
+    # Every root and leaf value the search reads comes from this source.
+    model.value_source = value_source
     runtime = InferenceRuntime(
         model=model,
         move_vocab=vocab,

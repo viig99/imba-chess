@@ -414,6 +414,27 @@ class HSTUChessModel(nn.Module):
         self.register_buffer(
             "square_ids", torch.arange(64, dtype=torch.long), persistent=False
         )
+        # Inference-time choice of the value every caller reads as
+        # value_logits: "head" (the value head) or "pi_q" (KLENT paper App. M:
+        # V(s) = sum_a pi(a|s) Q(s, a) from the policy and action-value heads).
+        self.value_source = "head"
+
+    def value_logits(self, x: torch.Tensor, policy_logits: torch.Tensor) -> torch.Tensor:
+        """Value readout shared by forward, both decode paths and TensorDecoder.
+
+        For "pi_q", V = sum_a softmax(policy_logits)_a * Q(s, a) over the whole
+        move vocabulary (the policy is trained with full-vocabulary
+        cross-entropy, so illegal mass is small), returned as W/D/L logits
+        with no draw mass so that P(win) - P(loss) = V.
+        """
+        if self.value_source == "head":
+            return self.value_head(x)
+        if self.value_source != "pi_q" or self.action_value_head is None:
+            raise ValueError("value_source 'pi_q' needs an action-value head")
+        q = torch.tanh(self.action_value_head(x)).float()
+        v = (torch.softmax(policy_logits.float(), -1) * q).sum(-1).clamp(-1.0, 1.0)
+        wdl = torch.stack([(1.0 - v) / 2.0, torch.zeros_like(v), (1.0 + v) / 2.0], -1)
+        return torch.log(wdl.clamp_min(1e-6))
 
     def _embed_board(self, piece_ids: torch.Tensor) -> torch.Tensor:
         # piece_ids: [S, 64] -> unique id per (piece, square) pair.
@@ -537,7 +558,7 @@ class HSTUChessModel(nn.Module):
                 value_logits = self.value_head[-1](features)
                 output["auxiliary_value_logits"] = self.auxiliary_value_head(features)
             else:
-                value_logits = self.value_head(x)
+                value_logits = self.value_logits(x, policy_logits)
             output["value_logits"] = value_logits
         if self.action_value_head is not None:
             output["q"] = torch.tanh(self.action_value_head(x))
@@ -690,7 +711,7 @@ class HSTUChessModel(nn.Module):
             "kv": new_kv,
         }
         if self.value_head is not None:
-            output["value_logits"] = self.value_head(x)
+            output["value_logits"] = self.value_logits(x, output["logits"])
         if self.action_value_head is not None:
             output["q"] = torch.tanh(self.action_value_head(x))
         return output
@@ -888,7 +909,7 @@ class HSTUChessModel(nn.Module):
             "kv": new_kv,
         }
         if self.value_head is not None:
-            output["value_logits"] = self.value_head(x)
+            output["value_logits"] = self.value_logits(x, output["logits"])
         if self.action_value_head is not None:
             output["q"] = torch.tanh(self.action_value_head(x))
         return output

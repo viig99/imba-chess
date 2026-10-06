@@ -108,3 +108,28 @@ def test_runner_rejects_oversized_suffix():
     model = _tiny_model().eval()
     with pytest.raises(ValueError, match="capacity"):
         DecoderRunner(model, "tensor")(request(model, "cpu", depth=33))
+
+
+def test_decoder_uses_the_models_value_source():
+    """The search's tensor decoder reads values through model.value_logits, so
+    KLENT's V = sum pi * Q (value_source "pi_q") reaches every leaf."""
+    from dataclasses import replace
+    from imba_chess.model import HSTUChessModel
+
+    base = _tiny_model()
+    model = HSTUChessModel(replace(base.config, enable_action_value_head=True)).eval()
+    model.load_state_dict({**base.state_dict(), **{
+        k: v for k, v in model.state_dict().items() if k.startswith("action_value_head.")
+    }})
+    torch.nn.init.normal_(model.action_value_head.weight, std=0.5)
+    model.value_source = "pi_q"
+    runner = DecoderRunner(model, "tensor")
+    with torch.inference_mode():
+        merged = request(model, "cpu", depth=3)
+        kwargs = {name: getattr(merged, name) for name in asdict(merged)}
+        expected = model.forward_decode_grouped(**kwargs, one_query_per_game=True)
+        actual = runner(merged)
+        torch.testing.assert_close(actual["value_logits"], expected["value_logits"], atol=1e-5, rtol=1e-5)
+        model.value_source = "head"
+        head = model.forward_decode_grouped(**kwargs, one_query_per_game=True)["value_logits"]
+    assert not torch.allclose(head, expected["value_logits"])
