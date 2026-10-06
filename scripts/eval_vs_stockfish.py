@@ -142,8 +142,10 @@ def _parse_args() -> argparse.Namespace:
         "--gumbel-value-scale",
         type=float,
         default=None,
-        help="Gumbel c_scale for the completed-Q transform (default: GumbelConfig's 0.1)",
+        help="Gumbel c_scale for the completed-Q transform (default: 0.5)",
     )
+    parser.add_argument("--gumbel-maxvisit-init", type=float, default=None,
+                        help="Initial visit term in Gumbel's Q multiplier (default: 50).")
     parser.add_argument("--gumbel-root-forcing", action="store_true",
                         help="Add every forcing root move to Gumbel's top-m candidates.")
     parser.add_argument("--gumbel-forcing-floor", action="store_true",
@@ -1110,6 +1112,13 @@ def main() -> None:
         raise ValueError("--gumbel-root-forcing/--gumbel-forcing-floor/--gumbel-minimax-weight apply only to gumbel")
     if args.model_move_policy != "gumbel" and args.gumbel_value_scale is not None:
         raise ValueError("--gumbel-value-scale applies only to gumbel")
+    if args.model_move_policy != "gumbel" and args.gumbel_maxvisit_init is not None:
+        raise ValueError("--gumbel-maxvisit-init applies only to gumbel")
+    args.gumbel_maxvisit_init = float(
+        GumbelConfig.maxvisit_init
+        if args.gumbel_maxvisit_init is None
+        else args.gumbel_maxvisit_init
+    )
     args.gumbel_value_scale = float(
         GumbelConfig.value_scale
         if args.gumbel_value_scale is None
@@ -1260,6 +1269,7 @@ def main() -> None:
         if args.model_move_policy == "gumbel":
             halving_config = GumbelConfig(
                 simulations=args.gumbel_simulations,
+                maxvisit_init=args.gumbel_maxvisit_init,
                 value_scale=args.gumbel_value_scale,
                 root_forcing=bool(args.gumbel_root_forcing),
                 forcing_floor=bool(args.gumbel_forcing_floor),
@@ -1319,6 +1329,7 @@ def main() -> None:
                 "search_expand_top": int(args.search_expand_top),
                 "search_max_depth": int(args.search_max_depth),
                 "gumbel_value_scale": float(args.gumbel_value_scale),
+                "gumbel_maxvisit_init": float(args.gumbel_maxvisit_init),
                 "gumbel_root_forcing": bool(args.gumbel_root_forcing),
                 "gumbel_forcing_floor": bool(args.gumbel_forcing_floor),
                 "gumbel_minimax_weight": float(args.gumbel_minimax_weight),
@@ -1371,6 +1382,7 @@ def main() -> None:
             "search_expand_top": int(args.search_expand_top),
             "search_max_depth": int(args.search_max_depth),
             "gumbel_value_scale": float(args.gumbel_value_scale),
+            "gumbel_maxvisit_init": float(args.gumbel_maxvisit_init),
                 "gumbel_root_forcing": bool(args.gumbel_root_forcing),
                 "gumbel_forcing_floor": bool(args.gumbel_forcing_floor),
                 "gumbel_minimax_weight": float(args.gumbel_minimax_weight),

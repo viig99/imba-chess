@@ -120,6 +120,43 @@ def test_search_stats_merge_sums_counts_but_takes_maximum_depth():
     assert merged.search_stats == {"evals_spent": 16, "max_depth": 4}
 
 
+@pytest.mark.parametrize("initial", [None, 15.0])
+def test_gumbel_initial_visit_term_reaches_search_and_saved_results(tmp_path, monkeypatch, initial):
+    module = _load_eval_script_module()
+    config_path = tmp_path / "experiment.toml"
+    config_path.write_text('[eval_vs_stockfish]\nmodel_move_policy = "gumbel"\n')
+    output_path = tmp_path / "result.json"
+    argv = ["eval_vs_stockfish.py", "--config", str(config_path),
+            "--checkpoint", "unused.pt", "--stockfish-path", sys.executable,
+            "--device", "cpu", "--no-save-games", "--ladder-elos", "2600",
+            "--ladder-games-per-segment", "1", "--no-include-full-strength-segment",
+            "--output-json", str(output_path), "--gumbel-simulations", "1024",
+            "--gumbel-visit-cap", "64", "--gumbel-value-scale", "0.5"]
+    if initial is not None:
+        argv += ["--gumbel-maxvisit-init", str(initial)]
+    monkeypatch.setattr(sys, "argv", argv)
+    monkeypatch.setattr(module, "load_runtime", lambda **kwargs: (
+        SimpleNamespace(model=None, move_vocab=_mini_vocab(), encoder=BoardStateEncoder()), 128))
+    observed = []
+
+    def run_segment(**kwargs):
+        cfg = kwargs["halving_config"]
+        observed.append(cfg)
+        assert cfg.maxvisit_init == (50.0 if initial is None else initial)
+        assert cfg.simulations == 1024 and cfg.visit_cap == 64 and cfg.value_scale == 0.5
+        assert not cfg.root_forcing and not cfg.forcing_floor and cfg.minimax_weight == 0
+        return module.EvalSummary(games=1, completed_games=1, draws=1)
+
+    monkeypatch.setattr(module, "_run_segment", run_segment)
+    module.main()
+    assert len(observed) == 1
+    payload = json.loads(output_path.read_text())
+    for result in (payload["aggregate"], payload["segments"][0]["results"]):
+        knobs = result["run_config"]["search"]
+        assert knobs["gumbel_maxvisit_init"] == observed[0].maxvisit_init
+        assert knobs["gumbel_visit_cap"] == 64
+
+
 def _dummy_kv(total_tokens: int) -> list[tuple[torch.Tensor, torch.Tensor]]:
     return [(torch.zeros(1, total_tokens, 1), torch.zeros(1, total_tokens, 1))]
 
