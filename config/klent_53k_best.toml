@@ -1,0 +1,35 @@
+# Best KLENT recipe found so far for chess (laptop 3070 Ti, from the flattened supervised 53250 model).
+# Every value was tested against a same-start control with equal-iteration, paired-opening matches
+# (400 games, greedy pi', colours swapped); see the 2026-10-04/05 runs under artifacts/klent/.
+#
+#   alpha 0.01  The paper's 0.03 flattens a pretrained chess policy (entropy 1.5 -> 2.7 nats, decisive
+#               games 60% -> 25-40%, greedy SF2600 ~8% -> ~1%): chess Q gaps between moves are small
+#               (~0.01-0.06), and the policy settles at pi ∝ exp(Q / alpha). 0.003 overshoots.
+#   beta 0.3    Beat beta 0.1 at iteration 40 by 64.6% +/- 2.0% (+104 Elo), as in the paper's Fig. 13
+#               (9x9 Go: alpha 0.01 -> 72 at beta 0.1, 88 at beta 0.3). Policy entropy settles ~1.04.
+#   tau 8       The paper's lambda e^-1/8. tau 16 lost 41.4% +/- 1.9% at iteration 40 (noisier targets).
+#   value head  Frozen (no loss, no gradient): training it on draw-heavy self-play outcomes erased its
+#               one-ply move discrimination (0.157 -> 0.04). It only bootstraps the warm-up.
+#   Q head      Linear readout, as the reference's head mirrors its policy head. A private MLP learned
+#               position value only (within-position Q spread 0.02 vs 0.10) and the policy flattened.
+#   loss        Full-vocabulary policy cross-entropy, as in the reference (legal-only let illegal mass
+#               drift 3.9% -> 12%); equal policy/Q weights (trunk gradient ratio ~2-3x, cosine ~0).
+#
+# Under test (2026-10-05): streaming human-prefix starts + gradient accumulation x4 with lr 2e-4,
+# config/klent_53k_laptop_a001_b03_streaming.toml.
+base_config = "config/imba_chess_v4.toml"
+init = "artifacts/checkpoints_keep/flatten53250_supervised_last_checkpoint.pt"
+alpha = 0.01
+beta = 0.3
+tau = 8.0
+positions_per_iteration = 2097152
+total_positions = 419430400
+batch_tokens = 4096
+slots = 256
+q_warmup_iterations = 2
+warmup_lr = 1e-3
+lr = 1e-4
+value_weight = 0.0
+freeze_value_head = true
+bootstrap = "q"
+inference_dtype = "bfloat16"
