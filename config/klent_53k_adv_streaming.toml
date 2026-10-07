@@ -1,0 +1,24 @@
+# Single-variable ablation of klent_53k_laptop_a001_b03_streaming.toml: q_mode "q" -> "advantage", everything
+# else identical. The action-value head predicts A = Q - V on top of the frozen 53250 value head (target
+# G - V(s)), so its capacity goes to move differences rather than position value. Control: the kept
+# snapshots of artifacts/klent/53k-laptop-a001-streaming-b03-2026-10-05 (iterations 40-200), compared at
+# equal iterations head-to-head.
+base_config = "config/imba_chess_v4.toml"
+init = "artifacts/checkpoints_keep/flatten53250_supervised_last_checkpoint.pt"
+alpha = 0.01
+beta = 0.3
+tau = 8.0
+positions_per_iteration = 2097152
+total_positions = 419430400
+batch_tokens = 4096
+gradient_accumulation = 4
+slots = 256
+q_warmup_iterations = 2
+warmup_lr = 1e-3
+lr = 2e-4
+value_weight = 0.0
+freeze_value_head = true
+bootstrap = "q"
+inference_dtype = "bfloat16"
+starts = "streaming"
+q_mode = "advantage"
