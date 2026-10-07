@@ -37,7 +37,6 @@ from torch.utils.tensorboard import SummaryWriter
 # the ladder flags. Ladder segments set UCI_LimitStrength and UCI_Elo
 # themselves (--stockfish-limit-strength would demand --stockfish-elo).
 STOCKFISH_ARGS = [
-    "--ladder-elos", "2600",
     "--stockfish-path", "/usr/bin/stockfish", "--stockfish-time-sec", "5",
     "--stockfish-nodes", "40000", "--stockfish-threads", "1", "--stockfish-hash-mb", "64",
 ]
@@ -78,7 +77,7 @@ def evaluate(run, checkpoint, name, mode, args):
         *MODES[mode], "--inference-dtype", "bfloat16",
         "--ladder-games-per-segment", str(args.games),
         "--concurrent-games", str(args.concurrent_games),
-        *STOCKFISH_ARGS, "--output-json", str(out),
+        "--ladder-elos", str(args.elo), *STOCKFISH_ARGS, "--output-json", str(out),
     ]
     start = time.perf_counter()
     subprocess.run(command, check=True, stdout=subprocess.DEVNULL)
@@ -91,6 +90,7 @@ def evaluate(run, checkpoint, name, mode, args):
     row = dict(
         name=name,
         mode=mode,
+        elo=args.elo,
         iteration=iteration,
         positions=0 if name == "baseline" else positions_at(run, iteration),
         games=args.games,
@@ -163,6 +163,8 @@ def main():
     parser.add_argument("run", type=Path, help="KLENT output directory")
     parser.add_argument("--config", type=Path, default=Path("config/imba_chess_v4.toml"))
     parser.add_argument("--games", type=int, default=200)
+    parser.add_argument("--elo", type=int, default=2600,
+                        help="Limited-strength Stockfish Elo for the external anchor (min 1320).")
     parser.add_argument("--h2h-games", type=int, default=400,
                         help="Games per snapshot-vs-previous match (paired openings).")
     parser.add_argument("--concurrent-games", type=int, default=8)
@@ -171,7 +173,8 @@ def main():
     parser.add_argument("--final-iteration", type=int, default=200,
                         help="Gumbel evals start once this snapshot exists (training is done).")
     parser.add_argument("--baseline", type=Path,
-                        default=Path("artifacts/checkpoints_keep/flatten53250_supervised_last_checkpoint.pt"))
+                        default=Path("artifacts/checkpoints_keep/flatten53250_supervised_last_checkpoint.pt"),
+                        help="Reference checkpoint evaluated first; pass '' to skip (e.g. from-scratch runs).")
     parser.add_argument("--gumbel-all-snapshots", action="store_true",
                         help="Gumbel-evaluate every kept snapshot, not only the final one.")
     parser.add_argument("--gumbel-baseline", action="store_true",
@@ -192,7 +195,8 @@ def main():
         writer.flush()
 
     # The baseline has no Q head, so it gets the greedy-policy eval only.
-    record(evaluate(args.run, args.baseline, "baseline", "policy", args))
+    if str(args.baseline):
+        record(evaluate(args.run, args.baseline, "baseline", "policy", args))
     while True:
         kept = keep_snapshots(args.run, args.every)
         for index, snapshot in enumerate(kept):
@@ -202,7 +206,7 @@ def main():
                 record(head_to_head(args.run, snapshot, kept[index - 1], args))
         final = [s for s in kept if int(s.stem.split("-")[1]) == args.final_iteration]
         if final:
-            if args.gumbel_baseline:
+            if args.gumbel_baseline and str(args.baseline):
                 record(evaluate(args.run, args.baseline, "baseline", "gumbel512", args))
             for snapshot in kept if args.gumbel_all_snapshots else final:
                 record(evaluate(args.run, snapshot, snapshot.stem, args.gumbel_mode, args))

@@ -40,7 +40,8 @@ class KlentConfig:
     # Keep the value head at its initial weights (no gradient, no value loss).
     freeze_value_head: bool = False
     # "q": the action-value head predicts Q (reference). "advantage": it predicts
-    # A with Q = V + A, V the frozen value head; the target subtracts V(s).
+    # A with Q = V + A, V the value head's W-L (frozen, or learned from game
+    # outcomes); A's target is G - V(s) with V detached.
     q_mode: str = "q"
     # "initial": every game starts at move one (reference). "streaming": the
     # Gumbel pipeline's StreamingStarts mixture (25% initial position, 75% real
@@ -64,8 +65,6 @@ class KlentConfig:
             raise ValueError("starts must be 'initial' or 'streaming'")
         if self.q_mode not in ("q", "advantage"):
             raise ValueError("q_mode must be 'q' or 'advantage'")
-        if self.q_mode == "advantage" and not self.freeze_value_head:
-            raise ValueError("q_mode 'advantage' needs freeze_value_head (a fixed baseline)")
         if self.bootstrap not in ("q", "value"):
             raise ValueError("bootstrap must be 'q' or 'value'")
         if self.inference_dtype not in ("float32", "bfloat16"):

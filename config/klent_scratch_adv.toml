@@ -1,0 +1,22 @@
+# KLENT from scratch (no imitation weights): the paper's setting. alpha 0.03 (paper default; the
+# pretrained-start flattening that forced alpha 0.01 does not apply to a uniform initial policy),
+# beta 0.3 (paper Fig. 13's best cell at alpha 0.03, 91 vs 88 at beta 0.1; also beat beta 0.1 for us),
+# tau 8. The value head is learned from game outcomes and the action-value head predicts the
+# advantage A = Q - V (target G - V(s), V detached), so Q's capacity goes to move differences
+# rather than position value. Linear Q readout (a private MLP collapsed to position value).
+base_config = "config/imba_chess_v4.toml"
+init = "scratch"
+alpha = 0.03
+beta = 0.3
+tau = 8.0
+positions_per_iteration = 2097152
+total_positions = 838860800
+batch_tokens = 4096
+slots = 256
+q_warmup_iterations = 0
+lr = 1e-3
+value_weight = 1.0
+q_mode = "advantage"
+bootstrap = "q"
+starts = "initial"
+inference_dtype = "bfloat16"

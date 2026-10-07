@@ -585,10 +585,24 @@ def test_advantage_bootstrap_adds_the_value_head_back():
     np.testing.assert_allclose(game["returns"], expected, atol=1e-5)
 
 
-def test_advantage_mode_requires_a_frozen_value_head():
+def test_advantage_mode_with_a_learned_value_head():
+    """Advantage mode no longer needs a frozen baseline: from scratch the value
+    head learns from outcomes while A's target uses V detached."""
     KlentConfig(init="some.pt", freeze_value_head=True, value_weight=0.0, q_mode="advantage")
-    with pytest.raises(ValueError, match="freeze_value_head"):
-        KlentConfig(init="some.pt", q_mode="advantage")
+    cfg = KlentConfig(q_mode="advantage", value_weight=1.0)
+    assert cfg.init == "scratch" and not cfg.freeze_value_head
+    torch.manual_seed(0)
+    model = tiny_model()
+    games, _ = _play(model, slots=2, positions=2 * 24, max_plies=6, advantage=True)
+    trainer = KlentTrainer(model, device=torch.device("cpu"), start_id=VOCAB.start_id,
+                           batch_tokens=16, grad_clip=1.0, compile_model=False, advantage=True)
+    trainer.set_phase(warmup=False, lr=3e-3, weight_decay=0.0)
+    before = {k: v.clone() for k, v in model.state_dict().items() if k.startswith("value_head.")}
+    first = trainer.train_epoch(games, np.random.default_rng(0), policy_weight=1.0, value_weight=1.0)
+    for _ in range(20):
+        last = trainer.train_epoch(games, np.random.default_rng(0), policy_weight=1.0, value_weight=1.0)
+    assert last["train/loss"] < first["train/loss"]
+    assert any(not torch.equal(model.state_dict()[k], v) for k, v in before.items())  # V learns
 
 
 CASTLING_PREFIX = ["e2e4", "e7e5", "g1f3", "b8c6", "f1c4", "g8f6", "e1g1"]
