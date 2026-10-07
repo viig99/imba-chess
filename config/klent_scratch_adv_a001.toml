@@ -1,0 +1,19 @@
+# Single-variable ablation of klent_scratch_adv.toml: alpha 0.03 -> 0.01, everything else identical.
+# At alpha 0.03 the from-scratch run's policy entropy rose from 2.01 (it 10) to 2.35 (it 33) while
+# kl_1 and q_loss shrank, the same flattening seen from 53250, where alpha 0.01 fixed it.
+base_config = "config/imba_chess_v4.toml"
+init = "scratch"
+alpha = 0.01
+beta = 0.3
+tau = 8.0
+positions_per_iteration = 2097152
+total_positions = 838860800
+batch_tokens = 4096
+slots = 256
+q_warmup_iterations = 0
+lr = 1e-3
+value_weight = 1.0
+q_mode = "advantage"
+bootstrap = "q"
+starts = "initial"
+inference_dtype = "bfloat16"
