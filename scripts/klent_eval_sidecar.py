@@ -172,8 +172,8 @@ def main():
                         help="Evaluate only snapshots whose iteration is a multiple of this.")
     parser.add_argument("--final-iteration", type=int, default=200,
                         help="Gumbel evals start once this snapshot exists (training is done).")
-    parser.add_argument("--baseline", type=Path,
-                        default=Path("artifacts/checkpoints_keep/flatten53250_supervised_last_checkpoint.pt"),
+    parser.add_argument("--baseline", type=str,
+                        default="artifacts/checkpoints_keep/flatten53250_supervised_last_checkpoint.pt",
                         help="Reference checkpoint evaluated first; pass '' to skip (e.g. from-scratch runs).")
     parser.add_argument("--gumbel-all-snapshots", action="store_true",
                         help="Gumbel-evaluate every kept snapshot, not only the final one.")
@@ -194,8 +194,10 @@ def main():
             writer.add_scalar(f"sf2600_{row['mode']}/{key}", row[key], row["positions"])
         writer.flush()
 
+    # Path("") would read as "."; keep the raw string so '' means "skip".
+    args.baseline = Path(args.baseline) if args.baseline else None
     # The baseline has no Q head, so it gets the greedy-policy eval only.
-    if str(args.baseline):
+    if args.baseline is not None:
         record(evaluate(args.run, args.baseline, "baseline", "policy", args))
     while True:
         kept = keep_snapshots(args.run, args.every)
@@ -206,7 +208,7 @@ def main():
                 record(head_to_head(args.run, snapshot, kept[index - 1], args))
         final = [s for s in kept if int(s.stem.split("-")[1]) == args.final_iteration]
         if final:
-            if args.gumbel_baseline and str(args.baseline):
+            if args.gumbel_baseline and args.baseline is not None:
                 record(evaluate(args.run, args.baseline, "baseline", "gumbel512", args))
             for snapshot in kept if args.gumbel_all_snapshots else final:
                 record(evaluate(args.run, snapshot, snapshot.stem, args.gumbel_mode, args))
