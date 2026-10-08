@@ -1,0 +1,20 @@
+# Single-variable ablation of klent_scratch_adv_a001.toml: q_mode "advantage" -> "q", everything else
+# identical. From 53250, advantage mode shrank A to ~0 (q_loss 0.003, kl_1 0) and the policy flattened
+# (entropy 1.55 -> 2.37, h2h 80 vs 40 29%) while plain Q held its gaps; this tests whether advantage mode
+# also caused the from-scratch run's entropy rise and decaying kl_1/q_loss.
+base_config = "config/imba_chess_v4.toml"
+init = "scratch"
+alpha = 0.01
+beta = 0.3
+tau = 8.0
+positions_per_iteration = 2097152
+total_positions = 838860800
+batch_tokens = 4096
+slots = 256
+q_warmup_iterations = 0
+lr = 1e-3
+value_weight = 1.0
+q_mode = "q"
+bootstrap = "q"
+starts = "initial"
+inference_dtype = "bfloat16"
