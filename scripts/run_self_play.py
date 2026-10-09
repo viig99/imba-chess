@@ -484,6 +484,9 @@ def main():
                     del best, common
                     break
                 del best, common
+                if torch.cuda.is_available():
+                    # Return screen search memory before collection workers restart.
+                    torch.cuda.empty_cache()
                 if screen is None:
                     break
                 recommended_action = decision(screen, confirmation)
