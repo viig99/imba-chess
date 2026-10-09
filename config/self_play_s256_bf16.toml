@@ -1,0 +1,58 @@
+# Single-stage plain Gumbel 256 self-play from rl_initial_53250_aux3 on the 5070 Ti.
+# The final recipe of the flatten-53250 plain raw-Q lineage (stage 3, actor-205: 36.5% plain raw 512
+# vs SF2600) applied from step 0: raw Q at value_scale 0.5 (entropy-matched at 200 sims), replay 500k,
+# reuse 1, value_search_mix 0.1, policy surprise, bf16 collection, fresh_positions 8192, and the
+# lineage's later lr 1e-4 held constant (single stage, no fork-time lr drop).
+# Changes vs that lineage: replay 1M (was 500k), 256 simulations instead of 512/1024 (more games per hour; a bigger budget
+# never helped), no visit_cap (only meaningful above ~512 sims).
+base_config = "config/imba_chess_v4_aux3.toml"
+
+[search]
+simulations = 256
+top_m = 16
+max_depth = 32
+maxvisit_init = 50.0
+value_scale = 0.5
+epsilon = 1e-8
+rescale_values = false
+
+[collection]
+concurrent_games = 256
+root_batch_tokens = 1024
+max_game_plies = 512
+fresh_positions = 8192
+inference_dtype = "bfloat16"
+
+[replay]
+window_positions = 1000000
+flush_games = 16
+flush_positions = 2048
+
+[learning]
+lr = 1e-4
+value_weight = 1.0
+auxiliary_value_weight = 0.15
+auxiliary_value_lambda = [0.8, 0.9, 0.95]
+value_search_mix = 0.1
+weight_decay = 0.01
+grad_clip = 2.0
+reuse = 1.0
+microbatch_tokens = 1024
+gradient_accumulation = 4
+policy_surprise_enabled = true
+policy_surprise_fraction = 0.5
+policy_surprise_cap = 3.0
+
+[run]
+seed = 42
+hours = 48.0
+reserve_minutes = 15.0
+drain_minutes = 10.0
+screen_pairs = 50
+confirmation_pairs = 250
+
+[streaming]
+block_rows = 10000
+prefetch_blocks = 2
+startup_timeout = 900.0
+shutdown_timeout = 5.0
