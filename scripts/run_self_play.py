@@ -484,8 +484,10 @@ def main():
                     del best, common
                     break
                 del best, common
+                # Return screen search memory (the decode workspace arena) before
+                # collection workers restart, as the workers do after each phase.
+                getattr(runtime, "clear_caches", lambda: None)()
                 if torch.cuda.is_available():
-                    # Return screen search memory before collection workers restart.
                     torch.cuda.empty_cache()
                 if screen is None:
                     break
