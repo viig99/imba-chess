@@ -408,6 +408,9 @@ def main():
                     ),
                     on_step=step,
                 )
+                if torch.cuda.is_available():
+                    # Return training activation memory before collection workers restart.
+                    torch.cuda.empty_cache()
                 if trainer.phase_exposures < state["exposure_budget"]:
                     publish_checkpoint()
                     break
