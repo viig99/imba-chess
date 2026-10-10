@@ -5,7 +5,7 @@ The external nightly schedule is deliberately not installed by this command.
 
 import argparse
 from contextlib import ExitStack
-from dataclasses import asdict
+from dataclasses import asdict, replace
 from datetime import datetime
 import json
 import math
@@ -23,7 +23,7 @@ from imba_chess.self_play.evaluation import (
 from imba_chess.self_play.runtime import load_runtime, run_lock, StopBudget
 from imba_chess.self_play.seeds import file_hash, load_seeds
 from imba_chess.self_play.streaming import StreamingStarts
-from imba_chess.self_play.trainer import Stage2Trainer
+from imba_chess.self_play.trainer import Stage2Trainer, atomic_checkpoint
 from imba_chess.self_play.workers import CollectionWorkers, split_games
 
 # About 5 iterations (~347 completed games each), i.e. 3 hours, on the 5090 tactical recipe.
@@ -51,6 +51,13 @@ def main():
     )
     parser.add_argument("--continuous", action="store_true", help="Run until interrupted; no time or default iteration cutoff")
     parser.add_argument("--max-iterations", type=int, default=100000)
+    parser.add_argument(
+        "--enable-ema",
+        action="store_true",
+        help="With --resume, let a run started without EMA continue under the config's "
+             "learning.ema_decay (the average starts from the current weights); a no-op "
+             "once the run has been upgraded",
+    )
     parser.add_argument(
         "--checkpoint-seconds",
         type=int,
@@ -169,12 +176,19 @@ def main():
             hard_exit=not args.continuous,
         ) as budget,
     ):
+        saved_config_id = cfg.identifier
         if args.resume:
             state = json.loads(state_path.read_text())
-            if state["config_id"] != cfg.identifier or state[
+            if args.enable_ema and state["config_id"] != cfg.identifier:
+                # The only accepted change is switching EMA on.
+                saved_config_id = replace(
+                    cfg, learning=replace(cfg.learning, ema_decay=0.0)
+                ).identifier
+            if state["config_id"] != saved_config_id or state[
                 "seed_manifest"
             ] != file_hash(args.seeds):
                 raise ValueError("run configuration or seed manifest changed")
+            state["config_id"] = cfg.identifier
             if state.get("halted"):
                 raise RuntimeError(
                     "automatic learning was halted; investigate the recorded failure before starting another run"
@@ -233,7 +247,12 @@ def main():
             run_seed=cfg.run.seed,
         )
         if args.resume:
-            restored = trainer.resume(checkpoint, store=store, config_id=cfg.identifier)
+            restored = trainer.resume(
+                checkpoint,
+                store=store,
+                config_id=saved_config_id,
+                enable_ema=saved_config_id != cfg.identifier,
+            )
             if (
                 restored["iteration"] != state["iteration"]
                 or restored["phase"] != state["phase"]
@@ -262,7 +281,9 @@ def main():
             )
             atomic_json(state_path, state)
             keep = {
-                str(Path(state[k]).resolve()) for k in ("actor", "best", "checkpoint")
+                str(Path(state[k]).resolve())
+                for k in ("actor", "best", "checkpoint", "ema_actor")
+                if k in state
             }
             recovery = sorted(
                 args.output.glob("state-*.pt"),
@@ -425,6 +446,10 @@ def main():
                     actor, progress=dict(state), store=store, config_id=cfg.identifier
                 )
                 state["actor_id"] = file_hash(actor)
+                if trainer.ema is not None:
+                    ema_actor = args.output / f"ema-{state['iteration'] + 1:06d}.pt"
+                    atomic_checkpoint(ema_actor, dict(model=trainer.ema_state_dict()))
+                    state.update(ema_actor=str(ema_actor), ema_actor_id=file_hash(ema_actor))
                 atomic_json(state_path, state)
             if state["phase"] == "evaluate":
                 screen_path = args.output / f"screen-{state['iteration']:06d}.json"
@@ -461,6 +486,26 @@ def main():
                     screen = evaluate_pair_checkpoints(
                         **common, output=screen_path, pairs=cfg.run.screen_pairs
                     )
+                    ema_actor = args.output / f"ema-{state['iteration'] + 1:06d}.pt"
+                    ema_screen = None
+                    if screen is not None and state.get("ema_actor") == str(ema_actor):
+                        # Observation only: the EMA never replaces the collecting actor.
+                        # Free the raw screen's decode workspace before the EMA builds its own.
+                        getattr(runtime, "clear_caches", lambda: None)()
+                        if torch.cuda.is_available():
+                            torch.cuda.empty_cache()
+                        ema_runtime, _ = load_runtime(cfg, ema_actor, args.device)
+                        ema_screen = evaluate_pair_checkpoints(
+                            **dict(common, candidate=ema_runtime,
+                                   candidate_id=state["ema_actor_id"]),
+                            output=args.output / f"screen-ema-{state['iteration']:06d}.json",
+                            pairs=cfg.run.screen_pairs,
+                        )
+                        getattr(ema_runtime, "clear_caches", lambda: None)()
+                        del ema_runtime
+                        if ema_screen is None:
+                            del best, common
+                            break
                     confirmation = None
                     if (
                         screen
@@ -501,6 +546,7 @@ def main():
                 log(
                     dict(
                         screen=screen,
+                        **({"ema_screen": ema_screen} if ema_screen is not None else {}),
                         confirmation=confirmation,
                         decision=action,
                         recommended_decision=recommended_action,

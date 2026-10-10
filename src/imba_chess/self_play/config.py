@@ -48,6 +48,9 @@ class LearningConfig:
     policy_surprise_enabled: bool = False
     policy_surprise_fraction: float = 0.5
     policy_surprise_cap: float = 3.0
+    # Per-step decay of an exponential moving average of the weights, screened
+    # next to the raw actor; 0 disables it. Collection always uses raw weights.
+    ema_decay: float = 0.0
 
     @property
     def auxiliary_value_lambdas(self):
@@ -78,6 +81,8 @@ class LearningConfig:
             raise ValueError("policy_surprise_fraction must be in [0, 1]")
         if not math.isfinite(self.policy_surprise_cap) or self.policy_surprise_cap < 1:
             raise ValueError("policy_surprise_cap must be >= 1")
+        if not math.isfinite(self.ema_decay) or not 0 <= self.ema_decay < 1:
+            raise ValueError("ema_decay must be in [0, 1)")
 
 
 @dataclass(frozen=True)
@@ -131,6 +136,8 @@ class SelfPlayConfig:
         if self.collection.inference_dtype == "float32":
             # Runs started before the option existed keep their identity.
             del settings["collection"]["inference_dtype"]
+        if self.learning.ema_decay == 0:
+            del settings["learning"]["ema_decay"]
         return hashlib.sha256(
             json.dumps(
                 dict(
@@ -161,7 +168,7 @@ def load_config(path):
     if cfg.collection.inference_dtype not in ("float32", "bfloat16"):
         raise ValueError("collection.inference_dtype must be float32 or bfloat16")
     for section in (cfg.collection, cfg.replay, cfg.learning):
-        if any(not math.isfinite(v) or v <= 0 for k, v in asdict(section).items() if not k.startswith(("policy_surprise_", "auxiliary_value_")) and k not in ("value_weight", "value_search_mix", "inference_dtype")):
+        if any(not math.isfinite(v) or v <= 0 for k, v in asdict(section).items() if not k.startswith(("policy_surprise_", "auxiliary_value_")) and k not in ("value_weight", "value_search_mix", "inference_dtype", "ema_decay")):
             raise ValueError("stage-2 sizes and learning settings must be positive")
     if not all(math.isfinite(v) for v in asdict(cfg.run).values()):
         raise ValueError("run settings must be finite")

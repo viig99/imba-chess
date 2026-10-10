@@ -99,11 +99,30 @@ class Stage2Trainer:
         self.scheduler = torch.optim.lr_scheduler.LambdaLR(
             self.optimizer, lambda step: 1.0
         )
+        # Parameters (deduplicated, so tied weights average once) and their
+        # moving averages; None when ema_decay is 0.
+        self._ema_parameters = list(model.parameters())
+        self.ema = self._fresh_ema() if config.ema_decay > 0 else None
         self.rng = random.Random(run_seed)
         self.steps = self.exposures = self.phase_exposures = 0
         self.queue = []
         self.reuse_counts = {}
         self.sample_ids = []
+
+    def _fresh_ema(self):
+        return [p.detach().clone() for p in self._ema_parameters]
+
+    def ema_state_dict(self):
+        """The model's state_dict with every parameter replaced by its moving average."""
+        average = {id(p): e for p, e in zip(self._ema_parameters, self.ema)}
+        return {
+            key: average.get(id(value), value).detach().cpu().clone()
+            for key, value in self.model.state_dict(keep_vars=True).items()
+        }
+
+    def _load_ema(self, saved):
+        names = {id(v): k for k, v in self.model.state_dict(keep_vars=True).items()}
+        self.ema = [saved[names[id(p)]].to(p.device, p.dtype).clone() for p in self._ema_parameters]
 
     def _clip_gradients(self):
         policy_norm = torch.nn.utils.clip_grad_norm_(
@@ -235,6 +254,12 @@ class Stage2Trainer:
                 learning_rate = self.optimizer.param_groups[0]["lr"]
                 self.optimizer.step()
                 self.scheduler.step()
+                if self.ema is not None:
+                    with torch.no_grad():
+                        torch._foreach_lerp_(
+                            self.ema, [p.detach() for p in self._ema_parameters],
+                            1 - self.config.ema_decay,
+                        )
                 self.steps += 1
                 self.exposures += positions
                 self.phase_exposures += positions
@@ -292,10 +317,13 @@ class Stage2Trainer:
                 config_id=config_id,
                 learning_config=asdict(self.config),
                 gradient_clipping="separate_value_head_v1",
+                **({"ema_model": self.ema_state_dict()} if self.ema is not None else {}),
             ),
         )
 
-    def resume(self, path, *, store, config_id):
+    def resume(self, path, *, store, config_id, enable_ema=False):
+        """Restore a checkpoint. enable_ema lets a checkpoint written without EMA
+        resume under this config's ema_decay, starting the average from its weights."""
         state = torch.load(path, map_location="cpu", weights_only=False)
         if state.get("stage2_schema") != 1:
             raise ValueError(
@@ -305,7 +333,12 @@ class Stage2Trainer:
             raise ValueError("resume configuration changed: gradient clipping mode")
         if "detach_value_features" in state["learning_config"]:
             raise ValueError("resume configuration changed: detached-value checkpoint")
-        saved_learning = {"auxiliary_value_weight": 0.0, **state["learning_config"]}
+        saved_learning = {"auxiliary_value_weight": 0.0, "ema_decay": 0.0, **state["learning_config"]}
+        upgrade = enable_ema and "ema_model" not in state and saved_learning["ema_decay"] == 0
+        if upgrade:
+            if self.config.ema_decay == 0:
+                raise ValueError("enable_ema needs a config with ema_decay > 0")
+            saved_learning["ema_decay"] = self.config.ema_decay
         if state["config_id"] != config_id or asdict(LearningConfig(**saved_learning)) != asdict(
             self.config
         ):
@@ -314,6 +347,13 @@ class Stage2Trainer:
             if not (store.directory / name).exists():
                 raise FileNotFoundError(f"checkpoint replay shard missing: {name}")
         self.model.load_state_dict(state["model"], strict=True)
+        if self.ema is not None:
+            if "ema_model" in state:
+                self._load_ema(state["ema_model"])
+            elif not upgrade:
+                raise ValueError("checkpoint has no EMA weights")
+            else:
+                self.ema = self._fresh_ema()
         self._restore_optimization(state)
         torch.set_rng_state(state["torch_rng"])
         if state["cuda_rng"] and torch.cuda.is_available():

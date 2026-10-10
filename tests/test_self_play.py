@@ -348,6 +348,35 @@ def test_corrupt_outcome_rejected():
         reconstruct(game, move_vocab=VOCAB, encoder=ENCODER, max_positions=128)
 
 
+class IdentifiedRuntime(ScriptRuntime):
+    def __init__(self, model):
+        self.model = model
+        self.device = torch.device("cpu")
+        self.executors = {"tick": lambda payloads: payloads}
+
+    def search(self, *, board, actor_id, game_id, **kwargs):
+        owner = (actor_id, game_id)
+        identity, _ = yield WorkRequest("tick", (owner, None))
+        assert identity == owner
+        uci = ["f2f3", "e7e5", "g2g4", "d8h4"][len(board.move_stack)]
+        ids = [VOCAB.encode(m.uci()) for m in board.legal_moves]
+        return GumbelResult(
+            uci,
+            VOCAB.encode(uci),
+            ids,
+            [1 / len(ids)] * len(ids),
+            0.0,
+            (0.0, 1.0, 0.0),
+            [0] * len(ids),
+            [0.0] * len(ids),
+            1,
+            1,
+            0,
+            0,
+            1,
+        )
+
+
 @pytest.mark.parametrize("failure_stage", ["screen", "confirmation"])
 @pytest.mark.parametrize("screen_mode", ["games", "seconds"])
 def test_multiple_iterations_and_runner_resume(tmp_path, monkeypatch, failure_stage, screen_mode):
@@ -359,34 +388,6 @@ def test_multiple_iterations_and_runner_resume(tmp_path, monkeypatch, failure_st
         CollectionConfig,
         ReplayConfig,
     )
-
-    class IdentifiedRuntime(ScriptRuntime):
-        def __init__(self, model):
-            self.model = model
-            self.device = torch.device("cpu")
-            self.executors = {"tick": lambda payloads: payloads}
-
-        def search(self, *, board, actor_id, game_id, **kwargs):
-            owner = (actor_id, game_id)
-            identity, _ = yield WorkRequest("tick", (owner, None))
-            assert identity == owner
-            uci = ["f2f3", "e7e5", "g2g4", "d8h4"][len(board.move_stack)]
-            ids = [VOCAB.encode(m.uci()) for m in board.legal_moves]
-            return GumbelResult(
-                uci,
-                VOCAB.encode(uci),
-                ids,
-                [1 / len(ids)] * len(ids),
-                0.0,
-                (0.0, 1.0, 0.0),
-                [0] * len(ids),
-                [0.0] * len(ids),
-                1,
-                1,
-                0,
-                0,
-                1,
-            )
 
     def runtime(cfg, checkpoint, device):
         model = tiny_model()
@@ -532,6 +533,78 @@ def test_multiple_iterations_and_runner_resume(tmp_path, monkeypatch, failure_st
     assert "protocol_stop" in (output / "metrics.jsonl").read_text()
     with pytest.raises(RuntimeError, match="automatic learning was halted"):
         runner.main()
+
+
+def test_runner_enables_ema_on_resume_and_screens_it(tmp_path, monkeypatch):
+    import sys
+    from dataclasses import replace
+    import scripts.run_self_play as runner
+    from imba_chess.self_play.config import (
+        SelfPlayConfig, RunConfig, CollectionConfig, ReplayConfig,
+    )
+
+    def runtime(cfg, checkpoint, device):
+        model = tiny_model()
+        if checkpoint.exists():
+            model.load_state_dict(torch.load(checkpoint, weights_only=False)["model"])
+        return IdentifiedRuntime(model), 128
+
+    plain = SelfPlayConfig(
+        learning=LearningConfig(auxiliary_value_weight=0.0),
+        search=GumbelConfig(simulations=1, max_depth=1),
+        collection=CollectionConfig(concurrent_games=2, fresh_positions=2),
+        replay=ReplayConfig(window_positions=20, flush_games=2),
+        run=RunConfig(screen_pairs=1, confirmation_pairs=1),
+    )
+    ema = replace(plain, learning=replace(plain.learning, ema_decay=0.5))
+    source = "monitor"
+    while source_split(source) != "monitor":
+        source += "x"
+    monitor = [Seed("monitor", source, ["f2f3", "e7e5", "g2g4"], 3, "monitor", "c")]
+    seed_path = tmp_path / "seeds.json"
+    seed_path.write_text("test")
+    cfg = [plain]
+    monkeypatch.setattr(runner, "load_config", lambda path: cfg[0])
+    monkeypatch.setattr(runner, "load_runtime", runtime)
+    monkeypatch.setattr(runner, "load_seeds", lambda path, split: monitor)
+    monkeypatch.setattr(
+        runner, "StreamingStarts",
+        lambda directory, config, should_stop: mate_starts(
+            directory, config, per_bucket=64, should_stop=should_stop)[0],
+    )
+    screens = []
+
+    def screen(**kwargs):
+        screens.append((kwargs["output"].name, kwargs["candidate_id"]))
+        return dict(score=0.6, lower=0.45, upper=0.75)
+
+    monkeypatch.setattr(runner, "evaluate_pair_checkpoints", screen)
+    output = tmp_path / "run"
+    base = ["run_self_play.py", "--config", "unused", "--seeds", str(seed_path),
+            "--output", str(output), "--device", "cpu", "--screen-games", "1",
+            "--observe-only-screen"]
+
+    def run(*extra):
+        monkeypatch.setattr(sys, "argv", base + list(extra))
+        runner.main()
+        return json.loads((output / "state.json").read_text())
+
+    run("--initialize", str(tmp_path / "weights.pt"), "--max-iterations", "1")
+    assert [name for name, _ in screens] == ["screen-000000.json"]
+    cfg[0] = ema
+    with pytest.raises(ValueError, match="configuration .*changed"):
+        run("--resume", "--max-iterations", "2")
+    state = run("--resume", "--enable-ema", "--max-iterations", "2")
+    assert state["config_id"] == ema.identifier
+    assert state["ema_actor"].endswith("ema-000002.pt") and Path(state["ema_actor"]).exists()
+    assert screens[1:] == [("screen-000001.json", state["actor_id"]),
+                           ("screen-ema-000001.json", state["ema_actor_id"])]
+    assert "ema_model" in torch.load(state["checkpoint"], weights_only=False)
+    # The flag is a no-op once upgraded, and older EMA actors are removed.
+    state = run("--resume", "--enable-ema", "--max-iterations", "3")
+    state = run("--resume", "--max-iterations", "4")
+    assert sorted(p.name for p in output.glob("ema-*.pt")) == ["ema-000004.pt"]
+    assert [name for name, _ in screens[-2:]] == ["screen-000003.json", "screen-ema-000003.json"]
 
 
 def test_hard_budget_exits_process():
@@ -977,6 +1050,73 @@ def test_gradient_accumulation_matches_single_step_and_resumes(tmp_path):
         cfg, learning=replace(cfg.learning, gradient_accumulation=1)).identifier
     assert cfg.identifier != replace(
         cfg, learning=replace(cfg.learning, gradient_accumulation=16)).identifier
+
+
+def test_ema_tracks_weights_checkpoints_and_upgrades_resume(tmp_path):
+    from dataclasses import replace
+    from dataclasses import asdict
+    import hashlib
+    from pathlib import Path
+    from imba_chess.self_play.config import SelfPlayConfig
+
+    torch.set_num_threads(1)
+    store = SelfPlayStore(tmp_path / "replay", flush_games=1)
+    store.add(mate_game())
+    positions = store.index["g"][1]["positions"]
+
+    def trainer(decay, seed=42):
+        torch.manual_seed(seed)
+        config = LearningConfig(auxiliary_value_weight=0.0, lr=0.01, ema_decay=decay)
+        t = Stage2Trainer(model=tiny_model(dropout=0.0), config=config, move_vocab=VOCAB,
+                          encoder=ENCODER, device=torch.device("cpu"), max_positions=128)
+        t.begin_phase(store)
+        return t
+
+    # One step: ema = d * w0 + (1 - d) * w1.
+    a = trainer(0.9)
+    before = [p.detach().clone() for p in a.model.parameters()]
+    a.train(store, exposure_budget=positions)
+    for w0, w1, e in zip(before, a.model.parameters(), a.ema):
+        torch.testing.assert_close(e, 0.9 * w0 + 0.1 * w1.detach())
+    averaged = a.ema_state_dict()
+    assert averaged.keys() == a.model.state_dict().keys()
+    loaded = tiny_model(dropout=0.0)
+    loaded.load_state_dict(averaged, strict=True)
+
+    # The average resumes exactly.
+    a.checkpoint(tmp_path / "ema.pt", progress={}, store=store, config_id="cfg")
+    a.train(store, exposure_budget=3 * positions)
+    b = trainer(0.9, seed=7)
+    b.resume(tmp_path / "ema.pt", store=store, config_id="cfg")
+    b.train(store, exposure_budget=3 * positions)
+    for x, y in zip(a.ema, b.ema):
+        torch.testing.assert_close(x, y, rtol=0, atol=0)
+
+    # A checkpoint without EMA resumes under EMA only when asked, starting
+    # the average from its weights.
+    plain = trainer(0.0)
+    assert plain.ema is None
+    plain.train(store, exposure_budget=positions)
+    plain.checkpoint(tmp_path / "plain.pt", progress={}, store=store, config_id="cfg")
+    with pytest.raises(ValueError, match="configuration changed"):
+        trainer(0.9).resume(tmp_path / "plain.pt", store=store, config_id="cfg")
+    upgraded = trainer(0.9, seed=7)
+    upgraded.resume(tmp_path / "plain.pt", store=store, config_id="cfg", enable_ema=True)
+    for p, e in zip(upgraded.model.parameters(), upgraded.ema):
+        torch.testing.assert_close(e, p.detach(), rtol=0, atol=0)
+
+    with pytest.raises(ValueError, match="ema_decay"):
+        LearningConfig(ema_decay=1.0)
+    cfg = SelfPlayConfig()
+    # Disabled EMA keeps the identity runs had before the option existed.
+    settings = asdict(cfg)
+    del settings["collection"]["inference_dtype"], settings["learning"]["ema_decay"]
+    assert cfg.identifier == hashlib.sha256(json.dumps(dict(
+        settings=settings,
+        base_sha256=hashlib.sha256(Path(cfg.base_config).read_bytes()).hexdigest(),
+    ), sort_keys=True).encode()).hexdigest()
+    assert cfg.identifier != replace(
+        cfg, learning=replace(cfg.learning, ema_decay=0.995)).identifier
 
 
 def test_inference_dtype_identity_and_validation(tmp_path):

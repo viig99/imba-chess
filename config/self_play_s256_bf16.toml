@@ -42,6 +42,9 @@ gradient_accumulation = 4
 policy_surprise_enabled = true
 policy_surprise_fraction = 0.5
 policy_surprise_cap = 3.0
+# Weight EMA over ~200 optimizer steps (~19 iterations at ~10.6 steps each), screened next to
+# the raw actor from iteration 151 on (resumed with --enable-ema); collection keeps raw weights.
+ema_decay = 0.995
 
 [run]
 seed = 42
