@@ -5,7 +5,7 @@ The external nightly schedule is deliberately not installed by this command.
 
 import argparse
 from contextlib import ExitStack
-from dataclasses import asdict, replace
+from dataclasses import asdict
 from datetime import datetime
 import json
 import math
@@ -52,11 +52,11 @@ def main():
     parser.add_argument("--continuous", action="store_true", help="Run until interrupted; no time or default iteration cutoff")
     parser.add_argument("--max-iterations", type=int, default=100000)
     parser.add_argument(
-        "--enable-ema",
-        action="store_true",
-        help="With --resume, let a run started without EMA continue under the config's "
-             "learning.ema_decay (the average starts from the current weights); a no-op "
-             "once the run has been upgraded",
+        "--previous-config",
+        type=Path,
+        help="With --resume, continue a run started under this config when only its "
+             "[learning] and [replay] sections differ from --config (an EMA switched on "
+             "starts from the current weights); a no-op once the run has been upgraded",
     )
     parser.add_argument(
         "--checkpoint-seconds",
@@ -176,14 +176,19 @@ def main():
             hard_exit=not args.continuous,
         ) as budget,
     ):
-        saved_config_id = cfg.identifier
+        saved_config_id, previous_learning = cfg.identifier, None
         if args.resume:
             state = json.loads(state_path.read_text())
-            if args.enable_ema and state["config_id"] != cfg.identifier:
-                # The only accepted change is switching EMA on.
-                saved_config_id = replace(
-                    cfg, learning=replace(cfg.learning, ema_decay=0.0)
-                ).identifier
+            if args.previous_config and state["config_id"] != cfg.identifier:
+                previous = load_config(args.previous_config)
+                changed = sorted(
+                    k for k, v in asdict(cfg).items() if asdict(previous)[k] != v
+                )
+                if not set(changed) <= {"learning", "replay"}:
+                    raise ValueError(
+                        f"--previous-config may differ only in learning and replay: {changed}"
+                    )
+                saved_config_id, previous_learning = previous.identifier, previous.learning
             if state["config_id"] != saved_config_id or state[
                 "seed_manifest"
             ] != file_hash(args.seeds):
@@ -251,7 +256,7 @@ def main():
                 checkpoint,
                 store=store,
                 config_id=saved_config_id,
-                enable_ema=saved_config_id != cfg.identifier,
+                previous_learning=previous_learning,
             )
             if (
                 restored["iteration"] != state["iteration"]
@@ -392,7 +397,6 @@ def main():
                 ):
                     publish_checkpoint()
                     break
-                trainer.begin_phase(store)
                 start_sampler.finish_phase()
                 # Counted once, persisted with the collect -> train transition.
                 state["games_since_screen"] = (
@@ -406,6 +410,9 @@ def main():
                     # to one step; charge that overshoot to the next phase so
                     # long-run reuse matches the configuration.
                     exposure_budget -= state.get("exposure_carry", 0)
+                trainer.begin_phase(
+                    store, iteration=state["iteration"], exposure_budget=exposure_budget
+                )
                 state.update(phase="train", exposure_budget=exposure_budget)
                 publish_checkpoint()
             if state["phase"] == "train":

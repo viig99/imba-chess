@@ -535,7 +535,7 @@ def test_multiple_iterations_and_runner_resume(tmp_path, monkeypatch, failure_st
         runner.main()
 
 
-def test_runner_enables_ema_on_resume_and_screens_it(tmp_path, monkeypatch):
+def test_runner_accepts_previous_config_and_screens_ema(tmp_path, monkeypatch):
     import sys
     from dataclasses import replace
     import scripts.run_self_play as runner
@@ -564,7 +564,8 @@ def test_runner_enables_ema_on_resume_and_screens_it(tmp_path, monkeypatch):
     seed_path = tmp_path / "seeds.json"
     seed_path.write_text("test")
     cfg = [plain]
-    monkeypatch.setattr(runner, "load_config", lambda path: cfg[0])
+    monkeypatch.setattr(
+        runner, "load_config", lambda path: plain if str(path) == "previous" else cfg[0])
     monkeypatch.setattr(runner, "load_runtime", runtime)
     monkeypatch.setattr(runner, "load_seeds", lambda path, split: monitor)
     monkeypatch.setattr(
@@ -594,14 +595,18 @@ def test_runner_enables_ema_on_resume_and_screens_it(tmp_path, monkeypatch):
     cfg[0] = ema
     with pytest.raises(ValueError, match="configuration .*changed"):
         run("--resume", "--max-iterations", "2")
-    state = run("--resume", "--enable-ema", "--max-iterations", "2")
-    assert state["config_id"] == ema.identifier
+    cfg[0] = replace(ema, search=replace(ema.search, simulations=2))
+    with pytest.raises(ValueError, match="only in learning and replay"):
+        run("--resume", "--previous-config", "previous", "--max-iterations", "2")
+    cfg[0] = replace(ema, replay=replace(ema.replay, window_positions=30))
+    state = run("--resume", "--previous-config", "previous", "--max-iterations", "2")
+    assert state["config_id"] == cfg[0].identifier
     assert state["ema_actor"].endswith("ema-000002.pt") and Path(state["ema_actor"]).exists()
     assert screens[1:] == [("screen-000001.json", state["actor_id"]),
                            ("screen-ema-000001.json", state["ema_actor_id"])]
     assert "ema_model" in torch.load(state["checkpoint"], weights_only=False)
     # The flag is a no-op once upgraded, and older EMA actors are removed.
-    state = run("--resume", "--enable-ema", "--max-iterations", "3")
+    state = run("--resume", "--previous-config", "previous", "--max-iterations", "3")
     state = run("--resume", "--max-iterations", "4")
     assert sorted(p.name for p in output.glob("ema-*.pt")) == ["ema-000004.pt"]
     assert [name for name, _ in screens[-2:]] == ["screen-000003.json", "screen-ema-000003.json"]
@@ -1101,9 +1106,23 @@ def test_ema_tracks_weights_checkpoints_and_upgrades_resume(tmp_path):
     with pytest.raises(ValueError, match="configuration changed"):
         trainer(0.9).resume(tmp_path / "plain.pt", store=store, config_id="cfg")
     upgraded = trainer(0.9, seed=7)
-    upgraded.resume(tmp_path / "plain.pt", store=store, config_id="cfg", enable_ema=True)
+    upgraded.resume(tmp_path / "plain.pt", store=store, config_id="cfg",
+                    previous_learning=plain.config)
     for p, e in zip(upgraded.model.parameters(), upgraded.ema):
         torch.testing.assert_close(e, p.detach(), rtol=0, atol=0)
+    # An lr change through previous_learning reaches the restored optimizer and schedule.
+    torch.manual_seed(7)
+    faster = Stage2Trainer(
+        model=tiny_model(dropout=0.0), move_vocab=VOCAB, encoder=ENCODER,
+        device=torch.device("cpu"), max_positions=128,
+        config=LearningConfig(auxiliary_value_weight=0.0, lr=0.02, ema_decay=0.9))
+    faster.resume(tmp_path / "plain.pt", store=store, config_id="cfg",
+                  previous_learning=plain.config)
+    faster.begin_phase(store)
+    records = []
+    faster.train(store, exposure_budget=2 * positions, on_step=records.append)
+    assert [r["learning_rate"] for r in records] == [0.02, 0.02]
+    assert all(g["lr"] == 0.02 for g in faster.optimizer.param_groups)
 
     with pytest.raises(ValueError, match="ema_decay"):
         LearningConfig(ema_decay=1.0)
@@ -1117,6 +1136,33 @@ def test_ema_tracks_weights_checkpoints_and_upgrades_resume(tmp_path):
     ), sort_keys=True).encode()).hexdigest()
     assert cfg.identifier != replace(
         cfg, learning=replace(cfg.learning, ema_decay=0.995)).identifier
+
+
+def test_fresh_first_phase_trains_every_new_game_and_fills_with_old(tmp_path):
+    from collections import Counter
+
+    store = SelfPlayStore(tmp_path / "replay", window_positions=10**6, flush_games=1)
+    for i in range(12):
+        game = mate_game(f"g{i}")
+        game["iteration"] = 5 if i < 3 else i % 3
+        store.add(game)
+    positions = store.index["g0"][1]["positions"]
+    t = Stage2Trainer(model=tiny_model(dropout=0.0),
+                      config=LearningConfig(auxiliary_value_weight=0.0, reuse=2.0),
+                      move_vocab=VOCAB, encoder=ENCODER, device=torch.device("cpu"),
+                      max_positions=128)
+    t.begin_phase(store, iteration=5, exposure_budget=2 * 3 * positions)
+    queued = Counter(t.queue)
+    # All three fresh games once, plus as many old positions, each old game at most once.
+    assert {g for g in queued if store.index[g][1]["iteration"] == 5} == {"g0", "g1", "g2"}
+    assert len(t.queue) == 6 and max(queued.values()) == 1
+    with pytest.raises(ValueError, match="no training trajectories from iteration 9"):
+        t.begin_phase(store, iteration=9, exposure_budget=positions)
+    with pytest.raises(ValueError, match="exposure budget"):
+        t.begin_phase(store, iteration=5)
+    # A budget below the fresh positions queues no old games.
+    t.begin_phase(store, iteration=5, exposure_budget=positions)
+    assert sorted(t.queue) == ["g0", "g1", "g2"]
 
 
 def test_inference_dtype_identity_and_validation(tmp_path):

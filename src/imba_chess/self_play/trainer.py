@@ -182,7 +182,10 @@ class Stage2Trainer:
                         raise ValueError("optimizer parameter shapes differ")
         self._restore_optimization(dict(state, scheduler_type="OneCycleLR"))
 
-    def begin_phase(self, store):
+    def begin_phase(self, store, *, iteration=None, exposure_budget=None):
+        """Queue every game collected in `iteration`, then older replay games up to
+        `exposure_budget` positions in total, shuffled together. Without an
+        iteration the phase samples the whole window uniformly."""
         self.phase_exposures = 0
         self.sample_ids = store.game_ids("train")
         self.reuse_counts = {
@@ -191,6 +194,23 @@ class Stage2Trainer:
         self.queue = []
         if not self.sample_ids:
             raise ValueError("no completed training trajectories")
+        if iteration is None:
+            return
+        if exposure_budget is None:
+            raise ValueError("fresh-first sampling needs the phase exposure budget")
+        fresh = [g for g in self.sample_ids if store.index[g][1].get("iteration") == iteration]
+        if not fresh:
+            raise ValueError(f"no training trajectories from iteration {iteration}")
+        old = [g for g in self.sample_ids if store.index[g][1].get("iteration") != iteration]
+        self.rng.shuffle(old)
+        remaining = exposure_budget - sum(store.index[g][1]["positions"] for g in fresh)
+        chosen = []
+        while remaining > 0 and old:
+            gid = old.pop()
+            chosen.append(gid)
+            remaining -= store.index[gid][1]["positions"]
+        self.queue = fresh + chosen
+        self.rng.shuffle(self.queue)
 
     def _next_batch(self, store):
         if not self.queue:
@@ -321,9 +341,10 @@ class Stage2Trainer:
             ),
         )
 
-    def resume(self, path, *, store, config_id, enable_ema=False):
-        """Restore a checkpoint. enable_ema lets a checkpoint written without EMA
-        resume under this config's ema_decay, starting the average from its weights."""
+    def resume(self, path, *, store, config_id, previous_learning=None):
+        """Restore a checkpoint. previous_learning, when given, is the learning
+        config the checkpoint was written under and may differ from this trainer's;
+        an EMA switched on by the change starts from the checkpoint's weights."""
         state = torch.load(path, map_location="cpu", weights_only=False)
         if state.get("stage2_schema") != 1:
             raise ValueError(
@@ -334,13 +355,9 @@ class Stage2Trainer:
         if "detach_value_features" in state["learning_config"]:
             raise ValueError("resume configuration changed: detached-value checkpoint")
         saved_learning = {"auxiliary_value_weight": 0.0, "ema_decay": 0.0, **state["learning_config"]}
-        upgrade = enable_ema and "ema_model" not in state and saved_learning["ema_decay"] == 0
-        if upgrade:
-            if self.config.ema_decay == 0:
-                raise ValueError("enable_ema needs a config with ema_decay > 0")
-            saved_learning["ema_decay"] = self.config.ema_decay
+        expected = self.config if previous_learning is None else previous_learning
         if state["config_id"] != config_id or asdict(LearningConfig(**saved_learning)) != asdict(
-            self.config
+            expected
         ):
             raise ValueError("resume configuration changed")
         for name in state["replay_shards"]:
@@ -350,11 +367,19 @@ class Stage2Trainer:
         if self.ema is not None:
             if "ema_model" in state:
                 self._load_ema(state["ema_model"])
-            elif not upgrade:
+            elif previous_learning is None or previous_learning.ema_decay != 0:
                 raise ValueError("checkpoint has no EMA weights")
             else:
                 self.ema = self._fresh_ema()
         self._restore_optimization(state)
+        if previous_learning is not None and previous_learning.lr != self.config.lr:
+            # The restored optimizer and schedule carry the old rate.
+            if not isinstance(self.scheduler, torch.optim.lr_scheduler.LambdaLR):
+                raise ValueError("an lr change on resume needs the constant schedule")
+            for group in self.optimizer.param_groups:
+                group["lr"] = group["initial_lr"] = self.config.lr
+            self.scheduler.base_lrs = [self.config.lr] * len(self.optimizer.param_groups)
+            self.scheduler._last_lr = [self.config.lr] * len(self.optimizer.param_groups)
         torch.set_rng_state(state["torch_rng"])
         if state["cuda_rng"] and torch.cuda.is_available():
             torch.cuda.set_rng_state_all(state["cuda_rng"])
