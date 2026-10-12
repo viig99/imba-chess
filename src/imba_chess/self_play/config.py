@@ -20,6 +20,34 @@ class CollectionConfig:
     fresh_positions: int = 4096
     # Collection-worker search precision; training always keeps FP32 weights.
     inference_dtype: str = "float32"
+    # Playout cap randomization (KataGo) with fast play-out of decided games. Off by
+    # default; when off none of the fields below affect play or the run identity.
+    # Each move runs the full [search] with probability full_search_probability, and
+    # otherwise a fast search (fast_simulations, fast_top_m, no Gumbel noise). A game
+    # is decided once the last decided_plies root values all have |v| >= decided_value;
+    # decided positions always get the fast search. Fast moves are played and keep
+    # their value targets but carry policy_training_weight 0 (no policy target).
+    playout_cap: bool = False
+    full_search_probability: float = 0.25
+    fast_simulations: int = 64
+    fast_top_m: int = 8
+    decided_value: float = 0.98
+    decided_plies: int = 3
+
+    PLAYOUT_CAP_FIELDS = (
+        "playout_cap", "full_search_probability", "fast_simulations", "fast_top_m",
+        "decided_value", "decided_plies",
+    )
+
+    def __post_init__(self):
+        if type(self.playout_cap) is not bool:
+            raise ValueError("playout_cap must be boolean")
+        if not math.isfinite(self.full_search_probability) or not 0 < self.full_search_probability <= 1:
+            raise ValueError("full_search_probability must be in (0, 1]")
+        if any(type(v) is not int or v < 1 for v in (self.fast_simulations, self.fast_top_m, self.decided_plies)):
+            raise ValueError("fast_simulations, fast_top_m and decided_plies must be positive integers")
+        if not math.isfinite(self.decided_value) or not 0 < self.decided_value <= 1:
+            raise ValueError("decided_value must be in (0, 1]")
 
 
 @dataclass(frozen=True)
@@ -136,6 +164,9 @@ class SelfPlayConfig:
         if self.collection.inference_dtype == "float32":
             # Runs started before the option existed keep their identity.
             del settings["collection"]["inference_dtype"]
+        if not self.collection.playout_cap:
+            for key in CollectionConfig.PLAYOUT_CAP_FIELDS:
+                del settings["collection"][key]
         if self.learning.ema_decay == 0:
             del settings["learning"]["ema_decay"]
         return hashlib.sha256(
@@ -167,8 +198,13 @@ def load_config(path):
     )
     if cfg.collection.inference_dtype not in ("float32", "bfloat16"):
         raise ValueError("collection.inference_dtype must be float32 or bfloat16")
+    if cfg.collection.playout_cap and (
+        cfg.collection.fast_simulations >= cfg.search.simulations
+        or cfg.collection.fast_top_m > cfg.search.top_m
+    ):
+        raise ValueError("the fast search must be smaller than the full [search]")
     for section in (cfg.collection, cfg.replay, cfg.learning):
-        if any(not math.isfinite(v) or v <= 0 for k, v in asdict(section).items() if not k.startswith(("policy_surprise_", "auxiliary_value_")) and k not in ("value_weight", "value_search_mix", "inference_dtype", "ema_decay")):
+        if any(not math.isfinite(v) or v <= 0 for k, v in asdict(section).items() if not k.startswith(("policy_surprise_", "auxiliary_value_")) and k not in ("value_weight", "value_search_mix", "inference_dtype", "ema_decay", *CollectionConfig.PLAYOUT_CAP_FIELDS)):
             raise ValueError("stage-2 sizes and learning settings must be positive")
     if not all(math.isfinite(v) for v in asdict(cfg.run).values()):
         raise ValueError("run settings must be finite")

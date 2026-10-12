@@ -13,7 +13,14 @@ def self_play_loss(output, batch, *, value_weight=1.0, auxiliary_value_weight=1.
     legal_logits = logits.gather(1, legal).masked_fill(~mask, -torch.inf)
     log_probs = F.log_softmax(legal_logits, -1).masked_fill(~mask, 0.0)
     per_position_ce = -(target * log_probs).sum(-1)
-    policy_loss = per_position_ce.mean()
+    # Policy diagnostics cover positions with a policy target only (playout-cap fast
+    # moves carry weight 0); a masked mean keeps the compiled loss free of selection.
+    if "policy_eligible" in batch:
+        has_policy = batch["policy_eligible"].to(logits.device).float()
+    else:
+        has_policy = torch.ones_like(per_position_ce)
+    policy_count = has_policy.sum().clamp_min(1)
+    policy_loss = (per_position_ce * has_policy).sum() / policy_count
     weighted_policy_loss = policy_loss
     if "policy_training_weight" in batch:
         weights = batch["policy_training_weight"].to(logits.device).float().detach()
@@ -28,7 +35,7 @@ def self_play_loss(output, batch, *, value_weight=1.0, auxiliary_value_weight=1.
     probs = value_log_probs.exp()
     # Keep the historical target entropy key; model entropy measures the
     # student's distribution and can move in a different direction.
-    entropy = -(target * target.clamp_min(1e-38).log()).sum(-1).mean()
+    entropy = (-(target * target.clamp_min(1e-38).log()).sum(-1) * has_policy).sum() / policy_count
     # Diagnostics use the actual game result. With value_search_mix the
     # training label is a blend and is never exactly decisive.
     outcome = (
@@ -36,7 +43,7 @@ def self_play_loss(output, batch, *, value_weight=1.0, auxiliary_value_weight=1.
         if "outcome_target" in batch else wdl
     )
     with torch.no_grad():
-        model_entropy = -(log_probs.exp() * log_probs).sum(-1).mean()
+        model_entropy = (-(log_probs.exp() * log_probs).sum(-1) * has_policy).sum() / policy_count
         decisive = outcome[:, 1] == 0
         decisive_count = decisive.sum()
         wl_logits = value_logits[:, [0, 2]]
@@ -45,7 +52,7 @@ def self_play_loss(output, batch, *, value_weight=1.0, auxiliary_value_weight=1.
         wl_correct = wl_logits.argmax(-1) == wl_targets.argmax(-1)
     actor_kl = {}
     if "actor_log_priors" in batch:
-        available = batch["actor_prior_available"].to(logits.device)
+        available = batch["actor_prior_available"].to(logits.device) & (has_policy > 0)
         actor_logs = batch["actor_log_priors"].to(logits.device)
         per_position = (target * (target.clamp_min(1e-38).log() - actor_logs)).sum(-1)
         actor_kl = dict(

@@ -1,7 +1,7 @@
 """One sequential search per game, inference batched across independent games."""
 
 from collections import Counter, defaultdict, deque
-from dataclasses import asdict
+from dataclasses import asdict, replace
 import random
 import time
 
@@ -52,7 +52,10 @@ def play_game(
     on_position=lambda result, elapsed: None,
     actor_for_turn=None,
     gumbel_noise=True,
+    playout_cap=None,
 ):
+    """playout_cap: a CollectionConfig with playout_cap on, or None for a full
+    search on every move (always the case outside self-play collection)."""
     board = seed.board()
     history = _SequenceHistory(
         move_vocab=runtime.move_vocab, board_state_encoder=runtime.encoder
@@ -84,6 +87,15 @@ def play_game(
         inference_config=getattr(runtime, "options", {}),
     )
     rng = random.Random(f"{run_seed}:{game_id}")
+    if playout_cap is not None:
+        if not playout_cap.playout_cap or actor_for_turn is not None:
+            raise ValueError("playout_cap needs an enabled config and a single actor")
+        # A separate stream, so the Gumbel noise draws do not depend on the coin flips.
+        cap_rng = random.Random(f"{run_seed}:{game_id}:playout-cap")
+        fast_config = replace(
+            search_config, simulations=playout_cap.fast_simulations, top_m=playout_cap.fast_top_m
+        )
+        game["playout_cap"] = asdict(playout_cap)
     try:
         while True:
             terminal = terminal_outcome(board)
@@ -108,22 +120,40 @@ def play_game(
                 if actor_for_turn is None
                 else actor_for_turn(board.turn)
             )
+            kind, config, noise = "full", search_config, gumbel_noise
+            if playout_cap is not None:
+                # Drawn every move, decided or not, so each ply's flip is fixed by the game seed.
+                full = cap_rng.random() < playout_cap.full_search_probability
+                recent = game["targets"][-playout_cap.decided_plies:]
+                if len(recent) == playout_cap.decided_plies and all(
+                    abs(t["root_value"]) >= playout_cap.decided_value for t in recent
+                ):
+                    kind = "decided"
+                elif not full:
+                    kind = "fast"
+                if kind != "full":
+                    config, noise = fast_config, False
             start = time.perf_counter()
             result = yield from current_runtime.search(
                 board=board,
                 history=history,
                 actor_id=current_actor,
                 game_id=game_id,
-                config=search_config,
+                config=config,
                 rng=rng,
                 should_stop=should_stop,
-                **({} if gumbel_noise else {"noise": 0.0}),
+                **({} if noise else {"noise": 0.0}),
             )
             move = chess.Move.from_uci(result.move_uci)
             if move not in board.legal_moves:
                 raise ValueError("search produced illegal move")
             on_position(result, time.perf_counter() - start)
-            game["targets"].append(asdict(result))
+            target = asdict(result)
+            if playout_cap is not None:
+                target["search_kind"] = kind
+                if kind != "full":
+                    target["policy_training_weight"] = 0.0
+            game["targets"].append(target)
             game["moves"].append(result.move_uci)
             history.append_observed_position(board)
             history.record_played_move(result.move_uci)
@@ -197,6 +227,10 @@ class CollectionMetrics:
                 counts["completed_continuation_plies"] += length
         if game["status"] == "completed":
             self.counts["completed_positions"] += length
+            # Recovered phase summaries carry no targets; their kinds go uncounted.
+            for target in game.get("targets", ()):
+                if "search_kind" in target:
+                    self.counts[target["search_kind"] + "_search_positions"] += 1
             if game["split"] == "train":
                 self.counts["usable_positions"] += length
                 self.counts["training_positions"] += length
@@ -463,4 +497,5 @@ def launch_game(
         config_id=config_id,
         should_stop=should_stop,
         on_position=on_position,
+        playout_cap=config.collection if config.collection.playout_cap else None,
     )

@@ -1130,6 +1130,9 @@ def test_ema_tracks_weights_checkpoints_and_upgrades_resume(tmp_path):
     # Disabled EMA keeps the identity runs had before the option existed.
     settings = asdict(cfg)
     del settings["collection"]["inference_dtype"], settings["learning"]["ema_decay"]
+    for key in ("playout_cap", "full_search_probability", "fast_simulations", "fast_top_m",
+                "decided_value", "decided_plies"):
+        del settings["collection"][key]
     assert cfg.identifier == hashlib.sha256(json.dumps(dict(
         settings=settings,
         base_sha256=hashlib.sha256(Path(cfg.base_config).read_bytes()).hexdigest(),
@@ -1183,3 +1186,117 @@ def test_inference_dtype_identity_and_validation(tmp_path):
         load_config(path)
     path.write_text(f'base_config = "{base}"\n[collection]\ninference_dtype = "bfloat16"\n')
     assert load_config(path).collection.inference_dtype == "bfloat16"
+
+
+SCHOLAR = ["e2e4", "e7e5", "f1c4", "b8c6", "d1h5", "g8f6", "h5f7"]
+
+
+class PlayoutRuntime:
+    """Plays the scholar's mate with scripted root values; records each search's settings."""
+    move_vocab = VOCAB
+    encoder = ENCODER
+
+    def __init__(self, values):
+        self.values, self.calls = values, []
+
+    def search(self, *, board, config, noise=None, **kwargs):
+        yield WorkRequest("tick", None)
+        ply = len(board.move_stack)
+        self.calls.append((config.simulations, config.top_m, noise))
+        uci = SCHOLAR[ply]
+        ids = [VOCAB.encode(m.uci()) for m in board.legal_moves]
+        policy = [1 / len(ids)] * len(ids)
+        return GumbelResult(uci, VOCAB.encode(uci), ids, policy, self.values[ply], (0.0, 1.0, 0.0),
+                            [0] * len(ids), [0.0] * len(ids), config.simulations, config.simulations,
+                            0, 0, 1, [math.log(p) for p in policy], (0.2, 0.3, 0.5))
+
+
+def playout_game(runtime, collection, gid="g"):
+    seed = Seed("s", "train-source", [], 0, "train", "c")
+    gen = play_game(seed=seed, game_id=gid, actor_id="a", runtime=runtime,
+                    search_config=GumbelConfig(simulations=256, top_m=16, max_depth=4),
+                    max_positions=128, playout_cap=collection)
+    try:
+        next(gen)
+        while True:
+            gen.send(None)
+    except StopIteration as stop:
+        return stop.value
+
+
+def test_playout_cap_decided_games_use_the_fast_search_without_policy_targets():
+    from imba_chess.self_play.config import CollectionConfig
+
+    collection = CollectionConfig(playout_cap=True, full_search_probability=1.0,
+                                  decided_value=0.98, decided_plies=2)
+    runtime = PlayoutRuntime([0.1, 0.99, -0.99, 0.99, 0.2, 0.99, 0.99])
+    game = playout_game(runtime, collection)
+    assert game["status"] == "completed" and game["outcome_white"] == 1
+    kinds = [t["search_kind"] for t in game["targets"]]
+    # Decided once the previous two root values are both |v| >= 0.98; undecided again after 0.2.
+    assert kinds == ["full", "full", "full", "decided", "decided", "full", "full"]
+    fast, full = (64, 8, 0.0), (256, 16, None)
+    assert runtime.calls == [full, full, full, fast, fast, full, full]
+    assert [t.get("policy_training_weight", 1.0) for t in game["targets"]] == [1, 1, 1, 0, 0, 1, 1]
+    learning = LearningConfig(auxiliary_value_weight=0.0, policy_surprise_enabled=True)
+    sample = reconstruct(game, move_vocab=VOCAB, encoder=ENCODER, max_positions=128, learning=learning)
+    assert sample["policy_eligible"] == [True, True, True, False, False, True, True]
+    assert sample["policy_training_weight"][3:5] == [0.0, 0.0]
+    assert sample["has_value_target"] == [False] + [True] * 7  # every move keeps its value target
+
+
+def test_playout_cap_coin_flips_are_seeded_per_game():
+    from imba_chess.self_play.config import CollectionConfig
+
+    collection = CollectionConfig(playout_cap=True, full_search_probability=0.5, decided_value=1.0)
+    kinds = lambda gid: [t["search_kind"] for t in playout_game(PlayoutRuntime([0.0] * 7), collection, gid)["targets"]]
+    assert kinds("g1") == kinds("g1")
+    seen = {k for gid in range(8) for k in kinds(f"g{gid}")}
+    assert seen == {"full", "fast"}
+
+
+def test_policy_diagnostics_skip_positions_without_policy_targets():
+    logits = torch.tensor([[0.0, 0.0, 0.0], [0.0, 5.0, 0.0]], requires_grad=True)
+    value = torch.zeros((2, 3), requires_grad=True)
+    batch = dict(
+        supervised_indices=torch.tensor([0, 1]),
+        legal_ids=torch.tensor([[1, 2], [1, 2]]),
+        legal_mask=torch.tensor([[True, True], [True, True]]),
+        policy=torch.tensor([[0.5, 0.5], [0.0, 1.0]]),
+        value_target=torch.tensor([[0.0, 1.0, 0.0], [0.0, 0.0, 1.0]]),
+        policy_training_weight=torch.tensor([1.0, 0.0]),
+        policy_eligible=torch.tensor([True, False]),
+        actor_prior_available=torch.tensor([True, True]),
+        actor_log_priors=torch.tensor([[math.log(0.5)] * 2, [math.log(0.9), math.log(0.1)]]),
+    )
+    loss = self_play_loss(dict(logits=logits, value_logits=value), batch, auxiliary_value_weight=0.0)
+    assert loss["policy_loss"].item() == pytest.approx(math.log(2))
+    assert loss["policy_entropy"].item() == pytest.approx(math.log(2))
+    assert loss["search_prior_kl"].item() == pytest.approx(0.0, abs=1e-6)
+    assert loss["actor_prior_positions"].item() == 1
+    assert loss["value_loss"].item() == pytest.approx(math.log(3))  # both positions
+    loss["loss"].backward()
+    assert logits.grad[1].abs().sum() == 0  # no policy gradient from the fast move
+
+
+def test_playout_cap_identity_and_validation(tmp_path):
+    from dataclasses import replace
+    from imba_chess.self_play.config import SelfPlayConfig, load_config
+
+    cfg = SelfPlayConfig()
+    off = replace(cfg, collection=replace(cfg.collection, fast_simulations=32, decided_plies=5))
+    assert cfg.identifier == off.identifier  # settings of a disabled feature do not change the run
+    on = replace(cfg, collection=replace(cfg.collection, playout_cap=True))
+    assert on.identifier != cfg.identifier
+    base = tmp_path / "model.toml"
+    base.write_text("")
+    path = tmp_path / "self_play.toml"
+    path.write_text(f'base_config = "{base}"\n[search]\nsimulations = 64\n[collection]\nplayout_cap = true\n')
+    with pytest.raises(ValueError, match="fast search must be smaller"):
+        load_config(path)
+    path.write_text(f'base_config = "{base}"\n[search]\nsimulations = 256\n[collection]\nplayout_cap = true\n')
+    assert load_config(path).collection.playout_cap
+    with pytest.raises(ValueError, match="full_search_probability"):
+        replace(cfg.collection, full_search_probability=0.0)
+    with pytest.raises(ValueError, match="playout_cap needs"):
+        playout_game(PlayoutRuntime([0.0] * 7), cfg.collection)
