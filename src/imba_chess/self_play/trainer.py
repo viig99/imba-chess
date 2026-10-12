@@ -157,10 +157,15 @@ class Stage2Trainer:
             self.scheduler._last_lr = [group["lr"] for group in self.optimizer.param_groups]
 
     def initialize_optimization(self, path):
-        """Carry supervised optimizer/schedule into a fresh self-play dataset."""
+        """Carry a checkpoint's optimizer/schedule into a fresh self-play dataset: a
+        supervised OneCycleLR checkpoint, or a self-play checkpoint (constant schedule,
+        plus its EMA weights when this trainer keeps an EMA)."""
         state = torch.load(path, map_location="cpu", weights_only=False)
-        if state.get("stage2_schema") or "_schedule_phases" not in state["scheduler"]:
-            raise ValueError("expected a supervised OneCycleLR checkpoint")
+        stage2 = state.get("stage2_schema") == 1
+        if not stage2 and "_schedule_phases" not in state["scheduler"]:
+            raise ValueError("expected a supervised OneCycleLR or self-play checkpoint")
+        if stage2 and state.get("scheduler_type") != "LambdaLR":
+            raise ValueError("expected a constant-schedule self-play checkpoint")
         source = {k.removeprefix("_orig_mod."): v for k, v in state["model"].items()}
         current = self.model.state_dict()
         if source.keys() != current.keys() or any(
@@ -180,7 +185,14 @@ class Stage2Trainer:
                 for name in ("exp_avg", "exp_avg_sq"):
                     if name in moments and moments[name].shape != param.shape:
                         raise ValueError("optimizer parameter shapes differ")
-        self._restore_optimization(dict(state, scheduler_type="OneCycleLR"))
+        if not stage2:
+            self._restore_optimization(dict(state, scheduler_type="OneCycleLR"))
+            return
+        self._restore_optimization(state)
+        if self.ema is not None:
+            if "ema_model" not in state:
+                raise ValueError("checkpoint has no EMA weights")
+            self._load_ema(state["ema_model"])
 
     def begin_phase(self, store, *, iteration=None, exposure_budget=None):
         """Queue every game collected in `iteration`, then older replay games up to

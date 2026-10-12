@@ -99,3 +99,29 @@ def test_imported_schedule_exhaustion_keeps_training_and_resumes_exactly(tmp_pat
     assert restored.optimizer.param_groups[0]["lr"] == floor
     for a, b in zip(target.model.parameters(), restored.model.parameters()):
         torch.testing.assert_close(a, b, rtol=0, atol=0)
+
+
+def test_self_play_checkpoint_carries_optimizer_and_ema_into_a_new_run(tmp_path):
+    torch.set_num_threads(1)
+    config = LearningConfig(auxiliary_value_weight=0.0, lr=0.0005, ema_decay=0.9)
+    make = lambda model: Stage2Trainer(model=model, config=config, move_vocab=None, encoder=None,
+                                       device=torch.device('cpu'), max_positions=128)
+    source = make(torch.nn.Linear(3, 2))
+    for _ in range(5):
+        update(source)
+        source.ema = [0.9 * e + 0.1 * p.detach() for e, p in zip(source.ema, source._ema_parameters)]
+    store = SelfPlayStore(tmp_path / 'replay')
+    path = tmp_path / 'actor.pt'
+    source.checkpoint(path, progress={'phase': 'collect'}, store=store, config_id='old')
+    target = make(copy.deepcopy(source.model))
+    target.initialize_optimization(path)
+    assert target.steps == target.exposures == 0 and not target.queue
+    for a, b in zip(source.ema, target.ema):
+        torch.testing.assert_close(a, b, rtol=0, atol=0)
+    for _ in range(3):
+        update(source)
+        update(target)
+        for a, b in zip(source.model.parameters(), target.model.parameters()):
+            torch.testing.assert_close(a, b, rtol=0, atol=0)
+    with pytest.raises(ValueError, match='match initialized model'):
+        make(torch.nn.Linear(3, 2)).initialize_optimization(path)

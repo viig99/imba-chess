@@ -9,6 +9,7 @@ from dataclasses import asdict
 from datetime import datetime
 import json
 import math
+import shutil
 from pathlib import Path
 import time
 import torch
@@ -37,7 +38,14 @@ def main():
     source.add_argument("--resume", action="store_true")
     parser.add_argument(
         "--initialize-optimizer", action="store_true",
-        help="Carry the supervised checkpoint optimizer and OneCycleLR schedule into self-play",
+        help="Carry the initialize checkpoint's optimizer and schedule into self-play: a supervised "
+             "OneCycleLR checkpoint, or a self-play checkpoint (with its EMA weights)",
+    )
+    parser.add_argument(
+        "--screen-best",
+        type=Path,
+        help="With --initialize, screen against this checkpoint (copied into the run) instead of "
+             "the initial actor, e.g. to keep a restarted run's screens on the original baseline",
     )
     parser.add_argument("--seeds", type=Path, required=True)
     parser.add_argument("--output", type=Path, required=True)
@@ -118,6 +126,8 @@ def main():
     args = parser.parse_args()
     if args.initialize_optimizer and not args.initialize:
         parser.error("--initialize-optimizer requires --initialize")
+    if args.screen_best and not args.initialize:
+        parser.error("--screen-best requires --initialize")
     if args.concurrent_games is not None and args.concurrent_games < 1:
         parser.error("--concurrent-games must be positive")
     if args.collect_workers < 1:
@@ -273,6 +283,10 @@ def main():
             )
             state["actor_id"] = file_hash(actor)
             state["best_id"] = state["actor_id"]
+            if args.screen_best:
+                best = args.output / "best-000000.pt"
+                shutil.copyfile(args.screen_best, best)
+                state.update(best=str(best), best_id=file_hash(best))
             atomic_json(state_path, state)
 
         def publish_checkpoint():
