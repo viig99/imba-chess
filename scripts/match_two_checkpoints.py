@@ -94,7 +94,9 @@ def _play_game(
 
     adjudicated = False
     while True:
-        if board.is_game_over(claim_draw=False):
+        # claim_draw=True: Gumbel search treats threefold/fifty-move positions as terminal
+        # (as eval_vs_stockfish and self-play do) and refuses to search them.
+        if board.is_game_over(claim_draw=True):
             break
         if len(board.move_stack) >= max_plies:
             adjudicated = True
@@ -116,7 +118,7 @@ def _play_game(
         a_score = 0.5
         result = "adjudicated-draw"
     else:
-        result = board.result(claim_draw=False)
+        result = board.result(claim_draw=True)
         if result == "1/2-1/2":
             a_score = 0.5
         else:
