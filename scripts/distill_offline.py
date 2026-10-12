@@ -120,11 +120,20 @@ def main():
     parser.add_argument("--milestones", default="0,250,500,1000,2000")
     parser.add_argument("--concurrency", type=int, default=32)
     parser.add_argument("--memory-fraction", type=float, default=0.3)
+    parser.add_argument("--microbatch-tokens", type=int, default=None,
+                        help="smaller microbatches with more accumulation, same tokens per step")
+    parser.add_argument("--save-weights", default="", help="comma-separated milestones to save model weights at")
     args = parser.parse_args()
     milestones = sorted({int(x) for x in args.milestones.split(",")})
     torch.cuda.set_per_process_memory_fraction(args.memory_fraction)
     cfg = load_config(args.config)
     learning = replace(cfg.learning, ema_decay=0.0)
+    if args.microbatch_tokens is not None:
+        factor, remainder = divmod(cfg.learning.microbatch_tokens * cfg.learning.gradient_accumulation, args.microbatch_tokens)
+        if remainder:
+            raise ValueError("microbatch tokens must divide the configured tokens per step")
+        learning = replace(learning, microbatch_tokens=args.microbatch_tokens, gradient_accumulation=factor)
+    save_at = {int(x) for x in args.save_weights.split(",") if x}
     positions, sf, targets = load_study(args.study)
     heldout_games = {p["game_id"] for p in positions}
 
@@ -167,7 +176,11 @@ def main():
         if milestone > trainer.steps:
             trainer.train(store, exposure_budget=float("inf"),
                           should_stop=lambda: trainer.steps >= milestone, on_step=on_step)
+        torch.cuda.empty_cache()
+        if trainer.steps in save_at:
+            torch.save(dict(model=runtime.model.state_dict()), args.out / f"distilled-{trainer.steps:06d}.pt")
         priors = prior_logs(runtime, positions, concurrency=args.concurrency)
+        torch.cuda.empty_cache()
         if start_priors is None:
             start_priors = priors
             gains = {}
