@@ -16,12 +16,15 @@ class EvaluationProtocolError(RuntimeError):
 
 
 PERMANENT_LIMITS = {"game_limit", "context_limit"}
+# Statuses that count toward a screen's score; "adjudicated" games are permanent-limit
+# games scored as draws (only when evaluate_pair_checkpoints(adjudicate_limits=True)).
+SCORED = {"completed", "adjudicated"}
 
 
 def paired_interval(results, *, pairs, seed=42, samples=10000):
     grouped = defaultdict(list)
     for row in results:
-        if row["status"] != "completed":
+        if row["status"] not in SCORED:
             continue
         score = (row["outcome_white"] * (1 if row["candidate_white"] else -1) + 1) / 2
         grouped[row["pair"]].append(score)
@@ -35,6 +38,7 @@ def paired_interval(results, *, pairs, seed=42, samples=10000):
         lower=draws[int(0.025 * samples)],
         upper=draws[min(samples - 1, int(0.975 * samples))],
         pairs=pairs,
+        adjudicated=sum(row["status"] == "adjudicated" for row in results),
     )
 
 
@@ -59,7 +63,10 @@ def evaluate_pair_checkpoints(
     pairs,
     should_stop=lambda: False,
     gumbel_noise=False,
+    adjudicate_limits=False,
 ):
+    """adjudicate_limits scores games that hit a permanent limit as draws instead of
+    failing the protocol; meant for observe-only screens, never for promotion."""
     if len(seeds) < pairs or any(s.split != "monitor" for s in seeds[:pairs]):
         raise ValueError(f"evaluation needs {pairs} held-out source-game prefixes")
     if len({s.source_id for s in seeds[:pairs]}) != pairs:
@@ -88,6 +95,8 @@ def evaluate_pair_checkpoints(
             tf32=False,
         ),
     )
+    if adjudicate_limits:
+        identity["limit_adjudication"] = "draw"
     state = (
         json.loads(output.read_text())
         if output.exists()
@@ -99,6 +108,8 @@ def evaluate_pair_checkpoints(
         )
 
     def check_protocol_failure():
+        if adjudicate_limits:
+            return
         failures = {
             key: row["termination"]
             for key, row in state["results"].items()
@@ -139,7 +150,7 @@ def evaluate_pair_checkpoints(
                 key = f"{pair}:{int(candidate_white)}"
                 if (
                     key in state["results"]
-                    and state["results"][key]["status"] == "completed"
+                    and state["results"][key]["status"] in SCORED
                 ):
                     continue
                 if should_stop():
@@ -170,13 +181,16 @@ def evaluate_pair_checkpoints(
 
     def done(key, game):
         pair, white = key.split(":")
-        state["results"][key] = dict(
+        row = dict(
             pair=int(pair),
             candidate_white=bool(int(white)),
             status=game["status"] if game else "unfinished",
             outcome_white=game.get("outcome_white") if game else None,
             termination=game.get("termination") if game else "error",
         )
+        if adjudicate_limits and row["status"] != "completed" and row["termination"] in PERMANENT_LIMITS:
+            row.update(status="adjudicated", outcome_white=0)
+        state["results"][key] = row
         atomic_json(output, state)
         check_protocol_failure()
 
@@ -192,7 +206,7 @@ def evaluate_pair_checkpoints(
         on_game_error=lambda *args: None,
     ).run()
     rows = list(state["results"].values())
-    if len(rows) != 2 * pairs or any(r["status"] != "completed" for r in rows):
+    if len(rows) != 2 * pairs or any(r["status"] not in SCORED for r in rows):
         return None
     interval = paired_interval(rows, pairs=pairs, seed=config.run.seed)
     state["interval"] = interval

@@ -885,6 +885,38 @@ def test_evaluation_permanent_caps_do_not_retry(tmp_path, monkeypatch, reason):
     assert len(calls) == count
 
 
+def test_observe_only_screen_adjudicates_permanent_limits_as_draws(tmp_path, monkeypatch):
+    from types import SimpleNamespace
+    import imba_chess.self_play.evaluation as evaluation
+    from imba_chess.self_play.config import SelfPlayConfig
+
+    def game(**kwargs):
+        yield from ()
+        if kwargs["game_id"] == first:
+            return dict(status="unfinished", termination="context_limit", outcome_white=None)
+        return dict(status="completed", termination="checkmate", outcome_white=1)
+
+    monkeypatch.setattr(evaluation, "play_game", game)
+    runtime = SimpleNamespace(executors={})
+    args = dict(
+        candidate=runtime, best=runtime, candidate_id="a", best_id="b",
+        seeds=[Seed("s", "source", [], 0, "monitor", "c")], config=SelfPlayConfig(),
+        max_positions=128, output=tmp_path / "eval.json", pairs=1, adjudicate_limits=True,
+    )
+    identity = dict(candidate="a", best="b", config=SelfPlayConfig().identifier, seeds=["s"], pairs=1)
+    first = evaluation.stable_hash(str(dict(identity, inference=dict(
+        candidate={}, best={}, algorithm="gumbel", simulations=SelfPlayConfig().search.simulations,
+        exploration="zero_gumbel_noise", precision="float32", tf32=False),
+        limit_adjudication="draw")) + "0:1")
+    interval = evaluation.evaluate_pair_checkpoints(**args)
+    state = json.loads(args["output"].read_text())
+    assert state["results"]["0:1"]["status"] == "adjudicated"
+    assert state["results"]["0:1"]["outcome_white"] == 0
+    # Candidate draws as White (adjudicated) and loses as Black (White mates): 0.25.
+    assert interval["score"] == 0.25 and interval["adjudicated"] == 1
+    assert "protocol_failure" not in state
+
+
 def test_evaluation_interruption_remains_resumable(tmp_path, monkeypatch):
     from types import SimpleNamespace
     import imba_chess.self_play.evaluation as evaluation

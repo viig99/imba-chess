@@ -499,6 +499,9 @@ def main():
                     seeds=monitor,
                     config=cfg,
                     max_positions=max_positions,
+                    # Observe-only screens never promote, so a game that hits the context
+                    # or ply limit is scored as a draw rather than halting the run.
+                    adjudicate_limits=args.observe_only_screen,
                     should_stop=(lambda: budget.stop() or not budget.launch())
                     if args.until
                     else budget.stop,
