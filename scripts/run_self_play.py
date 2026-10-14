@@ -15,7 +15,7 @@ import time
 import torch
 from imba_chess.data.self_play_store import SelfPlayStore, atomic_json
 from imba_chess.self_play.collector import collect, CollectionMetrics
-from imba_chess.self_play.config import load_config
+from imba_chess.self_play.config import CollectionConfig, load_config
 from imba_chess.self_play.evaluation import (
     evaluate_pair_checkpoints,
     decision,
@@ -63,8 +63,9 @@ def main():
         "--previous-config",
         type=Path,
         help="With --resume, continue a run started under this config when only its "
-             "[learning] and [replay] sections differ from --config (an EMA switched on "
-             "starts from the current weights); a no-op once the run has been upgraded",
+             "[learning] and [replay] sections and the playout-cap fields of [collection] "
+             "differ from --config (an EMA switched on starts from the current weights); "
+             "a no-op once the run has been upgraded",
     )
     parser.add_argument(
         "--checkpoint-seconds",
@@ -194,9 +195,18 @@ def main():
                 changed = sorted(
                     k for k, v in asdict(cfg).items() if asdict(previous)[k] != v
                 )
-                if not set(changed) <= {"learning", "replay"}:
+                # Playout-cap fields only change how each new move is searched, so a run
+                # can switch them on (e.g. fast play-out of decided games) and keep its buffer.
+                collection = sorted(
+                    k for k, v in asdict(cfg.collection).items()
+                    if asdict(previous.collection)[k] != v
+                )
+                if not set(changed) <= {"learning", "replay", "collection"} or not set(
+                    collection
+                ) <= set(CollectionConfig.PLAYOUT_CAP_FIELDS):
                     raise ValueError(
-                        f"--previous-config may differ only in learning and replay: {changed}"
+                        "--previous-config may differ only in learning, replay and the "
+                        f"playout-cap collection fields: {changed} {collection}"
                     )
                 saved_config_id, previous_learning = previous.identifier, previous.learning
             if state["config_id"] != saved_config_id or state[

@@ -40,14 +40,19 @@ root_batch_tokens = 1024
 max_game_plies = 512
 fresh_positions = 24576
 inference_dtype = "bfloat16"
-# Playout cap randomization + fast play-out of decided games (off; a [collection] change, so
-# it needs a new run). Smoke test on actor-2: neural evaluations per move 252 -> 104 (2.4x).
-# playout_cap = true
-# full_search_probability = 0.25
-# fast_simulations = 64
-# fast_top_m = 8
-# decided_value = 0.98
-# decided_plies = 3
+# Fast play-out of decided games only (from iteration ~238, 2026-10-14, resumed with
+# --previous-config): every undecided move keeps the full search (full_search_probability 1, so
+# no playout cap randomization); once the last 3 root values all have |v| >= 0.98, moves get the
+# fast 64-simulation search with value targets only. On the replay buffer at iteration 235, ~40%
+# of plies came after that trigger (resigning there would have been wrong in 0.74% of games), and
+# their policy targets were flat (KL ~0.1). The matched-hours PCR test found it safe: no reversed
+# results, 0.6% draws after the trigger.
+playout_cap = true
+full_search_probability = 1.0
+fast_simulations = 64
+fast_top_m = 8
+decided_value = 0.98
+decided_plies = 3
 
 [replay]
 window_positions = 500000

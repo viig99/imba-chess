@@ -596,9 +596,20 @@ def test_runner_accepts_previous_config_and_screens_ema(tmp_path, monkeypatch):
     with pytest.raises(ValueError, match="configuration .*changed"):
         run("--resume", "--max-iterations", "2")
     cfg[0] = replace(ema, search=replace(ema.search, simulations=2))
-    with pytest.raises(ValueError, match="only in learning and replay"):
+    with pytest.raises(ValueError, match="only in learning, replay and the playout-cap"):
         run("--resume", "--previous-config", "previous", "--max-iterations", "2")
-    cfg[0] = replace(ema, replay=replace(ema.replay, window_positions=30))
+    cfg[0] = replace(ema, collection=replace(ema.collection, concurrent_games=3))
+    with pytest.raises(ValueError, match="only in learning, replay and the playout-cap"):
+        run("--resume", "--previous-config", "previous", "--max-iterations", "2")
+    # Switching on fast play-out of decided games keeps the run and its buffer.
+    cfg[0] = replace(
+        ema,
+        replay=replace(ema.replay, window_positions=30),
+        collection=replace(
+            ema.collection, playout_cap=True, full_search_probability=1.0,
+            fast_simulations=1, fast_top_m=1,
+        ),
+    )
     state = run("--resume", "--previous-config", "previous", "--max-iterations", "2")
     assert state["config_id"] == cfg[0].identifier
     assert state["ema_actor"].endswith("ema-000002.pt") and Path(state["ema_actor"]).exists()
