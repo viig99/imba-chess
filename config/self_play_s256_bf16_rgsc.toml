@@ -1,0 +1,104 @@
+# RGSC variant of self_play_s256_bf16.toml (identical otherwise: reuse 1, lr 1e-4, fast play-out of
+# decided games), started 2026-10-14 as a new run from the reuse-1 run's latest checkpoint (weights,
+# optimizer and EMA carried; empty buffer). Regret settings are part of the start-stream identity, so
+# they cannot be switched on for a running run. One launch in five restarts from the regret buffer:
+# each ordinary completed game nominates its highest suffix-regret position (mean (selected Q - z)^2
+# to the end), the 256 highest are kept, restarts are sampled with temperature 0.2 on log priority
+# (as in self_play_5090.toml), and a restart's priority moves halfway to its new regret.
+# Single-stage plain Gumbel 256 self-play from rl_initial_53250_aux3 on the 5070 Ti.
+# The final recipe of the flatten-53250 plain raw-Q lineage (stage 3, actor-205: 36.5% plain raw 512
+# vs SF2600) applied from step 0: raw Q at value_scale 0.5 (entropy-matched at 200 sims), replay 500k,
+# reuse 1, value_search_mix 0.1, policy surprise, bf16 collection, fresh_positions 8192, and the
+# lineage's later lr 1e-4 held constant (single stage, no fork-time lr drop).
+# Changes vs that lineage: 256 simulations instead of 512/1024 (more games per hour; a bigger budget
+# never helped), no visit_cap (only meaningful above ~512 sims).
+# From iteration ~189 (resumed with --previous-config): replay 1M -> 500k, reuse 1 -> 2, lr 1e-4 -> 2e-4,
+# with fresh-first sampling (every new game trained once per phase, plus as many old positions).
+# Under reuse 1 / 1M only ~10 optimizer steps ran per ~28k-position iteration and 37% of
+# positions were never trained; screens vs 53250 sat at 65-70% from iteration ~100 on.
+# From iteration ~325: reuse 2 -> 5. Offline distillation on a frozen replay snapshot
+# (scripts/distill_offline.py) kept improving the held-out prior vs Stockfish through ~4 passes
+# per position (expected loss 0.083 -> 0.070, beyond the loop's own actor at 0.079); KataGo's
+# loop caps at 8 passes and the replay-ratio paper (arXiv 2604.08706) found ~2-6 safe.
+# Reverted 2026-10-12: reuse 5 overfit. Training policy KL fell 0.60 -> 0.49 while KL on fresh
+# games rose 0.65 -> 0.70, training value loss fell 0.46 -> 0.36, screens vs 53250 fell 0.64 -> 0.54,
+# and value_weight 0.4 did not stop it. Restarted as a new run from actor-326 (last reuse-2 weights,
+# optimizer and EMA carried) with an empty buffer at reuse 1: every game trained once.
+# ema-371 (reuse 5) scored 15% vs SF2600 at 512 sims against ema-255's 34.5%. The restart also
+# raises fresh_positions 8192 -> 24576 (~47k instead of ~30k positions per iteration once the 160
+# in-flight games drain), so the drain tail is a smaller share of each phase.
+# From iteration ~236 of that restart (2026-10-14, resumed with --previous-config): lr 2e-4 -> 1e-4.
+# SF2600 had climbed only slowly (ema-130 41.5%, ema-230 43%; ~26 +- 28 Elo/day) while policy KL kept
+# easing down, the usual point for an lr step-down. Screens also moved to every 15000 games (CLI).
+base_config = "config/imba_chess_v4_aux3.toml"
+
+[search]
+simulations = 256
+top_m = 16
+max_depth = 32
+maxvisit_init = 50.0
+value_scale = 0.5
+epsilon = 1e-8
+rescale_values = false
+
+[collection]
+concurrent_games = 256
+root_batch_tokens = 1024
+max_game_plies = 512
+fresh_positions = 24576
+inference_dtype = "bfloat16"
+# Fast play-out of decided games only (from iteration ~238, 2026-10-14, resumed with
+# --previous-config): every undecided move keeps the full search (full_search_probability 1, so
+# no playout cap randomization); once the last 3 root values all have |v| >= 0.98, moves get the
+# fast 64-simulation search with value targets only. On the replay buffer at iteration 235, ~40%
+# of plies came after that trigger (resigning there would have been wrong in 0.74% of games), and
+# their policy targets were flat (KL ~0.1). The matched-hours PCR test found it safe: no reversed
+# results, 0.6% draws after the trigger.
+playout_cap = true
+full_search_probability = 1.0
+fast_simulations = 64
+fast_top_m = 8
+decided_value = 0.98
+decided_plies = 3
+
+[replay]
+window_positions = 500000
+flush_games = 16
+flush_positions = 2048
+
+[learning]
+lr = 1e-4
+value_weight = 1.0
+auxiliary_value_weight = 0.15
+auxiliary_value_lambda = [0.8, 0.9, 0.95]
+value_search_mix = 0.1
+weight_decay = 0.01
+grad_clip = 2.0
+reuse = 1.0
+microbatch_tokens = 1024
+gradient_accumulation = 4
+policy_surprise_enabled = true
+policy_surprise_fraction = 0.5
+policy_surprise_cap = 3.0
+# Weight EMA over ~200 optimizer steps (~19 iterations at ~10.6 steps each), screened next to
+# the raw actor from iteration 151 on (resumed with --enable-ema); collection keeps raw weights.
+ema_decay = 0.995
+
+[run]
+seed = 42
+hours = 48.0
+reserve_minutes = 15.0
+drain_minutes = 10.0
+screen_pairs = 50
+confirmation_pairs = 250
+
+[streaming]
+block_rows = 10000
+prefetch_blocks = 2
+startup_timeout = 900.0
+shutdown_timeout = 5.0
+
+[regret]
+capacity = 256
+temperature = 0.2
+ema_alpha = 0.5
