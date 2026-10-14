@@ -38,7 +38,9 @@ def test_render_game_html_embeds_frames_moves_and_metadata():
     assert len(frames) == 4  # start position + 3 plies
     assert frames[0]["san"] is None
     assert [frame["san"] for frame in frames[1:]] == ["e4", "e5", "Nf3"]
-    assert all("<svg" in frame["svg"] for frame in frames)
+    assert frames[0]["fen"] == chess.STARTING_BOARD_FEN
+    assert frames[3]["fen"] == "rnbqkbnr/pppp1ppp/8/4p3/4P3/5N2/PPPP1PPP/RNBQKB1R"
+    assert frames[1]["slides"] == [[chess.E2, chess.E4]]
 
 
 def test_render_game_html_handles_game_with_no_moves():
@@ -79,3 +81,15 @@ def test_render_game_html_shows_players_result_and_search_analysis():
     assert frames[1]["analysis"] is None
     assert [c["san"] for c in frames[3]["analysis"]["candidates"]] == ["g4", "d4"]
     assert frames[3]["uci"] == "g2g4" and frames[3]["player"] == "imba-chess"
+    # The eval bar holds the model's search expected score (White's view) until it moves again.
+    assert [f["white_score"] for f in frames] == [None, None, None, 0.25, 0.25]
+    assert frames[4]["check"] == chess.E1
+
+
+def test_render_game_html_slides_both_castling_pieces():
+    board = chess.Board()
+    for move_uci in ["e2e4", "e7e5", "g1f3", "b8c6", "f1c4", "g8f6", "e1g1"]:
+        board.push_uci(move_uci)
+    frames = _extract_frames(render_game_html(chess.pgn.Game.from_board(board)))
+    assert frames[-1]["san"] == "O-O"
+    assert frames[-1]["slides"] == [[chess.E1, chess.G1], [chess.H1, chess.F1]]
