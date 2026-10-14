@@ -318,8 +318,28 @@ def test_save_traced_game_writes_pgn_and_html(tmp_path):
     assert '[Black "imba-chess"]' in pgn_text
     assert '[Result "*"]' in pgn_text
     assert "1. e4 e5" in pgn_text
+    assert '[Termination "ply limit"]' in pgn_text
     html_path = save_games_dir / "sf_elo_1400_game002_incomplete.html"
     assert html_path.read_text(encoding="utf-8").startswith("<!doctype html>")
+
+
+def test_gumbel_analysis_keeps_top_candidates_and_the_played_move():
+    import math
+    from types import SimpleNamespace
+    module = _load_eval_script_module()
+    vocab = SimpleNamespace(decode=lambda i: ["e2e4", "d2d4", "g1f3", "a2a3"][i])
+    result = SimpleNamespace(
+        legal_ids=[0, 1, 2, 3], move_id=3, root_log_priors=[math.log(p) for p in (0.4, 0.3, 0.2, 0.1)],
+        visits=[10, 30, 20, 0], policy=[0.2, 0.5, 0.25, 0.05], qvalues=[0.1, 0.3, 0.2, 0.0],
+        root_wdl=(0.2, 0.3, 0.5), search_wdl=None, simulations=60,
+    )
+
+    analysis = module._gumbel_analysis(result, vocab, top=2)
+
+    assert [c["uci"] for c in analysis["candidates"]] == ["d2d4", "g1f3", "a2a3"]
+    assert analysis["candidates"][0]["prior"] == pytest.approx(0.3)
+    assert analysis["wdl"] == [0.2, 0.3, 0.5] and analysis["search_wdl"] is None
+    assert analysis["legal_moves"] == 4
 
 
 class _DummyHalvingModel(torch.nn.Module):

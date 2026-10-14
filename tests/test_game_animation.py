@@ -49,3 +49,33 @@ def test_render_game_html_handles_game_with_no_moves():
     frames = _extract_frames(html)
     assert len(frames) == 1
     assert frames[0]["san"] is None
+
+
+def test_render_game_html_shows_players_result_and_search_analysis():
+    board = chess.Board()
+    for move_uci in ["f2f3", "e7e5", "g2g4", "d8h4"]:
+        board.push_uci(move_uci)
+    game = chess.pgn.Game.from_board(board)
+    game.headers["Event"] = "sf_elo_2600"
+    game.headers["White"] = "imba-chess"
+    game.headers["Black"] = "Stockfish (elo=2600)"
+    game.headers["Result"] = "0-1"
+    game.headers["Termination"] = "checkmate"
+    analysis = dict(
+        wdl=[0.5, 0.3, 0.2], search_wdl=[0.6, 0.3, 0.1], simulations=512, legal_moves=20,
+        candidates=[
+            dict(uci="g2g4", prior=0.4, visits=300, q=-0.25, policy=0.6),
+            dict(uci="d2d4", prior=0.3, visits=0, q=0.0, policy=0.1),
+        ],
+    )
+
+    html = render_game_html(game, analyses={3: analysis})
+
+    assert "White: imba-chess" in html and "Black: Stockfish (elo=2600)" in html
+    assert "Stockfish (elo=2600) (Black) wins by checkmate · 0-1" in html
+    frames = _extract_frames(html)
+    assert [f["color"] for f in frames[1:]] == ["White", "Black", "White", "Black"]
+    assert [f["move_number"] for f in frames[1:]] == [1, 1, 2, 2]
+    assert frames[1]["analysis"] is None
+    assert [c["san"] for c in frames[3]["analysis"]["candidates"]] == ["g4", "d4"]
+    assert frames[3]["uci"] == "g2g4" and frames[3]["player"] == "imba-chess"

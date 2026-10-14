@@ -3,6 +3,7 @@ from imba_chess.eval.inference_runtime import INFERENCE_DTYPES, RUNTIME_REVISION
 from imba_chess.eval.gumbel_search import GumbelConfig
 import argparse
 import json
+import math
 import os
 import random
 import time
@@ -314,7 +315,39 @@ def _select_model_move_stepwise(
             terminal_hits=result.terminal_hits,
             depth_cutoffs=result.depth_cutoffs,
         )
+    if runtime.algorithm == "gumbel":
+        debug["analysis"] = _gumbel_analysis(result, runtime.move_vocab)
     return (chess.Move.from_uci(result.move_uci), debug)
+
+
+def _gumbel_analysis(result, move_vocab, top=8):
+    """The model's view of one move for the saved-game viewer, side-to-move POV:
+    network and search WDL (loss, draw, win) and the most-visited candidates
+    (always including the played move) with prior, visits, Q and search policy."""
+    priors = [math.exp(p) for p in result.root_log_priors]
+    order = sorted(
+        range(len(result.legal_ids)), key=lambda i: (-result.visits[i], -result.policy[i])
+    )
+    rows = order[:top]
+    chosen = result.legal_ids.index(result.move_id)
+    if chosen not in rows:
+        rows.append(chosen)
+    return dict(
+        wdl=None if result.root_wdl is None else list(result.root_wdl),
+        search_wdl=None if result.search_wdl is None else list(result.search_wdl),
+        simulations=result.simulations,
+        legal_moves=len(result.legal_ids),
+        candidates=[
+            dict(
+                uci=move_vocab.decode(result.legal_ids[i]),
+                prior=priors[i],
+                visits=result.visits[i],
+                q=result.qvalues[i],
+                policy=result.policy[i],
+            )
+            for i in rows
+        ],
+    )
 
 
 def _update_summary(
@@ -522,10 +555,12 @@ def _save_traced_game(
     stockfish_label: str,
     game_idx: int,
     save_games_dir: Path,
+    analyses: dict[int, dict] | None = None,
 ) -> None:
     """Overwrites {segment}_game{N:03d}_{outcome}.*; if outcome changes between
     reruns (e.g. nondeterministic engine timing), the prior file is orphaned —
-    use a different --save-games-dir to keep runs side by side."""
+    use a different --save-games-dir to keep runs side by side. analyses maps a
+    1-based ply to the model's search analysis of the move played there."""
     game = chess.pgn.Game.from_board(board)
     game.headers["Event"] = segment_name
     game.headers["White"] = (
@@ -535,6 +570,7 @@ def _save_traced_game(
         stockfish_label if model_color == chess.WHITE else "imba-chess"
     )
     game.headers["Result"] = result
+    game.headers["Termination"] = _termination_label(board=board, completed=completed)
     outcome = _outcome_label(
         completed=completed, result=result, model_color=model_color
     )
@@ -542,8 +578,17 @@ def _save_traced_game(
     save_games_dir.mkdir(parents=True, exist_ok=True)
     (save_games_dir / f"{base_name}.pgn").write_text(str(game), encoding="utf-8")
     (save_games_dir / f"{base_name}.html").write_text(
-        render_game_html(game), encoding="utf-8"
+        render_game_html(game, analyses=analyses), encoding="utf-8"
     )
+
+
+def _termination_label(*, board: chess.Board, completed: bool) -> str:
+    if not completed:
+        return "ply limit"
+    outcome = board.outcome(claim_draw=True)
+    if outcome is None:
+        return "unfinished"
+    return outcome.termination.name.lower().replace("_", " ")
 
 
 def _build_segment_options(
@@ -671,6 +716,8 @@ def _play_game(
     model_color = chess.WHITE if game_idx % 2 == 0 else chess.BLACK
     completed = True
     plies = 0
+    saving = save_games_dir is not None and game_idx < debug_trace_games
+    analyses: dict[int, dict] = {}
     while not board.is_game_over(claim_draw=True):
         if plies >= max_plies:
             completed = False
@@ -697,6 +744,8 @@ def _play_game(
                 if game_idx < debug_trace_games and plies < debug_trace_max_plies
                 else 0,
             )
+            if saving and "analysis" in debug_info:
+                analyses[plies + 1] = debug_info["analysis"]
             summary.model_turns += 1
             summary.model_selection_seconds += time.perf_counter() - selection_start
             search.merge_search_stats(
@@ -739,7 +788,7 @@ def _play_game(
         board.push(move)
         plies += 1
     result = board.result(claim_draw=True) if completed else "*"
-    if save_games_dir is not None and game_idx < debug_trace_games:
+    if saving:
         _save_traced_game(
             board=board,
             model_color=model_color,
@@ -749,6 +798,7 @@ def _play_game(
             stockfish_label=stockfish_label,
             game_idx=game_idx,
             save_games_dir=save_games_dir,
+            analyses=analyses,
         )
     _update_summary(
         summary,
