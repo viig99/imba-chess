@@ -1288,6 +1288,17 @@ def test_playout_cap_decided_games_use_the_fast_search_without_policy_targets():
     assert sample["has_value_target"] == [False] + [True] * 7  # every move keeps its value target
 
 
+def test_playout_cap_decided_needs_both_players_to_agree_on_the_winner():
+    from imba_chess.self_play.config import CollectionConfig
+
+    collection = CollectionConfig(playout_cap=True, full_search_probability=1.0,
+                                  decided_value=0.98, decided_plies=2)
+    # Side-to-move values: each player in turn is sure it is winning, so never decided.
+    runtime = PlayoutRuntime([0.99, 0.99, 0.99, 0.99, 0.99, 0.99, 0.99])
+    game = playout_game(runtime, collection)
+    assert {t["search_kind"] for t in game["targets"]} == {"full"}
+
+
 def test_playout_cap_coin_flips_are_seeded_per_game():
     from imba_chess.self_play.config import CollectionConfig
 

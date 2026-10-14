@@ -37,6 +37,14 @@ def terminal_outcome(board):
     ), outcome.termination.name.lower()
 
 
+def _agreed_decided(recent, threshold):
+    """Every recent root value is confident and all agree on the winner. Root values
+    are side-to-move POV, so they alternate sign across plies when both players
+    expect the same side to win; two players each sure of winning is not decided."""
+    common = [t["root_value"] * (-1) ** (len(recent) - 1 - i) for i, t in enumerate(recent)]
+    return all(v >= threshold for v in common) or all(v <= -threshold for v in common)
+
+
 def play_game(
     *,
     seed,
@@ -125,8 +133,8 @@ def play_game(
                 # Drawn every move, decided or not, so each ply's flip is fixed by the game seed.
                 full = cap_rng.random() < playout_cap.full_search_probability
                 recent = game["targets"][-playout_cap.decided_plies:]
-                if len(recent) == playout_cap.decided_plies and all(
-                    abs(t["root_value"]) >= playout_cap.decided_value for t in recent
+                if len(recent) == playout_cap.decided_plies and _agreed_decided(
+                    recent, playout_cap.decided_value
                 ):
                     kind = "decided"
                 elif not full:
