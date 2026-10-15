@@ -262,11 +262,11 @@ def _mate_in_one_setup():
 def test_stockfish_label_formats_limited_and_full_strength():
     module = _load_eval_script_module()
     assert (
-        module._stockfish_label(limit_strength=True, elo=1400) == "Stockfish (elo=1400)"
+        module._stockfish_label(limit_strength=True, elo=1400) == "SF@1400"
     )
     assert (
         module._stockfish_label(limit_strength=False, elo=None)
-        == "Stockfish (full strength)"
+        == "SF (full strength)"
     )
 
 
@@ -306,7 +306,7 @@ def test_save_traced_game_writes_pgn_html_and_gif(tmp_path):
         result="*",
         completed=False,
         segment_name="sf_elo_1400",
-        stockfish_label="Stockfish (elo=1400)",
+        stockfish_label="SF@1400",
         game_idx=1,
         save_games_dir=save_games_dir,
     )
@@ -314,8 +314,8 @@ def test_save_traced_game_writes_pgn_html_and_gif(tmp_path):
         encoding="utf-8"
     )
     assert '[Event "sf_elo_1400"]' in pgn_text
-    assert '[White "Stockfish (elo=1400)"]' in pgn_text
-    assert '[Black "imba-chess"]' in pgn_text
+    assert '[White "SF@1400"]' in pgn_text
+    assert '[Black "US"]' in pgn_text
     assert '[Result "*"]' in pgn_text
     assert "1. e4 e5" in pgn_text
     assert '[Termination "ply limit"]' in pgn_text
@@ -328,7 +328,7 @@ def test_save_traced_game_writes_pgn_html_and_gif(tmp_path):
         result="*",
         completed=False,
         segment_name="sf_elo_1400",
-        stockfish_label="Stockfish (elo=1400)",
+        stockfish_label="SF@1400",
         game_idx=0,
         save_games_dir=save_games_dir,
     )

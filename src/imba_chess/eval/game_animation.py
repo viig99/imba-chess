@@ -180,7 +180,7 @@ __HEADER_HTML__
     <section class="card" id="info"></section>
     <section class="card">
       <h2>Scoresheet</h2>
-      <div class="muted">imba-chess's moves are in brown, with its search's expected score for the move it played.</div>
+      <div class="muted">Our moves are in brown, with the search's expected score for the move it played.</div>
       <div class="sheet" id="sheet"></div>
     </section>
   </div>
@@ -449,7 +449,7 @@ def render_game_html(
     headers = game.headers
     summary = _result_summary(headers)
     analysed = {f["player"] for f in frames[1:] if f["analysis"] is not None}
-    model = next(iter(analysed)) if len(analysed) == 1 else "imba-chess"
+    model = next(iter(analysed)) if len(analysed) == 1 else "US"
     game_json = dict(
         summary=summary,
         event=headers.get("Event", "?"),

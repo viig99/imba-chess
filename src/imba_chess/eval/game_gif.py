@@ -129,7 +129,7 @@ class _Renderer:
         self.game, self.frames = game, frames
         self.white, self.black = game.headers["White"], game.headers["Black"]
         analysed = {f["player"] for f in frames[1:] if f["analysis"] is not None}
-        self.model = next(iter(analysed)) if len(analysed) == 1 else "imba-chess"
+        self.model = next(iter(analysed)) if len(analysed) == 1 else "US"
         self.rows = self._rows()
         self.layout = _Layout(len(self.rows))
 

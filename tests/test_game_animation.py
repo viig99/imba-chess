@@ -14,8 +14,8 @@ def _short_game() -> chess.pgn.Game:
         board.push_uci(move_uci)
     game = chess.pgn.Game.from_board(board)
     game.headers["Event"] = "sf_elo_1400"
-    game.headers["White"] = "imba-chess"
-    game.headers["Black"] = "Stockfish (elo=1400)"
+    game.headers["White"] = "US"
+    game.headers["Black"] = "SF@1400"
     game.headers["Result"] = "*"
     return game
 
@@ -30,7 +30,7 @@ def test_render_game_html_embeds_frames_moves_and_metadata():
     html = render_game_html(_short_game())
 
     assert html.startswith("<!doctype html>")
-    assert "imba-chess vs Stockfish (elo=1400)" in html
+    assert "US vs SF@1400" in html
     assert "Event: sf_elo_1400" in html
     assert "Plies: 3" in html
 
@@ -59,8 +59,8 @@ def test_render_game_html_shows_players_result_and_search_analysis():
         board.push_uci(move_uci)
     game = chess.pgn.Game.from_board(board)
     game.headers["Event"] = "sf_elo_2600"
-    game.headers["White"] = "imba-chess"
-    game.headers["Black"] = "Stockfish (elo=2600)"
+    game.headers["White"] = "US"
+    game.headers["Black"] = "SF@2600"
     game.headers["Result"] = "0-1"
     game.headers["Termination"] = "checkmate"
     analysis = dict(
@@ -73,14 +73,14 @@ def test_render_game_html_shows_players_result_and_search_analysis():
 
     html = render_game_html(game, analyses={3: analysis})
 
-    assert "White: imba-chess" in html and "Black: Stockfish (elo=2600)" in html
-    assert "Stockfish (elo=2600) (Black) wins by checkmate · 0-1" in html
+    assert "White: US" in html and "Black: SF@2600" in html
+    assert "SF@2600 (Black) wins by checkmate · 0-1" in html
     frames = _extract_frames(html)
     assert [f["color"] for f in frames[1:]] == ["White", "Black", "White", "Black"]
     assert [f["move_number"] for f in frames[1:]] == [1, 1, 2, 2]
     assert frames[1]["analysis"] is None
     assert [c["san"] for c in frames[3]["analysis"]["candidates"]] == ["g4", "d4"]
-    assert frames[3]["uci"] == "g2g4" and frames[3]["player"] == "imba-chess"
+    assert frames[3]["uci"] == "g2g4" and frames[3]["player"] == "US"
     # The eval bar holds the model's search expected score (White's view) until it moves again.
     assert [f["white_score"] for f in frames] == [None, None, None, 0.25, 0.25]
     assert frames[4]["check"] == chess.E1
@@ -122,7 +122,7 @@ def test_render_game_gif_draws_eval_bar_extremes(tmp_path):
     for move_uci in ["f2f3", "e7e5", "g2g4", "d8h4"]:
         board.push_uci(move_uci)
     game = chess.pgn.Game.from_board(board)
-    game.headers.update(Event="sf", White="imba-chess", Black="Stockfish", Result="0-1")
+    game.headers.update(Event="sf", White="US", Black="Stockfish", Result="0-1")
     for i, wdl in enumerate(([1.0, 0.0, 0.0], [0.0, 0.0, 1.0], [0.999, 0.001, 0.0], [0.5, 0.0, 0.5])):
         analysis = dict(wdl=wdl, search_wdl=wdl, simulations=1, legal_moves=1,
                         candidates=[dict(uci="f2f3", prior=1.0, visits=1, q=0.0, policy=1.0)])

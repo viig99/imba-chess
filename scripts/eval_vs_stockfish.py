@@ -527,10 +527,13 @@ def _print_segment_summary(*, segment_name: str, payload: dict[str, Any]) -> Non
     print(f"  as_black (W/D/L): {black['wins']}/{black['draws']}/{black['losses']}")
 
 
+MODEL_LABEL = "US"
+
+
 def _stockfish_label(*, limit_strength: bool, elo: int | None) -> str:
     if limit_strength:
-        return f"Stockfish (elo={elo})"
-    return "Stockfish (full strength)"
+        return f"SF@{elo}"
+    return "SF (full strength)"
 
 
 def _outcome_label(*, completed: bool, result: str, model_color: chess.Color) -> str:
@@ -565,10 +568,10 @@ def _save_traced_game(
     game = chess.pgn.Game.from_board(board)
     game.headers["Event"] = segment_name
     game.headers["White"] = (
-        "imba-chess" if model_color == chess.WHITE else stockfish_label
+        MODEL_LABEL if model_color == chess.WHITE else stockfish_label
     )
     game.headers["Black"] = (
-        stockfish_label if model_color == chess.WHITE else "imba-chess"
+        stockfish_label if model_color == chess.WHITE else MODEL_LABEL
     )
     game.headers["Result"] = result
     game.headers["Termination"] = _termination_label(board=board, completed=completed)
