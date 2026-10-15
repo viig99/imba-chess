@@ -21,6 +21,7 @@ from imba_chess.eval import search
 from imba_chess.eval.batch_scheduler import BatchScheduler, WorkRequest
 from imba_chess.eval.engine_pool import EnginePool, make_sf_move_executor
 from imba_chess.eval.game_animation import render_game_html
+from imba_chess.eval.game_gif import render_game_gif
 from imba_chess.eval.position_evaluator import _SequenceHistory
 from imba_chess.eval.search import HalvingConfig
 from tqdm.auto import tqdm
@@ -580,6 +581,7 @@ def _save_traced_game(
     (save_games_dir / f"{base_name}.html").write_text(
         render_game_html(game, analyses=analyses), encoding="utf-8"
     )
+    render_game_gif(game, save_games_dir / f"{base_name}.gif", analyses=analyses)
 
 
 def _termination_label(*, board: chess.Board, completed: bool) -> str:

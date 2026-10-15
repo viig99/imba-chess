@@ -93,3 +93,22 @@ def test_render_game_html_slides_both_castling_pieces():
     frames = _extract_frames(render_game_html(chess.pgn.Game.from_board(board)))
     assert frames[-1]["san"] == "O-O"
     assert frames[-1]["slides"] == [[chess.E1, chess.G1], [chess.H1, chess.F1]]
+
+
+def test_render_game_gif_frames_and_timing(tmp_path):
+    from PIL import Image
+
+    from imba_chess.eval.game_gif import render_game_gif
+
+    path = tmp_path / "game.gif"
+    render_game_gif(_short_game(), path)
+    with Image.open(path) as gif:
+        assert gif.n_frames == 1 + 1 + 3 * 6 + 1
+        durations = []
+        for i in range(gif.n_frames):
+            gif.seek(i)
+            durations.append(gif.info["duration"])
+    assert durations[0] == 3000 and durations[1] == 1000  # title card, start position
+    # GIF delays are whole centiseconds, so a 1/24 s frame is stored as 40 ms.
+    assert durations[2:7] == [40] * 5 and durations[7] == 1040  # glide, then land and pause
+    assert durations[-2] == 3040 and durations[-1] == 2000  # final hold, result card

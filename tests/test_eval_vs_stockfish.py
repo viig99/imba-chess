@@ -294,7 +294,7 @@ def test_outcome_label_covers_all_cases():
     )
 
 
-def test_save_traced_game_writes_pgn_and_html(tmp_path):
+def test_save_traced_game_writes_pgn_html_and_gif(tmp_path):
     module = _load_eval_script_module()
     board = chess.Board()
     for move_uci in ["e2e4", "e7e5"]:
@@ -321,6 +321,10 @@ def test_save_traced_game_writes_pgn_and_html(tmp_path):
     assert '[Termination "ply limit"]' in pgn_text
     html_path = save_games_dir / "sf_elo_1400_game002_incomplete.html"
     assert html_path.read_text(encoding="utf-8").startswith("<!doctype html>")
+    from PIL import Image
+    with Image.open(save_games_dir / "sf_elo_1400_game002_incomplete.gif") as gif:
+        # Title card, start position, 5 glide frames and a landing frame per ply, result card.
+        assert gif.n_frames == 1 + 1 + 2 * 6 + 1
 
 
 def test_gumbel_analysis_keeps_top_candidates_and_the_played_move():

@@ -281,8 +281,9 @@ function drawEval() {
   const bottom = $("evalBottom"), top = $("evalTop");
   bottom.style.color = bottomWhite ? "var(--ebony)" : "#f7f1e3";
   top.style.color = bottomWhite ? "#f7f1e3" : "var(--ebony)";
-  bottom.textContent = known ? Math.round(100 * share) : "";
-  top.textContent = known ? Math.round(100 * (1 - share)) : "";
+  // Like lichess, only the side ahead shows its number, at its own end of the bar.
+  bottom.textContent = known && share >= 0.5 ? Math.round(100 * share) : "";
+  top.textContent = known && share < 0.5 ? Math.round(100 * (1 - share)) : "";
   $("evalbar").title = known
     ? `${GAME.model}'s search: White's expected score ${pct(white)} (updated on ${GAME.model}'s moves)`
     : `No estimate yet: ${GAME.model} has not moved`;
