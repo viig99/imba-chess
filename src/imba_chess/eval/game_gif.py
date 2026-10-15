@@ -193,8 +193,9 @@ class _Renderer:
         top, bottom = lay.case_y, lay.case_y + CASE - 1
         draw.rectangle([lay.bar_x, top, lay.bar_x + BAR_W - 1, bottom], fill=(43, 36, 32), outline=(85, 69, 58))
         share = 0.5 if white is None else white
-        split = round(bottom - share * (bottom - top))
-        draw.rectangle([lay.bar_x + 1, split, lay.bar_x + BAR_W - 2, bottom - 1], fill=IVORY)
+        split = max(top + 1, round(bottom - share * (bottom - top)))
+        if split < bottom:  # nothing to fill when White's score rounds to 0
+            draw.rectangle([lay.bar_x + 1, split, lay.bar_x + BAR_W - 2, bottom - 1], fill=IVORY)
         if white is not None:
             num = _font("mono", 9)
             cx = lay.bar_x + BAR_W // 2

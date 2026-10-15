@@ -112,3 +112,19 @@ def test_render_game_gif_frames_and_timing(tmp_path):
     # GIF delays are whole centiseconds, so a 1/24 s frame is stored as 40 ms.
     assert durations[2:7] == [40] * 5 and durations[7] == 1040  # glide, then land and pause
     assert durations[-2] == 3040 and durations[-1] == 2000  # final hold, result card
+
+
+def test_render_game_gif_draws_eval_bar_extremes(tmp_path):
+    from imba_chess.eval.game_gif import render_game_gif
+
+    # A fool's mate with the model as White: its search says it is lost, then winning, then sure.
+    board = chess.Board()
+    for move_uci in ["f2f3", "e7e5", "g2g4", "d8h4"]:
+        board.push_uci(move_uci)
+    game = chess.pgn.Game.from_board(board)
+    game.headers.update(Event="sf", White="imba-chess", Black="Stockfish", Result="0-1")
+    for i, wdl in enumerate(([1.0, 0.0, 0.0], [0.0, 0.0, 1.0], [0.999, 0.001, 0.0], [0.5, 0.0, 0.5])):
+        analysis = dict(wdl=wdl, search_wdl=wdl, simulations=1, legal_moves=1,
+                        candidates=[dict(uci="f2f3", prior=1.0, visits=1, q=0.0, policy=1.0)])
+        render_game_gif(game, tmp_path / f"game{i}.gif", analyses={1: analysis})
+        assert (tmp_path / f"game{i}.gif").stat().st_size > 0
