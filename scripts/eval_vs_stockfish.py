@@ -581,7 +581,8 @@ def _save_traced_game(
     (save_games_dir / f"{base_name}.html").write_text(
         render_game_html(game, analyses=analyses), encoding="utf-8"
     )
-    render_game_gif(game, save_games_dir / f"{base_name}.gif", analyses=analyses)
+    if game_idx == 0:  # GIFs run ~5 MB, so only each run's first game gets one
+        render_game_gif(game, save_games_dir / f"{base_name}.gif", analyses=analyses)
 
 
 def _termination_label(*, board: chess.Board, completed: bool) -> str:

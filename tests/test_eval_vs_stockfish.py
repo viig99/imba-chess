@@ -321,8 +321,19 @@ def test_save_traced_game_writes_pgn_html_and_gif(tmp_path):
     assert '[Termination "ply limit"]' in pgn_text
     html_path = save_games_dir / "sf_elo_1400_game002_incomplete.html"
     assert html_path.read_text(encoding="utf-8").startswith("<!doctype html>")
+    assert not (save_games_dir / "sf_elo_1400_game002_incomplete.gif").exists()
+    module._save_traced_game(
+        board=board,
+        model_color=chess.WHITE,
+        result="*",
+        completed=False,
+        segment_name="sf_elo_1400",
+        stockfish_label="Stockfish (elo=1400)",
+        game_idx=0,
+        save_games_dir=save_games_dir,
+    )
     from PIL import Image
-    with Image.open(save_games_dir / "sf_elo_1400_game002_incomplete.gif") as gif:
+    with Image.open(save_games_dir / "sf_elo_1400_game001_incomplete.gif") as gif:
         # Title card, start position, 5 glide frames and a landing frame per ply, result card.
         assert gif.n_frames == 1 + 1 + 2 * 6 + 1
 
