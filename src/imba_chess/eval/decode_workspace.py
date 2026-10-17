@@ -100,7 +100,12 @@ class DecodeWorkspace:
         self.numpy = None
         self.slots = {}
         self.free_rows = []
-        self.arena = None
+        # K/V of every evaluated node: one [layers, 2 (K, V), rows, heads, dim]
+        # tensor, so a wave's scatter and ancestor gather are one operation each.
+        self.arena_stack = self.arena = None
+        self.branch_stack = None
+        self._gather_views = {}
+        self._aranges = {}
         self.host = self.metadata = self.branch = None
         self.row_owners = []
         self.batch_capacity = self.prefix_capacity = self.legal_capacity = 0
@@ -130,17 +135,19 @@ class DecodeWorkspace:
     def _grow_arena(self, reference):
         old = self.row_capacity
         size = max(256, old * 2)
-        arena = tuple(
-            t.new_zeros((len(reference), size, t.size(0), t.size(-1)))
-            for t in reference[0]
-        )
-        if self.arena is not None:
-            for target, source in zip(arena, self.arena):
-                target[:, :old].copy_(source)
-                self.counters["arena_growth_copy_bytes"] += (
-                    source.numel() * source.element_size()
-                )
-        self.arena, self.row_capacity = arena, size
+        k = reference[0][0]
+        if any(t.shape != k.shape or t.dtype != k.dtype for pair in reference for t in pair):
+            raise ValueError("decoder layers must share one K/V shape and dtype")
+        stack = k.new_zeros((len(reference), 2, size, k.size(0), k.size(-1)))
+        if self.arena_stack is not None:
+            stack[:, :, :old].copy_(self.arena_stack)
+            self.counters["arena_growth_copy_bytes"] += (
+                self.arena_stack.numel() * self.arena_stack.element_size()
+            )
+        self.arena_stack, self.row_capacity = stack, size
+        # Per-kind views ([layers, rows, heads, dim]) for inspection and tests.
+        self.arena = (stack[:, 0], stack[:, 1])
+        self._gather_views = {}
         # Row zero is permanent zero padding, never assigned to a node.
         self.free_rows.extend(range(size - 1, max(1, old) - 1, -1))
         self.counters["arena_growths"] += 1
@@ -255,8 +262,9 @@ class DecodeWorkspace:
             self.batch_capacity = max(self.batch_capacity, _capacity(g))
             self.prefix_capacity = max(self.prefix_capacity, _capacity(p))
             ref = requests[0].prefix_kv
+            k = ref[0][0]
             # Match the reference's independent input storages. Shared layer
-            # views can select numerically different cold-compiled graphs.
+            # views select numerically different cold-compiled graphs.
             self.branch = [
                 tuple(
                     t.new_empty(
@@ -266,6 +274,11 @@ class DecodeWorkspace:
                 )
                 for pair in ref
             ]
+            # One gather fills this scratch for every layer's K and V.
+            self.branch_stack = k.new_empty(
+                (len(ref), 2, self.batch_capacity, k.size(0), self.capacity, k.size(-1))
+            )
+            self._gather_views = {}
             self.branch_gather_width = None
             # The reference packs prefixes outside inference_mode. Preserve
             # that dispatch metadata too: inference tensors can select a
@@ -403,29 +416,42 @@ class DecodeWorkspace:
                 t.numel() * t.element_size() for t in padding
             )
         self.branch_gather_width = width
-        indices = self.device_fields[3][:, :width]
-        suffix = []
-        for layer, pair in enumerate(self.branch):
-            targets = []
-            for arena, buffer in zip(self.arena, pair):
-                target = buffer[:g]
-                if width:
-                    source = arena[layer].permute(1, 0, 2)[None].expand(g, -1, -1, -1)
-                    selected = target[:, :, :width]
-                    gather_indices = indices[:, None, :, None].expand_as(selected)
-                    torch.gather(source, 2, gather_indices, out=selected)
-                    self.counters["gather_bytes"] += (
-                        selected.numel() * selected.element_size()
-                    )
-                targets.append(target)
-            suffix.append(tuple(targets))
+        views = self._gather_views.get((g, width))
+        if views is None:
+            # Every layer's K and V in one gather, [layers, 2, g, heads, width,
+            # dim], then one multi-tensor copy into the layers' own buffers.
+            stack = self.arena_stack
+            selected = self.branch_stack[:, :, :g, :, :width]
+            source = stack.permute(0, 1, 3, 2, 4)[:, :, None].expand(
+                -1, -1, g, -1, -1, -1
+            )
+            targets = [buffer[:g, :, :width] for buffer in buffers]
+            sources = [selected[layer, kind] for layer in range(len(self.branch)) for kind in (0, 1)]
+            suffix = [tuple(buffer[:g] for buffer in pair) for pair in self.branch]
+            views = self._gather_views[(g, width)] = (selected, source, targets, sources, suffix)
+        selected, source, targets, sources, suffix = views
+        if width:
+            indices = self.device_fields[3][:, :width]
+            torch.gather(
+                source, 4, indices[None, None, :, None, :, None].expand_as(selected),
+                out=selected,
+            )
+            torch._foreach_copy_(targets, sources)
+            self.counters["gather_bytes"] += selected.numel() * selected.element_size()
         self.counters[f"branch_gather_width_{width}_batches"] += 1
         return suffix
 
     def _prepare_attention(self, p, positions, lengths, depths):
         max_pos = self.runner.model.layers[0]._max_seq_len
-        prefix_pos = torch.arange(p, device=self.device)[None, :]
-        branch_pos = torch.arange(self.capacity, device=self.device)[None, :]
+        # Position ranges are constants per prefix length; never mutated below.
+        prefix_pos = self._aranges.get(p)
+        if prefix_pos is None:
+            prefix_pos = self._aranges[p] = torch.arange(p, device=self.device)[None, :]
+        branch_pos = self._aranges.get("branch")
+        if branch_pos is None:
+            branch_pos = self._aranges["branch"] = torch.arange(
+                self.capacity, device=self.device
+            )[None, :]
         prefix_rel = (prefix_pos - positions[:, None] + max_pos - 1).clamp(
             0, 2 * max_pos - 2
         )
@@ -465,10 +491,12 @@ class DecodeWorkspace:
             owner = slot.owner()
             if owner is not None:
                 owner._validate_handles(req.nodes)
-        for i, arena in enumerate(self.arena):
-            rows = torch.stack([pair[i].squeeze(2) for pair in out["kv"]])
-            arena.index_copy_(1, self.device_fields[2][3], rows)
-            self.counters["scatter_bytes"] += rows.numel() * rows.element_size()
+        # Every layer's new K and V rows in one scatter: [layers, 2, g, heads, dim].
+        layers = len(out["kv"])
+        rows = torch.stack([t.squeeze(2) for pair in out["kv"] for t in pair])
+        rows = rows.view(layers, 2, *rows.shape[1:])
+        self.arena_stack.index_copy_(2, self.device_fields[2][3], rows)
+        self.counters["scatter_bytes"] += rows.numel() * rows.element_size()
         for req, chain, (_, dest) in zip(requests, chains, slots_rows):
             req.nodes[0].arena_chain = chain + [dest]
         picked = out["logits"].float().gather(1, self.device_fields[4][:, :width])

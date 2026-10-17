@@ -223,3 +223,18 @@ def test_forcing_covers_promotion_capture_and_check_distinctly() -> None:
     assert flags["a7b8q"] is True, "promotion that is also a capture"
     assert flags["g1g8"] is True, "quiet move giving check"
     assert flags["a1a2"] is False, "quiet king move"
+
+
+@pytest.mark.parametrize("board", _POSITIONS)
+def test_lean_projection_matches_the_list_projection(board: chess.Board) -> None:
+    """The native LegalSet, including its lazily computed forcing flags, holds
+    exactly what project_legal_moves returns as Python lists."""
+    native_board = _native_board(board)
+    ids, moves, ucis, forcing, total = cozy_bridge.project_legal_moves(
+        native_board, _STATIC_VOCAB
+    )
+    lean = cozy_bridge.project_legal_lean(native_board, _STATIC_VOCAB)
+    assert len(lean) == len(ids) and lean.total == total
+    assert lean.ids == ids and lean.ucis == ucis
+    assert [_move_fields(m) for m in lean.moves] == [_move_fields(m) for m in moves]
+    assert lean.forcing == forcing == _python_forcing(board, ucis)

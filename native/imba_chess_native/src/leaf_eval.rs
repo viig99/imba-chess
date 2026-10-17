@@ -21,6 +21,7 @@ use crate::board::Board;
 use crate::board_state::{encode, EncodeConfig};
 use crate::chess_move::ChessMove;
 use crate::gumbel::NodeStats;
+use crate::move_projector::is_forcing;
 
 /// One node's mapped legal moves in canonical UCI order (see MoveProjector).
 #[pyclass(frozen)]
@@ -28,8 +29,17 @@ pub struct LegalSet {
     pub(crate) ids: Vec<i64>,
     pub(crate) moves: Vec<cozy_chess::Move>,
     pub(crate) ucis: Vec<Arc<str>>,
-    pub(crate) forcing: Vec<bool>,
+    pub(crate) forcing: std::sync::OnceLock<Vec<bool>>,
+    pub(crate) board: cozy_chess::Board,
     pub(crate) total: usize,
+}
+
+impl LegalSet {
+    /// Promotion, capture or check per move, computed once on first use.
+    fn forcing_flags(&self) -> &Vec<bool> {
+        self.forcing
+            .get_or_init(|| self.moves.iter().map(|mv| is_forcing(&self.board, *mv)).collect())
+    }
 }
 
 #[pymethods]
@@ -61,7 +71,7 @@ impl LegalSet {
 
     #[getter]
     fn forcing(&self) -> Vec<bool> {
-        self.forcing.clone()
+        self.forcing_flags().clone()
     }
 }
 
@@ -174,15 +184,17 @@ pub struct LeafEvaluation {
     value: f64,
     wdl: [f64; 3],
     priors: Vec<f64>,
-    ids: Vec<i64>,
-    moves: Vec<cozy_chess::Move>,
-    ucis: Vec<Arc<str>>,
-    forcing: Vec<bool>,
+    // The node's projection, shared rather than copied.
+    legal: Py<LegalSet>,
 }
 
 impl LeafEvaluation {
+    fn legal(&self) -> &LegalSet {
+        self.legal.get()
+    }
+
     fn checked(&self, index: usize) -> PyResult<usize> {
-        if index < self.ids.len() {
+        if index < self.legal().ids.len() {
             Ok(index)
         } else {
             Err(PyValueError::new_err("legal move index out of range"))
@@ -193,7 +205,7 @@ impl LeafEvaluation {
 #[pymethods]
 impl LeafEvaluation {
     fn __len__(&self) -> usize {
-        self.ids.len()
+        self.legal().ids.len()
     }
 
     #[getter]
@@ -208,17 +220,17 @@ impl LeafEvaluation {
 
     #[getter]
     fn legal_ids(&self) -> Vec<i64> {
-        self.ids.clone()
+        self.legal().ids.clone()
     }
 
     #[getter]
     fn legal_moves(&self) -> Vec<ChessMove> {
-        self.moves.iter().map(|m| ChessMove(*m)).collect()
+        self.legal().moves.iter().map(|m| ChessMove(*m)).collect()
     }
 
     #[getter]
     fn legal_ucis(&self) -> Vec<String> {
-        self.ucis.iter().map(|u| u.to_string()).collect()
+        self.legal().ucis.iter().map(|u| u.to_string()).collect()
     }
 
     #[getter]
@@ -228,26 +240,27 @@ impl LeafEvaluation {
 
     #[getter]
     fn legal_forcing(&self) -> Vec<bool> {
-        self.forcing.clone()
+        self.legal().forcing_flags().clone()
     }
 
     fn move_at(&self, index: usize) -> PyResult<ChessMove> {
-        Ok(ChessMove(self.moves[self.checked(index)?]))
+        Ok(ChessMove(self.legal().moves[self.checked(index)?]))
     }
 
     fn id_at(&self, index: usize) -> PyResult<i64> {
-        Ok(self.ids[self.checked(index)?])
+        Ok(self.legal().ids[self.checked(index)?])
     }
 
     fn uci_at(&self, index: usize) -> PyResult<String> {
-        Ok(self.ucis[self.checked(index)?].to_string())
+        Ok(self.legal().ucis[self.checked(index)?].to_string())
     }
 
     /// NodeStats.from_evaluation over this evaluation, plus forcing flags
     /// when the search's forcing floors need them.
     #[pyo3(signature = (minimax_weight=0.0, with_forcing=false))]
     fn node_stats(&self, minimax_weight: f64, with_forcing: bool) -> PyResult<NodeStats> {
-        if self.ids.is_empty() {
+        let legal = self.legal();
+        if legal.ids.is_empty() {
             return Err(PyValueError::new_err(
                 "nonterminal evaluation has invalid legal projection",
             ));
@@ -257,7 +270,7 @@ impl LeafEvaluation {
             self.priors.clone(),
             Some(self.wdl.to_vec()),
             minimax_weight,
-            with_forcing.then(|| self.forcing.clone()),
+            with_forcing.then(|| legal.forcing_flags().clone()),
         )
     }
 }
@@ -267,7 +280,7 @@ impl LeafEvaluation {
 #[pyfunction]
 pub fn make_evaluations(
     py: Python<'_>,
-    legal: Vec<PyRef<'_, LegalSet>>,
+    legal: Vec<Bound<'_, LegalSet>>,
     values: &Bound<'_, PyAny>,
     wdls: &Bound<'_, PyAny>,
     priors: &Bound<'_, PyAny>,
@@ -290,7 +303,8 @@ pub fn make_evaluations(
     legal
         .iter()
         .enumerate()
-        .map(|(row, legal)| {
+        .map(|(row, bound)| {
+            let legal = bound.get();
             let n = legal.ids.len();
             if n > width {
                 return Err(PyValueError::new_err("legal ids exceed result width"));
@@ -306,10 +320,7 @@ pub fn make_evaluations(
                     .iter()
                     .map(|p| f64::from(p.get()))
                     .collect(),
-                ids: legal.ids.clone(),
-                moves: legal.moves.clone(),
-                ucis: legal.ucis.clone(),
-                forcing: legal.forcing.clone(),
+                legal: bound.clone().unbind(),
             })
         })
         .collect()

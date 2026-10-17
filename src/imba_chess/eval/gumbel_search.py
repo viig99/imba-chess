@@ -152,8 +152,9 @@ class GumbelResult:
     search_wdl: tuple[float, float, float] | None = None
 
 
-@dataclass
+@dataclass(slots=True)
 class _Node:
+    # Slots: a search allocates and frees one node per simulation.
     board: Any
     history: list[int]
     handle: Any
@@ -164,6 +165,7 @@ class _Node:
     means: list[float] | None = None
     children: dict[int, Any] = field(default_factory=dict)
     stats: Any = None
+    priors: list[float] | None = None
 
     def initialize(self, evaluation, config=None, role="root"):
         """role: "root", "opponent" (opponent to move) or "own" (root player, not root)."""

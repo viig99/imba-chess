@@ -101,7 +101,7 @@ fn gives_check(board: &cozy_chess::Board, mv: cozy_chess::Move) -> bool {
 /// Short-circuits in the same order the Python did, so `gives_check` (much the
 /// most expensive of the three) is skipped whenever the cheap tests already
 /// resolve the move.
-fn is_forcing(board: &cozy_chess::Board, mv: cozy_chess::Move) -> bool {
+pub(crate) fn is_forcing(board: &cozy_chess::Board, mv: cozy_chess::Move) -> bool {
     mv.promotion.is_some() || is_capture(board, mv) || gives_check(board, mv)
 }
 
@@ -219,14 +219,16 @@ impl MoveProjector {
             ids: Vec::with_capacity(selected.len()),
             moves: Vec::with_capacity(selected.len()),
             ucis: Vec::with_capacity(selected.len()),
-            forcing: Vec::with_capacity(selected.len()),
+            // Forcing flags cost a move per legal move; most searches never
+            // read them, so they are computed from this board on first use.
+            forcing: std::sync::OnceLock::new(),
+            board: inner.clone(),
             total,
         };
         for (entry, mv) in selected {
             legal.ids.push(entry.id);
             legal.moves.push(mv);
             legal.ucis.push(entry.uci.clone());
-            legal.forcing.push(is_forcing(inner, mv));
         }
         Ok(legal)
     }
