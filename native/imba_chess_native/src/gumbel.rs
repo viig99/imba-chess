@@ -264,7 +264,7 @@ fn gumbel_root_action(
 }
 
 #[pyclass]
-struct NodeStats {
+pub(crate) struct NodeStats {
     value: f64,
     priors: Vec<f64>,
     probs: Vec<f64>,
@@ -281,6 +281,21 @@ struct NodeStats {
 }
 
 impl NodeStats {
+    /// from_evaluation for native callers, optionally with forcing flags set.
+    pub(crate) fn from_parts(
+        value: f64,
+        priors: Vec<f64>,
+        wdl: Option<Vec<f64>>,
+        minimax_weight: f64,
+        forcing: Option<Vec<bool>>,
+    ) -> PyResult<Self> {
+        let mut stats = Self::from_evaluation(value, priors, wdl, minimax_weight)?;
+        if let Some(forcing) = forcing {
+            stats.set_forcing(forcing)?;
+        }
+        Ok(stats)
+    }
+
     /// Edge Q used for selection and reported to Python: the running mean, or
     /// (1 - w) * mean + w * negamax for visited edges when minimax_weight > 0.
     fn qvalues(&self) -> Vec<f64> {

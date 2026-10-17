@@ -6,6 +6,7 @@ use pyo3::types::{PyDict, PyString};
 
 use crate::board::Board;
 use crate::chess_move::ChessMove;
+use crate::leaf_eval::LegalSet;
 
 // ── MoveProjector ──────────────────────────────────────────────────────────
 
@@ -25,6 +26,8 @@ struct ProjectionEntry {
     id: i64,
     sort_key: String,
     py_uci: Py<PyString>,
+    // Shared text for native legal sets; cloning an Arc never allocates.
+    uci: std::sync::Arc<str>,
 }
 
 /// An immutable move vocabulary that projects a board's legal moves onto ids.
@@ -102,50 +105,12 @@ fn is_forcing(board: &cozy_chess::Board, mv: cozy_chess::Move) -> bool {
     mv.promotion.is_some() || is_capture(board, mv) || gives_check(board, mv)
 }
 
-#[pymethods]
 impl MoveProjector {
-    #[new]
-    fn py_new(move_token_to_id: &Bound<'_, PyDict>) -> PyResult<Self> {
-        let mut entries = HashMap::with_capacity(move_token_to_id.len());
-        for (key, value) in move_token_to_id.iter() {
-            let py_uci = key
-                .downcast::<PyString>()
-                .map_err(|_| PyValueError::new_err(format!("invalid UCI move: {}", key)))?;
-            let uci = py_uci.to_str()?.to_owned();
-            let mv = uci
-                .parse::<cozy_chess::Move>()
-                .map_err(|_| PyValueError::new_err(format!("invalid UCI move: {}", uci)))?;
-            let id: i64 = value.extract()?;
-            entries.insert(
-                mv,
-                ProjectionEntry {
-                    id,
-                    sort_key: uci,
-                    py_uci: py_uci.clone().unbind(),
-                },
-            );
-        }
-        Ok(MoveProjector { entries })
-    }
-
-    /// (ids, moves, UCIs) for the mapped legal moves in canonical UCI order,
-    /// plus the total legal move count.
-    ///
-    /// The four lists stay index-aligned so a caller can gather logits by id
-    /// and still know which move each one belongs to, and whether it is
-    /// forcing (promotion, capture, or check -- what the search's refutation
-    /// floor selects on). Forcing is computed here because this call has
-    /// already generated the moves and holds the board: the search used to
-    /// re-walk the identical (board, moves) pair afterwards, at ~19.8 us per
-    /// node and two FFI crossings per move. Moves come back in their
-    /// raw generated form -- normalization is for the vocabulary only, and a
-    /// normalized castle is not playable. Unmapped moves are dropped but still
-    /// counted in the total.
-    ///
-    /// Raises ValueError if two legal moves normalize onto one token, which
-    /// only Chess960 castling geometry can produce; see the check below.
-    fn project(&self, py: Python<'_>, board: &Board) -> PyResult<Projection> {
-        let inner = &board.0;
+    /// Mapped legal moves in canonical UCI order, plus the total legal count.
+    fn select(
+        &self,
+        inner: &cozy_chess::Board,
+    ) -> PyResult<(Vec<(&ProjectionEntry, cozy_chess::Move)>, usize)> {
         let mut total = 0usize;
         let mut selected: Vec<(&ProjectionEntry, cozy_chess::Move)> = Vec::with_capacity(32);
         inner.generate_moves(|piece_moves| {
@@ -183,7 +148,56 @@ impl MoveProjector {
                 pair[0].0.sort_key, pair[0].1, pair[1].1,
             )));
         }
+        Ok((selected, total))
+    }
+}
 
+#[pymethods]
+impl MoveProjector {
+    #[new]
+    fn py_new(move_token_to_id: &Bound<'_, PyDict>) -> PyResult<Self> {
+        let mut entries = HashMap::with_capacity(move_token_to_id.len());
+        for (key, value) in move_token_to_id.iter() {
+            let py_uci = key
+                .downcast::<PyString>()
+                .map_err(|_| PyValueError::new_err(format!("invalid UCI move: {}", key)))?;
+            let uci = py_uci.to_str()?.to_owned();
+            let mv = uci
+                .parse::<cozy_chess::Move>()
+                .map_err(|_| PyValueError::new_err(format!("invalid UCI move: {}", uci)))?;
+            let id: i64 = value.extract()?;
+            entries.insert(
+                mv,
+                ProjectionEntry {
+                    id,
+                    uci: std::sync::Arc::from(uci.as_str()),
+                    sort_key: uci,
+                    py_uci: py_uci.clone().unbind(),
+                },
+            );
+        }
+        Ok(MoveProjector { entries })
+    }
+
+    /// (ids, moves, UCIs) for the mapped legal moves in canonical UCI order,
+    /// plus the total legal move count.
+    ///
+    /// The four lists stay index-aligned so a caller can gather logits by id
+    /// and still know which move each one belongs to, and whether it is
+    /// forcing (promotion, capture, or check -- what the search's refutation
+    /// floor selects on). Forcing is computed here because this call has
+    /// already generated the moves and holds the board: the search used to
+    /// re-walk the identical (board, moves) pair afterwards, at ~19.8 us per
+    /// node and two FFI crossings per move. Moves come back in their
+    /// raw generated form -- normalization is for the vocabulary only, and a
+    /// normalized castle is not playable. Unmapped moves are dropped but still
+    /// counted in the total.
+    ///
+    /// Raises ValueError if two legal moves normalize onto one token, which
+    /// only Chess960 castling geometry can produce; see the check below.
+    fn project(&self, py: Python<'_>, board: &Board) -> PyResult<Projection> {
+        let inner = &board.0;
+        let (selected, total) = self.select(inner)?;
         let mut ids = Vec::with_capacity(selected.len());
         let mut moves = Vec::with_capacity(selected.len());
         let mut ucis = Vec::with_capacity(selected.len());
@@ -195,6 +209,26 @@ impl MoveProjector {
             forcing.push(is_forcing(inner, mv));
         }
         Ok((ids, moves, ucis, forcing, total))
+    }
+
+    /// The same projection held natively: no per-move Python objects.
+    fn project_lean(&self, board: &Board) -> PyResult<LegalSet> {
+        let inner = &board.0;
+        let (selected, total) = self.select(inner)?;
+        let mut legal = LegalSet {
+            ids: Vec::with_capacity(selected.len()),
+            moves: Vec::with_capacity(selected.len()),
+            ucis: Vec::with_capacity(selected.len()),
+            forcing: Vec::with_capacity(selected.len()),
+            total,
+        };
+        for (entry, mv) in selected {
+            legal.ids.push(entry.id);
+            legal.moves.push(mv);
+            legal.ucis.push(entry.uci.clone());
+            legal.forcing.push(is_forcing(inner, mv));
+        }
+        Ok(legal)
     }
 
     fn __len__(&self) -> usize {

@@ -5,6 +5,7 @@ import math
 import weakref
 
 import chess
+import imba_chess_native as cc
 import pytest
 import torch
 
@@ -190,9 +191,11 @@ def test_arena_growth_slot_reclamation_and_empty_projection(monkeypatch):
     model = _tiny_model(len(VOCAB)).eval()
     ws = DecodeWorkspace(DecoderRunner(model, "tensor"))
     owner = evaluator(model, 3)
-    original_projection = cozy_bridge.project_legal_moves
+    original_projection = cozy_bridge.project_legal_lean
+    # A projector over an empty vocabulary maps no legal move.
+    empty = cc.MoveProjector({})
     monkeypatch.setattr(
-        cozy_bridge, "project_legal_moves", lambda *a: ([], [], [], [], 0)
+        cozy_bridge, "project_legal_lean", lambda board, vocab: empty.project_lean(board)
     )
     with torch.inference_mode():
         saved = None
@@ -212,7 +215,7 @@ def test_arena_growth_slot_reclamation_and_empty_projection(monkeypatch):
         gc.collect()
         assert ref() is None
         owner = evaluator(model, 2)
-        monkeypatch.setattr(cozy_bridge, "project_legal_moves", original_projection)
+        monkeypatch.setattr(cozy_bridge, "project_legal_lean", original_projection)
         args, state = ws.prepare([payload(owner)])
         ws.consume(state, ws.runner.decode(*args))
         assert len(ws.slots) == 1 and ws.arena[0].data_ptr() == pointer

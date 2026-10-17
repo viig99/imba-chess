@@ -59,6 +59,17 @@ class PositionEval(NamedTuple):
     # Optional for scalar-only evaluators; never infer draw mass from a scalar.
     wdl: tuple[float, float, float] | None = None  # loss, draw, win; side to move
 
+    # Indexed accessors shared with the native LeafEvaluation, so the search
+    # reads one move without materializing the native lists.
+    def move_at(self, index: int) -> "cc.Move":
+        return self.legal_moves[index]
+
+    def id_at(self, index: int) -> int:
+        return self.legal_ids[index]
+
+    def uci_at(self, index: int) -> str:
+        return self.legal_ucis[index]
+
 
 class PositionEvaluator(Protocol):
     """`handle` is opaque (a search-node handle); `evaluate` batch entries

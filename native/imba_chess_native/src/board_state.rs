@@ -97,32 +97,46 @@ fn ep_file_id(board: &cozy_chess::Board, ep_mode: u8) -> i64 {
 /// (piece_ids[64], turn_id, castle_id, ep_file_id, halfmove_bucket, fullmove_bucket)
 type EncodedState = (Vec<u8>, i64, i64, i64, i64, i64);
 
-/// Encode one board into the model's board-state token ids, in one crossing.
-#[pyfunction]
-#[pyo3(signature = (
-    board, ep_mode, halfmove_max, halfmove_bucket_size, fullmove_max,
-    fullmove_bucket_size,
-))]
-pub fn encode_board_state(
-    board: &Board,
+/// Validated encoder settings, shared by the per-board and per-wave paths.
+#[derive(Clone, Copy)]
+pub(crate) struct EncodeConfig {
     ep_mode: u8,
     halfmove_max: i64,
     halfmove_bucket_size: i64,
     fullmove_max: i64,
     fullmove_bucket_size: i64,
-) -> PyResult<EncodedState> {
-    if ep_mode > EP_MODE_XFEN {
-        return Err(PyValueError::new_err(format!(
-            "ep_mode must be 0 (fen), 1 (legal) or 2 (xfen), got {}",
-            ep_mode
-        )));
-    }
-    if halfmove_bucket_size <= 0 || fullmove_bucket_size <= 0 {
-        return Err(PyValueError::new_err("bucket sizes must be > 0"));
-    }
-    let inner = &board.0;
+}
 
-    let mut piece_ids = vec![0u8; 64];
+impl EncodeConfig {
+    pub(crate) fn new(
+        ep_mode: u8,
+        halfmove_max: i64,
+        halfmove_bucket_size: i64,
+        fullmove_max: i64,
+        fullmove_bucket_size: i64,
+    ) -> PyResult<Self> {
+        if ep_mode > EP_MODE_XFEN {
+            return Err(PyValueError::new_err(format!(
+                "ep_mode must be 0 (fen), 1 (legal) or 2 (xfen), got {}",
+                ep_mode
+            )));
+        }
+        if halfmove_bucket_size <= 0 || fullmove_bucket_size <= 0 {
+            return Err(PyValueError::new_err("bucket sizes must be > 0"));
+        }
+        Ok(Self {
+            ep_mode,
+            halfmove_max,
+            halfmove_bucket_size,
+            fullmove_max,
+            fullmove_bucket_size,
+        })
+    }
+}
+
+/// Piece ids per square and [turn, castle, ep file, halfmove, fullmove] ids.
+pub(crate) fn encode(inner: &cozy_chess::Board, cfg: &EncodeConfig) -> ([u8; 64], [i64; 5]) {
+    let mut piece_ids = [0u8; 64];
     let white = inner.colors(cozy_chess::Color::White);
     for (white_id, piece) in PIECES {
         let bb = inner.pieces(piece);
@@ -141,22 +155,49 @@ pub fn encode_board_state(
         | (i64::from(rights_black.short.is_some()) << 2)
         | (i64::from(rights_black.long.is_some()) << 3);
 
-    Ok((
+    (
         piece_ids,
-        i64::from(inner.side_to_move() == cozy_chess::Color::Black),
-        castle_id,
-        ep_file_id(inner, ep_mode),
-        bucket(
-            inner.halfmove_clock() as i64,
-            halfmove_max,
-            halfmove_bucket_size,
-        ),
-        bucket(
-            inner.fullmove_number() as i64,
-            fullmove_max,
-            fullmove_bucket_size,
-        ),
-    ))
+        [
+            i64::from(inner.side_to_move() == cozy_chess::Color::Black),
+            castle_id,
+            ep_file_id(inner, cfg.ep_mode),
+            bucket(
+                inner.halfmove_clock() as i64,
+                cfg.halfmove_max,
+                cfg.halfmove_bucket_size,
+            ),
+            bucket(
+                inner.fullmove_number() as i64,
+                cfg.fullmove_max,
+                cfg.fullmove_bucket_size,
+            ),
+        ],
+    )
+}
+
+/// Encode one board into the model's board-state token ids, in one crossing.
+#[pyfunction]
+#[pyo3(signature = (
+    board, ep_mode, halfmove_max, halfmove_bucket_size, fullmove_max,
+    fullmove_bucket_size,
+))]
+pub fn encode_board_state(
+    board: &Board,
+    ep_mode: u8,
+    halfmove_max: i64,
+    halfmove_bucket_size: i64,
+    fullmove_max: i64,
+    fullmove_bucket_size: i64,
+) -> PyResult<EncodedState> {
+    let cfg = EncodeConfig::new(
+        ep_mode,
+        halfmove_max,
+        halfmove_bucket_size,
+        fullmove_max,
+        fullmove_bucket_size,
+    )?;
+    let (pieces, [turn, castle, ep, halfmove, fullmove]) = encode(&board.0, &cfg);
+    Ok((pieces.to_vec(), turn, castle, ep, halfmove, fullmove))
 }
 
 pub fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {

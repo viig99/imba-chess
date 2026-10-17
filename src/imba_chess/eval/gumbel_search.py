@@ -167,32 +167,38 @@ class _Node:
 
     def initialize(self, evaluation, config=None, role="root"):
         """role: "root", "opponent" (opponent to move) or "own" (root player, not root)."""
-        n = len(evaluation.legal_ids)
-        if (
-            not n
-            or len(evaluation.legal_moves) != n
-            or len(evaluation.legal_ucis) != n
-            or len(evaluation.legal_log_priors) != n
-        ):
-            raise ValueError("nonterminal evaluation has invalid legal projection")
-        priors = list(evaluation.legal_log_priors)
-        # Native: finite value/prior and WDL validation, then the FLT_MIN-clamped
-        # prior softmax, bit-identical to the former Python implementation.
-        stats = cc.NodeStats.from_evaluation(
-            evaluation.value_stm,
-            priors,
-            evaluation.wdl,
-            0.0 if config is None else config.minimax_weight,
-        )
-        if len(evaluation.legal_forcing) != n:
-            raise ValueError("nonterminal evaluation has invalid legal projection")
+        minimax_weight = 0.0 if config is None else config.minimax_weight
+        floors = config is not None and (config.forcing_floor or config.own_forcing_floor)
+        if isinstance(evaluation, cc.LeafEvaluation):
+            # Native decode results validate and build their stats in one call.
+            stats = evaluation.node_stats(minimax_weight, floors)
+            n, priors = len(evaluation), None
+        else:
+            n = len(evaluation.legal_ids)
+            if (
+                not n
+                or len(evaluation.legal_moves) != n
+                or len(evaluation.legal_ucis) != n
+                or len(evaluation.legal_log_priors) != n
+            ):
+                raise ValueError("nonterminal evaluation has invalid legal projection")
+            priors = list(evaluation.legal_log_priors)
+            # Native: finite value/prior and WDL validation, then the FLT_MIN-clamped
+            # prior softmax, bit-identical to the former Python implementation.
+            stats = cc.NodeStats.from_evaluation(
+                evaluation.value_stm, priors, evaluation.wdl, minimax_weight
+            )
+            if len(evaluation.legal_forcing) != n:
+                raise ValueError("nonterminal evaluation has invalid legal projection")
+            if floors:
+                stats.set_forcing(list(evaluation.legal_forcing))
         self.evaluation = evaluation
         self.value = evaluation.value_stm
         self.priors = priors
         self.stats = stats
-        if config is not None and (config.forcing_floor or config.own_forcing_floor):
-            self.stats.set_forcing(list(evaluation.legal_forcing))
         if config is not None and config.own_width and role == "own" and n > config.own_width:
+            if priors is None:
+                priors = evaluation.legal_log_priors
             keep = set(sorted(range(n), key=lambda i: (-priors[i], i))[: config.own_width])
             self.stats.set_candidates([i in keep for i in range(n)])
 
@@ -267,13 +273,13 @@ def gumbel_stepwise(
             if action not in node.children:
                 ev = node.evaluation
                 child_board, history, terminal = cc.push_and_classify(
-                    node.board, ev.legal_moves[action], node.history, True
+                    node.board, ev.move_at(action), node.history, True
                 )
                 child = _Node(child_board, history, None, value=terminal)
                 node.children[action] = child
                 if terminal is None:
                     child.handle = extend(
-                        node.handle, ev.legal_ucis[action], ev.legal_ids[action]
+                        node.handle, ev.uci_at(action), ev.id_at(action)
                     )
                     (evaluation,) = yield EvalRequest([(child.handle, child.board)])
                     child.initialize(evaluation, config, "opponent" if depth % 2 else "own")

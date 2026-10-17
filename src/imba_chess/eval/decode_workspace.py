@@ -8,11 +8,10 @@ from collections import Counter
 from dataclasses import dataclass, field
 import weakref
 
+import imba_chess_native as cc
 import torch
 
 from . import cozy_bridge
-from .position_evaluator import _batched_value_scalars
-from .search import PositionEval
 from imba_chess.data.event_builder import EVENT_TOKEN_ID
 
 
@@ -33,18 +32,26 @@ class _StagedRequest:
     boards: tuple
     prefix_kv: object
     prefix_len: int
-    encoded: object
 
 
 def _stage_request(evaluator, batch):
     node, board = batch[0]
     evaluator._validate_handles((node,))
     return _StagedRequest(
-        (node,),
-        (board,),
-        evaluator._prefix_kv,
-        evaluator._prefix_len,
-        evaluator._board_state_encoder.encode_cozy(board),
+        (node,), (board,), evaluator._prefix_kv, evaluator._prefix_len
+    )
+
+
+def _wave_stager(encoder):
+    """Native board-feature writer configured like encoder.encode_cozy."""
+    cfg = encoder.config
+    return cc.WaveStager(
+        encoder._ep_mode_code,
+        cfg.halfmove_max,
+        cfg.halfmove_bucket_size,
+        cfg.fullmove_max,
+        cfg.fullmove_bucket_size,
+        EVENT_TOKEN_ID,
     )
 
 
@@ -83,6 +90,7 @@ class DecodeWorkspace:
         self.runner = runner
         self.device = runner.model.piece_square_embedding.weight.device
         self.counters = Counter()
+        self._stager = None  # (encoder, WaveStager)
         self.clear()
 
     def clear(self):
@@ -226,12 +234,17 @@ class DecodeWorkspace:
                 )
             chains.append(chain)
         per_node = [
-            cozy_bridge.project_legal_moves(req.boards[0], e._move_vocab)
+            cozy_bridge.project_legal_lean(req.boards[0], e._move_vocab)
             for (e, _), req in zip(payloads, requests)
         ]
+        encoder = payloads[0][0]._board_state_encoder
+        if any(e._board_state_encoder is not encoder for e, _ in payloads):
+            raise ValueError("decode wave mixes board-state encoders")
+        if self._stager is None or self._stager[0] is not encoder:
+            self._stager = (encoder, _wave_stager(encoder))
         slots_rows = [self._slot(e, req) for (e, _), req in zip(payloads, requests)]
         g, p = len(requests), max(r.prefix_len for r in requests)
-        width = max(len(row[0]) for row in per_node)
+        width = max(len(legal) for legal in per_node)
         full_refresh = False
         if (
             g > self.batch_capacity
@@ -305,29 +318,29 @@ class DecodeWorkspace:
         # Logical rows are contiguous just like the compiled reference. Capacity
         # padding lives after the used range, outside each layer's active view.
         keys = FEATURE_KEYS
+        # Native: piece ids, the event token, five board scalars and legal ids.
+        pitch = (g + 31) // 32 * 32
+        self._stager[1].stage(
+            self.numpy,
+            [req.boards[0] for req in requests],
+            per_node,
+            pitch,
+            64 * g,
+            64 * g + 11 * pitch + 32 * g,
+            self.legal_capacity,
+        )
+        nodes = [req.nodes[0] for req in requests]
+        host_fields[1][6] = [node.move_id for node in nodes]
+        host_fields[2][0] = [
+            req.prefix_len + node.depth for req, node in zip(requests, nodes)
+        ]
+        host_fields[2][1] = [req.prefix_len for req in requests]
+        host_fields[2][2] = [len(chain) for chain in chains]
+        host_fields[2][3] = [dest for _, dest in slots_rows]
         dirty = []
-        for row, (req, chain, (slot, dest), legal) in enumerate(
-            zip(requests, chains, slots_rows, per_node)
-        ):
-            state, node = req.encoded, req.nodes[0]
-            host_fields[0][row] = state.piece_ids
-            host_fields[1][:, row] = (
-                EVENT_TOKEN_ID,
-                state.turn_id,
-                state.castle_id,
-                state.ep_file_id,
-                state.halfmove_bucket_id,
-                state.fullmove_bucket_id,
-                node.move_id,
-            )
-            host_fields[2][:, row] = (
-                req.prefix_len + node.depth,
-                req.prefix_len,
-                len(chain),
-                dest,
-            )
-            host_fields[3][row, : len(chain)] = chain
-            host_fields[4][row, : len(legal[0])] = legal[0]
+        for row, (chain, (slot, _)) in enumerate(zip(chains, slots_rows)):
+            if chain:
+                host_fields[3][row, : len(chain)] = chain
             owner = (slot.owner, slot.stamp)
             if self.row_owners[row] != owner:
                 dirty.append(row)
@@ -463,27 +476,17 @@ class DecodeWorkspace:
         packed = torch.cat((picked, out["value_logits"].float()), dim=1).cpu()
         self.counters["readbacks"] += 1
         self.counters["d2h_bytes"] += packed.numel() * packed.element_size()
-        values = _batched_value_scalars(packed[:, width:].contiguous())
-        wdls = torch.softmax(packed[:, width:].contiguous(), -1).tolist()
-        lens = [len(row[0]) for row in per_node]
+        # The same CPU float32 operations as before; native code only widens
+        # the results to f64 (as .tolist() did) and builds one object per row.
+        wdls = torch.softmax(packed[:, width:].contiguous(), -1)
+        values = (wdls[:, 2] - wdls[:, 0]).contiguous()
+        lens = torch.tensor([len(legal) for legal in per_node])
         # Match the reference's logical width and contiguous CPU normalization.
         priors = packed[:, :width].contiguous()
-        for row, length in enumerate(lens):
-            priors[row, length:] = -torch.inf
-        prior_rows = (
-            torch.log_softmax(priors, dim=1).tolist() if width else [[] for _ in lens]
+        priors.masked_fill_(torch.arange(width) >= lens[:, None], -torch.inf)
+        if width:
+            priors = torch.log_softmax(priors, dim=1)
+        evaluations = cc.make_evaluations(
+            per_node, values.numpy(), wdls.numpy(), priors.numpy(), width
         )
-        return [
-            [
-                PositionEval(
-                    value_stm=values[row],
-                    legal_moves=moves,
-                    legal_ucis=ucis,
-                    legal_log_priors=prior_rows[row][: len(ids)],
-                    legal_forcing=forcing,
-                    legal_ids=ids,
-                    wdl=tuple(wdls[row]),
-                )
-            ]
-            for row, (ids, moves, ucis, forcing, _) in enumerate(per_node)
-        ]
+        return [[evaluation] for evaluation in evaluations]

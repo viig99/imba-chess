@@ -327,6 +327,16 @@ def project_legal_moves(
     refutation floor needs that predicate over exactly this pair, and used to
     re-walk it afterwards at ~19.8us per opponent-to-move node.
     """
+    return _projector(move_vocab).project(cozy_board)
+
+
+def project_legal_lean(cozy_board: cc.Board, move_vocab: MoveVocab) -> "cc.LegalSet":
+    """project_legal_moves held natively (ids, moves, UCIs, forcing, total):
+    the decode wave stages and consumes it without per-move Python objects."""
+    return _projector(move_vocab).project_lean(cozy_board)
+
+
+def _projector(move_vocab: MoveVocab) -> "cc.MoveProjector":
     projector = _PROJECTORS.get(move_vocab)
     if projector is None:
         # Special tokens are not UCI and would be rejected by the projector's
@@ -344,4 +354,4 @@ def project_legal_moves(
             }
         )
         _PROJECTORS[move_vocab] = projector
-    return projector.project(cozy_board)
+    return projector
