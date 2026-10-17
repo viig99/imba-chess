@@ -35,6 +35,11 @@
 # From iteration ~236 of that restart (2026-10-14, resumed with --previous-config): lr 2e-4 -> 1e-4.
 # SF2600 had climbed only slowly (ema-130 41.5%, ema-230 43%; ~26 +- 28 Elo/day) while policy KL kept
 # easing down, the usual point for an lr step-down. Screens also moved to every 15000 games (CLI).
+# From iteration ~290 (2026-10-17, resumed with --previous-config set to this file's previous
+# version): fresh_positions 24576 -> fresh_games 640 (4x the 160 parallel games, ~56k positions).
+# After the fused decode kernel and root reuse the 24576-position phases updated weights every
+# ~65 s; 640 games restores the earlier ~2.5 min cadence and halves the fixed per-phase share.
+# Training per position is unchanged (reuse 1).
 base_config = "config/imba_chess_v4_aux3.toml"
 
 [search]
@@ -50,7 +55,7 @@ rescale_values = false
 concurrent_games = 256
 root_batch_tokens = 1024
 max_game_plies = 512
-fresh_positions = 24576
+fresh_games = 640
 inference_dtype = "bfloat16"
 # Fast play-out of decided games only (from iteration ~238, 2026-10-14, resumed with
 # --previous-config): every undecided move keeps the full search (full_search_probability 1, so
