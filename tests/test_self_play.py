@@ -644,8 +644,9 @@ def test_hard_budget_exits_process():
     assert result.returncode == 124
 
 
-def mate_starts(directory, cfg=None, *, per_bucket=4, **kwargs):
-    """Streamed starts whose human prefixes all lie on ScriptRuntime's mate line."""
+def mate_starts(directory, cfg=None, *, per_bucket=4, plies=(1, 2, 3), **kwargs):
+    """Streamed starts whose human prefixes all lie on ScriptRuntime's mate line.
+    plies: the prefix length of each human bucket's seeds (the line mates in 4)."""
     from dataclasses import asdict
     from imba_chess.data.self_play_store import atomic_json
     from imba_chess.self_play.config import SelfPlayConfig
@@ -657,7 +658,7 @@ def mate_starts(directory, cfg=None, *, per_bucket=4, **kwargs):
     if block.exists():  # A resumed run reuses its journaled block.
         return starts, cfg
     groups = []
-    for ply in (1, 2, 3):
+    for ply in plies:
         group = []
         for i in range(per_bucket):
             source = f"mate-{ply}-{i}"

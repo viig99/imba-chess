@@ -30,6 +30,21 @@ def scripted_loader(config, checkpoint, device):
     return WeightedRuntime(), 128
 
 
+def gated_loader(config, checkpoint, device):
+    """Scripted runtime whose searches wait for a "launch-gate" file next to the
+    checkpoint, so a test can hand out a phase's launches before any game moves."""
+    gate = checkpoint.with_name("launch-gate")
+
+    def execute(payloads):
+        deadline = time.monotonic() + 60
+        while not gate.exists():
+            if time.monotonic() > deadline:
+                raise TimeoutError("launch gate never opened")
+            time.sleep(0.005)
+        return payloads
+    return WeightedRuntime(execute), 128
+
+
 def _fail(payloads):
     raise RuntimeError("inference failed")
 
@@ -305,13 +320,29 @@ def test_carried_games_pause_at_phase_end_and_finish_under_new_weights(tmp_path)
         search=GumbelConfig(simulations=1, max_depth=1),
         collection=CollectionConfig(carry_over_games=True),
     )
-    starts, cfg = mate_starts(tmp_path / "stream", cfg)
+    # Every block of four launches covers the four start buckets: the initial
+    # position (4 moves to mate) and three human buckets, here all one move from
+    # mate. No game moves until all four are handed out, so each worker holds two
+    # of them, whichever order their requests arrive in. The worker holding the
+    # 4-move game also holds a 1-move one: that mates first, finds launches over,
+    # and the long game pauses with moves left. The other worker's two 1-move games
+    # end together. Exactly one game is carried, independent of timing.
+    starts, cfg = mate_starts(tmp_path / "stream", cfg, plies=(3, 3, 3))
     store = SelfPlayStore(tmp_path / "replay", flush_games=16)
-    # The first four launches have four distinct lengths (1-4 plies), so each
-    # worker's shorter game ends first, finds launches over, and the longer one
-    # pauses at its next move boundary.
+    gate = tmp_path / "launch-gate"
+    sample = starts.next_launch
+    handed = []
+
+    def next_launch(*args):
+        launch = sample(*args)
+        handed.append(launch)
+        if len(handed) == 4:
+            gate.touch()
+        return launch
+
+    starts.next_launch = next_launch
     weights = {}
-    with workers_for(tmp_path, cfg) as workers:
+    with workers_for(tmp_path, cfg, loader=gated_loader) as workers:
         for iteration in range(6):
             actor = f"actor-{iteration}"
             weights[actor] = 2.0 * (iteration + 1)  # root_value: sum of 2 weights
@@ -327,7 +358,7 @@ def test_carried_games_pause_at_phase_end_and_finish_under_new_weights(tmp_path)
                 iteration=iteration,
             )
             if iteration == 0:
-                assert len(workers.carried_ids) == 2
+                assert len(workers.carried_ids) == 1
             starts.finish_phase(keep=workers.carried_ids)
             if not workers.carried_ids:
                 break
@@ -349,7 +380,7 @@ def test_carried_games_pause_at_phase_end_and_finish_under_new_weights(tmp_path)
                 t["root_value"] == weights[actor] for t in game["targets"][start:end]
             )
         spanning += len(segments) > 1
-    assert spanning == 2
+    assert spanning == 1
 
 
 def test_lost_carried_launches_retire_on_restart(tmp_path):
