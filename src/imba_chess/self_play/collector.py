@@ -7,7 +7,7 @@ import time
 
 import chess
 
-from imba_chess.eval.batch_scheduler import BatchScheduler
+from imba_chess.eval.batch_scheduler import PAUSE, BatchScheduler, WorkRequest
 from imba_chess.eval.gumbel_search import REFERENCE_REVISION
 from imba_chess.eval.position_evaluator import (
     _SequenceHistory,
@@ -61,9 +61,18 @@ def play_game(
     actor_for_turn=None,
     gumbel_noise=True,
     playout_cap=None,
+    should_pause=lambda: False,
+    current_actor=None,
 ):
     """playout_cap: a CollectionConfig with playout_cap on, or None for a full
-    search on every move (always the case outside self-play collection)."""
+    search on every move (always the case outside self-play collection).
+
+    should_pause: checked before each search; when true the game yields a PAUSE
+    request at this move boundary (no search state is live) and re-checks on
+    resume. current_actor() names the actor whose weights search the next move;
+    a game that spans actors is labeled by the actor that completes it, with
+    launch_actor_id and actor_segments ([first ply index, actor]) recording
+    the history."""
     board = seed.board()
     history = _SequenceHistory(
         move_vocab=runtime.move_vocab, board_state_encoder=runtime.encoder
@@ -95,6 +104,11 @@ def play_game(
         inference_config=getattr(runtime, "options", {}),
     )
     rng = random.Random(f"{run_seed}:{game_id}")
+    current_actor_fn = current_actor
+    if current_actor_fn is not None:
+        if actor_for_turn is not None:
+            raise ValueError("current_actor needs a single-actor game")
+        game["launch_actor_id"] = actor_id
     if playout_cap is not None:
         if not playout_cap.playout_cap or actor_for_turn is not None:
             raise ValueError("playout_cap needs an enabled config and a single actor")
@@ -123,11 +137,20 @@ def play_game(
             if len(board.move_stack) >= max_game_plies:
                 game["termination"] = "game_limit"
                 break
+            if should_pause():
+                yield WorkRequest(PAUSE, None)
+                continue
             current_actor, current_runtime = (
                 (actor_id, runtime)
                 if actor_for_turn is None
                 else actor_for_turn(board.turn)
             )
+            if current_actor_fn is not None:
+                current_actor = current_actor_fn()
+                segments = game.setdefault("actor_segments", [])
+                if not segments or segments[-1][1] != current_actor:
+                    segments.append([len(game["moves"]), current_actor])
+                    game["actor_id"] = current_actor
             kind, config, noise = "full", search_config, gumbel_noise
             if playout_cap is not None:
                 # Drawn every move, decided or not, so each ply's flip is fixed by the game seed.
@@ -309,18 +332,30 @@ class CollectionPhase:
         on_game=lambda game: None,
         skip_ids=(),
         metrics=None,
+        carried=None,
     ):
+        """carried: {game_id: launch metadata} of games paused by an earlier phase
+        that resume in this one (collection.carry_over_games)."""
         self.config, self.actor_id, self.store = config, actor_id, store
         self.start_sampler, self.game_count = start_sampler, game_count
         self.should_launch, self.iteration, self.on_game = should_launch, iteration, on_game
         self.metrics = metrics or CollectionMetrics()
         self.skipped = set(skip_ids)
-        self.active = {}
+        self.active = dict(carried or {})
         self.launches = 0
         self.exhausted = False
+        if self.active and not config.collection.carry_over_games:
+            raise ValueError("carried games need collection.carry_over_games")
         if config.regret is None:
-            start_sampler.begin_phase(iteration, actor_id, self.skipped)
+            carry = (
+                dict(carried=frozenset(self.active))
+                if config.collection.carry_over_games
+                else {}
+            )
+            start_sampler.begin_phase(iteration, actor_id, self.skipped, **carry)
         else:
+            if self.active:
+                raise ValueError("carried games do not support regret restarts")
             start_sampler.begin_phase(
                 iteration, actor_id, store, max_positions=max_positions
             )
@@ -490,10 +525,12 @@ def collect(
 
 def launch_game(
     *, runtime, config, config_id, actor_id, seed, game_id, max_positions,
-    should_stop, on_position,
+    should_stop, on_position, should_pause=lambda: False, current_actor=None,
 ):
     """One self-play game coroutine with the run's search and collection limits."""
     return play_game(
+        should_pause=should_pause,
+        current_actor=current_actor,
         seed=seed,
         game_id=game_id,
         actor_id=actor_id,

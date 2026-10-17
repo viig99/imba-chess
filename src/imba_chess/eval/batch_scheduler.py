@@ -20,6 +20,11 @@ class WorkRequest(NamedTuple):
     payload: Any  # opaque; executor understands it
 
 
+# A game yielding this kind is parked: no executor runs it, and run_phase
+# returns once only parked games remain. Resuming sends it None.
+PAUSE = "pause"
+
+
 @dataclass
 class _Slot:
     stream_idx: int
@@ -62,6 +67,7 @@ class BatchScheduler:
         # Finished-but-not-yet-emitted games, keyed by stream index.
         self._held_back: dict[int, tuple[str, list[Any] | None]] = {}
         self._next_expected_idx = 0
+        self._live: dict[int, _Slot] = {}  # run_phase keeps paused games here
 
     def run(self) -> None:
         slots: dict[int, _Slot] = {}
@@ -70,6 +76,34 @@ class BatchScheduler:
         finally:
             for slot in slots.values():
                 slot.gen.close()
+
+    def run_phase(self, game_factory: Iterator[tuple[str, Generator]]) -> list[str]:
+        """Resume paused games, then run until the factory is exhausted and every
+        live game has finished or paused. Paused games stay live for the next
+        call; returns their ids. Any error closes every live game."""
+        if not self._completion_order:
+            raise ValueError("phased scheduling reports games in completion order")
+        self._game_factory = game_factory
+        slots = self._live
+        try:
+            # Resume before launching: every carried game plays at least its
+            # next move, even in a phase whose launches end immediately.
+            for slot_id in sorted(slots):
+                slot = slots.get(slot_id)
+                if slot is not None and slot.pending is not None and slot.pending.kind == PAUSE:
+                    slot.pending = None
+                    self._advance(slot_id, slots, send_value=None, first=True)
+            self._run(slots)
+        except BaseException:
+            self.close()
+            raise
+        return [slots[i].game_id for i in sorted(slots)]
+
+    def close(self) -> None:
+        """Close every paused game (run_phase only)."""
+        slots, self._live = self._live, {}
+        for slot in slots.values():
+            slot.gen.close()
 
     def _run(self, slots: dict[int, _Slot]) -> None:
         self._fill_slots(slots)
@@ -100,8 +134,15 @@ class BatchScheduler:
             by_kind: dict[str, list[tuple[int, WorkRequest]]] = defaultdict(list)
             for slot_id in sorted(slots):
                 slot = slots[slot_id]
-                if slot.pending is not None:
+                if slot.pending is not None and slot.pending.kind != PAUSE:
                     by_kind[slot.pending.kind].append((slot_id, slot.pending))
+            if not by_kind:
+                # Only paused games remain; stop unless new games can start.
+                before = len(slots)
+                self._fill_slots(slots)
+                if len(slots) == before:
+                    return
+                continue
 
             # Phase 3: one merged executor call per kind; scatter results.
             for kind, entries in by_kind.items():

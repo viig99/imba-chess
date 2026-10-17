@@ -6,7 +6,7 @@ tick's merged payload list, letting every scheduler property be asserted
 deterministically.
 """
 
-from imba_chess.eval.batch_scheduler import BatchScheduler, WorkRequest
+from imba_chess.eval.batch_scheduler import PAUSE, BatchScheduler, WorkRequest
 
 
 def _fake_game(game_id, num_requests, log):
@@ -123,3 +123,59 @@ def test_determinism_same_inputs_same_ticks():
         return ticks
 
     assert run_once() == run_once()
+
+
+def _pausing_game(game_id, num_requests, paused, log):
+    """Yields one echo per step; parks at each step boundary while paused()."""
+    rows = []
+    for i in range(num_requests):
+        while paused():
+            yield WorkRequest(kind=PAUSE, payload=None)
+        result = yield WorkRequest(kind="echo", payload=(game_id, i))
+        rows.append(result)
+    log.append(f"done:{game_id}")
+    return rows
+
+
+def test_run_phase_parks_paused_games_and_resumes_them_first():
+    state = {"ended": False}
+    ticks, done = [], []
+
+    def executor(payloads):
+        ticks.append(sorted(payloads))
+        return list(payloads)
+
+    def factory(games):
+        yield from games
+        state["ended"] = True  # Launches over: live games park at the next step.
+
+    scheduler = BatchScheduler(
+        game_factory=iter(()),
+        executors={"echo": executor},
+        concurrent_games=2,
+        on_game_done=lambda gid, rows: done.append((gid, rows)),
+        on_game_error=lambda gid, exc: done.append((gid, repr(exc))),
+        completion_order=True,
+    )
+    paused = lambda: state["ended"]
+    log = []
+    first = [("long", _pausing_game("long", 4, paused, log)),
+             ("short", _pausing_game("short", 1, paused, log))]
+    assert scheduler.run_phase(factory(first)) == ["long"]
+    assert [gid for gid, _ in done] == ["short"]
+    steps = [p for tick in ticks for p in tick if p[0] == "long"]
+    assert steps == [("long", 0), ("long", 1)]
+
+    # The next phase resumes the parked game before any launch; with no new
+    # games it still plays one step, then parks again.
+    state["ended"] = False
+    assert scheduler.run_phase(factory([])) == ["long"]
+    steps = [p for tick in ticks for p in tick if p[0] == "long"]
+    assert steps[-1] == ("long", 2)
+
+    state["ended"] = False
+    new = [("next", _pausing_game("next", 3, paused, log))]
+    assert scheduler.run_phase(factory(new)) == ["next"]
+    assert ("long", [("long", i) for i in range(4)]) in done
+    scheduler.close()
+    assert log == ["done:short", "done:long"]

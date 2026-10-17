@@ -67,7 +67,7 @@ def main():
         "--previous-config",
         type=Path,
         help="With --resume, continue a run started under this config when only its "
-             "[learning] and [replay] sections and the playout-cap fields of [collection] "
+             "[learning] and [replay] sections and the playout-cap/carry-over fields of [collection] "
              "differ from --config (an EMA switched on starts from the current weights); "
              "a no-op once the run has been upgraded",
     )
@@ -168,6 +168,10 @@ def main():
     elif cfg.collection.inference_dtype != "float32":
         # The in-process runtime is also the FP32 training model.
         parser.error("collection.inference_dtype other than float32 needs --collect-workers > 1")
+    elif cfg.collection.carry_over_games:
+        parser.error("collection.carry_over_games needs --collect-workers > 1")
+    if cfg.collection.carry_over_games and cfg.regret is not None:
+        parser.error("collection.carry_over_games does not support regret restarts")
     monitor =load_seeds(args.seeds, split="monitor")
     if len(monitor) < max(cfg.run.screen_pairs, cfg.run.confirmation_pairs):
         parser.error(
@@ -207,10 +211,10 @@ def main():
                 )
                 if not set(changed) <= {"learning", "replay", "collection"} or not set(
                     collection
-                ) <= set(CollectionConfig.PLAYOUT_CAP_FIELDS):
+                ) <= set(CollectionConfig.RESUMABLE_FIELDS):
                     raise ValueError(
                         "--previous-config may differ only in learning, replay and the "
-                        f"playout-cap collection fields: {changed} {collection}"
+                        f"playout-cap/carry-over collection fields: {changed} {collection}"
                     )
                 saved_config_id, previous_learning = previous.identifier, previous.learning
             if state["config_id"] != saved_config_id or state[
@@ -427,7 +431,7 @@ def main():
                 ):
                     publish_checkpoint()
                     break
-                start_sampler.finish_phase()
+                start_sampler.finish_phase(keep=workers.carried_ids if workers else frozenset())
                 # Counted once, persisted with the collect -> train transition.
                 state["games_since_screen"] = (
                     state.get("games_since_screen", 0) + metrics.counts["completed_games"]

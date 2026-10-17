@@ -125,7 +125,7 @@ class CyclingStarts:
     def __init__(self, seeds, prefix):
         self.seeds, self.prefix, self.launches = seeds, prefix, 0
 
-    def begin_phase(self, iteration, actor_id, completed):
+    def begin_phase(self, iteration, actor_id, completed, carried=frozenset()):
         pass
 
     def next_launch(self, iteration, actor_id):
@@ -213,8 +213,8 @@ def worker_stage_report(directory):
     workers = []
     for path in sorted(Path(directory).glob("worker-*.jsonl")):
         snapshots = [json.loads(line) for line in path.read_text().splitlines()]
-        # Snapshots: [warm-up start, warm-up end, measured start, measured end].
-        before, after = snapshots[-2], snapshots[-1]
+        # Two snapshots per phase; the first phase is the warm-up.
+        before, after = snapshots[2], snapshots[-1]
         wall = after["marks"][-1] - before["marks"][-1]
         stages = {
             key: after[key] - before[key]
@@ -279,6 +279,10 @@ def main():
     parser.add_argument("--max-seconds", type=float, default=1800.0,
                         help="Hard cap on the measured phase; stops and interrupts games")
     parser.add_argument("--seed-offset", type=int, default=0)
+    parser.add_argument("--phases", type=int, default=1,
+                        help="Consecutive measured phases (same weights, no training)")
+    parser.add_argument("--carry-over", action="store_true",
+                        help="collection.carry_over_games: pause games at phase end")
     parser.add_argument("--py-spy", type=Path, help="py-spy binary; samples every worker")
     parser.add_argument("--py-spy-seconds", type=float, default=120.0)
     parser.add_argument("--py-spy-delay", type=float, default=30.0,
@@ -292,6 +296,8 @@ def main():
         cfg = replace(
             cfg, collection=replace(cfg.collection, fresh_positions=args.fresh_positions)
         )
+    if args.carry_over:
+        cfg = replace(cfg, collection=replace(cfg.collection, carry_over_games=True))
     if cfg.regret is not None:
         raise ValueError("benchmark supports configs without regret restarts")
     seeds = load_seeds(args.seeds, split="train")
@@ -333,55 +339,56 @@ def main():
             )
             warmup = time.perf_counter() - warm_start
 
-            metrics = TimedMetrics()
-            spies = []
-            start = time.perf_counter()
-
-            def should_launch():
-                now = time.perf_counter()
-                if args.py_spy is not None and not spies and now - start >= args.py_spy_delay:
-                    for index, pid in enumerate(pids):
-                        spies.append(subprocess.Popen(
-                            [str(args.py_spy), "record", "--pid", str(pid), "--native",
-                             "--rate", str(args.py_spy_rate), "--duration",
-                             str(int(args.py_spy_seconds)), "--format", "raw",
-                             "-o", str(args.output / f"py-spy-worker{index}.txt")],
-                            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-                        ))
-                return True
-
-            def should_stop():
-                return time.perf_counter() - start >= args.max_seconds
-
-            original_launch = metrics.launched
-
-            # The phase calls should_launch for every launch; it stops on its own
-            # once fresh_positions completed positions exist.
-            def launched(metadata):
-                original_launch(metadata)
-
-            metrics.launched = launched
             from imba_chess.self_play import collector as collector_module
 
             phase_next = collector_module.CollectionPhase.next_launch
+            current = {}
 
             def next_launch(self):
                 launch = phase_next(self)
-                if launch is None and metrics.launch_stopped is None:
-                    metrics.launch_stopped = time.perf_counter()
+                if launch is None and current["metrics"].launch_stopped is None:
+                    current["metrics"].launch_stopped = time.perf_counter()
                 return launch
 
             collector_module.CollectionPhase.next_launch = next_launch
-            workers.collect(
-                runtime=runtime, config=cfg, actor_id="bench",
-                store=NullStore(), max_positions=workers.max_positions,
-                start_sampler=CyclingStarts(seeds, "bench"),
-                concurrent_games=args.concurrent_games,
-                should_launch=should_launch,
-                should_stop=should_stop,
-                metrics=metrics,
-            )
-            end = time.perf_counter()
+            spies, phases = [], []
+            sampler = CyclingStarts(seeds, "bench")
+            measured_start = time.perf_counter()
+            for index in range(args.phases):
+                metrics = TimedMetrics()
+                current["metrics"] = metrics
+                start = time.perf_counter()
+                carried_in = len(workers.carried)
+
+                def should_launch(start=start):
+                    now = time.perf_counter()
+                    if args.py_spy is not None and not spies and now - measured_start >= args.py_spy_delay:
+                        for worker, pid in enumerate(pids):
+                            spies.append(subprocess.Popen(
+                                [str(args.py_spy), "record", "--pid", str(pid), "--native",
+                                 "--rate", str(args.py_spy_rate), "--duration",
+                                 str(int(args.py_spy_seconds)), "--format", "raw",
+                                 "-o", str(args.output / f"py-spy-worker{worker}.txt")],
+                                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                            ))
+                    return True
+
+                workers.collect(
+                    runtime=runtime, config=cfg, actor_id=f"bench-{index}",
+                    store=NullStore(), max_positions=workers.max_positions,
+                    start_sampler=sampler,
+                    concurrent_games=args.concurrent_games,
+                    should_launch=should_launch,
+                    should_stop=lambda start=start: time.perf_counter() - start >= args.max_seconds,
+                    metrics=metrics, iteration=index,
+                )
+                end = time.perf_counter()
+                summary = summarize_phase(metrics, start, end, args.concurrent_games)
+                summary.update(carried_in=carried_in, carried_out=len(workers.carried))
+                phases.append(summary)
+                print(f"phase {index}: wall {summary['wall']:.0f}s drain {summary['drain']:.1f}s "
+                      f"usable {summary['usable_positions']} carried {carried_in}->{len(workers.carried)} "
+                      f"pos/h {summary['usable_positions_per_hour']:.0f}", flush=True)
             collector_module.CollectionPhase.next_launch = phase_next
             for spy in spies:
                 spy.wait()
@@ -390,7 +397,16 @@ def main():
         gpu.wait()
         gpu_log.close()
 
-    summary = summarize_phase(metrics, start, end, args.concurrent_games)
+    wall = sum(p["wall"] for p in phases)
+    usable = sum(p["usable_positions"] for p in phases)
+    evals = sum(p["neural_evaluations"] for p in phases)
+    summary = dict(
+        phases=len(phases), wall=wall, usable_positions=usable, neural_evaluations=evals,
+        usable_positions_per_hour=3600 * usable / wall, evals_per_second=evals / wall,
+        drain=sum(p["drain"] for p in phases),
+    )
+    end = time.perf_counter()
+    start = measured_start
     worker_reports = worker_stage_report(stats_dir)
     gpu_rows = []
     for line in (args.output / "gpu.csv").read_text().splitlines():
@@ -406,6 +422,7 @@ def main():
         startup_seconds=startup,
         warmup_seconds=warmup,
         phase=summary,
+        per_phase=phases,
         gpu_util_mean=sum(r[0] for r in measured) / max(1, len(measured)),
         gpu_memory_max_mb=max((r[1] for r in gpu_rows), default=0),
         workers=worker_reports,
@@ -416,8 +433,7 @@ def main():
         for key, value in worker["stages"].items():
             totals[key] += value
     wall = sum(w["wall"] for w in worker_reports)
-    print(json.dumps({k: v for k, v in summary.items() if k != "evals_per_second_15s_bins"},
-                     indent=1))
+    print(json.dumps(summary, indent=1))
     print("gpu util mean", round(result["gpu_util_mean"], 1))
     print("stage share of worker wall:",
           {k: round(v / wall, 3) for k, v in totals.items()})

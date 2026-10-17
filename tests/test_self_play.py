@@ -1174,7 +1174,7 @@ def test_ema_tracks_weights_checkpoints_and_upgrades_resume(tmp_path):
     settings = asdict(cfg)
     del settings["collection"]["inference_dtype"], settings["learning"]["ema_decay"]
     for key in ("playout_cap", "full_search_probability", "fast_simulations", "fast_top_m",
-                "decided_value", "decided_plies"):
+                "decided_value", "decided_plies", "carry_over_games"):
         del settings["collection"][key]
     assert cfg.identifier == hashlib.sha256(json.dumps(dict(
         settings=settings,

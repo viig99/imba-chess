@@ -11,11 +11,16 @@ phase, so every game in a phase is played by the same, current actor.
 Protocol (one duplex pipe per worker; the coordinator only ever replies):
   worker -> coordinator  ("ready", max_positions) | ("launch",) |
                          ("position", counters, elapsed, bucket) |
-                         ("game", game_id, game) | ("phase_done",) |
+                         ("game", game_id, game) | ("phase_done", paused_ids) |
                          ("error", traceback)
   coordinator -> worker  ("phase", job) | ("exit",) | launch replies
                          (game_id, seed, metadata) or None
 Any worker failure or exit aborts the phase and raises in the coordinator.
+
+With collection.carry_over_games, a worker whose launches have ended pauses
+each game at its next move boundary instead of finishing it, reports the paused
+game ids with phase_done, and resumes them first in the next phase under the
+new weights. The coordinator carries their launch metadata across phases.
 """
 
 import ctypes
@@ -96,6 +101,8 @@ class CollectionWorkers:
         self._messages = queue.Queue(maxsize=count)
         self._reader_stop = threading.Event()
         self._readers = []
+        # {game_id: launch metadata} of games paused at the last phase boundary.
+        self.carried = {}
         try:
             for index in range(count):
                 parent, child = context.Pipe()
@@ -223,7 +230,10 @@ class CollectionWorkers:
             on_game=on_game,
             skip_ids=skip_ids,
             metrics=metrics,
+            carried=self.carried,
         )
+        self.carried = {}
+        paused = set()
         try:
             if torch.cuda.is_available():
                 # Training's cached activations stay reserved in this process;
@@ -268,6 +278,7 @@ class CollectionWorkers:
                     elif kind == "game":
                         phase.done(message[1], message[2])
                     elif kind == "phase_done":
+                        paused.update(message[1])
                         running.discard(index)
                     elif kind == "error":
                         raise WorkerFailed(f"collection worker {index} failed:\n{message[1]}")
@@ -279,6 +290,9 @@ class CollectionWorkers:
                     for other in running:
                         last_progress[other] += handled - handling_started
                     last_progress[index] = handled
+            if paused != set(phase.active):
+                raise WorkerFailed("paused games disagree with the phase's live games")
+            self.carried = {gid: phase.active[gid] for gid in sorted(paused)}
         except BaseException as exc:
             # Workers may be mid-phase; there is no partial recovery.
             self.close(force=True)
@@ -287,6 +301,11 @@ class CollectionWorkers:
         finally:
             phase.finish()
         return phase.metrics
+
+    @property
+    def carried_ids(self):
+        """Games paused at the last phase boundary; keep their launches pending."""
+        return frozenset(self.carried)
 
     def close(self, *, force=False):
         self.stop.value = True
@@ -329,20 +348,23 @@ def _worker_main(connection, config, checkpoint, device, cpu_threads, runtime_lo
         torch.set_num_threads(cpu_threads)
         runtime, max_positions = runtime_loader(config, Path(checkpoint), device)
         connection.send(("ready", max_positions))
+        carry = _Carry()
         while True:
             message = connection.recv()
             if message[0] == "exit":
+                carry.close()
                 return
             job = message[1]
             weights = torch.load(job["weights"], map_location="cpu", weights_only=True)
             runtime.model.load_state_dict(weights)
             del weights
+            # Paused games hold no search state: they stopped between moves.
             getattr(runtime, "clear_caches", lambda: None)()
-            _play_phase(connection, runtime, config, max_positions, job, stop)
+            paused = _play_phase(connection, runtime, config, max_positions, job, stop, carry)
             getattr(runtime, "clear_caches", lambda: None)()
             if torch.cuda.is_available():
                 torch.cuda.empty_cache()  # Return search memory for training/evaluation.
-            connection.send(("phase_done",))
+            connection.send(("phase_done", paused))
     except (EOFError, BrokenPipeError):
         return  # The coordinator is gone.
     except BaseException:
@@ -352,36 +374,78 @@ def _worker_main(connection, config, checkpoint, device, cpu_threads, runtime_lo
             os._exit(1)
 
 
-def _play_phase(connection, runtime, config, max_positions, job, stop):
+class _Carry:
+    """A worker's games paused across phases (collection.carry_over_games)."""
+
+    def __init__(self):
+        self.scheduler = None
+        self.actor_id = None
+        self.launches_ended = False
+
+    def close(self):
+        if self.scheduler is not None:
+            self.scheduler.close()
+
+
+def _play_phase(connection, runtime, config, max_positions, job, stop, carry):
+    """Play one phase; returns the ids of games paused for the next phase."""
+    carry_over = config.collection.carry_over_games
+    carry.actor_id, carry.launches_ended = job["actor_id"], False
+    pausing = (
+        dict(
+            should_pause=lambda: carry.launches_ended,
+            current_actor=lambda: carry.actor_id,
+        )
+        if carry_over
+        else {}
+    )
+
     def factory():
-        while not stop.value:
-            connection.send(("launch",))
-            launch = connection.recv()
-            if launch is None:
-                return
-            gid, seed, metadata = launch
+        try:
+            while not stop.value:
+                connection.send(("launch",))
+                launch = connection.recv()
+                if launch is None:
+                    return
+                yield from _launch(launch)
+        finally:
+            # Live games now pause at their next move boundary.
+            carry.launches_ended = True
 
-            def on_position(result, elapsed, bucket=metadata.get("starting_bucket")):
-                counters = {k: getattr(result, k) for k in POSITION_COUNTERS}
-                connection.send(("position", counters, elapsed, bucket))
+    def _launch(launch):
+        gid, seed, metadata = launch
 
-            yield gid, launch_game(
-                runtime=runtime,
-                config=config,
-                config_id=job["config_id"],
-                actor_id=job["actor_id"],
-                seed=seed,
-                game_id=gid,
-                max_positions=max_positions,
-                should_stop=lambda: stop.value,
-                on_position=on_position,
-            )
+        def on_position(result, elapsed, bucket=metadata.get("starting_bucket")):
+            counters = {k: getattr(result, k) for k in POSITION_COUNTERS}
+            connection.send(("position", counters, elapsed, bucket))
 
-    BatchScheduler(
-        game_factory=iter(factory()),
-        executors=runtime.executors,
-        concurrent_games=job["concurrent_games"],
-        on_game_done=lambda gid, game: connection.send(("game", gid, game)),
-        on_game_error=raise_game_error,
-        completion_order=True,
-    ).run()
+        yield gid, launch_game(
+            runtime=runtime,
+            config=config,
+            config_id=job["config_id"],
+            actor_id=job["actor_id"],
+            seed=seed,
+            game_id=gid,
+            max_positions=max_positions,
+            should_stop=lambda: stop.value,
+            on_position=on_position,
+            **pausing,
+        )
+
+    def scheduler(game_factory):
+        return BatchScheduler(
+            game_factory=game_factory,
+            executors=runtime.executors,
+            concurrent_games=job["concurrent_games"],
+            on_game_done=lambda gid, game: connection.send(("game", gid, game)),
+            on_game_error=raise_game_error,
+            completion_order=True,
+        )
+
+    if not carry_over:
+        scheduler(iter(factory())).run()
+        return []
+    if carry.scheduler is None:
+        carry.scheduler = scheduler(iter(()))
+    carry.scheduler._concurrent_games = job["concurrent_games"]
+    return carry.scheduler.run_phase(iter(factory()))

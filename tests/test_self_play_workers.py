@@ -294,3 +294,86 @@ def test_slow_coordinator_launches_do_not_trip_worker_watchdog(tmp_path):
                                   store=SelfPlayStore(tmp_path / "replay"), max_positions=128,
                                   start_sampler=starts, concurrent_games=2, game_count=2)
     assert metrics.counts["completed_games"] == 2
+
+
+def test_carried_games_pause_at_phase_end_and_finish_under_new_weights(tmp_path):
+    from imba_chess.eval.gumbel_search import GumbelConfig
+    from imba_chess.self_play.config import CollectionConfig, SelfPlayConfig
+    from tests.test_self_play import mate_starts
+
+    cfg = SelfPlayConfig(
+        search=GumbelConfig(simulations=1, max_depth=1),
+        collection=CollectionConfig(carry_over_games=True),
+    )
+    starts, cfg = mate_starts(tmp_path / "stream", cfg)
+    store = SelfPlayStore(tmp_path / "replay", flush_games=16)
+    # The first four launches have four distinct lengths (1-4 plies), so each
+    # worker's shorter game ends first, finds launches over, and the longer one
+    # pauses at its next move boundary.
+    weights = {}
+    with workers_for(tmp_path, cfg) as workers:
+        for iteration in range(6):
+            actor = f"actor-{iteration}"
+            weights[actor] = 2.0 * (iteration + 1)  # root_value: sum of 2 weights
+            workers.collect(
+                runtime=coordinator_runtime(iteration + 1.0),
+                config=cfg,
+                actor_id=actor,
+                store=store,
+                max_positions=128,
+                start_sampler=starts,
+                game_count=4 if iteration == 0 else 0,
+                concurrent_games=4,
+                iteration=iteration,
+            )
+            if iteration == 0:
+                assert len(workers.carried_ids) == 2
+            starts.finish_phase(keep=workers.carried_ids)
+            if not workers.carried_ids:
+                break
+        assert not workers.carried_ids and iteration >= 1
+    ids = store.game_ids()
+    assert len(ids) == 4
+    assert starts.state["pending"] == {} and starts.state["retired"] == {}
+    spanning = 0
+    for gid in ids:
+        game = store.read_game(gid)
+        segments = game["actor_segments"]
+        assert game["launch_actor_id"] == "actor-0" == segments[0][1]
+        assert game["actor_id"] == segments[-1][1]
+        assert game["iteration"] == int(segments[-1][1].split("-")[1])
+        bounds = [start for start, _ in segments] + [len(game["targets"])]
+        for (start, actor), end in zip(segments, bounds[1:]):
+            assert start < end
+            assert all(
+                t["root_value"] == weights[actor] for t in game["targets"][start:end]
+            )
+        spanning += len(segments) > 1
+    assert spanning == 2
+
+
+def test_lost_carried_launches_retire_on_restart(tmp_path):
+    from imba_chess.eval.gumbel_search import GumbelConfig
+    from imba_chess.self_play.config import CollectionConfig, SelfPlayConfig
+    from tests.test_self_play import mate_starts
+
+    cfg = SelfPlayConfig(
+        search=GumbelConfig(simulations=1, max_depth=1),
+        collection=CollectionConfig(carry_over_games=True),
+    )
+    starts, cfg = mate_starts(tmp_path / "stream", cfg)
+    starts.begin_phase(0, "a", set())
+    kept, _ = starts.next_launch(0, "a"), starts.next_launch(0, "a")
+    gid = kept[1]
+    starts.finish_phase(keep={gid})
+    assert list(starts.state["pending"]) == [gid]
+    # Still live in a collector: neither retried nor retired.
+    starts.begin_phase(1, "b", set(), carried=frozenset({gid}))
+    assert starts.retry == [] and gid in starts.state["pending"]
+    # After a restart nothing carries it: it can never resume.
+    starts.begin_phase(1, "b", set())
+    assert starts.state["pending"] == {}
+    assert starts.state["retired"] == {
+        "phase_finished_uncompleted": 1,  # The launch that was not carried.
+        "carry_over_lost": 1,
+    }

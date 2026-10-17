@@ -33,15 +33,25 @@ class CollectionConfig:
     fast_top_m: int = 8
     decided_value: float = 0.98
     decided_plies: int = 3
+    # Multi-worker collection only. Off: once a phase stops launching, in-flight
+    # games finish under the phase's actor (the drain). On: they pause at their
+    # next move boundary and resume next phase under the new weights, so a game
+    # can span actors; the completing phase's actor and iteration label it, and
+    # actor_segments records which actor searched each ply.
+    carry_over_games: bool = False
 
     PLAYOUT_CAP_FIELDS = (
         "playout_cap", "full_search_probability", "fast_simulations", "fast_top_m",
         "decided_value", "decided_plies",
     )
+    # Fields a resumed run may change with --previous-config.
+    RESUMABLE_FIELDS = PLAYOUT_CAP_FIELDS + ("carry_over_games",)
 
     def __post_init__(self):
         if type(self.playout_cap) is not bool:
             raise ValueError("playout_cap must be boolean")
+        if type(self.carry_over_games) is not bool:
+            raise ValueError("carry_over_games must be boolean")
         if not math.isfinite(self.full_search_probability) or not 0 < self.full_search_probability <= 1:
             raise ValueError("full_search_probability must be in (0, 1]")
         if any(type(v) is not int or v < 1 for v in (self.fast_simulations, self.fast_top_m, self.decided_plies)):
@@ -167,6 +177,8 @@ class SelfPlayConfig:
         if not self.collection.playout_cap:
             for key in CollectionConfig.PLAYOUT_CAP_FIELDS:
                 del settings["collection"][key]
+        if not self.collection.carry_over_games:
+            del settings["collection"]["carry_over_games"]
         if self.learning.ema_decay == 0:
             del settings["learning"]["ema_decay"]
         return hashlib.sha256(
@@ -204,7 +216,7 @@ def load_config(path):
     ):
         raise ValueError("the fast search must be smaller than the full [search]")
     for section in (cfg.collection, cfg.replay, cfg.learning):
-        if any(not math.isfinite(v) or v <= 0 for k, v in asdict(section).items() if not k.startswith(("policy_surprise_", "auxiliary_value_")) and k not in ("value_weight", "value_search_mix", "inference_dtype", "ema_decay", *CollectionConfig.PLAYOUT_CAP_FIELDS)):
+        if any(not math.isfinite(v) or v <= 0 for k, v in asdict(section).items() if not k.startswith(("policy_surprise_", "auxiliary_value_")) and k not in ("value_weight", "value_search_mix", "inference_dtype", "ema_decay", *CollectionConfig.RESUMABLE_FIELDS)):
             raise ValueError("stage-2 sizes and learning settings must be positive")
     if not all(math.isfinite(v) for v in asdict(cfg.run).values()):
         raise ValueError("run settings must be finite")

@@ -326,7 +326,11 @@ class StreamingStarts:
             max_depth=self.config.search.max_depth,
         )
 
-    def begin_phase(self, iteration, actor_id, completed, *, max_positions=None):
+    def begin_phase(
+        self, iteration, actor_id, completed, *, max_positions=None, carried=frozenset()
+    ):
+        """carried: launches of earlier phases still live in the collectors
+        (collection.carry_over_games); they are neither retried nor retired."""
         if self.config.regret is not None:
             if max_positions is None:
                 raise ValueError("regret starts require the collection context limit")
@@ -337,11 +341,20 @@ class StreamingStarts:
         self.reconcile(completed)
         for gid, record in list(self.state["pending"].items()):
             if (record["iteration"], record["actor_id"]) != (iteration, actor_id):
+                if gid in carried:
+                    continue
+                if self.config.collection.carry_over_games:
+                    # Paused in an earlier phase and lost with its collector
+                    # (a restart): the game cannot resume.
+                    self.retire(gid, "carry_over_lost")
+                    continue
                 raise ValueError(
                     "pending streamed launches belong to another actor/phase"
                 )
+        if not set(carried) <= set(self.state["pending"]):
+            raise ValueError("carried games are not pending streamed launches")
         self.retry = sorted(
-            self.state["pending"],
+            (gid for gid in self.state["pending"] if gid not in carried),
             key=lambda gid: self.state["pending"][gid]["sequence"],
         )
 
@@ -398,9 +411,11 @@ class StreamingStarts:
             counts[reason] = counts.get(reason, 0) + 1
             self.save()
 
-    def finish_phase(self):
+    def finish_phase(self, keep=frozenset()):
+        """Retire uncompleted launches, except carried games that stay live."""
         for gid in list(self.state["pending"]):
-            self.retire(gid, "phase_finished_uncompleted")
+            if gid not in keep:
+                self.retire(gid, "phase_finished_uncompleted")
 
     def next_launch(self, iteration, actor_id):
         if self.retry:
