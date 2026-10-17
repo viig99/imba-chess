@@ -5,13 +5,14 @@ from dataclasses import dataclass
 from pathlib import Path
 import time
 
+import chess
 import torch
 
 from . import cozy_bridge, search
 from .batch_scheduler import WorkRequest
 from .gumbel_search import gumbel_stepwise, GumbelConfig
 from .merged_executors import _make_root_eval_executor, _make_decode_wave_executor
-from .position_evaluator import CachedPositionEvaluator, _project_legal_logits
+from .position_evaluator import CachedPositionEvaluator
 from .search import PositionEval, HalvingConfig
 
 
@@ -247,38 +248,46 @@ class InferenceRuntime:
             raise RuntimeError("search invalidated by cache refresh")
         if identity != owner:
             raise RuntimeError("root result ownership mismatch")
-        logits, moves, total, mapped = _project_legal_logits(
-            logits=output["logits"][-1], board=board, move_vocab=self.move_vocab
+        # Native projection: vocabulary ids, UCIs, playable moves and forcing
+        # flags in canonical UCI order, the order python-chess projection used.
+        legal = cozy_bridge.project_legal_lean(
+            cozy_bridge.board_to_cozy(board), self.move_vocab
         )
-        if total != mapped:
+        if legal.total != len(legal):
             raise ValueError("incomplete legal vocabulary")
-        if not moves:
+        if not len(legal):
             raise ValueError("cannot search a position without legal moves")
+        ids, ucis = legal.ids, legal.ucis
+        row = output["logits"][-1]
+        index = torch.tensor(ids, dtype=torch.long).to(row.device, non_blocking=True)
+        logits = row.index_select(0, index)
         if root_observer is not None:
-            root_observer(moves, logits)
+            root_observer([chess.Move.from_uci(uci) for uci in ucis], logits)
         if self.algorithm == "policy":
-            return PolicyResult(moves[int(torch.argmax(logits))].uci())
+            return PolicyResult(ucis[int(torch.argmax(logits))])
         if self.algorithm == "policy_q":
             if "q" not in output:
                 raise ValueError("policy_q requires a checkpoint with an action-value head")
-            q, q_moves, _, _ = _project_legal_logits(
-                logits=output["q"][-1], board=board, move_vocab=self.move_vocab
-            )
-            if q_moves != moves:
-                raise RuntimeError("policy and action-value legal moves are misaligned")
+            q = output["q"][-1].index_select(0, index)
             scores = POLICY_Q_BETA * logits.float() + q.float()
-            return PolicyResult(moves[int(torch.argmax(scores))].uci())
+            return PolicyResult(ucis[int(torch.argmax(scores))])
         if noise == 0.0:
-            noise = [0.0] * len(moves)
-        wdl = tuple(torch.softmax(output["value_logits"][-1].float(), -1).tolist())
+            noise = [0.0] * len(ids)
+        # One readback for the root's log priors and WDL.
+        host = torch.cat(
+            (
+                torch.log_softmax(logits.float(), 0),
+                torch.softmax(output["value_logits"][-1].float(), -1),
+            )
+        ).cpu()
+        wdl = tuple(host[len(ids):].tolist())
         root = PositionEval(
             wdl[2] - wdl[0],
-            [cozy_bridge.py_move_to_cozy(board, m) for m in moves],
-            [m.uci() for m in moves],
-            torch.log_softmax(logits.float(), 0).tolist(),
-            [board.is_capture(m) or bool(m.promotion) or board.gives_check(m)
-             for m in moves],
-            [self.move_vocab.encode(m.uci()) for m in moves],
+            legal.moves,
+            ucis,
+            host[: len(ids)].tolist(),
+            legal.forcing,
+            ids,
             wdl=wdl,
         )
         evaluator = CachedPositionEvaluator(
@@ -310,7 +319,7 @@ class InferenceRuntime:
                 extend=evaluator.extend,
                 root_handle=None,
                 board=board,
-                legal_moves=moves,
+                legal_moves=[chess.Move.from_uci(uci) for uci in ucis],
                 legal_log_priors=root.legal_log_priors,
                 config=config,
             )
@@ -331,7 +340,7 @@ class InferenceRuntime:
         except StopIteration as stop:
             if self.algorithm == "value_search_halving":
                 chosen, rows = stop.value
-                return HalvingResult(moves[chosen].uci(), rows)
+                return HalvingResult(ucis[chosen], rows)
             return stop.value
         finally:
             gen.close()
