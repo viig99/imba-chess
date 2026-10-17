@@ -588,3 +588,53 @@ def test_stable_placement_and_selective_gather(device, mode, monkeypatch):
         reference.clear_cache()
         candidate.clear_cache()
         assert not ws.slots and ws.arena is None and ws.branch_gather_width is None
+
+
+@pytest.mark.extended
+@pytest.mark.parametrize("mode", ["tensor", "compiled"])
+def test_decoder_graphs_replay_exactly_what_eager_decoding_computes(mode, monkeypatch):
+    """Two identical workspaces stage the same waves; one decodes through
+    exact-shape CUDA graphs, the other eagerly. Every output must match bit for
+    bit, including after shape changes, graph reuse and invalidation."""
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA unavailable")
+    from imba_chess.model.tensor_decoder import DecoderRunner as CompiledRunner
+
+    torch.manual_seed(321)
+    model = _tiny_model(len(VOCAB)).cuda().eval()
+    runner_class = DecoderRunner if mode == "tensor" else CompiledRunner
+    graphed, eager = DecodeWorkspace(runner_class(model)), DecodeWorkspace(runner_class(model))
+    prefixes = [evaluator(model, n, immutable=True) for n in (3, 9, 17, 5)]
+    owners = {
+        "graphed": prefixes,
+        "eager": [evaluator(model, e._prefix_len, e._prefix_kv, immutable=True) for e in prefixes],
+    }
+    parents = {"graphed": [None] * 4, "eager": [None] * 4}
+    with torch.inference_mode():
+        for step in range(30):
+            rows = [0, 1, 2, 3] if step % 3 else [1, 3]
+            if step == 20:  # A longer history changes the prefix shape and refreshes rows.
+                owners["graphed"][0] = evaluator(model, 23, immutable=True)
+                owners["eager"][0] = evaluator(
+                    model, 23, owners["graphed"][0]._prefix_kv, immutable=True
+                )
+                parents = {"graphed": [None] * 4, "eager": [None] * 4}
+            outs = {}
+            for name, ws in (("graphed", graphed), ("eager", eager)):
+                batch = [payload(owners[name][i], parents[name][i]) for i in rows]
+                args, state = ws.prepare(batch, attention=name == "eager")
+                out = ws.decode(args) if name == "graphed" else ws.runner.decode(*args)
+                outs[name] = (
+                    out["logits"].clone(), out["value_logits"].clone(),
+                    [t.clone() for pair in out["kv"] for t in pair],
+                )
+                ws.consume(state, out)
+                for i, (_, entry) in zip(rows, batch):
+                    parents[name][i] = entry[0][0] if step % 4 else None
+            (lg, vg, kg), (le, ve, ke) = outs["graphed"], outs["eager"]
+            assert torch.equal(lg, le) and torch.equal(vg, ve)
+            assert all(torch.equal(a, b) for a, b in zip(kg, ke))
+    assert graphed.counters["graph_captures"] > 0
+    assert graphed.counters["graph_replays"] > 0
+    graphed.clear()
+    assert not graphed._graphs

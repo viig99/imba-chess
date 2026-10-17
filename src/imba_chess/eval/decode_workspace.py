@@ -4,7 +4,7 @@ One synchronous result readback completes all queued work before pinned input
 storage is reused. The executor is deliberately single-stream and non-reentrant.
 """
 
-from collections import Counter
+from collections import Counter, OrderedDict
 from dataclasses import dataclass, field
 import weakref
 
@@ -85,18 +85,25 @@ def _stamp(request):
 
 class DecodeWorkspace:
     capacity = 32
+    # Exact-shape decoder CUDA graphs kept per workspace (LRU).
+    graph_capacity = 32
 
     def __init__(self, runner):
         self.runner = runner
         self.device = runner.model.piece_square_embedding.weight.device
         self.counters = Counter()
         self._stager = None  # (encoder, WaveStager)
+        self._graphs = OrderedDict()
+        self._graph_pool = None
+        self._capture_stream = None
+        self._generation = 0
         self.clear()
 
     def clear(self):
         if self.device.type == "cuda" and getattr(self, "host", None) is not None:
             # Also safe after cancellation or a decoder exception before readback.
             torch.cuda.current_stream(self.device).synchronize()
+        self._drop_graphs()
         self.numpy = None
         self.slots = {}
         self.free_rows = []
@@ -219,7 +226,9 @@ class DecodeWorkspace:
             slot.rows.extend(slot.free)
         return slot, slot.free.pop()
 
-    def prepare(self, payloads, *, prefix_inference=False):
+    def prepare(self, payloads, *, prefix_inference=False, attention=True):
+        """Stage one wave. attention=False leaves the four attention tensors to
+        decode(), which builds them inside the captured decoder graph."""
         if any(len(batch) != 1 for _, batch in payloads):
             raise ValueError("reusable decode buffers require one query per game")
         if len({id(e) for e, _ in payloads}) != len(payloads):
@@ -309,6 +318,7 @@ class DecodeWorkspace:
             self.row_owners = [None] * self.batch_capacity
             full_refresh = True
             self.host = None
+            self._drop_graphs()  # Decoder input buffers were reallocated.
         if self.host is None or width > self.legal_capacity:
             self.legal_capacity = max(1, self.legal_capacity, _capacity(width))
             # 64 squares, seven scalar features, position/prefix/depth/destination,
@@ -319,6 +329,7 @@ class DecodeWorkspace:
                 pin_memory=self.device.type == "cuda",
             )
             self.metadata = torch.empty_like(self.host, device=self.device)
+            self._drop_graphs()  # Graphs read lengths/depths from metadata.
             self.numpy = self.host.numpy()
         count = self._packed_size(g)
         self.numpy[:count].fill(0)
@@ -380,9 +391,13 @@ class DecodeWorkspace:
         )
         _, lengths, depths, _ = self.device_fields[2].unbind(0)
         positions = feature_targets[-1]
-        prefix_rel, prefix_fill, suffix_rel, suffix_fill = self._prepare_attention(
-            p, positions, lengths, depths
-        )
+        self._attention_inputs = (p, positions, lengths, depths)
+        if attention:
+            prefix_rel, prefix_fill, suffix_rel, suffix_fill = self._prepare_attention(
+                p, positions, lengths, depths
+            )
+        else:
+            prefix_rel = prefix_fill = suffix_rel = suffix_fill = None
         batch = {"piece_ids": feature_targets[0]}
         batch.update({key: feature_targets[col + 1] for col, key in enumerate(keys)})
         args = (
@@ -441,9 +456,10 @@ class DecodeWorkspace:
         self.counters[f"branch_gather_width_{width}_batches"] += 1
         return suffix
 
-    def _prepare_attention(self, p, positions, lengths, depths):
-        max_pos = self.runner.model.layers[0]._max_seq_len
-        # Position ranges are constants per prefix length; never mutated below.
+    def _ranges(self, p):
+        # Position ranges are constants per prefix length; never mutated. Built
+        # outside graph capture: tensors allocated during capture stay unwritten
+        # until the graph first replays.
         prefix_pos = self._aranges.get(p)
         if prefix_pos is None:
             prefix_pos = self._aranges[p] = torch.arange(p, device=self.device)[None, :]
@@ -452,6 +468,11 @@ class DecodeWorkspace:
             branch_pos = self._aranges["branch"] = torch.arange(
                 self.capacity, device=self.device
             )[None, :]
+        return prefix_pos, branch_pos
+
+    def _prepare_attention(self, p, positions, lengths, depths, ranges=None):
+        max_pos = self.runner.model.layers[0]._max_seq_len
+        prefix_pos, branch_pos = self._ranges(p) if ranges is None else ranges
         prefix_rel = (prefix_pos - positions[:, None] + max_pos - 1).clamp(
             0, 2 * max_pos - 2
         )
@@ -464,6 +485,67 @@ class DecodeWorkspace:
         prefix_fill = (prefix_pos >= lengths[:, None])[:, None, None, :]
         suffix_fill = (branch_pos >= depths[:, None])[:, None, None, :]
         return prefix_rel, prefix_fill, suffix_rel, suffix_fill
+
+    def decode(self, args):
+        """Run the decoder on prepare(..., attention=False) arguments.
+
+        On CUDA each exact (generation, batch, prefix) shape gets one captured
+        graph of the attention-index prep and the compiled decoder: the same
+        kernels on the same static buffers, replayed without Python launches.
+        The first wave of a shape runs normally (its result is used), then the
+        shape is captured. Graph outputs are overwritten by the next replay, so
+        callers consume them before decoding again (consume() does)."""
+        p, positions, lengths, depths = self._attention_inputs
+        ranges = self._ranges(p)
+        head = args[:4]
+
+        def run():
+            attention = self._prepare_attention(p, positions, lengths, depths, ranges)
+            return self.runner.decode(*head, *attention)
+
+        if self.device.type != "cuda":
+            return run()
+        key = (self._generation, positions.size(0), p)
+        entry = self._graphs.get(key)
+        if entry is not None:
+            self._graphs.move_to_end(key)
+            entry[0].replay()
+            self.counters["graph_replays"] += 1
+            return entry[1]
+        out = run()
+        self._graphs[key] = self._capture(run)
+        self.counters["graph_captures"] += 1
+        while len(self._graphs) > self.graph_capacity:
+            self._graphs.popitem(last=False)
+            self.counters["graph_evictions"] += 1
+        return out
+
+    def _capture(self, run):
+        current = torch.cuda.current_stream(self.device)
+        if self._capture_stream is None:
+            self._capture_stream = torch.cuda.Stream(self.device)
+        stream = self._capture_stream
+        stream.wait_stream(current)
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.stream(stream):
+            # The low-level API skips torch.cuda.graph's gc.collect/empty_cache.
+            graph.capture_begin(pool=self._graph_pool, capture_error_mode="thread_local")
+            try:
+                out = run()
+            finally:
+                graph.capture_end()
+        current.wait_stream(stream)
+        if self._graph_pool is None:
+            self._graph_pool = graph.pool()
+        return graph, out
+
+    def _drop_graphs(self):
+        if getattr(self, "_graphs", None):
+            self.counters["graph_invalidations"] += 1
+        self._graphs = OrderedDict()
+        # The pool is released with its last graph; never capture into it again.
+        self._graph_pool = None
+        self._generation = getattr(self, "_generation", 0) + 1
 
     def _packed_size(self, g):
         return (96 + self.legal_capacity) * g + 11 * ((g + 31) // 32 * 32)

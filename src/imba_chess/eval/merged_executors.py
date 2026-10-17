@@ -447,10 +447,12 @@ def _make_decode_wave_executor(
                     start = time.perf_counter()
                     order = reusable.placement_order(payloads)
                     args, state = reusable.prepare(
-                        [payloads[i] for i in order], prefix_inference=prefix_inference
+                        [payloads[i] for i in order],
+                        prefix_inference=prefix_inference,
+                        attention=False,
                     )
                     prepared = time.perf_counter()
-                    out = runner.decode(*args)
+                    out = reusable.decode(args)
                     decoded = time.perf_counter()
                     results = reusable.consume(state, out)
                     restored = [None] * len(results)
