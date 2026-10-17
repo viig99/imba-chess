@@ -108,12 +108,10 @@ class DecodeWorkspace:
         self.slots = {}
         self.free_rows = []
         # K/V of every evaluated node: one [layers, 2 (K, V), rows, heads, dim]
-        # tensor, so a wave's scatter and ancestor gather are one operation each.
+        # tensor. A wave scatters its new rows in one operation, and the decoder
+        # reads each row's ancestors from it by chain index.
         self.arena_stack = self.arena = None
-        self.branch_stack = None
-        self._gather_views = {}
-        self._aranges = {}
-        self.host = self.metadata = self.branch = None
+        self.host = self.metadata = None
         self.row_owners = []
         self.batch_capacity = self.prefix_capacity = self.legal_capacity = 0
         self.row_capacity = 0
@@ -121,7 +119,6 @@ class DecodeWorkspace:
         self.device_fields = None
         self.prefix_inputs = self.feature_inputs = None
         self.prefix_inference = None
-        self.branch_gather_width = None
 
     def placement_order(self, payloads):
         """Keep live owners in their active rows; callers restore result order."""
@@ -154,7 +151,7 @@ class DecodeWorkspace:
         self.arena_stack, self.row_capacity = stack, size
         # Per-kind views ([layers, rows, heads, dim]) for inspection and tests.
         self.arena = (stack[:, 0], stack[:, 1])
-        self._gather_views = {}
+        self._drop_graphs()  # Graphs read the arena by address.
         # Row zero is permanent zero padding, never assigned to a node.
         self.free_rows.extend(range(size - 1, max(1, old) - 1, -1))
         self.counters["arena_growths"] += 1
@@ -180,7 +177,9 @@ class DecodeWorkspace:
         return prefix
 
     def _refresh_direct(self, prefix, requests, dirty):
-        targets, sources, padding = [], [], []
+        # Only each row's real history is copied: the decoder never reads past a
+        # row's length, so padding is left as is.
+        targets, sources = [], []
         for row in dirty:
             req = requests[row]
             for buffers, refs in zip(prefix, req.prefix_kv):
@@ -188,20 +187,12 @@ class DecodeWorkspace:
                     if req.prefix_len:
                         targets.append(target[row, :, : req.prefix_len])
                         sources.append(source[:, : req.prefix_len])
-                    if req.prefix_len < target.size(2):
-                        padding.append(target[row, :, req.prefix_len :])
         if targets:
             torch._foreach_copy_(targets, sources)
             self.counters["history_copy_submissions"] += 1
-        if padding:
-            torch._foreach_zero_(padding)
-            self.counters["history_zero_submissions"] += 1
         copied = sum(t.numel() * t.element_size() for t in targets)
         self.counters["decoder_prefix_copy_bytes"] += copied
         self.counters["history_copied_bytes"] += copied
-        self.counters["history_zeroed_bytes"] += sum(
-            t.numel() * t.element_size() for t in padding
-        )
 
     def _slot(self, evaluator, request):
         key = id(evaluator)
@@ -226,9 +217,8 @@ class DecodeWorkspace:
             slot.rows.extend(slot.free)
         return slot, slot.free.pop()
 
-    def prepare(self, payloads, *, prefix_inference=False, attention=True):
-        """Stage one wave. attention=False leaves the four attention tensors to
-        decode(), which builds them inside the captured decoder graph."""
+    def prepare(self, payloads, *, prefix_inference=False):
+        """Stage one wave; returns the decoder arguments and consume() state."""
         if any(len(batch) != 1 for _, batch in payloads):
             raise ValueError("reusable decode buffers require one query per game")
         if len({id(e) for e, _ in payloads}) != len(payloads):
@@ -271,24 +261,6 @@ class DecodeWorkspace:
             self.batch_capacity = max(self.batch_capacity, _capacity(g))
             self.prefix_capacity = max(self.prefix_capacity, _capacity(p))
             ref = requests[0].prefix_kv
-            k = ref[0][0]
-            # Match the reference's independent input storages. Shared layer
-            # views select numerically different cold-compiled graphs.
-            self.branch = [
-                tuple(
-                    t.new_empty(
-                        (self.batch_capacity, t.size(0), self.capacity, t.size(-1))
-                    )
-                    for t in pair
-                )
-                for pair in ref
-            ]
-            # One gather fills this scratch for every layer's K and V.
-            self.branch_stack = k.new_empty(
-                (len(ref), 2, self.batch_capacity, k.size(0), self.capacity, k.size(-1))
-            )
-            self._gather_views = {}
-            self.branch_gather_width = None
             # The reference packs prefixes outside inference_mode. Preserve
             # that dispatch metadata too: inference tensors can select a
             # numerically different compiled graph after a weight update.
@@ -374,7 +346,6 @@ class DecodeWorkspace:
         self.device_fields = self._fields(metadata, g)
         self.counters["h2d_bytes"] += metadata.numel() * metadata.element_size()
         self.counters["h2d_copies"] += 1
-        suffix = self._gather_ancestors(g)
         prefix = self._prefix_views(requests[0].prefix_kv, g, p)
         self.counters["history_dirty_rows"] += len(dirty)
         if dirty:
@@ -391,121 +362,35 @@ class DecodeWorkspace:
         )
         _, lengths, depths, _ = self.device_fields[2].unbind(0)
         positions = feature_targets[-1]
-        self._attention_inputs = (p, positions, lengths, depths)
-        if attention:
-            prefix_rel, prefix_fill, suffix_rel, suffix_fill = self._prepare_attention(
-                p, positions, lengths, depths
-            )
-        else:
-            prefix_rel = prefix_fill = suffix_rel = suffix_fill = None
         batch = {"piece_ids": feature_targets[0]}
         batch.update({key: feature_targets[col + 1] for col, key in enumerate(keys)})
         args = (
             batch,
             positions,
             prefix,
-            suffix,
-            prefix_rel,
-            prefix_fill,
-            suffix_rel,
-            suffix_fill,
+            self.arena_stack,
+            self.device_fields[3],
+            lengths,
+            depths,
         )
         return args, (requests, chains, slots_rows, per_node, width)
 
-    def _gather_ancestors(self, g):
-        # Read staged CPU depths without a device synchronization. Keep the full
-        # independent, contiguous decoder buffers: only the gather work shrinks.
-        width = int(self._fields(self.numpy, g)[2][2].max())
-        buffers = [buffer for pair in self.branch for buffer in pair]
-        if self.branch_gather_width is None:
-            torch._foreach_zero_(buffers)
-            self.counters["branch_zeroed_bytes"] += sum(
-                t.numel() * t.element_size() for t in buffers
-            )
-            self.branch_gather_width = 0
-        if width < self.branch_gather_width:
-            # Include inactive rows so later batch growth cannot expose stale K/V.
-            padding = [t[:, :, width : self.branch_gather_width] for t in buffers]
-            torch._foreach_zero_(padding)
-            self.counters["branch_zeroed_bytes"] += sum(
-                t.numel() * t.element_size() for t in padding
-            )
-        self.branch_gather_width = width
-        views = self._gather_views.get((g, width))
-        if views is None:
-            # Every layer's K and V in one gather, [layers, 2, g, heads, width,
-            # dim], then one multi-tensor copy into the layers' own buffers.
-            stack = self.arena_stack
-            selected = self.branch_stack[:, :, :g, :, :width]
-            source = stack.permute(0, 1, 3, 2, 4)[:, :, None].expand(
-                -1, -1, g, -1, -1, -1
-            )
-            targets = [buffer[:g, :, :width] for buffer in buffers]
-            sources = [selected[layer, kind] for layer in range(len(self.branch)) for kind in (0, 1)]
-            suffix = [tuple(buffer[:g] for buffer in pair) for pair in self.branch]
-            views = self._gather_views[(g, width)] = (selected, source, targets, sources, suffix)
-        selected, source, targets, sources, suffix = views
-        if width:
-            indices = self.device_fields[3][:, :width]
-            torch.gather(
-                source, 4, indices[None, None, :, None, :, None].expand_as(selected),
-                out=selected,
-            )
-            torch._foreach_copy_(targets, sources)
-            self.counters["gather_bytes"] += selected.numel() * selected.element_size()
-        self.counters[f"branch_gather_width_{width}_batches"] += 1
-        return suffix
-
-    def _ranges(self, p):
-        # Position ranges are constants per prefix length; never mutated. Built
-        # outside graph capture: tensors allocated during capture stay unwritten
-        # until the graph first replays.
-        prefix_pos = self._aranges.get(p)
-        if prefix_pos is None:
-            prefix_pos = self._aranges[p] = torch.arange(p, device=self.device)[None, :]
-        branch_pos = self._aranges.get("branch")
-        if branch_pos is None:
-            branch_pos = self._aranges["branch"] = torch.arange(
-                self.capacity, device=self.device
-            )[None, :]
-        return prefix_pos, branch_pos
-
-    def _prepare_attention(self, p, positions, lengths, depths, ranges=None):
-        max_pos = self.runner.model.layers[0]._max_seq_len
-        prefix_pos, branch_pos = self._ranges(p) if ranges is None else ranges
-        prefix_rel = (prefix_pos - positions[:, None] + max_pos - 1).clamp(
-            0, 2 * max_pos - 2
-        )
-        suffix_positions = torch.where(
-            branch_pos < depths[:, None], lengths[:, None] + branch_pos, 0
-        )
-        suffix_rel = (suffix_positions - positions[:, None] + max_pos - 1).clamp(
-            0, 2 * max_pos - 2
-        )
-        prefix_fill = (prefix_pos >= lengths[:, None])[:, None, None, :]
-        suffix_fill = (branch_pos >= depths[:, None])[:, None, None, :]
-        return prefix_rel, prefix_fill, suffix_rel, suffix_fill
-
     def decode(self, args):
-        """Run the decoder on prepare(..., attention=False) arguments.
+        """Run the decoder on prepare() arguments.
 
         On CUDA each exact (generation, batch, prefix) shape gets one captured
-        graph of the attention-index prep and the compiled decoder: the same
-        kernels on the same static buffers, replayed without Python launches.
-        The first wave of a shape runs normally (its result is used), then the
-        shape is captured. Graph outputs are overwritten by the next replay, so
-        callers consume them before decoding again (consume() does)."""
-        p, positions, lengths, depths = self._attention_inputs
-        ranges = self._ranges(p)
-        head = args[:4]
+        graph of the compiled decoder: the same kernels on the same static
+        buffers (prefix inputs, arena, metadata), replayed without Python
+        launches. The first wave of a shape runs normally (its result is used),
+        then the shape is captured. Graph outputs are overwritten by the next
+        replay, so callers consume them before decoding again (consume() does)."""
 
         def run():
-            attention = self._prepare_attention(p, positions, lengths, depths, ranges)
-            return self.runner.decode(*head, *attention)
+            return self.runner.decode(*args)
 
         if self.device.type != "cuda":
             return run()
-        key = (self._generation, positions.size(0), p)
+        key = (self._generation, args[1].size(0), args[2][0][0].size(2))
         entry = self._graphs.get(key)
         if entry is not None:
             self._graphs.move_to_end(key)

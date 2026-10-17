@@ -449,7 +449,6 @@ def _make_decode_wave_executor(
                     args, state = reusable.prepare(
                         [payloads[i] for i in order],
                         prefix_inference=prefix_inference,
-                        attention=False,
                     )
                     prepared = time.perf_counter()
                     out = reusable.decode(args)

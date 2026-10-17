@@ -6,7 +6,7 @@ fresh projections, not views into mutable staging storage.
 
 import torch
 import torch.nn.functional as F
-from .hstu_attention import GroupedDecodeCache, _one_query_attention
+from .decode_attention import decode_attention_silu
 
 
 class TensorDecoder(torch.nn.Module):
@@ -16,58 +16,50 @@ class TensorDecoder(torch.nn.Module):
         super().__init__()
         self.model = model
 
-    def forward(
-        self,
-        batch,
-        positions,
-        prefix,
-        suffix,
-        prefix_rel,
-        prefix_fill,
-        suffix_rel,
-        suffix_fill,
-    ):
+    def forward(self, batch, positions, prefix, arena, chain, lengths, depths):
+        """prefix: per layer (K, V) [g, H, P, d]; arena: [layers, 2 (K, V),
+        rows, H, d] holding every evaluated node; chain: [g, S] each row's
+        ancestor arena rows; lengths/depths: [g] real prefix and suffix sizes."""
         model = self.model
         x = model.position_embedding.at_positions(
             model._build_content(batch), positions
         )
-        cache = GroupedDecodeCache(
-            [], [], [], [], prefix_rel, prefix_fill, suffix_rel, suffix_fill
-        )
         new_kv = []
         for index, layer in enumerate(model.layers):
             residual = x.unsqueeze(1)
-            uvqk = F.silu(layer._uvqk(layer._norm_input(residual)))
-            u, v, q, k = uvqk.split(
+            heads = layer._num_heads
+            u, v, q, k = layer._uvqk(layer._norm_input(residual)).split(
                 [
-                    layer._linear_dim * layer._num_heads,
-                    layer._linear_dim * layer._num_heads,
-                    layer._attention_dim * layer._num_heads,
-                    layer._attention_dim * layer._num_heads,
+                    layer._linear_dim * heads,
+                    layer._linear_dim * heads,
+                    layer._attention_dim * heads,
+                    layer._attention_dim * heads,
                 ],
                 dim=-1,
             )
-            q = layer._reshape_uvqk_for_mm(q, layer._num_heads, layer._attention_dim)
-            k = layer._reshape_uvqk_for_mm(k, layer._num_heads, layer._attention_dim)
-            v = layer._reshape_uvqk_for_mm(v, layer._num_heads, layer._linear_dim)
-            self_bias = layer._ps_w[:, layer._max_seq_len - 1].view(1, -1, 1, 1)
-            attn = _one_query_attention(
+            # Raw projections as [g, H, 1, d] views; the kernel applies SiLU and
+            # returns the new K/V, so no per-head copies are materialized.
+            q, k, v = (t.unflatten(-1, (heads, -1)).transpose(1, 2) for t in (q, k, v))
+            attn, k, v = decode_attention_silu(
                 q,
-                *prefix[index],
                 k,
                 v,
-                *suffix[index],
-                cache,
+                *prefix[index],
+                arena[index, 0],
+                arena[index, 1],
+                chain,
+                lengths,
+                depths,
                 layer._ps_w,
-                self_bias,
                 layer._attention_dim ** (-0.5),
+                layer._max_seq_len,
             )
             attn = layer._norm_attn_output(
                 attn.permute(0, 2, 1, 3).reshape(
                     x.size(0), 1, layer._num_heads * layer._linear_dim
                 )
             )
-            x = (layer._o(u * attn) + residual).squeeze(1)
+            x = (layer._o(F.silu(u) * attn) + residual).squeeze(1)
             new_kv.append((k, v))
         x = model.final_norm(x)
         output = {"logits": model.prediction_head(x), "kv": new_kv}
@@ -79,7 +71,7 @@ class TensorDecoder(torch.nn.Module):
 class DecoderRunner:
     """Host-side validation/preparation, kept outside the compiled graph.
 
-    The caller owns prefix and branch storage; the runner retains no search
+    The caller owns prefix and arena storage; the runner retains no search
     owners or cached decode inputs between calls.
     """
 
@@ -113,45 +105,39 @@ class DecoderRunner:
             for key, value in merged.new_token_batch.items()
         }
         g = len(lengths)
-        suffix = []
-        for i, (k, v) in enumerate(merged.prefix_kv_grouped):
-            if merged.suffix_kv is None:
-                suffix.append(
-                    (
-                        k.new_zeros((g, k.size(1), capacity, k.size(3))),
-                        v.new_zeros((g, v.size(1), capacity, v.size(3))),
-                    )
-                )
-            else:
-                sk, sv = merged.suffix_kv[i]
-                suffix.append(
-                    (
-                        F.pad(sk, (0, 0, 0, capacity - s)),
-                        F.pad(sv, (0, 0, 0, capacity - s)),
-                    )
-                )
-        q = positions[:, None]
-        max_pos = self.model.layers[0]._max_seq_len
-        prefix_rel = (torch.arange(p, device=device)[None, :] - q + max_pos - 1).clamp(
-            0, 2 * max_pos - 2
-        )
-        prefix_fill = (torch.arange(p, device=device)[None, :] >= prefix_lens[:, None])[
-            :, None, None, :
-        ]
-        sp = torch.zeros((g, capacity), device=device, dtype=torch.long)
-        sm = torch.zeros((g, capacity), device=device, dtype=torch.bool)
+        depths = positions - prefix_lens
         if s:
-            sp[:, :s] = merged.suffix_positions.to(device, non_blocking=True)
-            sm[:, :s] = merged.suffix_mask.to(device, non_blocking=True)
-        suffix_rel = (sp - q + max_pos - 1).clamp(0, 2 * max_pos - 2)
-        suffix_fill = ~sm[:, None, None, :]
+            # The decoder reads suffix key j at position length + j for j < depth.
+            j = torch.arange(s, device=device)
+            mask = merged.suffix_mask.to(device)
+            expected = j[None, :] < depths[:, None]
+            suffix_pos = merged.suffix_positions.to(device)
+            if not torch.equal(mask, expected) or not torch.equal(
+                suffix_pos[mask], (prefix_lens[:, None] + j)[mask]
+            ):
+                raise ValueError("suffix must be each row's contiguous ancestors")
+        elif bool((depths != 0).any()):
+            raise ValueError("positions exceed prefix lengths without a suffix")
+        # Stage every row's suffix as arena rows; row 0 stays zero padding.
+        k0 = merged.prefix_kv_grouped[0][0]
+        arena = k0.new_zeros(
+            (len(merged.prefix_kv_grouped), 2, 1 + g * s, k0.size(1), k0.size(-1))
+        )
+        if s:
+            for i, pair in enumerate(merged.suffix_kv):
+                for kind, t in enumerate(pair):
+                    arena[i, kind, 1:] = t.permute(0, 2, 1, 3).reshape(
+                        g * s, t.size(1), t.size(-1)
+                    )
+        chain = torch.zeros((g, capacity), dtype=torch.long, device=device)
+        if s:
+            chain[:, :s] = 1 + torch.arange(g * s, device=device).view(g, s)
         return self.decode(
             batch,
             positions,
             merged.prefix_kv_grouped,
-            suffix,
-            prefix_rel,
-            prefix_fill,
-            suffix_rel,
-            suffix_fill,
+            arena,
+            chain,
+            prefix_lens,
+            depths,
         )

@@ -113,12 +113,10 @@ def test_workspace_mixed_depth_owner_changes_and_kv_lifetime(device, mode):
             assert args[1].is_contiguous()
             assert not any(t.is_inference() for pair in args[2] for t in pair)
             inputs = [*args[0].values(), args[1]] + [
-                t for pairs in args[2:4] for pair in pairs for t in pair
+                t for pair in args[2] for t in pair
             ]
             assert len({t.untyped_storage().data_ptr() for t in inputs}) == len(inputs)
-            assert all(
-                t.is_contiguous() for pairs in args[2:4] for pair in pairs for t in pair
-            )
+            assert all(t.is_contiguous() for pair in args[2] for t in pair)
             for key in merged.new_token_batch:
                 torch.testing.assert_close(
                     args[0][key].cpu(), merged.new_token_batch[key], atol=0, rtol=0
@@ -126,18 +124,32 @@ def test_workspace_mixed_depth_owner_changes_and_kv_lifetime(device, mode):
             torch.testing.assert_close(args[1].cpu(), merged.positions, atol=0, rtol=0)
             for got, ref in zip(args[2], merged.prefix_kv_grouped):
                 for x, y in zip(got, ref):
-                    torch.testing.assert_close(x, y, atol=0, rtol=0)
+                    # Only real history is staged; the decoder never reads padding.
+                    assert x.shape == y.shape
+                    for row, n in enumerate(merged.prefix_lens_list):
+                        torch.testing.assert_close(
+                            x[row, :, :n], y[row, :, :n], atol=0, rtol=0
+                        )
                     assert x._is_view() == y._is_view()
                     if x._base is not None:
                         assert x._base.shape == y._base.shape
                         assert x._base.stride() == y._base.stride()
+            torch.testing.assert_close(
+                args[5].cpu(), merged.prefix_lens, atol=0, rtol=0
+            )
+            torch.testing.assert_close(
+                (args[5] + args[6]).cpu(), merged.positions, atol=0, rtol=0
+            )
             if merged.suffix_kv is not None:
+                # The decoder reads each row's ancestors from the arena by chain.
                 width = merged.suffix_positions.size(1)
-                for got, ref in zip(args[3], merged.suffix_kv):
-                    for x, y in zip(got, ref):
+                chain = args[4][:, :width]
+                for layer, ref in enumerate(merged.suffix_kv):
+                    for kind, y in enumerate(ref):
+                        x = args[3][layer, kind][chain].permute(0, 2, 1, 3)
                         mask = merged.suffix_mask[:, None, :, None].expand_as(y)
                         torch.testing.assert_close(
-                            x[:, :, :width][mask], y[mask], atol=1e-5, rtol=1e-5
+                            x[mask], y[mask], atol=1e-5, rtol=1e-5
                         )
             if mode == "compiled" and step in (0, 36):
                 # Cold compilation must also match after entering a single-row tail.
@@ -385,7 +397,6 @@ def test_history_refresh_and_padding_shrink_without_owner_change():
                 torch.testing.assert_close(
                     tensor[0, :, :3], owner._prefix_kv[layer][kind], atol=0, rtol=0
                 )
-                assert torch.count_nonzero(tensor[0, :, 3:]) == 0
         ws.consume(state, ws.runner.decode(*args))
         assert ws.counters["history_refreshes"] == 3
         assert ws.counters["history_dirty_rows"] == 3
@@ -446,13 +457,10 @@ def test_direct_dirty_rows_batch_resize_and_width_changes(immutable):
                 for t, ref in zip(pair, refs):
                     n = owners[i]._prefix_len
                     torch.testing.assert_close(t[row, :, :n], ref, atol=0, rtol=0)
-                    assert torch.count_nonzero(t[row, :, n:]) == 0
         if not dirty:
             for key in (
                 "history_copied_bytes",
-                "history_zeroed_bytes",
                 "history_copy_submissions",
-                "history_zero_submissions",
             ):
                 assert ws.counters[key] == before[key]
 
@@ -524,7 +532,7 @@ def test_mutable_external_tensor_replacement_is_fingerprinted():
     "device,mode",
     [("cpu", "tensor"), pytest.param("cuda", "compiled", marks=pytest.mark.extended)],
 )
-def test_stable_placement_and_selective_gather(device, mode, monkeypatch):
+def test_stable_placement_and_ancestor_chains(device, mode, monkeypatch):
     """Compare reordered execution to the independent legacy decoder path."""
     if device == "cuda" and not torch.cuda.is_available():
         pytest.skip("CUDA unavailable")
@@ -543,21 +551,19 @@ def test_stable_placement_and_selective_gather(device, mode, monkeypatch):
     reference = _make_decode_wave_executor(**kwargs, algorithm="value_search_halving")
     candidate = _make_decode_wave_executor(**kwargs, algorithm="gumbel")
     ws = candidate.workspace
-    gather = ws._gather_ancestors
+    prepare = ws.prepare
+    depths = set()
 
-    def checked_gather(g):
-        result = gather(g)
-        for layer, pair in enumerate(result):
-            for arena, target in zip(ws.arena, pair):
-                source = arena[layer].permute(1, 0, 2)[None].expand(g, -1, -1, -1)
-                indices = ws.device_fields[3][:, None, :, None].expand_as(target)
-                torch.testing.assert_close(
-                    target, torch.gather(source, 2, indices), atol=0, rtol=0
-                )
-                assert target.is_contiguous() and target.size(2) == 32
-        return result
+    def checked_prepare(*args, **kwargs):
+        decoder_args, state = prepare(*args, **kwargs)
+        # Each row's chain names exactly its node's ancestor arena rows.
+        for row, chain in enumerate(state[1]):
+            assert decoder_args[4][row, : len(chain)].tolist() == chain
+            assert int(decoder_args[6][row]) == len(chain)
+        depths.update(decoder_args[6].tolist())
+        return decoder_args, state
 
-    monkeypatch.setattr(ws, "_gather_ancestors", checked_gather)
+    monkeypatch.setattr(ws, "prepare", checked_prepare)
     a = [evaluator(model, n, immutable=True) for n in (0, 7, 19)]
     b = [evaluator(model, e._prefix_len, e._prefix_kv, immutable=True) for e in a]
     pa, pb = [None] * 3, [None] * 3
@@ -583,11 +589,10 @@ def test_stable_placement_and_selective_gather(device, mode, monkeypatch):
                 assert ws.counters["history_copied_bytes"] == copied
             for i, x, y in zip(order, aa, bb):
                 pa[i], pb[i] = x[1][0][0], y[1][0][0]
-        assert ws.counters["branch_gather_width_0_batches"] > 0
-        assert ws.counters["branch_gather_width_32_batches"] > 0
+        assert 0 in depths and 32 in depths
         reference.clear_cache()
         candidate.clear_cache()
-        assert not ws.slots and ws.arena is None and ws.branch_gather_width is None
+        assert not ws.slots and ws.arena is None
 
 
 @pytest.mark.extended
@@ -622,7 +627,7 @@ def test_decoder_graphs_replay_exactly_what_eager_decoding_computes(mode, monkey
             outs = {}
             for name, ws in (("graphed", graphed), ("eager", eager)):
                 batch = [payload(owners[name][i], parents[name][i]) for i in rows]
-                args, state = ws.prepare(batch, attention=name == "eager")
+                args, state = ws.prepare(batch)
                 out = ws.decode(args) if name == "graphed" else ws.runner.decode(*args)
                 outs[name] = (
                     out["logits"].clone(), out["value_logits"].clone(),
