@@ -78,6 +78,14 @@ def main():
         help="Training recovery-save interval; phase boundaries always save",
     )
     parser.add_argument(
+        "--full-checkpoint-iterations",
+        type=int,
+        default=10,
+        help="Write the full trainer state (optimizer, EMA, replay progress) with every Nth "
+             "actor; the others are weights only. A crash resumes from the last full state "
+             "and redoes up to N iterations of training; graceful stops always save it",
+    )
+    parser.add_argument(
         "--keep-recovery-checkpoints",
         type=int,
         default=1,
@@ -144,6 +152,8 @@ def main():
         parser.error("--cpu-threads must be positive")
     if args.checkpoint_seconds < 1:
         parser.error("--checkpoint-seconds must be positive")
+    if args.full_checkpoint_iterations < 1:
+        parser.error("--full-checkpoint-iterations must be positive")
     if args.keep_recovery_checkpoints < 1:
         parser.error("--keep-recovery-checkpoints must be positive")
     if args.screen_seconds is not None and args.screen_seconds < 1:
@@ -287,11 +297,31 @@ def main():
                 config_id=saved_config_id,
                 previous_learning=previous_learning,
             )
-            if (
-                restored["iteration"] != state["iteration"]
-                or restored["phase"] != state["phase"]
-            ):
+            order = ("collect", "train", "evaluate")
+            saved_at = (restored["iteration"], order.index(restored["phase"]))
+            published_at = (state["iteration"], order.index(state["phase"]))
+            if saved_at > published_at:
                 raise ValueError("checkpoint and published phase disagree")
+            if saved_at < published_at:
+                # Only full trainer states are resume points; after a crash the run
+                # redoes the training since the last one. Replay data and the start
+                # stream stay as they are; the current best remains the screen anchor.
+                print(
+                    f"Resuming from the last full checkpoint (iteration "
+                    f"{restored['iteration']}, {restored['phase']}); state.json was at "
+                    f"iteration {state['iteration']}, {state['phase']}",
+                    flush=True,
+                )
+                kept = {k: state[k] for k in ("best", "best_id") if k in state}
+                if kept and not Path(kept["best"]).exists():
+                    kept = {}
+                state = dict(restored, config_id=cfg.identifier, **kept)
+                ema_actor = state.get("ema_actor")
+                if ema_actor and not Path(ema_actor).exists():
+                    # Pruned since; the full state holds the same EMA weights.
+                    atomic_checkpoint(ema_actor, dict(model=trainer.ema_state_dict()))
+                    state["ema_actor_id"] = file_hash(ema_actor)
+                atomic_json(state_path, state)
         else:
             if args.initialize_optimizer:
                 trainer.initialize_optimization(checkpoint)
@@ -308,6 +338,9 @@ def main():
                 state.update(best=str(best), best_id=file_hash(best))
             atomic_json(state_path, state)
 
+        # (iteration, phase) of the newest full trainer state on disk.
+        full_at = [(state["iteration"], state["phase"])]
+
         def publish_checkpoint():
             path = (
                 args.output
@@ -318,6 +351,10 @@ def main():
                 path, progress=dict(state), store=store, config_id=cfg.identifier
             )
             atomic_json(state_path, state)
+            full_at[0] = (state["iteration"], state["phase"])
+            prune()
+
+        def prune():
             keep = {
                 str(Path(state[k]).resolve())
                 for k in ("actor", "best", "checkpoint", "ema_actor")
@@ -365,6 +402,7 @@ def main():
                 until=args.until.isoformat() if args.until else None,
                 continuous=args.continuous,
                 checkpoint_seconds=args.checkpoint_seconds,
+                full_checkpoint_iterations=args.full_checkpoint_iterations,
                 keep_recovery_checkpoints=args.keep_recovery_checkpoints,
                 screen_seconds=args.screen_seconds,
                 screen_games=args.screen_games,
@@ -375,10 +413,12 @@ def main():
 
         def finish_iteration():
             state.update(iteration=state["iteration"] + 1, phase="collect")
-            publish_checkpoint()
+            atomic_json(state_path, state)
+            prune()
             pinned = set(store.active_shards())
             for path in args.output.glob("*.pt"):
-                saved = torch.load(path, map_location="cpu", weights_only=False)
+                # Memory-mapped: only the shard list is read, not the tensors.
+                saved = torch.load(path, map_location="cpu", weights_only=False, mmap=True)
                 pinned.update(saved.get("replay_shards", []))
                 del saved
             store.collect_garbage(pinned_shards=pinned)
@@ -448,7 +488,7 @@ def main():
                     store, iteration=state["iteration"], exposure_budget=exposure_budget
                 )
                 state.update(phase="train", exposure_budget=exposure_budget)
-                publish_checkpoint()
+                atomic_json(state_path, state)
             if state["phase"] == "train":
                 last_save = time.monotonic()
 
@@ -482,10 +522,16 @@ def main():
                     )
                 state["phase"] = "evaluate"
                 actor = args.output / f"actor-{state['iteration'] + 1:06d}.pt"
-                state.update(actor=str(actor), checkpoint=str(actor))
-                trainer.checkpoint(
-                    actor, progress=dict(state), store=store, config_id=cfg.identifier
-                )
+                state.update(actor=str(actor))
+                if (state["iteration"] + 1) % args.full_checkpoint_iterations == 0:
+                    state["checkpoint"] = str(actor)
+                    trainer.checkpoint(
+                        actor, progress=dict(state), store=store, config_id=cfg.identifier
+                    )
+                    full_at[0] = (state["iteration"], state["phase"])
+                else:
+                    # Weights only: what collection, screens and evaluations load.
+                    atomic_checkpoint(actor, dict(model=trainer.model.state_dict()))
                 state["actor_id"] = file_hash(actor)
                 if trainer.ema is not None:
                     ema_actor = args.output / f"ema-{state['iteration'] + 1:06d}.pt"
@@ -610,6 +656,9 @@ def main():
                 next_screen = time.monotonic() + (args.screen_seconds or 0)
                 state["games_since_screen"] = 0
                 finish_iteration()
+        if full_at[0] != (state["iteration"], state["phase"]):
+            # Graceful stops never lose training: save the current full state.
+            publish_checkpoint()
         print(
             f"Stopped at iteration {state['iteration']}, phase {state['phase']}; "
             + (

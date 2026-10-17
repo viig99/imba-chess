@@ -1354,3 +1354,96 @@ def test_playout_cap_identity_and_validation(tmp_path):
         replace(cfg.collection, full_search_probability=0.0)
     with pytest.raises(ValueError, match="playout_cap needs"):
         playout_game(PlayoutRuntime([0.0] * 7), cfg.collection)
+
+
+def test_sparse_full_checkpoints_and_crash_rollback(tmp_path, monkeypatch):
+    """Only every Nth actor carries the full trainer state; a crash resumes from
+    the last one (redoing later training), a graceful stop loses nothing."""
+    import sys
+    from dataclasses import replace
+    import scripts.run_self_play as runner
+    from imba_chess.self_play.config import (
+        SelfPlayConfig, RunConfig, CollectionConfig, ReplayConfig,
+    )
+
+    def runtime(cfg, checkpoint, device):
+        model = tiny_model()
+        if checkpoint.exists():
+            model.load_state_dict(torch.load(checkpoint, weights_only=False)["model"])
+        return IdentifiedRuntime(model), 128
+
+    cfg = SelfPlayConfig(
+        learning=LearningConfig(auxiliary_value_weight=0.0, ema_decay=0.5),
+        search=GumbelConfig(simulations=1, max_depth=1),
+        collection=CollectionConfig(concurrent_games=2, fresh_positions=2),
+        replay=ReplayConfig(window_positions=20, flush_games=2),
+        run=RunConfig(screen_pairs=1, confirmation_pairs=1),
+    )
+    source = "monitor"
+    while source_split(source) != "monitor":
+        source += "x"
+    monitor = [Seed("monitor", source, ["f2f3", "e7e5", "g2g4"], 3, "monitor", "c")]
+    seed_path = tmp_path / "seeds.json"
+    seed_path.write_text("test")
+    monkeypatch.setattr(runner, "load_config", lambda path: cfg)
+    monkeypatch.setattr(runner, "load_runtime", runtime)
+    monkeypatch.setattr(runner, "load_seeds", lambda path, split: monitor)
+    monkeypatch.setattr(
+        runner, "StreamingStarts",
+        lambda directory, config, should_stop: mate_starts(
+            directory, config, per_bucket=64, should_stop=should_stop)[0],
+    )
+    crash_at = [None]
+
+    def screen(**kwargs):
+        if kwargs["output"].name == crash_at[0]:
+            raise RuntimeError("simulated crash")
+        return dict(score=0.6, lower=0.45, upper=0.75)
+
+    monkeypatch.setattr(runner, "evaluate_pair_checkpoints", screen)
+    output = tmp_path / "run"
+    base = ["run_self_play.py", "--config", "unused", "--seeds", str(seed_path),
+            "--output", str(output), "--device", "cpu", "--screen-games", "1",
+            "--observe-only-screen", "--full-checkpoint-iterations", "2"]
+
+    def run(*extra):
+        monkeypatch.setattr(sys, "argv", base + list(extra))
+        runner.main()
+        return json.loads((output / "state.json").read_text())
+
+    def full(path):
+        return "optimizer" in torch.load(path, weights_only=False, mmap=True)
+
+    written = {}
+    original = runner.atomic_checkpoint
+
+    def recording(path, state):
+        written[Path(path).name] = "optimizer" in state
+        return original(path, state)
+
+    monkeypatch.setattr(runner, "atomic_checkpoint", recording)
+    crash_at[0] = "screen-000004.json"
+    with pytest.raises(RuntimeError, match="simulated crash"):
+        run("--initialize", str(tmp_path / "weights.pt"), "--max-iterations", "8")
+    # Odd actors are written weights-only here; even ones carry the full trainer
+    # state (through Stage2Trainer.checkpoint).
+    assert {n: k for n, k in written.items() if n.startswith("actor-")} == {
+        "actor-000001.pt": False, "actor-000003.pt": False, "actor-000005.pt": False,
+    }
+    state = json.loads((output / "state.json").read_text())
+    assert (state["iteration"], state["phase"]) == (4, "evaluate")
+    assert state["checkpoint"].endswith("actor-000004.pt") and full(state["checkpoint"])
+    assert not full(state["actor"]) or state["actor"] == state["checkpoint"]
+    # The crash interrupted iteration 4's screen; the full state is iteration 3's.
+    saved = torch.load(state["checkpoint"], weights_only=False, mmap=True)["progress"]
+    assert (saved["iteration"], saved["phase"]) == (3, "evaluate")
+    crash_at[0] = None
+    state = run("--resume", "--max-iterations", "6")
+    assert state["iteration"] == 6 and not state["halted"]
+    assert all(Path(state[k]).exists() for k in ("actor", "best", "checkpoint", "ema_actor"))
+    # A graceful stop leaves a current full resume point.
+    saved = torch.load(state["checkpoint"], weights_only=False, mmap=True)["progress"]
+    assert (saved["iteration"], saved["phase"]) == (state["iteration"], state["phase"])
+    assert len(list(output.glob("*.pt"))) <= 5
+    state = run("--resume", "--max-iterations", "7")
+    assert state["iteration"] == 7
