@@ -88,8 +88,11 @@ def game_summary(game):
 class SelfPlayStore:
     """Single-writer store; the run lock is owned by the orchestrator.
 
-    Inactive shard metadata remains indexed for deduplication. Garbage collection
-    is explicit and must be called only with all checkpoint-pinned shard names.
+    Games stay indexed, and deduplicated, while their shard file exists: evicted
+    games of a kept shard still count for phase recovery. Garbage collection is
+    explicit, must be called only with all checkpoint-pinned shard names, and
+    forgets the shards it deletes. A re-delivered game (a launch retried after a
+    crash) is always recent, so it is still indexed; launch ids never repeat.
     Read-only instances use the published manifest without recovery or trimming;
     they never create files or publish state. They do not pin shards against GC.
     """
@@ -124,6 +127,9 @@ class SelfPlayStore:
         )
         if self.manifest["schema_version"] != 1:
             raise ValueError("unsupported replay schema")
+        # Shard numbers keep increasing after garbage collection forgets shards. Older
+        # manifests listed every shard ever written, so their count is the next number.
+        self.manifest.setdefault("next_shard", len(self.manifest["shards"]))
         indexed = {s["file"] for s in self.manifest["shards"]}
         self.seen = {g["id"] for s in self.manifest["shards"] for g in s["games"]}
         self.index = {
@@ -131,6 +137,12 @@ class SelfPlayStore:
         }
         if read_only:
             return
+        # Manifests from before collection forgot deleted shards still list them.
+        gone = [s for s in self.manifest["shards"] if not (self.directory / s["file"]).exists()]
+        active = set(self.manifest["active"])
+        if any(g["id"] in active for s in gone for g in s["games"]):
+            raise FileNotFoundError("active replay shard missing")
+        self._forget(gone)
         for shard in sorted(self.directory.glob("shard-*.parquet")):
             if shard.name not in indexed:
                 self._index_shard(shard)
@@ -152,6 +164,15 @@ class SelfPlayStore:
                 self.index[gid] = (path.name, entry)
                 self.manifest["active"].append(gid)
         self.manifest["shards"].append(dict(file=path.name, games=entries))
+        self.manifest["next_shard"] = max(self.manifest["next_shard"], int(path.name.split("-")[1]) + 1)
+
+    def _forget(self, shards):
+        files = {s["file"] for s in shards}
+        for shard in shards:
+            for g in shard["games"]:
+                self.seen.discard(g["id"])
+                del self.index[g["id"]]
+        self.manifest["shards"] = [s for s in self.manifest["shards"] if s["file"] not in files]
 
     def _trim(self):
         active = self.manifest["active"]
@@ -208,7 +229,7 @@ class SelfPlayStore:
         )
         path = (
             self.directory
-            / f'shard-{len(self.manifest["shards"]):08d}-{uuid.uuid4().hex}.parquet'
+            / f'shard-{self.manifest["next_shard"]:08d}-{uuid.uuid4().hex}.parquet'
         )
         tmp = path.with_suffix(".parquet.tmp")
         pq.write_table(table, tmp, compression="zstd")
@@ -276,7 +297,10 @@ class SelfPlayStore:
     def collect_garbage(self, *, pinned_shards):
         self._require_writer()
         keep = set(pinned_shards) | set(self.active_shards())
-        for shard in self.manifest["shards"]:
-            if shard["file"] not in keep:
-                (self.directory / shard["file"]).unlink(missing_ok=True)
+        deleted = [s for s in self.manifest["shards"] if s["file"] not in keep]
+        for shard in deleted:
+            (self.directory / shard["file"]).unlink(missing_ok=True)
         sync_directory(self.directory)
+        if deleted:
+            self._forget(deleted)
+            self._publish()

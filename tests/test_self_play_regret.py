@@ -455,7 +455,7 @@ def test_reconcile_launch_order_atomic_rollback_and_gc_survival(tmp_path, monkey
     store.window_positions = 4
     store.add(mate_game("unrelated"))
     store.collect_garbage(pinned_shards=[])
-    with pytest.raises(FileNotFoundError):
+    with pytest.raises(KeyError):  # deleted and forgotten
         store.read_game(entry["parent_game_id"])
     restored = StreamingStarts(starts.directory, cfg, start_worker=False)
     restored.begin_phase(0, "a", store, max_positions=128)

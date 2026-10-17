@@ -12,24 +12,22 @@ from torch.utils.tensorboard import SummaryWriter
 from imba_chess.self_play.runtime import run_lock, StopBudget
 
 
-def published_progress(directory):
-    """A published snapshot excludes the collector's bounded pending buffer."""
+def published_progress(directory, totals):
+    """Whole-run totals summed from the collect rows of metrics.jsonl (`totals`),
+    which are logged at phase ends, plus the current replay window."""
     directory = Path(directory)
     state = json.loads((directory / "state.json").read_text())
     manifest_path = directory / "replay" / "manifest.json"
+    # The manifest lists only shards still on disk; garbage collection forgets the rest.
     manifest = (
         json.loads(manifest_path.read_text())
         if manifest_path.exists()
-        else {"shards": []}
+        else {"active": [], "shards": []}
     )
-    entries = [g for s in manifest["shards"] for g in s["games"]]
-    current = Counter()
-    # Shard entries describe all published games, including retired replay data.
-    current["published_games"] = len(entries)
-    current["published_positions"] = sum(g["positions"] for g in entries)
-    current["published_training_positions"] = sum(
-        g["positions"] for g in entries if g["split"] == "train"
-    )
+    positions = {g["id"]: g["positions"] for s in manifest["shards"] for g in s["games"]}
+    current = Counter(totals)
+    current["replay_window_games"] = len(manifest["active"])
+    current["replay_window_positions"] = sum(positions[g] for g in manifest["active"])
     return dict(
         current,
         iteration=state["iteration"],
@@ -67,14 +65,35 @@ def main():
     ):
         writer.add_text(
             "notes",
-            "Published replay counts exclude buffered games. Phase: 0 collection, 1 training, 2 evaluation. Counts span all iterations. Training metrics are not held-out strength measurements.",
+            "Published counts sum the completed collect phases in metrics.jsonl; replay_window counts are the current replay window. Phase: 0 collection, 1 training, 2 evaluation. Training metrics are not held-out strength measurements.",
         )
         offset = 0
         metric_step = 0
         previous = None
+        totals = Counter()
         while not stop.stop():
+            metrics = args.run / "metrics.jsonl"
+            if metrics.exists():
+                with metrics.open() as stream:
+                    stream.seek(offset)
+                    while line := stream.readline():
+                        if not line.endswith("\n"):
+                            break  # Retry a partially written record on the next poll.
+                        row = json.loads(line)
+                        if "completed_games" in row:
+                            totals["published_games"] += row["completed_games"]
+                            totals["published_positions"] += row["completed_positions"]
+                            totals["published_training_positions"] += row["training_positions"]
+                        metric_step += 1
+                        for key, value in scalars(row):
+                            writer.add_scalar(
+                                f"{row.get('phase', 'metrics')}/{key}",
+                                value,
+                                metric_step,
+                            )
+                        offset = stream.tell()
             try:
-                progress = published_progress(args.run)
+                progress = published_progress(args.run, totals)
             except FileNotFoundError:
                 progress = None
             if progress is not None:
@@ -85,22 +104,6 @@ def main():
                 if progress != previous:
                     print(json.dumps(progress), flush=True)
                     previous = progress
-            metrics = args.run / "metrics.jsonl"
-            if metrics.exists():
-                with metrics.open() as stream:
-                    stream.seek(offset)
-                    while line := stream.readline():
-                        if not line.endswith("\n"):
-                            break  # Retry a partially written record on the next poll.
-                        row = json.loads(line)
-                        metric_step += 1
-                        for key, value in scalars(row):
-                            writer.add_scalar(
-                                f"{row.get('phase', 'metrics')}/{key}",
-                                value,
-                                metric_step,
-                            )
-                        offset = stream.tell()
             evaluations = [
                 (path, path.stem)
                 for path in sorted(args.run.glob("*-*.json"))

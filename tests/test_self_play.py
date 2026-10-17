@@ -134,7 +134,51 @@ def test_replay_recovery_dedup_eviction(tmp_path):
     assert not recovered.add(mate_game("2"))
     recovered.collect_garbage(pinned_shards=[])
     assert len(list(tmp_path.glob("shard-*.parquet"))) == 2
-    assert not SelfPlayStore(tmp_path, window_positions=8).add(mate_game("0"))
+    # Collection forgets the shards it deletes; games of kept shards stay deduplicated.
+    reopened = SelfPlayStore(tmp_path, window_positions=8)
+    assert "0" not in reopened.seen and not reopened.add(mate_game("1"))
+    assert [s["file"] for s in reopened.manifest["shards"]] == sorted(
+        p.name for p in tmp_path.glob("shard-*.parquet"))
+
+
+def test_garbage_collection_forgets_deleted_shards_but_keeps_pinned(tmp_path):
+    store = SelfPlayStore(tmp_path, window_positions=4, flush_games=1)
+    for i in range(4):
+        store.add(mate_game(str(i)))
+    assert store.game_ids() == ["3"]
+    pinned = store.index["1"][0]
+    store.collect_garbage(pinned_shards=[pinned])
+    on_disk = sorted(p.name for p in tmp_path.glob("shard-*.parquet"))
+    assert on_disk == sorted({pinned, store.index["3"][0]})
+    # A pinned shard (a checkpoint's replay) keeps its games indexed for rollback and recovery.
+    assert set(store.index) == store.seen == {"1", "3"}
+    manifest = json.loads((tmp_path / "manifest.json").read_text())
+    assert sorted(s["file"] for s in manifest["shards"]) == on_disk
+    # Shard numbers keep increasing although the manifest now lists fewer shards.
+    store.add(mate_game("4"))
+    assert store.index["4"][0].startswith("shard-00000004-")
+    assert SelfPlayStore(tmp_path, window_positions=4).manifest["next_shard"] == 5
+
+
+def test_writer_prunes_a_legacy_manifest_once(tmp_path):
+    store = SelfPlayStore(tmp_path, window_positions=4, flush_games=1)
+    for i in range(3):
+        store.add(mate_game(str(i)))
+    first = store.index["0"][0]
+    manifest = json.loads((tmp_path / "manifest.json").read_text())
+    del manifest["next_shard"]
+    (tmp_path / "manifest.json").write_text(json.dumps(manifest))
+    (tmp_path / first).unlink()  # deleted by an older collector that kept its entry
+    reader = SelfPlayStore(tmp_path, read_only=True)
+    assert "0" in reader.seen and reader.manifest["next_shard"] == 3
+    writer = SelfPlayStore(tmp_path, window_positions=4, flush_games=1)
+    assert "0" not in writer.seen and "0" not in writer.index
+    assert first not in {s["file"] for s in json.loads((tmp_path / "manifest.json").read_text())["shards"]}
+    writer.add(mate_game("3"))
+    assert writer.index["3"][0].startswith("shard-00000003-")
+    (tmp_path / writer.index["3"][0]).unlink()  # the window's only game
+    with pytest.raises(FileNotFoundError, match="active replay shard missing"):
+        SelfPlayStore(tmp_path, window_positions=4)
 
 
 def test_completion_order_option():
