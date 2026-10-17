@@ -5,10 +5,12 @@ The external nightly schedule is deliberately not installed by this command.
 
 import argparse
 from contextlib import ExitStack
+import hashlib
 from dataclasses import asdict
 from datetime import datetime
 import json
 import math
+import os
 import shutil
 from pathlib import Path
 import time
@@ -78,12 +80,13 @@ def main():
         help="Training recovery-save interval; phase boundaries always save",
     )
     parser.add_argument(
-        "--full-checkpoint-iterations",
+        "--save-every",
         type=int,
         default=10,
-        help="Write the full trainer state (optimizer, EMA, replay progress) with every Nth "
-             "actor; the others are weights only. A crash resumes from the last full state "
-             "and redoes up to N iterations of training; graceful stops always save it",
+        help="Iterations between saves of the full trainer state with its actor and EMA "
+             "weights. Between saves weights stay in memory (workers get them through "
+             "RAM); screens save the actor and EMA they evaluate, and graceful stops save "
+             "the full state. A crash resumes from the last full state",
     )
     parser.add_argument(
         "--keep-recovery-checkpoints",
@@ -152,8 +155,8 @@ def main():
         parser.error("--cpu-threads must be positive")
     if args.checkpoint_seconds < 1:
         parser.error("--checkpoint-seconds must be positive")
-    if args.full_checkpoint_iterations < 1:
-        parser.error("--full-checkpoint-iterations must be positive")
+    if args.save_every < 1:
+        parser.error("--save-every must be positive")
     if args.keep_recovery_checkpoints < 1:
         parser.error("--keep-recovery-checkpoints must be positive")
     if args.screen_seconds is not None and args.screen_seconds < 1:
@@ -340,6 +343,40 @@ def main():
 
         # (iteration, phase) of the newest full trainer state on disk.
         full_at = [(state["iteration"], state["phase"])]
+        # The current actor's weights, serialized once in RAM: their hash is the
+        # actor id, and a saved actor file is a copy of these bytes.
+        staging_root = Path("/dev/shm") if Path("/dev/shm").is_dir() else args.output
+        key = hashlib.sha1(str(args.output.resolve()).encode()).hexdigest()[:12]
+        staged = staging_root / f"imba-chess-actor-{key}.pt"
+        resources.callback(staged.unlink, missing_ok=True)
+
+        def stage_actor():
+            atomic_checkpoint(staged, dict(model=trainer.model.state_dict()))
+            state["actor_id"] = file_hash(staged)
+
+        def save_actor():
+            """Write the evaluate-phase actor (weights for the next iteration) and
+            its EMA to the run directory, if they are not there already."""
+            actor = args.output / f"actor-{state['iteration'] + 1:06d}.pt"
+            if state.get("actor") != str(actor):
+                if not staged.exists():
+                    stage_actor()  # Lost with RAM across a restart; same weights.
+                temporary = actor.with_name(actor.name + ".tmp")
+                shutil.copyfile(staged, temporary)
+                with temporary.open("rb+") as stream:
+                    os.fsync(stream.fileno())
+                os.replace(temporary, actor)
+                state["actor"] = str(actor)
+            save_ema()
+            atomic_json(state_path, state)
+
+        def save_ema():
+            if trainer.ema is None:
+                return
+            ema_actor = args.output / f"ema-{state['iteration'] + 1:06d}.pt"
+            if state.get("ema_actor") != str(ema_actor):
+                atomic_checkpoint(ema_actor, dict(model=trainer.ema_state_dict()))
+                state.update(ema_actor=str(ema_actor), ema_actor_id=file_hash(ema_actor))
 
         def publish_checkpoint():
             path = (
@@ -402,7 +439,7 @@ def main():
                 until=args.until.isoformat() if args.until else None,
                 continuous=args.continuous,
                 checkpoint_seconds=args.checkpoint_seconds,
-                full_checkpoint_iterations=args.full_checkpoint_iterations,
+                save_every=args.save_every,
                 keep_recovery_checkpoints=args.keep_recovery_checkpoints,
                 screen_seconds=args.screen_seconds,
                 screen_games=args.screen_games,
@@ -521,22 +558,15 @@ def main():
                         trainer.phase_exposures - state["exposure_budget"]
                     )
                 state["phase"] = "evaluate"
-                actor = args.output / f"actor-{state['iteration'] + 1:06d}.pt"
-                state.update(actor=str(actor))
-                if (state["iteration"] + 1) % args.full_checkpoint_iterations == 0:
-                    state["checkpoint"] = str(actor)
+                stage_actor()
+                if (state["iteration"] + 1) % args.save_every == 0:
+                    actor = args.output / f"actor-{state['iteration'] + 1:06d}.pt"
+                    state.update(actor=str(actor), checkpoint=str(actor))
                     trainer.checkpoint(
                         actor, progress=dict(state), store=store, config_id=cfg.identifier
                     )
                     full_at[0] = (state["iteration"], state["phase"])
-                else:
-                    # Weights only: what collection, screens and evaluations load.
-                    atomic_checkpoint(actor, dict(model=trainer.model.state_dict()))
-                state["actor_id"] = file_hash(actor)
-                if trainer.ema is not None:
-                    ema_actor = args.output / f"ema-{state['iteration'] + 1:06d}.pt"
-                    atomic_checkpoint(ema_actor, dict(model=trainer.ema_state_dict()))
-                    state.update(ema_actor=str(ema_actor), ema_actor_id=file_hash(ema_actor))
+                    save_ema()
                 atomic_json(state_path, state)
             if state["phase"] == "evaluate":
                 screen_path = args.output / f"screen-{state['iteration']:06d}.json"
@@ -556,6 +586,7 @@ def main():
                     )
                     finish_iteration()
                     continue
+                save_actor()
                 best, _ = load_runtime(cfg, Path(state["best"]), args.device)
                 common = dict(
                     candidate=runtime,

@@ -24,10 +24,12 @@ new weights. The coordinator carries their launch metadata across phases.
 """
 
 import ctypes
+import hashlib
 import multiprocessing
 import os
 from pathlib import Path
 import queue
+import shutil
 import signal
 import sys
 import threading
@@ -94,7 +96,15 @@ class CollectionWorkers:
         self.progress_timeout, self.shutdown_timeout = progress_timeout, shutdown_timeout
         self.directory = Path(directory)
         self.directory.mkdir(parents=True, exist_ok=True)
-        self.weights_path = self.directory / "weights.pt"
+        # The per-phase weights handoff lives in RAM (tmpfs) when available: it is
+        # rewritten every phase and never needs to outlive the run. One directory
+        # per run directory, so a restart reuses it instead of leaking another.
+        self._handoff = None
+        if Path("/dev/shm").is_dir():
+            key = hashlib.sha1(str(self.directory.resolve()).encode()).hexdigest()[:12]
+            self._handoff = Path("/dev/shm") / f"imba-chess-weights-{key}"
+            self._handoff.mkdir(exist_ok=True)
+        self.weights_path = (self._handoff or self.directory) / "weights.pt"
         context = multiprocessing.get_context("spawn")
         self.stop = context.RawValue(ctypes.c_bool, False)
         self.processes, self.connections = [], []
@@ -328,6 +338,8 @@ class CollectionWorkers:
             reader.join(timeout=0.5)
         self._readers = []
         self.processes, self.connections = [], []
+        if self._handoff is not None:
+            shutil.rmtree(self._handoff, ignore_errors=True)
 
 
 def _worker_main(connection, config, checkpoint, device, cpu_threads, runtime_loader, stop):
