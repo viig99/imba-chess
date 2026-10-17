@@ -51,6 +51,10 @@ def main():
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--device", default="cuda")
     parser.add_argument(
+        "--no-compile-training", dest="compile_training", action="store_false",
+        help="Run training eagerly; CUDA compilation is enabled by default (execution-only)",
+    )
+    parser.add_argument(
         "--cpu-threads",
         type=int,
         default=1,
@@ -270,6 +274,7 @@ def main():
             device=runtime.device,
             max_positions=max_positions,
             run_seed=cfg.run.seed,
+            compile_model=args.compile_training,
         )
         if args.resume:
             restored = trainer.resume(
@@ -347,6 +352,7 @@ def main():
                 concurrent_games=args.concurrent_games
                 or cfg.collection.concurrent_games,
                 inference_options=getattr(runtime, "options", {}),
+                training_compiled=trainer.compile_enabled,
                 cpu_threads=torch.get_num_threads(),
                 collect_workers=args.collect_workers,
                 worker_startup_timeout=args.worker_startup_timeout,

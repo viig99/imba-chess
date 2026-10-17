@@ -20,7 +20,9 @@ def make_runtime(monkeypatch, algorithm):
 
     def factory(**kwargs):
         options.append(kwargs)
-        return lambda payloads: payloads
+        execute = lambda payloads: payloads
+        execute.compile_enabled = kwargs["dtype"] == torch.float32
+        return execute
 
     monkeypatch.setattr(runtime, "_make_root_eval_executor", factory)
     monkeypatch.setattr(runtime, "_make_decode_wave_executor", factory)
@@ -46,6 +48,7 @@ def test_algorithm_owns_execution_choices(monkeypatch, algorithm, single):
         not {"decoder_mode", "one_query_per_game", "reuse_decode_buffers"} & leaf.keys()
     )
     assert instance.options["algorithm"] == algorithm
+    assert instance.options["root_compiled"] is True
 
 
 def test_identified_results_and_duplicate_owners(monkeypatch):
@@ -261,7 +264,9 @@ def test_inference_dtype_must_match_weights(monkeypatch):
 
     def factory(**kwargs):
         built.append(kwargs["dtype"])
-        return lambda payloads: payloads
+        execute = lambda payloads: payloads
+        execute.compile_enabled = kwargs["dtype"] == torch.float32
+        return execute
 
     monkeypatch.setattr(runtime, "_make_root_eval_executor", factory)
     monkeypatch.setattr(runtime, "_make_decode_wave_executor", factory)
@@ -276,6 +281,7 @@ def test_inference_dtype_must_match_weights(monkeypatch):
     assert build(torch.float32, torch.float32).options["dtype"] == "float32"
     instance = build(torch.bfloat16, torch.bfloat16)
     assert instance.options["dtype"] == "bfloat16"
+    assert instance.options["root_compiled"] is False
     assert built[-2:] == [torch.bfloat16, torch.bfloat16]
     with pytest.raises(ValueError, match="weights"):
         build(torch.float32, torch.bfloat16)

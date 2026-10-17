@@ -132,7 +132,19 @@ def _make_root_eval_executor(
     dtype,
     stats: "TimingStatsLike | None",
     max_tokens: int | None = None,
+    compile_model: bool = True,
 ):
+    # Keep the wrapper local: training/checkpoints own the original model.
+    # _forward_model builds the dense mask before entering this tensor graph.
+    # BF16 fusion changes exceeded root-logit parity tolerances; keep that
+    # precision eager until its effect on search has been validated separately.
+    compile_enabled = bool(
+        compile_model and torch.device(device).type == "cuda" and dtype == torch.float32
+    )
+    root_model = (
+        torch.compile(model, dynamic=True, fullgraph=True) if compile_enabled else model
+    )
+
     def executor(payloads: list[dict[str, Any]]) -> list[dict[str, Any]]:
         if max_tokens is not None:
             if max_tokens < 1 or any(
@@ -154,12 +166,13 @@ def _make_root_eval_executor(
         merged = _merge_root_batches(payloads)
         t0 = time.perf_counter()
         output = _forward_model(
-            model=model, batch=merged, device=device, dtype=dtype, return_kv=True
+            model=root_model, batch=merged, device=device, dtype=dtype, return_kv=True
         )
         if stats is not None:
             stats.root_eval += time.perf_counter() - t0
         return _split_root_output(output, payloads)
 
+    executor.compile_enabled = compile_enabled
     return executor
 
 
@@ -418,8 +431,6 @@ def _make_decode_wave_executor(
     def clear_cache():
         nonlocal cached_owners, cached_prefixes
         cached_owners, cached_prefixes = (), None
-        if runner is not None:
-            runner.clear()
         if reusable is not None:
             reusable.clear()
 

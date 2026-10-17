@@ -128,24 +128,23 @@ class InferenceRuntime:
         )
         self.algorithm, self.dtype = algorithm, dtype
         self._cache_token = object()
+        root_executor = _make_root_eval_executor(
+            model=model, device=device, dtype=dtype, stats=stats,
+            max_tokens=root_batch_tokens,
+        )
         self.options = dict(
             algorithm=algorithm,
             dtype=str(dtype).removeprefix("torch."),
             tf32=False,
             runtime_revision=RUNTIME_REVISION,
+            root_compiled=root_executor.compile_enabled,
         )
         self.waves = dict(root_eval=Counter(), decode_wave=Counter())
         self.seconds = Counter()
         self.inference_rows = Counter()
         self.executors = {}
         for kind, executor in dict(
-            root_eval=_make_root_eval_executor(
-                model=model,
-                device=device,
-                dtype=dtype,
-                stats=stats,
-                max_tokens=root_batch_tokens,
-            ),
+            root_eval=root_executor,
             **({} if algorithm in ("policy", "policy_q") else dict(decode_wave=_make_decode_wave_executor(
                 model=model,
                 device=device,

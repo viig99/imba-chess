@@ -20,6 +20,10 @@ def main():
     parser.add_argument("--exposures", type=int, required=True)
     parser.add_argument("--seconds", type=float, default=3600)
     parser.add_argument("--device", default="cuda")
+    parser.add_argument(
+        "--no-compile-training", dest="compile_training", action="store_false",
+        help="Run training eagerly; CUDA compilation is enabled by default",
+    )
     args = parser.parse_args()
     if args.exposures < 1 or args.seconds <= 0:
         parser.error("exposures and seconds must be positive")
@@ -37,6 +41,7 @@ def main():
             device=runtime.device,
             max_positions=positions,
             run_seed=cfg.run.seed,
+            compile_model=args.compile_training,
         )
         if args.resume:
             trainer.resume(args.resume, store=store, config_id=cfg.identifier)

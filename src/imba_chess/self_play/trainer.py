@@ -1,6 +1,7 @@
 """Stage-2 trainer with whole-trajectory sampling and explicit resumable state."""
 
 from dataclasses import asdict
+from functools import partial
 import os
 from pathlib import Path
 import random
@@ -60,7 +61,8 @@ def atomic_checkpoint(path, state):
 
 class Stage2Trainer:
     def __init__(
-        self, *, model, config, move_vocab, encoder, device, max_positions, run_seed=42
+        self, *, model, config, move_vocab, encoder, device, max_positions, run_seed=42,
+        compile_model=True,
     ):
         self.model, self.config, self.move_vocab, self.encoder = (
             model,
@@ -68,10 +70,17 @@ class Stage2Trainer:
             move_vocab,
             encoder,
         )
-        self.device, self.max_positions = device, max_positions
-        # Keep the model shared with collection and plain checkpoint keys. The
-        # benchmark wraps this tensor-only callable without replacing the model.
-        self._loss_fn = _training_loss
+        self.device, self.max_positions = torch.device(device), max_positions
+        # Compile only forward+loss: mask construction stays outside the graph,
+        # and collection/checkpoints keep the original shared model. Retain the
+        # callable across training phases so warm graphs can be reused.
+        self.compile_enabled = bool(compile_model and self.device.type == "cuda")
+        self._loss_fn = (
+            partial(_training_loss, model_loss=torch.compile(
+                _model_loss, fullgraph=True, dynamic=True
+            ))
+            if self.compile_enabled else _training_loss
+        )
         auxiliary = getattr(model, "auxiliary_value_head", None)
         if config.auxiliary_value_weight > 0 and auxiliary is None:
             raise ValueError("auxiliary value loss requires an enabled auxiliary value head")
