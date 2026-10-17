@@ -20,9 +20,14 @@ def smoothed_search_wdl(game, decay):
     the actual terminal outcome. Uses all continuation plies BEFORE batching.
     Missing historical search distributions are errors, not raw-root substitutes.
     """
+    validate_game(game)
+    return _smoothed_search_wdl(game, decay)
+
+
+def _smoothed_search_wdl(game, decay):
+    """smoothed_search_wdl for an already validated game."""
     if not math.isfinite(decay) or not 0 <= decay <= 1:
         raise ValueError("auxiliary value decay must be in [0, 1]")
-    validate_game(game)
     targets = game["targets"]
     terminal_white_to_move = (game["takeover_ply"] + len(targets)) % 2 == 0
     following = outcome_wdl(game["outcome_white"], terminal_white_to_move)
@@ -160,11 +165,11 @@ def reconstruct(game, *, move_vocab, encoder, max_positions, learning=None):
     if learning is not None and learning.auxiliary_value_weight > 0:
         if isinstance(learning.auxiliary_value_lambda, tuple):
             # Per position: one WDL row per horizon, shape (horizons, 3).
-            horizons = [smoothed_search_wdl(game, decay)
+            horizons = [_smoothed_search_wdl(game, decay)
                         for decay in learning.auxiliary_value_lambda]
             sample["auxiliary_value_target"] = [list(rows) for rows in zip(*horizons)]
         else:
-            sample["auxiliary_value_target"] = smoothed_search_wdl(
+            sample["auxiliary_value_target"] = _smoothed_search_wdl(
                 game, learning.auxiliary_value_lambda
             )
     return sample

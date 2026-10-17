@@ -235,6 +235,8 @@ def test_arena_growth_slot_reclamation_and_empty_projection(monkeypatch):
 class FixedStarts:
     """Start sampler double: every launch replays one seed under a fresh game ID."""
 
+    durable_launches = True  # Nothing to journal before replay flushes.
+
     def __init__(self, seed):
         self.seed, self.launches = seed, 0
 

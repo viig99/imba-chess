@@ -82,7 +82,7 @@ touch artifacts/self_play/new-run/STOP   # remove it before restarting
 | `--continuous` | on | `--no-continuous` stops after the config's `[run] hours`; `--until` sets a deadline. |
 | `--observe-only-screen` | on | Screens record strength against the initial actor without rollback or promotion; `--no-observe-only-screen` gates on them. |
 | `--screen-games` | 100,000 | About 7 hours. |
-| `--save-every` | 5 | Actor (full trainer state) and EMA files are saved every 5th iteration (~12 min with 640-game phases), at screens and at graceful stops; weights stay in memory between saves. |
+| `--save-every` | 5 | The actor (a full trainer state, EMA included) is saved every 5th iteration (~12 min with 640-game phases), at screens and at graceful stops; weights stay in memory between saves. Screens also write the EMA they evaluate. |
 
 Run the workers under the CUDA MPS daemon (`nvidia-cuda-mps-control -d`, or a user systemd unit),
 so the 5 processes share the GPU concurrently. On the 5070 Ti, at commit 8e757d6, the recipe ran at
@@ -92,8 +92,9 @@ On a larger GPU, raise `--collect-workers` and `--concurrent-games`. The 32 GB 5
 
 Screens only compare the run against itself. Track strength with Stockfish about twice a day
 (100 games, 512 simulations):
-`scripts/run_stockfish_eval.py --checkpoint <copy of RUN/ema-NNNNNN.pt> --config config/imba_chess_v4_aux3.toml --out <dir> -- --gumbel-simulations 512`.
-Use the first saved EMA at or after the iteration you want, and copy it out first: the run prunes old checkpoint files. The 2026-10 lineage sat at about 44%
+`scripts/extract_ema.py --checkpoint RUN/actor-NNNNNN.pt --output <dir>/ema-NNNNNN.pt`, then
+`scripts/run_stockfish_eval.py --checkpoint <dir>/ema-NNNNNN.pt --config config/imba_chess_v4_aux3.toml --out <dir> -- --gumbel-simulations 512`.
+Use the first saved actor at or after the iteration you want, and extract its EMA promptly: the run prunes old checkpoint files. The 2026-10 lineage sat at about 44%
 against SF2600 (ema-100 of the LR 2e-4 run).
 
 Collection is limited by its single search thread, not the GPU. `--collect-workers N` (default 5) splits `--concurrent-games` across N processes sharing the GPU. The main process keeps replay, streamed starts, regret state and training, and workers load its weights at every collect phase. On the 8 GB laptop, 2 workers × 32 games collected 24% faster than one process with 64 games; 4 × 16 saturated the GPU. `--cpu-threads` (default 1) stops idle OpenMP workers from spinning on every core. Both flags are execution-only and keep the resume config identity.

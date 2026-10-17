@@ -124,6 +124,7 @@ def test_replay_recovery_dedup_eviction(tmp_path):
     assert store.game_ids() == ["1", "2"]
     assert not store.add(mate_game("0"))
     assert store.read_game("1")["moves"] == ["f2f3", "e7e5", "g2g4", "d8h4"]
+    store.flush()  # A phase end publishes the manifest.
     (tmp_path / "orphan.tmp").write_text("bad")
     manifest = json.loads((tmp_path / "manifest.json").read_text())
     manifest["shards"].pop()
@@ -139,6 +140,28 @@ def test_replay_recovery_dedup_eviction(tmp_path):
     assert "0" not in reopened.seen and not reopened.add(mate_game("1"))
     assert [s["file"] for s in reopened.manifest["shards"]] == sorted(
         p.name for p in tmp_path.glob("shard-*.parquet"))
+
+
+def test_automatic_flushes_leave_the_manifest_to_explicit_flushes(tmp_path):
+    store = SelfPlayStore(tmp_path, window_positions=8, flush_games=1)
+    store.add(mate_game("0"))
+    store.flush()
+    manifest = tmp_path / "manifest.json"
+    published = manifest.read_bytes()
+    for i in range(1, 4):
+        store.add(mate_game(str(i)))
+    # Every add wrote an fsynced shard, but only explicit flushes rewrite the index.
+    assert len(list(tmp_path.glob("shard-*.parquet"))) == 4
+    assert manifest.read_bytes() == published
+    assert store.game_ids() == ["2", "3"]
+    assert store.read_game("3")["game_id"] == "3"
+    # A crash here loses no games: reopening indexes the unpublished shards and
+    # trims to the same window.
+    recovered = SelfPlayStore(tmp_path, window_positions=8)
+    assert recovered.manifest == store.manifest
+    assert not recovered.add(mate_game("1"))
+    store.flush()
+    assert json.loads(manifest.read_text()) == store.manifest
 
 
 def test_garbage_collection_forgets_deleted_shards_but_keeps_pinned(tmp_path):
@@ -165,6 +188,7 @@ def test_writer_prunes_a_legacy_manifest_once(tmp_path):
     for i in range(3):
         store.add(mate_game(str(i)))
     first = store.index["0"][0]
+    store.flush()
     manifest = json.loads((tmp_path / "manifest.json").read_text())
     del manifest["next_shard"]
     (tmp_path / "manifest.json").write_text(json.dumps(manifest))
@@ -175,6 +199,7 @@ def test_writer_prunes_a_legacy_manifest_once(tmp_path):
     assert "0" not in writer.seen and "0" not in writer.index
     assert first not in {s["file"] for s in json.loads((tmp_path / "manifest.json").read_text())["shards"]}
     writer.add(mate_game("3"))
+    writer.flush()
     assert writer.index["3"][0].startswith("shard-00000003-")
     (tmp_path / writer.index["3"][0]).unlink()  # the window's only game
     with pytest.raises(FileNotFoundError, match="active replay shard missing"):
@@ -458,8 +483,9 @@ def test_multiple_iterations_and_runner_resume(tmp_path, monkeypatch, failure_st
     monkeypatch.setattr(
         runner,
         "StreamingStarts",
-        lambda directory, config, should_stop: mate_starts(
-            directory, config, per_bucket=64, should_stop=should_stop
+        lambda directory, config, should_stop, durable_launches: mate_starts(
+            directory, config, per_bucket=64, should_stop=should_stop,
+            durable_launches=durable_launches
         )[0],
     )
     output = tmp_path / "run"
@@ -618,8 +644,9 @@ def test_runner_accepts_previous_config_and_screens_ema(tmp_path, monkeypatch):
     monkeypatch.setattr(runner, "load_seeds", lambda path, split: monitor)
     monkeypatch.setattr(
         runner, "StreamingStarts",
-        lambda directory, config, should_stop: mate_starts(
-            directory, config, per_bucket=64, should_stop=should_stop)[0],
+        lambda directory, config, should_stop, durable_launches: mate_starts(
+            directory, config, per_bucket=64, should_stop=should_stop,
+            durable_launches=durable_launches)[0],
     )
     screens = []
 
@@ -715,6 +742,38 @@ def mate_starts(directory, cfg=None, *, per_bucket=4, plies=(1, 2, 3), **kwargs)
         block, dict(identity=starts.identity, number=0, exhausted=True, groups=groups)
     )
     return starts, cfg
+
+
+def test_batched_launch_journal_covers_every_published_game(tmp_path):
+    """Without per-launch saves, collection journals before every replay flush:
+    every game in a shard has its launch on disk (pending, or acknowledged by a
+    later save), so a crash never rewinds the stream past a published game."""
+    import json as _json
+    from imba_chess.self_play.collector import collect
+
+    runtime = ScriptRuntime()
+    runtime.executors = {"tick": lambda ps: ps}
+    starts, cfg = mate_starts(tmp_path / "stream", per_bucket=8, durable_launches=False)
+    store = SelfPlayStore(tmp_path / "replay", flush_games=2)
+    saves, flush = [], store.flush
+
+    def checked_flush(*args, **kwargs):
+        before = set(store.seen)
+        flush(*args, **kwargs)
+        journal = _json.loads((tmp_path / "stream" / "consumer.json").read_text())
+        for gid in set(store.seen) - before:
+            # Journaled before the shard was written; acknowledged only later.
+            assert gid in journal["pending"]
+        saves.append(journal["sequence"])
+
+    store.flush = checked_flush
+    collect(runtime=runtime, config=cfg, actor_id="actor", store=store,
+            max_positions=128, game_count=7, concurrent_games=3, start_sampler=starts)
+    assert len(store.game_ids()) == 7 and len(saves) >= 4
+    restored = mate_starts(tmp_path / "stream", cfg, durable_launches=False)[0]
+    # The phase end acknowledged every published game.
+    assert not set(restored.state["pending"]) & store.seen
+    assert restored.state["sequence"] == 7
 
 
 def test_collection_concurrency_invariance_and_executor_failure(tmp_path):
@@ -843,6 +902,7 @@ def test_legacy_phase_summary_migration_reads_each_shard_once(tmp_path, monkeypa
         game = mate_game(str(number))
         game["iteration"] = 7
         store.add(game)
+    store.flush()
     path = tmp_path / "manifest.json"
     manifest = json.loads(path.read_text())
     for shard in manifest["shards"]:
@@ -875,6 +935,7 @@ def test_legacy_phase_summary_migration_reads_each_shard_once(tmp_path, monkeypa
 def test_read_only_replay_preserves_published_snapshot(tmp_path):
     writer = SelfPlayStore(tmp_path, flush_games=1)
     writer.add(mate_game("first"))
+    writer.flush()
     manifest = tmp_path / "manifest.json"
     before = manifest.read_bytes()
     stamp = manifest.stat().st_mtime_ns
@@ -884,6 +945,7 @@ def test_read_only_replay_preserves_published_snapshot(tmp_path):
     assert manifest.read_bytes() == before
     assert manifest.stat().st_mtime_ns == stamp
     writer.add(mate_game("second"))
+    writer.flush()
     updated = manifest.read_bytes()
     assert reader.read_game("first")["game_id"] == "first"
     for operation in (
@@ -1149,6 +1211,43 @@ def test_gradient_accumulation_matches_single_step_and_resumes(tmp_path):
         cfg, learning=replace(cfg.learning, gradient_accumulation=1)).identifier
     assert cfg.identifier != replace(
         cfg, learning=replace(cfg.learning, gradient_accumulation=16)).identifier
+
+
+def test_samples_prepared_during_collection_train_identically(tmp_path):
+    torch.set_num_threads(1)
+    store = SelfPlayStore(tmp_path / "replay", flush_games=2)
+    games = []
+    for i, prefix in enumerate([[], ["f2f3"], ["f2f3", "e7e5"], []]):
+        game = mate_game(str(i), prefix=prefix)
+        game["iteration"] = 0 if i == 3 else 1
+        store.add(game)
+        games.append(game)
+    store.flush()
+
+    def trainer():
+        torch.manual_seed(42)
+        config = LearningConfig(auxiliary_value_weight=0.0, lr=0.01)
+        return Stage2Trainer(model=tiny_model(dropout=0.0), config=config, move_vocab=VOCAB,
+                             encoder=ENCODER, device=torch.device("cpu"), max_positions=128)
+
+    budget = sum(len(g["moves"]) for g in games[:3])
+    plain, prepared = trainer(), trainer()
+    # Fresh games (one left unprepared) plus an old game outside this phase's queue.
+    for game in games[:2] + games[3:]:
+        prepared.prepare(game)
+    plain.begin_phase(store, iteration=1, exposure_budget=budget)
+    prepared.begin_phase(store, iteration=1, exposure_budget=budget)
+    assert set(prepared.prepared) == {"0", "1"}  # Bounded by the phase's queue.
+    reads = []
+    read_game = store.read_game
+    store.read_game = lambda gid: reads.append(gid) or read_game(gid)
+    prepared.train(store, exposure_budget=budget)
+    assert reads == ["2"] and not prepared.prepared
+    store.read_game = read_game
+    plain.train(store, exposure_budget=budget)
+    assert plain.steps == prepared.steps and plain.exposures == prepared.exposures
+    for x, y in zip(plain.model.parameters(), prepared.model.parameters()):
+        torch.testing.assert_close(x, y, rtol=0, atol=0)
 
 
 def test_ema_tracks_weights_checkpoints_and_upgrades_resume(tmp_path):
@@ -1442,8 +1541,9 @@ def test_weights_stay_in_memory_between_saves_and_crash_rollback(tmp_path, monke
     monkeypatch.setattr(runner, "load_seeds", lambda path, split: monitor)
     monkeypatch.setattr(
         runner, "StreamingStarts",
-        lambda directory, config, should_stop: mate_starts(
-            directory, config, per_bucket=64, should_stop=should_stop)[0],
+        lambda directory, config, should_stop, durable_launches: mate_starts(
+            directory, config, per_bucket=64, should_stop=should_stop,
+            durable_launches=durable_launches)[0],
     )
     crash_at = [None]
 
@@ -1465,14 +1565,25 @@ def test_weights_stay_in_memory_between_saves_and_crash_rollback(tmp_path, monke
     def full(path):
         return "optimizer" in torch.load(path, weights_only=False, mmap=True)
 
-    # Deferred screens: only every second actor and its EMA reach the disk.
+    # Deferred screens: only every second actor reaches the disk, as a full state that
+    # holds its EMA; no separate EMA file is written.
     quiet = tmp_path / "quiet"
     state = run(quiet, "--initialize", str(tmp_path / "weights.pt"),
                 "--max-iterations", "5", "--screen-games", "100000")
     assert state["iteration"] == 5
     assert sorted(p.name for p in quiet.glob("actor-*.pt")) == ["actor-000000.pt", "actor-000004.pt"]
-    assert sorted(p.name for p in quiet.glob("ema-*.pt")) == ["ema-000004.pt"]
+    assert not list(quiet.glob("ema-*.pt"))
     assert full(quiet / "actor-000004.pt")
+    import importlib.util
+    spec = importlib.util.spec_from_file_location("extract_ema", "scripts/extract_ema.py")
+    extract = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(extract)
+    monkeypatch.setattr(sys, "argv", ["extract_ema.py", "--checkpoint", str(quiet / "actor-000004.pt"),
+                                      "--output", str(tmp_path / "ema-000004.pt")])
+    extract.main()
+    saved = torch.load(quiet / "actor-000004.pt", weights_only=False, mmap=True)["ema_model"]
+    written = torch.load(tmp_path / "ema-000004.pt", weights_only=False)["model"]
+    assert saved.keys() == written.keys() and all(torch.equal(saved[k], written[k]) for k in saved)
     # The graceful stop left a current full resume point.
     saved = torch.load(state["checkpoint"], weights_only=False, mmap=True)["progress"]
     assert (saved["iteration"], saved["phase"]) == (state["iteration"], state["phase"])
@@ -1545,8 +1656,9 @@ def test_phase_size_in_games(tmp_path, monkeypatch):
     monkeypatch.setattr(runner, "load_seeds", lambda path, split: monitor)
     monkeypatch.setattr(
         runner, "StreamingStarts",
-        lambda directory, config, should_stop: mate_starts(
-            directory, config, per_bucket=64, should_stop=should_stop)[0],
+        lambda directory, config, should_stop, durable_launches: mate_starts(
+            directory, config, per_bucket=64, should_stop=should_stop,
+            durable_launches=durable_launches)[0],
     )
     output = tmp_path / "run"
     monkeypatch.setattr(sys, "argv", [

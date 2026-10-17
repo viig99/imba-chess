@@ -2,6 +2,7 @@
 
 from dataclasses import asdict
 from functools import partial
+import json
 import os
 from pathlib import Path
 import random
@@ -117,6 +118,26 @@ class Stage2Trainer:
         self.queue = []
         self.reuse_counts = {}
         self.sample_ids = []
+        # {game_id: training sample} built by prepare() while collection runs.
+        self.prepared = {}
+
+    def prepare(self, game):
+        """Reconstruct a completed game's training sample now, while collection
+        leaves this process idle, instead of at the phase boundary. The sample is
+        built from the game's JSON form, exactly what replay stores and returns."""
+        if game["split"] == "train":
+            self.prepared[game["game_id"]] = self._reconstruct(
+                json.loads(json.dumps(game, allow_nan=False))
+            )
+
+    def _reconstruct(self, game):
+        return reconstruct(
+            game,
+            move_vocab=self.move_vocab,
+            encoder=self.encoder,
+            max_positions=self.max_positions,
+            learning=self.config,
+        )
 
     def _fresh_ema(self):
         return [p.detach().clone() for p in self._ema_parameters]
@@ -216,6 +237,7 @@ class Stage2Trainer:
         if not self.sample_ids:
             raise ValueError("no completed training trajectories")
         if iteration is None:
+            self.prepared = {}
             return
         if exposure_budget is None:
             raise ValueError("fresh-first sampling needs the phase exposure budget")
@@ -232,6 +254,9 @@ class Stage2Trainer:
             remaining -= store.index[gid][1]["positions"]
         self.queue = fresh + chosen
         self.rng.shuffle(self.queue)
+        # Bounded by one phase: keep only samples this phase will train on.
+        queued = set(self.queue)
+        self.prepared = {g: v for g, v in self.prepared.items() if g in queued}
 
     def _next_batch(self, store):
         if not self.queue:
@@ -240,19 +265,17 @@ class Stage2Trainer:
         samples, gids, tokens = [], [], 0
         while self.queue:
             gid = self.queue[-1]
-            sample = reconstruct(
-                store.read_game(gid),
-                move_vocab=self.move_vocab,
-                encoder=self.encoder,
-                max_positions=self.max_positions,
-                learning=self.config,
-            )
+            sample = self.prepared.get(gid)
+            if sample is None:
+                # Kept until consumed: a full microbatch leaves it for the next one.
+                sample = self.prepared[gid] = self._reconstruct(store.read_game(gid))
             size = len(sample["seq_token_id"])
             if size > self.config.microbatch_tokens:
                 raise ValueError("trajectory exceeds training microbatch token limit")
             if samples and tokens + size > self.config.microbatch_tokens:
                 break
             self.queue.pop()
+            self.prepared.pop(gid, None)
             gids.append(gid)
             samples.append(sample)
             tokens += size

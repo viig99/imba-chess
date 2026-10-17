@@ -2,9 +2,10 @@
 
 HF does not checkpoint its shuffle buffer. We therefore checkpoint the filtered
 UNSHUFFLED source cursor after each immutable block, and shuffle that block with
-a deterministic seed. The collector journals a launch before using it; replay
-publication acknowledges completed launches. Crashed/in-flight launches can be
-reissued with identical game IDs, prefixes and exploration RNG.
+a deterministic seed. Launches are journaled before replay can publish their
+games: before every launch (durable_launches), or before every replay flush;
+replay publication acknowledges completed launches. Journaled crashed/in-flight
+launches can be reissued with identical game IDs, prefixes and exploration RNG.
 """
 
 from dataclasses import asdict
@@ -192,9 +193,15 @@ class StreamingStarts:
         durable_launches=True,
     ):
         # durable_launches=False skips the per-launch fsync; the caller saves
-        # (or reconciles) once per batch of launches. KLENT launches ~15k games
+        # (or reconciles) once per batch of launches. Self-play collection then
+        # journals before every replay flush, so every published game's launch
+        # is on disk and the stream never rewinds past it; a crash only reissues
+        # starts whose games were lost unpublished. KLENT launches ~15k games
         # per iteration and re-seeds every iteration, so it needs no per-launch
-        # crash journal.
+        # crash journal. Regret restarts read replay against the journal and
+        # keep journaling every launch.
+        if config.regret is not None and not durable_launches:
+            raise ValueError("regret restarts need durable launches")
         self.durable_launches = durable_launches
         self.directory = Path(directory)
         self.directory.mkdir(parents=True, exist_ok=True)
@@ -404,18 +411,21 @@ class StreamingStarts:
                 del self.state["pending"][gid]
         self.save()
 
-    def retire(self, gid, reason):
+    def retire(self, gid, reason, *, save=True):
         if gid in self.state["pending"]:
             del self.state["pending"][gid]
             counts = self.state["retired"]
             counts[reason] = counts.get(reason, 0) + 1
-            self.save()
+            if save:
+                self.save()
 
     def finish_phase(self, keep=frozenset()):
         """Retire uncompleted launches, except carried games that stay live."""
-        for gid in list(self.state["pending"]):
-            if gid not in keep:
-                self.retire(gid, "phase_finished_uncompleted")
+        retired = [gid for gid in self.state["pending"] if gid not in keep]
+        for gid in retired:
+            self.retire(gid, "phase_finished_uncompleted", save=False)
+        if retired:
+            self.save()
 
     def next_launch(self, iteration, actor_id):
         if self.retry:

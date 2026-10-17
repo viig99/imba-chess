@@ -95,6 +95,11 @@ class SelfPlayStore:
     crash) is always recent, so it is still indexed; launch ids never repeat.
     Read-only instances use the published manifest without recovery or trimming;
     they never create files or publish state. They do not pin shards against GC.
+
+    Shards are the durable record: each is fsynced before it is indexed. The manifest
+    is an index of them, rewritten only by explicit flushes (phase ends) and garbage
+    collection, not by the automatic flushes of `add`; a writer reopening after a
+    crash indexes the shards it is missing, so the recovered window is the same.
     """
 
     def __init__(
@@ -119,6 +124,7 @@ class SelfPlayStore:
         )
         self.pending = OrderedDict()
         self.pending_positions = 0
+        self.unpublished = False
         path = self.directory / "manifest.json"
         self.manifest = (
             json.loads(path.read_text())
@@ -150,21 +156,27 @@ class SelfPlayStore:
         self._publish()
 
     def _index_shard(self, path):
-        entries = []
+        games = []
         for row in pq.ParquetFile(path).iter_batches(batch_size=16):
             for stored in row.to_pylist():
                 game = json.loads(stored["trajectory"])
                 validate_game(game)
-                gid = game["game_id"]
-                if gid in self.seen:
-                    continue
-                self.seen.add(gid)
-                entry = game_summary(game)
-                entries.append(entry)
-                self.index[gid] = (path.name, entry)
-                self.manifest["active"].append(gid)
-        self.manifest["shards"].append(dict(file=path.name, games=entries))
-        self.manifest["next_shard"] = max(self.manifest["next_shard"], int(path.name.split("-")[1]) + 1)
+                games.append(game)
+        self._index_games(path.name, games)
+
+    def _index_games(self, name, games):
+        entries = []
+        for game in games:
+            gid = game["game_id"]
+            if gid in self.seen:
+                continue
+            self.seen.add(gid)
+            entry = game_summary(game)
+            entries.append(entry)
+            self.index[gid] = (name, entry)
+            self.manifest["active"].append(gid)
+        self.manifest["shards"].append(dict(file=name, games=entries))
+        self.manifest["next_shard"] = max(self.manifest["next_shard"], int(name.split("-")[1]) + 1)
 
     def _forget(self, shards):
         files = {s["file"] for s in shards}
@@ -187,8 +199,10 @@ class SelfPlayStore:
     def _publish(self):
         self._require_writer()
         atomic_json(self.directory / "manifest.json", self.manifest)
+        self.unpublished = False
 
-    def add(self, game):
+    def add(self, game, *, before_flush=None):
+        """before_flush, if given, runs just before an automatic flush writes."""
         self._require_writer()
         validate_game(game)
         gid = game["game_id"]
@@ -202,13 +216,20 @@ class SelfPlayStore:
             len(self.pending) >= self.flush_games
             or self.pending_positions >= self.flush_positions
         ):
-            self.flush()
+            self.flush(publish=False, before=before_flush)
         return True
 
-    def flush(self):
+    def flush(self, publish=True, *, before=None):
+        """Write pending games as one fsynced shard, calling `before` first;
+        publish=False leaves the manifest for a later explicit flush (see the
+        class docstring)."""
         self._require_writer()
         if not self.pending:
+            if publish and self.unpublished:
+                self._publish()
             return
+        if before is not None:
+            before()
         # A fixed Arrow schema avoids null-list inference changing between shards.
         table = pa.Table.from_pylist(
             [
@@ -237,11 +258,14 @@ class SelfPlayStore:
             os.fsync(stream.fileno())
         os.replace(tmp, path)
         sync_directory(self.directory)
-        self._index_shard(path)
+        # Validated by add; index from memory rather than reading the shard back.
+        self._index_games(path.name, self.pending.values())
         self._trim()
-        self._publish()
         self.pending.clear()
         self.pending_positions = 0
+        self.unpublished = True
+        if publish:
+            self._publish()
 
     def game_ids(self, split="train"):
         return [

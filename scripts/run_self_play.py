@@ -92,8 +92,9 @@ def main():
         "--save-every",
         type=int,
         default=5,
-        help="Iterations between saves of the full trainer state with its actor and EMA "
-             "weights. Between saves weights stay in memory (workers get them through "
+        help="Iterations between saves of the full trainer state (actor-NNNNNN.pt), which "
+             "holds the actor and EMA weights; scripts/extract_ema.py writes its EMA out for "
+             "evaluation. Between saves weights stay in memory (workers get them through "
              "RAM); screens save the actor and EMA they evaluate, and graceful stops save "
              "the full state. A crash resumes from the last full state",
     )
@@ -269,7 +270,9 @@ def main():
             raise FileNotFoundError("stream consumer state missing; refusing source rewind")
         start_sampler = resources.enter_context(
             StreamingStarts(
-                args.output / "stream", cfg, should_stop=lambda: not budget.launch()
+                args.output / "stream", cfg, should_stop=lambda: not budget.launch(),
+                # Collection journals launches before each replay flush instead.
+                durable_launches=cfg.regret is not None,
             )
         )
         if args.resume and state.get("stream_identity") != start_sampler.identity:
@@ -485,7 +488,9 @@ def main():
                     metrics.done(summary)
 
                 def record_game(game):
-                    if game["status"] != "completed":
+                    if game["status"] == "completed":
+                        trainer.prepare(game)
+                    else:
                         log(
                             dict(
                                 game_id=game["game_id"],
@@ -572,11 +577,12 @@ def main():
                 if (state["iteration"] + 1) % args.save_every == 0:
                     actor = args.output / f"actor-{state['iteration'] + 1:06d}.pt"
                     state.update(actor=str(actor), checkpoint=str(actor))
+                    # The full state holds the EMA too (scripts/extract_ema.py writes it
+                    # out for evaluation); only screens write their own EMA file.
                     trainer.checkpoint(
                         actor, progress=dict(state), store=store, config_id=cfg.identifier
                     )
                     full_at[0] = (state["iteration"], state["phase"])
-                    save_ema()
                 atomic_json(state_path, state)
             if state["phase"] == "evaluate":
                 screen_path = args.output / f"screen-{state['iteration']:06d}.json"

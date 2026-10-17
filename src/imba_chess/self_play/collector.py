@@ -422,7 +422,7 @@ class CollectionPhase:
                 from .regret import suffix_regrets
 
                 suffix_regrets(game)  # Fail explicitly before replay serialization.
-            store.add(game)
+            store.add(game, before_flush=self._journal)
             if config.regret is not None and gid in store.seen:
                 self.start_sampler.reconcile(store)
         elif game.get("termination") not in (
@@ -443,8 +443,14 @@ class CollectionPhase:
             self.active[gid]["error"] = f"{type(exc).__name__}: {exc}"
             self.done(gid, self.active[gid], aborted=True)
 
+    def _journal(self):
+        """Before a replay flush: put every launch (including the games being
+        flushed) on disk, acknowledging games already published."""
+        if not self.start_sampler.durable_launches:
+            self.start_sampler.reconcile(self.store.seen)
+
     def finish(self):
-        self.store.flush()
+        self.store.flush(before=self._journal)
         self.start_sampler.reconcile(
             self.store.seen if self.config.regret is None else self.store
         )
