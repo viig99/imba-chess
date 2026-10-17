@@ -32,6 +32,24 @@ POLICY_Q_BETA = 0.1
 
 
 @dataclass(frozen=True)
+class _RootCarry:
+    """The played child of the previous search, ready to be the next root.
+
+    The child was decoded as the token right after the previous prefix, so it
+    is exactly the next root token: its evaluation is the next root's, and the
+    next prefix is the previous one plus the child's K/V row. Valid only for
+    the same runtime weights (token), game owner and history position."""
+
+    token: object
+    owner: tuple
+    fen: str
+    move_id: int
+    prefix_len: int
+    prefix_kv: list
+    evaluation: object
+
+
+@dataclass(frozen=True)
 class PolicyResult:
     """Greedy move with no search: argmax of the legal policy logits
     ("policy", the KLENT paper's eval) or of KLENT's improved policy pi',
@@ -218,7 +236,44 @@ class InferenceRuntime:
                 rng=rng,
                 should_stop=should_stop,
                 noise=noise,
+                carry=history,
             )
+        )
+
+    def _take_root_carry(self, holder, owner, token, board, batch):
+        """Pop the holder's carry; return it if it is this exact root."""
+        carry, holder.root_carry = holder.root_carry, None
+        if (
+            carry is None
+            or carry.token is not token
+            or carry.owner != owner
+            or carry.prefix_len != batch["total_tokens"]
+            or carry.move_id != int(batch["prev_move_id"][-1])
+            or carry.fen != board.fen()
+        ):
+            return None
+        return carry
+
+    def _root_carry(self, owner, token, board, result, played, prefix_kv, prefix_len):
+        child = played[0] if played else None
+        if child is None or child.evaluation is None or not child.handle.arena_chain:
+            return None
+        workspace = self.executors["decode_wave"].workspace
+        rows = workspace.arena_stack[:, :, child.handle.arena_chain[-1]]
+        if len(prefix_kv) != rows.size(0) or any(
+            k.dtype != rows.dtype or k.dim() != 3 for k, _ in prefix_kv
+        ):
+            raise RuntimeError("root prefix does not match the decode arena")
+        # Copies, not views: the arena row is reclaimed with this search.
+        prefix = [
+            (torch.cat((k, rows[i, 0][:, None]), 1), torch.cat((v, rows[i, 1][:, None]), 1))
+            for i, (k, v) in enumerate(prefix_kv)
+        ]
+        after = board.copy(stack=False)
+        after.push_uci(result.move_uci)
+        return _RootCarry(
+            token, owner, after.fen(), int(result.move_id), prefix_len + 1, prefix,
+            child.evaluation,
         )
 
     def search_batch(
@@ -232,7 +287,11 @@ class InferenceRuntime:
         should_stop=lambda: False,
         noise=None,
         root_observer=None,
+        carry=None,
     ):
+        """carry: the game's history object. Gumbel searches leave the played
+        child on it so the next search of the same game reuses that decode as
+        its root instead of re-running the whole history (see _RootCarry)."""
         if self.model.training:
             raise ValueError("search requires an evaluation-mode model")
         expected = GumbelConfig if self.algorithm == "gumbel" else HalvingConfig
@@ -243,64 +302,78 @@ class InferenceRuntime:
         if should_stop():
             raise InterruptedError("search cancelled")
         token = self._cache_token
-        identity, output = yield WorkRequest("root_eval", (owner, batch))
-        if token is not self._cache_token:
-            raise RuntimeError("search invalidated by cache refresh")
-        if identity != owner:
-            raise RuntimeError("root result ownership mismatch")
-        # Native projection: vocabulary ids, UCIs, playable moves and forcing
-        # flags in canonical UCI order, the order python-chess projection used.
-        legal = cozy_bridge.project_legal_lean(
-            cozy_bridge.board_to_cozy(board), self.move_vocab
-        )
-        if legal.total != len(legal):
-            raise ValueError("incomplete legal vocabulary")
-        if not len(legal):
-            raise ValueError("cannot search a position without legal moves")
-        ids, ucis = legal.ids, legal.ucis
-        row = output["logits"][-1]
-        index = torch.tensor(ids, dtype=torch.long).to(row.device, non_blocking=True)
-        logits = row.index_select(0, index)
-        if root_observer is not None:
-            root_observer([chess.Move.from_uci(uci) for uci in ucis], logits)
-        if self.algorithm == "policy":
-            return PolicyResult(ucis[int(torch.argmax(logits))])
-        if self.algorithm == "policy_q":
-            if "q" not in output:
-                raise ValueError("policy_q requires a checkpoint with an action-value head")
-            q = output["q"][-1].index_select(0, index)
-            scores = POLICY_Q_BETA * logits.float() + q.float()
-            return PolicyResult(ucis[int(torch.argmax(scores))])
-        if noise == 0.0:
-            noise = [0.0] * len(ids)
-        # One readback for the root's log priors and WDL.
-        host = torch.cat(
-            (
-                torch.log_softmax(logits.float(), 0),
-                torch.softmax(output["value_logits"][-1].float(), -1),
+        reused = None
+        if carry is not None and self.algorithm == "gumbel" and root_observer is None:
+            reused = self._take_root_carry(carry, owner, token, board, batch)
+        if reused is None:
+            identity, output = yield WorkRequest("root_eval", (owner, batch))
+            if token is not self._cache_token:
+                raise RuntimeError("search invalidated by cache refresh")
+            if identity != owner:
+                raise RuntimeError("root result ownership mismatch")
+            # Native projection: vocabulary ids, UCIs, playable moves and forcing
+            # flags in canonical UCI order, the order python-chess projection used.
+            legal = cozy_bridge.project_legal_lean(
+                cozy_bridge.board_to_cozy(board), self.move_vocab
             )
-        ).cpu()
-        wdl = tuple(host[len(ids):].tolist())
-        root = PositionEval(
-            wdl[2] - wdl[0],
-            legal.moves,
-            ucis,
-            host[: len(ids)].tolist(),
-            legal.forcing,
-            ids,
-            wdl=wdl,
-        )
+            if legal.total != len(legal):
+                raise ValueError("incomplete legal vocabulary")
+            if not len(legal):
+                raise ValueError("cannot search a position without legal moves")
+            ids, ucis = legal.ids, legal.ucis
+            row = output["logits"][-1]
+            index = torch.tensor(ids, dtype=torch.long).to(row.device, non_blocking=True)
+            logits = row.index_select(0, index)
+            if root_observer is not None:
+                root_observer([chess.Move.from_uci(uci) for uci in ucis], logits)
+            if self.algorithm == "policy":
+                return PolicyResult(ucis[int(torch.argmax(logits))])
+            if self.algorithm == "policy_q":
+                if "q" not in output:
+                    raise ValueError("policy_q requires a checkpoint with an action-value head")
+                q = output["q"][-1].index_select(0, index)
+                scores = POLICY_Q_BETA * logits.float() + q.float()
+                return PolicyResult(ucis[int(torch.argmax(scores))])
+            if noise == 0.0:
+                noise = [0.0] * len(ids)
+            # One readback for the root's log priors and WDL.
+            host = torch.cat(
+                (
+                    torch.log_softmax(logits.float(), 0),
+                    torch.softmax(output["value_logits"][-1].float(), -1),
+                )
+            ).cpu()
+            wdl = tuple(host[len(ids):].tolist())
+            root = PositionEval(
+                wdl[2] - wdl[0],
+                legal.moves,
+                ucis,
+                host[: len(ids)].tolist(),
+                legal.forcing,
+                ids,
+                wdl=wdl,
+            )
+            prefix_kv, prefix_len = output["kv_caches"], batch["total_tokens"]
+        else:
+            # The previous search already decoded this exact token (its played
+            # child) against the same prefix with the same weights.
+            root, prefix_kv, prefix_len = reused.evaluation, reused.prefix_kv, reused.prefix_len
+            wdl = tuple(root.wdl)
+            output = None
+            if noise == 0.0:
+                noise = [0.0] * len(root.legal_ids)
         evaluator = CachedPositionEvaluator(
             model=self.model,
             move_vocab=self.move_vocab,
             board_state_encoder=self.encoder,
             device=self.device,
             dtype=self.dtype,
-            prefix_kv=output["kv_caches"],
-            prefix_len=batch["total_tokens"],
+            prefix_kv=prefix_kv,
+            prefix_len=prefix_len,
             immutable_prefix=True,
         )
         evaluator._runtime_token = token
+        played = []
         if self.algorithm == "gumbel":
             gen = gumbel_stepwise(
                 board=board,
@@ -311,6 +384,7 @@ class InferenceRuntime:
                 root_wdl=wdl,
                 noise=noise,
                 should_stop=should_stop,
+                on_played=played.append if carry is not None else None,
             )
         else:
             if noise is not None:
@@ -341,6 +415,10 @@ class InferenceRuntime:
             if self.algorithm == "value_search_halving":
                 chosen, rows = stop.value
                 return HalvingResult(ucis[chosen], rows)
+            if carry is not None:
+                carry.root_carry = self._root_carry(
+                    owner, token, board, stop.value, played, prefix_kv, prefix_len
+                )
             return stop.value
         finally:
             gen.close()

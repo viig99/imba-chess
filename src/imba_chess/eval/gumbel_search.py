@@ -219,8 +219,11 @@ def gumbel_stepwise(
     root_eval: PositionEval | None = None,
     root_wdl=None,
     should_stop: Callable[[], bool] = lambda: False,
+    on_played: Callable | None = None,
 ):
     """Yield at most one new neural leaf per simulation; retain history per path.
+
+    on_played, if given, receives the played action's child node (or None).
 
     A supplied root_eval is counted as one neural evaluation too. Terminal
     roots are not playable and raise ValueError. Cancellation raises InterruptedError.
@@ -321,6 +324,8 @@ def gumbel_stepwise(
                 wdl_sums[i] += probability
     root.visits, root.sums, root.means = root.stats.snapshot()
     action = root_action(max(root.visits))
+    if on_played is not None:
+        on_played(root.children.get(action))
     q = completed_q(
         root.value, priors, root.visits, root.qs(), config, root.stats.probs
     )

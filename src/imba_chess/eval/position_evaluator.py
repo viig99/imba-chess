@@ -48,6 +48,8 @@ class _SequenceHistory:
         self.played_by_elo: list[int] = [0]
 
         self._prev_move_id_for_next_token = self._move_vocab.start_id
+        # The search runtime's played-child carry (inference_runtime._RootCarry).
+        self.root_carry = None
 
     def append_observed_position(self, board: chess.Board) -> None:
         state = self._board_state_encoder.encode(board)
