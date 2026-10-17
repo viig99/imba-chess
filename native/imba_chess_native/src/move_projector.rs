@@ -25,6 +25,9 @@ type Projection = (
 struct ProjectionEntry {
     id: i64,
     sort_key: String,
+    // Position of sort_key among all entries' keys: sorting a projection by it
+    // orders exactly as comparing the strings would.
+    rank: u32,
     py_uci: Py<PyString>,
     // Shared text for native legal sets; cloning an Arc never allocates.
     uci: std::sync::Arc<str>,
@@ -36,8 +39,19 @@ struct ProjectionEntry {
 /// vocabularies never share state.
 #[pyclass(frozen)]
 pub struct MoveProjector {
-    entries: HashMap<cozy_chess::Move, ProjectionEntry>,
+    entries: Vec<ProjectionEntry>,
+    // Direct index by (from, to, promotion): entry index + 1, or 0 if the
+    // move is not in the vocabulary. Replaces a hashed lookup per legal move.
+    table: Vec<u32>,
 }
+
+/// Table slot of a move: 64 x 64 squares x (no promotion + six piece kinds).
+fn slot(mv: cozy_chess::Move) -> usize {
+    let promotion = mv.promotion.map_or(0, |piece| piece as usize + 1);
+    (mv.from as usize * 64 + mv.to as usize) * 7 + promotion
+}
+
+const TABLE_SLOTS: usize = 64 * 64 * 7;
 
 /// Standard UCI form of a generated move.
 ///
@@ -116,15 +130,16 @@ impl MoveProjector {
         inner.generate_moves(|piece_moves| {
             for mv in piece_moves {
                 total += 1;
-                if let Some(entry) = self.entries.get(&lookup_move(inner, mv)) {
-                    selected.push((entry, mv));
+                let index = self.table[slot(lookup_move(inner, mv))];
+                if index != 0 {
+                    selected.push((&self.entries[index as usize - 1], mv));
                 }
             }
             false
         });
         // Stable, and by UCI string, so the order matches the Python oracle's
         // `sorted(..., key=lambda i: ucis[i])`.
-        selected.sort_by(|a, b| a.0.sort_key.cmp(&b.0.sort_key));
+        selected.sort_by_key(|entry| entry.0.rank);
 
         // Two distinct legal moves can normalize onto the same token when the
         // king does not start on the e-file: a plain king step to c1/g1 lands
@@ -156,7 +171,10 @@ impl MoveProjector {
 impl MoveProjector {
     #[new]
     fn py_new(move_token_to_id: &Bound<'_, PyDict>) -> PyResult<Self> {
-        let mut entries = HashMap::with_capacity(move_token_to_id.len());
+        // Moves map to entries; a move parsed twice keeps its last entry.
+        let mut index_of: HashMap<cozy_chess::Move, usize> =
+            HashMap::with_capacity(move_token_to_id.len());
+        let mut entries: Vec<ProjectionEntry> = Vec::with_capacity(move_token_to_id.len());
         for (key, value) in move_token_to_id.iter() {
             let py_uci = key
                 .downcast::<PyString>()
@@ -166,17 +184,31 @@ impl MoveProjector {
                 .parse::<cozy_chess::Move>()
                 .map_err(|_| PyValueError::new_err(format!("invalid UCI move: {}", uci)))?;
             let id: i64 = value.extract()?;
-            entries.insert(
-                mv,
-                ProjectionEntry {
-                    id,
-                    uci: std::sync::Arc::from(uci.as_str()),
-                    sort_key: uci,
-                    py_uci: py_uci.clone().unbind(),
-                },
-            );
+            let entry = ProjectionEntry {
+                id,
+                uci: std::sync::Arc::from(uci.as_str()),
+                sort_key: uci,
+                rank: 0,
+                py_uci: py_uci.clone().unbind(),
+            };
+            match index_of.get(&mv) {
+                Some(&index) => entries[index] = entry,
+                None => {
+                    index_of.insert(mv, entries.len());
+                    entries.push(entry);
+                }
+            }
         }
-        Ok(MoveProjector { entries })
+        let mut order: Vec<usize> = (0..entries.len()).collect();
+        order.sort_by(|&a, &b| entries[a].sort_key.cmp(&entries[b].sort_key));
+        for (rank, index) in order.into_iter().enumerate() {
+            entries[index].rank = rank as u32;
+        }
+        let mut table = vec![0u32; TABLE_SLOTS];
+        for (mv, index) in index_of {
+            table[slot(mv)] = index as u32 + 1;
+        }
+        Ok(MoveProjector { entries, table })
     }
 
     /// (ids, moves, UCIs) for the mapped legal moves in canonical UCI order,

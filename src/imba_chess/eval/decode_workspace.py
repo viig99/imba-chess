@@ -36,7 +36,9 @@ class _StagedRequest:
 
 def _stage_request(evaluator, batch):
     node, board = batch[0]
-    evaluator._validate_handles((node,))
+    # Inline evaluator._validate_handles: this runs for every staged node.
+    if node.history_token is not evaluator._history_token:
+        raise RuntimeError("stale or foreign history handle")
     return _StagedRequest(
         (node,), (board,), evaluator._prefix_kv, evaluator._prefix_len
     )
@@ -115,8 +117,10 @@ class DecodeWorkspace:
         self.row_owners = []
         self.batch_capacity = self.prefix_capacity = self.legal_capacity = 0
         self.row_capacity = 0
-        self.logical_prefix = 0
         self.device_fields = None
+        # Per batch size: prefix views, metadata fields and decoder feature
+        # inputs. Views of fixed buffers, rebuilt only when a buffer is replaced.
+        self._wave_views = {}
         self.prefix_inputs = self.feature_inputs = None
         self.prefix_inference = None
 
@@ -163,18 +167,23 @@ class DecodeWorkspace:
         self.counters["fallback_validation_calls"] += 1
         return (evaluator.history_revision, _stamp(request))
 
-    def _prefix_views(self, reference, g, p):
-        prefix = []
-        for buffers, refs in zip(self.prefix_inputs, reference):
-            row = []
-            for target, ref in zip(buffers, refs):
-                shape = (ref.size(0), p, ref.size(-1))
-                # Preserve the reference stack's single-row logical base shape,
-                # independent storage, contiguous strides and inference metadata.
-                target.resize_(shape if g == 1 else (g, *shape))
-                row.append(target.unsqueeze(0) if g == 1 else target)
-            prefix.append(tuple(row))
-        return prefix
+    def _views(self, g):
+        """Fixed-layout views for a g-row wave. Prefix inputs keep their full
+        capacity: the decoder reads each row only up to its own length, so the
+        wave's longest prefix never changes the layout, the rows' contents or
+        the captured graph."""
+        views = self._wave_views.get(g)
+        if views is None:
+            fields = self._fields(self.metadata, g)
+            features = [t[:g] for t in self.feature_inputs]
+            views = self._wave_views[g] = (
+                [tuple(t[:g] for t in pair) for pair in self.prefix_inputs],
+                fields,
+                features,
+                [fields[0], *fields[1].unbind(0), fields[2][0]],
+                fields[2].unbind(0),
+            )
+        return views
 
     def _refresh_direct(self, prefix, requests, dirty):
         # Only each row's real history is copied: the decoder never reads past a
@@ -290,6 +299,7 @@ class DecodeWorkspace:
             self.row_owners = [None] * self.batch_capacity
             full_refresh = True
             self.host = None
+            self._wave_views = {}
             self._drop_graphs()  # Decoder input buffers were reallocated.
         if self.host is None or width > self.legal_capacity:
             self.legal_capacity = max(1, self.legal_capacity, _capacity(width))
@@ -301,15 +311,12 @@ class DecodeWorkspace:
                 pin_memory=self.device.type == "cuda",
             )
             self.metadata = torch.empty_like(self.host, device=self.device)
+            self._wave_views = {}
             self._drop_graphs()  # Graphs read lengths/depths from metadata.
             self.numpy = self.host.numpy()
         count = self._packed_size(g)
         self.numpy[:count].fill(0)
         host_fields = self._fields(self.numpy, g)
-        if p != self.logical_prefix:
-            self.row_owners = [None] * self.batch_capacity
-            self.logical_prefix = p
-            full_refresh = True
         self.counters["history_full_refreshes"] += int(full_refresh)
         # Logical rows are contiguous just like the compiled reference. Capacity
         # padding lives after the used range, outside each layer's active view.
@@ -343,24 +350,17 @@ class DecodeWorkspace:
                 self.row_owners[row] = owner
         metadata = self.metadata[:count]
         metadata.copy_(self.host[:count], non_blocking=True)
-        self.device_fields = self._fields(metadata, g)
+        prefix, self.device_fields, feature_targets, feature_sources, scalars = self._views(g)
         self.counters["h2d_bytes"] += metadata.numel() * metadata.element_size()
         self.counters["h2d_copies"] += 1
-        prefix = self._prefix_views(requests[0].prefix_kv, g, p)
         self.counters["history_dirty_rows"] += len(dirty)
         if dirty:
             self._refresh_direct(prefix, requests, dirty)
-        feature_targets = [t[:g] for t in self.feature_inputs]
-        feature_sources = [
-            self.device_fields[0],
-            *self.device_fields[1].unbind(0),
-            self.device_fields[2][0],
-        ]
         torch._foreach_copy_(feature_targets, feature_sources)
         self.counters["decoder_feature_copy_bytes"] += sum(
             t.numel() * t.element_size() for t in feature_targets
         )
-        _, lengths, depths, _ = self.device_fields[2].unbind(0)
+        _, lengths, depths, _ = scalars
         positions = feature_targets[-1]
         batch = {"piece_ids": feature_targets[0]}
         batch.update({key: feature_targets[col + 1] for col, key in enumerate(keys)})
@@ -378,7 +378,7 @@ class DecodeWorkspace:
     def decode(self, args):
         """Run the decoder on prepare() arguments.
 
-        On CUDA each exact (generation, batch, prefix) shape gets one captured
+        On CUDA each (buffer generation, batch size) gets one captured
         graph of the compiled decoder: the same kernels on the same static
         buffers (prefix inputs, arena, metadata), replayed without Python
         launches. The first wave of a shape runs normally (its result is used),
@@ -390,7 +390,8 @@ class DecodeWorkspace:
 
         if self.device.type != "cuda":
             return run()
-        key = (self._generation, args[1].size(0), args[2][0][0].size(2))
+        # Prefix inputs keep their capacity, so a batch size fixes every shape.
+        key = (self._generation, args[1].size(0))
         entry = self._graphs.get(key)
         if entry is not None:
             self._graphs.move_to_end(key)
@@ -457,7 +458,10 @@ class DecodeWorkspace:
         for req, (slot, _) in zip(requests, slots_rows):
             owner = slot.owner()
             if owner is not None:
-                owner._validate_handles(req.nodes)
+                token = owner._history_token
+                for node in req.nodes:
+                    if node.history_token is not token:
+                        raise RuntimeError("stale or foreign history handle")
         # Every layer's new K and V rows in one scatter: [layers, 2, g, heads, dim].
         layers = len(out["kv"])
         rows = torch.stack([t.squeeze(2) for pair in out["kv"] for t in pair])

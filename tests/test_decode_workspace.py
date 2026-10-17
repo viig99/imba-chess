@@ -124,16 +124,13 @@ def test_workspace_mixed_depth_owner_changes_and_kv_lifetime(device, mode):
             torch.testing.assert_close(args[1].cpu(), merged.positions, atol=0, rtol=0)
             for got, ref in zip(args[2], merged.prefix_kv_grouped):
                 for x, y in zip(got, ref):
-                    # Only real history is staged; the decoder never reads padding.
-                    assert x.shape == y.shape
+                    # Fixed-capacity rows; only real history is staged and read.
+                    assert x.shape[:2] == y.shape[:2] and x.size(3) == y.size(3)
+                    assert x.size(2) >= y.size(2) and x.is_contiguous()
                     for row, n in enumerate(merged.prefix_lens_list):
                         torch.testing.assert_close(
                             x[row, :, :n], y[row, :, :n], atol=0, rtol=0
                         )
-                    assert x._is_view() == y._is_view()
-                    if x._base is not None:
-                        assert x._base.shape == y._base.shape
-                        assert x._base.stride() == y._base.stride()
             torch.testing.assert_close(
                 args[5].cpu(), merged.prefix_lens, atol=0, rtol=0
             )
@@ -436,7 +433,7 @@ def test_immutable_revision_and_stale_handles(monkeypatch):
         args, state = ws.prepare([payload(owner)])
         for pair, source in zip(args[2], other._prefix_kv):
             for t, ref in zip(pair, source):
-                torch.testing.assert_close(t[0], ref, atol=0, rtol=0)
+                torch.testing.assert_close(t[0, :, :3], ref[:, :3], atol=0, rtol=0)
         assert ws.counters["fast_validation_calls"] == 2
         assert ws.counters["fallback_validation_calls"] == 0
 
@@ -479,12 +476,14 @@ def test_direct_dirty_rows_batch_resize_and_width_changes(immutable):
         prepare([0, 1, 2, 3, 4], 1)
     prepare([1, 2], 2)  # zero-width prefix
     prepare([1], 0)
-    prepare([0, 1], 2)  # logical width changes within storage capacity
+    prepare([0, 1], 2)  # both rows change owner; the longest prefix grows
     owners[0].replace_history(evaluator(model, 19)._prefix_kv, 19)
-    prepare([0, 1], 2)
+    prepare([0, 1], 2)  # capacity growth reallocates every row
     owners[0].replace_history(evaluator(model, 2)._prefix_kv, 2)
-    prepare([0, 1], 2)
-    assert ws.counters["history_full_refreshes"] == 6
+    # The longest prefix shrinks, but row 1's history is untouched.
+    prepare([0, 1], 1)
+    # First fill and two reallocations; prefix length changes alone never refresh.
+    assert ws.counters["history_full_refreshes"] == 3
 
 
 def test_workspace_executor_error_cleans_buffers(monkeypatch):
@@ -523,7 +522,7 @@ def test_mutable_external_tensor_replacement_is_fingerprinted():
     with torch.inference_mode():
         args, _ = ws.prepare([payload(owner)])
     for t, expected in zip(args[2][0], prefix[0]):
-        torch.testing.assert_close(t[0], expected, atol=0, rtol=0)
+        torch.testing.assert_close(t[0, :, :3], expected, atol=0, rtol=0)
     assert ws.counters["fallback_validation_calls"] == 2
     assert ws.counters["history_dirty_rows"] == 2
 

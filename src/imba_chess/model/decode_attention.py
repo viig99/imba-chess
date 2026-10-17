@@ -170,7 +170,11 @@ def _decode_attention_reference(
     q, k_new, v_new, prefix_k, prefix_v, arena_k, arena_v, chain, lengths, depths,
     ps_w, scale, max_pos,
 ):
-    g, p, s = q.size(0), prefix_k.size(2), chain.size(1)
+    # Read only up to the longest real prefix, as the kernel does: padding then
+    # cannot change the result, whatever the buffers' capacity.
+    p = int(lengths.max()) if lengths.numel() else 0
+    prefix_k, prefix_v = prefix_k[:, :, :p], prefix_v[:, :, :p]
+    g, s = q.size(0), chain.size(1)
     t = torch.arange(p, device=q.device)
     j = torch.arange(s, device=q.device)
     pos = lengths + depths

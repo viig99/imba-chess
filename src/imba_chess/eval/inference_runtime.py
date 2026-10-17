@@ -225,8 +225,14 @@ class InferenceRuntime:
         noise=None,
     ):
         owner = (actor_id, game_id)
-        batch = history.build_batch_for_current_position(board)
-        batch["game_id"] = [game_id]
+        reused = None
+        if self.algorithm == "gumbel":
+            reused = self._take_root_carry(history, owner, board, *history.next_root_key())
+        batch = None
+        if reused is None:
+            # Only a root prefill needs the whole history as tensors.
+            batch = history.build_batch_for_current_position(board)
+            batch["game_id"] = [game_id]
         return (
             yield from self.search_batch(
                 board=board,
@@ -237,18 +243,19 @@ class InferenceRuntime:
                 should_stop=should_stop,
                 noise=noise,
                 carry=history,
+                reused=reused,
             )
         )
 
-    def _take_root_carry(self, holder, owner, token, board, batch):
+    def _take_root_carry(self, holder, owner, board, total_tokens, prev_move_id):
         """Pop the holder's carry; return it if it is this exact root."""
         carry, holder.root_carry = holder.root_carry, None
         if (
             carry is None
-            or carry.token is not token
+            or carry.token is not self._cache_token
             or carry.owner != owner
-            or carry.prefix_len != batch["total_tokens"]
-            or carry.move_id != int(batch["prev_move_id"][-1])
+            or carry.prefix_len != total_tokens
+            or carry.move_id != prev_move_id
             or carry.fen != board.fen()
         ):
             return None
@@ -288,10 +295,13 @@ class InferenceRuntime:
         noise=None,
         root_observer=None,
         carry=None,
+        reused=None,
     ):
         """carry: the game's history object. Gumbel searches leave the played
         child on it so the next search of the same game reuses that decode as
-        its root instead of re-running the whole history (see _RootCarry)."""
+        its root instead of re-running the whole history (see _RootCarry).
+        reused: a carry already validated for this root by search(); batch is
+        then None."""
         if self.model.training:
             raise ValueError("search requires an evaluation-mode model")
         expected = GumbelConfig if self.algorithm == "gumbel" else HalvingConfig
@@ -302,9 +312,8 @@ class InferenceRuntime:
         if should_stop():
             raise InterruptedError("search cancelled")
         token = self._cache_token
-        reused = None
-        if carry is not None and self.algorithm == "gumbel" and root_observer is None:
-            reused = self._take_root_carry(carry, owner, token, board, batch)
+        if reused is not None and (reused.token is not token or root_observer is not None):
+            raise ValueError("a reused root needs the current weights and no root observer")
         if reused is None:
             identity, output = yield WorkRequest("root_eval", (owner, batch))
             if token is not self._cache_token:

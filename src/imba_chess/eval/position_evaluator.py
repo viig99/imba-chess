@@ -108,6 +108,11 @@ class _SequenceHistory:
             "played_by_elo": torch.tensor(self.played_by_elo, dtype=torch.long),
         }
 
+    def next_root_key(self) -> tuple[int, int]:
+        """(total_tokens, prev_move_id) of the next current-position batch,
+        without building it."""
+        return len(self.seq_token_id) + 1, self._prev_move_id_for_next_token
+
     def build_batch_for_current_position(self, board: chess.Board) -> dict[str, Any]:
         # Add transient current-position token for next-move prediction only.
         state = self._board_state_encoder.encode(board)
@@ -620,8 +625,9 @@ class CachedPositionEvaluator:
         the string there.
         """
         parent = handle if isinstance(handle, _CachedNode) else None
-        if parent is not None:
-            self._validate_handles((parent,))
+        # Inline _validate_handles: this runs once per new search node.
+        if parent is not None and parent.history_token is not self._history_token:
+            raise RuntimeError("stale or foreign history handle")
         depth = parent.depth + 1 if parent is not None else 0
         if move_vocab_id is None:
             move_vocab_id = int(self._move_vocab.encode(move_uci))
