@@ -2,7 +2,11 @@
 # (artifacts/self_play/plain-s256-lr2e4-from-rgsc-it441-2026-10-16), the default of
 # scripts/run_self_play.py. Identical to self_play_s256_bf16_lr2e4_carry.toml (which carries the
 # lineage's full history) except concurrent_games = 160, the 5 workers x 32 games that run had on
-# the command line.
+# the command line, and the phase size in games (fresh_games = 640, from 2026-10-17): 4x the 160
+# parallel games, ~56k positions. That run had 24576 positions (~280 games) per phase; after the
+# collection speedups that meant a weight update every ~65 s, and 640 games restores the earlier
+# ~2.5 min cadence while halving the share of fixed per-phase costs. Training per position is
+# unchanged (reuse 1); bigger phases only regroup it.
 # Plain Gumbel 256 (raw Q, value_scale 0.5), bf16 collection in 5 worker processes, fast 64-sim
 # play-out of decided games, in-flight games carried across phases, a 500k replay window trained
 # once per position (reuse 1), constant lr 2e-4 with EMA 0.995, policy surprise weighting and three
@@ -23,7 +27,7 @@ rescale_values = false
 concurrent_games = 160
 root_batch_tokens = 1024
 max_game_plies = 512
-fresh_positions = 24576
+fresh_games = 640
 inference_dtype = "bfloat16"
 # Fast play-out of decided games only (from iteration ~238, 2026-10-14, resumed with
 # --previous-config): every undecided move keeps the full search (full_search_probability 1, so

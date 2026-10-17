@@ -265,6 +265,7 @@ class CollectionMetrics:
             if game["split"] == "train":
                 self.counts["usable_positions"] += length
                 self.counts["training_positions"] += length
+                self.counts["training_games"] += 1
 
     def report(self):
         elapsed = max(time.perf_counter() - self.start, 1e-9)
@@ -367,10 +368,8 @@ class CollectionPhase:
                 self.game_count is not None and self.launches >= self.game_count
             ):
                 break
-            if (
-                self.game_count is None
-                and self.metrics.counts["training_positions"]
-                >= self.config.collection.fresh_positions
+            if self.game_count is None and self.config.collection.phase_complete(
+                self.metrics.counts
             ):
                 break
             try:

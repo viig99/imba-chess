@@ -1180,7 +1180,7 @@ def test_ema_tracks_weights_checkpoints_and_upgrades_resume(tmp_path):
     settings = asdict(cfg)
     del settings["collection"]["inference_dtype"], settings["learning"]["ema_decay"]
     for key in ("playout_cap", "full_search_probability", "fast_simulations", "fast_top_m",
-                "decided_value", "decided_plies", "carry_over_games"):
+                "decided_value", "decided_plies", "carry_over_games", "fresh_games"):
         del settings["collection"][key]
     assert cfg.identifier == hashlib.sha256(json.dumps(dict(
         settings=settings,
@@ -1452,3 +1452,66 @@ def test_weights_stay_in_memory_between_saves_and_crash_rollback(tmp_path, monke
     assert state["iteration"] == 6 and not state["halted"]
     assert all(Path(state[k]).exists() for k in ("actor", "best", "checkpoint", "ema_actor"))
     assert len(list(output.glob("*.pt"))) <= 6
+
+
+def test_phase_size_in_games(tmp_path, monkeypatch):
+    """fresh_games sizes a phase by completed training games instead of positions;
+    either size may change on resume, and only the one in effect is identity."""
+    import sys
+    from dataclasses import replace
+    import scripts.run_self_play as runner
+    from imba_chess.self_play.config import (
+        SelfPlayConfig, RunConfig, CollectionConfig, ReplayConfig,
+    )
+
+    base = SelfPlayConfig()
+    games = replace(base, collection=replace(base.collection, fresh_games=640))
+    assert games.identifier != base.identifier
+    # With fresh_games set, fresh_positions no longer matters, and vice versa.
+    assert games.identifier == replace(
+        games, collection=replace(games.collection, fresh_positions=7)).identifier
+    assert {"fresh_positions", "fresh_games"} <= set(CollectionConfig.RESUMABLE_FIELDS)
+    with pytest.raises(ValueError, match="fresh_games"):
+        CollectionConfig(fresh_games=-1)
+    assert CollectionConfig(fresh_games=3).phase_complete({"training_games": 3, "training_positions": 0})
+    assert not CollectionConfig(fresh_games=3).phase_complete({"training_games": 2, "training_positions": 10**6})
+
+    def runtime(cfg, checkpoint, device):
+        model = tiny_model()
+        if checkpoint.exists():
+            model.load_state_dict(torch.load(checkpoint, weights_only=False)["model"])
+        return IdentifiedRuntime(model), 128
+
+    cfg = SelfPlayConfig(
+        learning=LearningConfig(auxiliary_value_weight=0.0),
+        search=GumbelConfig(simulations=1, max_depth=1),
+        collection=CollectionConfig(concurrent_games=2, fresh_games=5),
+        replay=ReplayConfig(window_positions=200, flush_games=2),
+        run=RunConfig(screen_pairs=1, confirmation_pairs=1),
+    )
+    source = "monitor"
+    while source_split(source) != "monitor":
+        source += "x"
+    monitor = [Seed("monitor", source, ["f2f3", "e7e5", "g2g4"], 3, "monitor", "c")]
+    seed_path = tmp_path / "seeds.json"
+    seed_path.write_text("test")
+    monkeypatch.setattr(runner, "load_config", lambda path: cfg)
+    monkeypatch.setattr(runner, "load_runtime", runtime)
+    monkeypatch.setattr(runner, "load_seeds", lambda path, split: monitor)
+    monkeypatch.setattr(
+        runner, "StreamingStarts",
+        lambda directory, config, should_stop: mate_starts(
+            directory, config, per_bucket=64, should_stop=should_stop)[0],
+    )
+    output = tmp_path / "run"
+    monkeypatch.setattr(sys, "argv", [
+        "run_self_play.py", "--config", "unused", "--seeds", str(seed_path),
+        "--output", str(output), "--device", "cpu", "--collect-workers", "1",
+        "--no-continuous", "--screen-games", "100000", "--max-iterations", "2",
+        "--initialize", str(tmp_path / "weights.pt")])
+    runner.main()
+    rows = [json.loads(line) for line in (output / "metrics.jsonl").read_text().splitlines()]
+    phases = [row for row in rows if "training_games" in row]
+    assert len(phases) == 2
+    # Launching stops at five completed games; at most the two in flight finish after.
+    assert all(5 <= row["training_games"] <= 5 + 2 for row in phases)

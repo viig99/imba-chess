@@ -82,7 +82,7 @@ touch artifacts/self_play/new-run/STOP   # remove it before restarting
 | `--continuous` | on | `--no-continuous` stops after the config's `[run] hours`; `--until` sets a deadline. |
 | `--observe-only-screen` | on | Screens record strength against the initial actor without rollback or promotion; `--no-observe-only-screen` gates on them. |
 | `--screen-games` | 100,000 | About 7 hours. |
-| `--save-every` | 10 | Actor (full trainer state) and EMA files are saved every 10th iteration, at screens and at graceful stops; weights stay in memory between saves. |
+| `--save-every` | 5 | Actor (full trainer state) and EMA files are saved every 5th iteration (~12 min with 640-game phases), at screens and at graceful stops; weights stay in memory between saves. |
 
 Run the workers under the CUDA MPS daemon (`nvidia-cuda-mps-control -d`, or a user systemd unit),
 so the 5 processes share the GPU concurrently. On the 5070 Ti, at commit 8e757d6, the recipe ran at

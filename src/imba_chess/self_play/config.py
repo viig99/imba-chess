@@ -18,6 +18,10 @@ class CollectionConfig:
     root_batch_tokens: int = 1024
     max_game_plies: int = 512
     fresh_positions: int = 4096
+    # Phase size in games instead of positions (0 = use fresh_positions): a phase
+    # stops launching once this many training games completed during it. With
+    # carry_over_games the in-flight games finish under the next phase's actor.
+    fresh_games: int = 0
     # Collection-worker search precision; training always keeps FP32 weights.
     inference_dtype: str = "float32"
     # Playout cap randomization (KataGo) with fast play-out of decided games. Off by
@@ -45,13 +49,25 @@ class CollectionConfig:
         "decided_value", "decided_plies",
     )
     # Fields a resumed run may change with --previous-config.
-    RESUMABLE_FIELDS = PLAYOUT_CAP_FIELDS + ("carry_over_games",)
+    # The phase size only regroups the same training (reuse x positions), so a run
+    # may change it too.
+    RESUMABLE_FIELDS = PLAYOUT_CAP_FIELDS + ("carry_over_games", "fresh_positions", "fresh_games")
+
+    def phase_complete(self, counts):
+        """Whether a phase's CollectionMetrics counts reached its size."""
+        if self.fresh_games:
+            return counts["training_games"] >= self.fresh_games
+        return counts["training_positions"] >= self.fresh_positions
 
     def __post_init__(self):
         if type(self.playout_cap) is not bool:
             raise ValueError("playout_cap must be boolean")
         if type(self.carry_over_games) is not bool:
             raise ValueError("carry_over_games must be boolean")
+        if type(self.fresh_games) is not int or self.fresh_games < 0:
+            raise ValueError("fresh_games must be a nonnegative integer")
+        if type(self.fresh_positions) is not int or self.fresh_positions < 1:
+            raise ValueError("fresh_positions must be a positive integer")
         if not math.isfinite(self.full_search_probability) or not 0 < self.full_search_probability <= 1:
             raise ValueError("full_search_probability must be in (0, 1]")
         if any(type(v) is not int or v < 1 for v in (self.fast_simulations, self.fast_top_m, self.decided_plies)):
@@ -179,6 +195,12 @@ class SelfPlayConfig:
                 del settings["collection"][key]
         if not self.collection.carry_over_games:
             del settings["collection"]["carry_over_games"]
+        # Exactly one phase size is in effect; runs from before fresh_games keep
+        # their identity.
+        if self.collection.fresh_games:
+            del settings["collection"]["fresh_positions"]
+        else:
+            del settings["collection"]["fresh_games"]
         if self.learning.ema_decay == 0:
             del settings["learning"]["ema_decay"]
         return hashlib.sha256(

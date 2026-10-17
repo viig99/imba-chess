@@ -91,7 +91,7 @@ def main():
     parser.add_argument(
         "--save-every",
         type=int,
-        default=10,
+        default=5,
         help="Iterations between saves of the full trainer state with its actor and EMA "
              "weights. Between saves weights stay in memory (workers get them through "
              "RAM); screens save the actor and EMA they evaluate, and graceful stops save "
@@ -515,10 +515,7 @@ def main():
                 )
                 log(metrics.report())
                 log(start_sampler.report())
-                if (
-                    metrics.counts["training_positions"]
-                    < cfg.collection.fresh_positions
-                ):
+                if not cfg.collection.phase_complete(metrics.counts):
                     publish_checkpoint()
                     break
                 start_sampler.finish_phase(keep=workers.carried_ids if workers else frozenset())
