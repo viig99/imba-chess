@@ -49,21 +49,54 @@ Install project dependencies and native bindings with `uv sync --extra dev`. Dat
 # Stage 1: use the config matching the intended architecture.
 .venv/bin/python scripts/train.py --config config/imba_chess_v4.toml
 
-# New stage-2 run (requires a prepared monitor seed manifest).
-.venv/bin/python scripts/run_self_play.py \
-  --config config/self_play_5090.toml \
-  --initialize artifacts/flatten-board-ckpt34/initial.pt \
-  --seeds artifacts/corpus/v4_self_play_seeds_4096.json \
-  --output artifacts/self_play/new-run --device cuda
-
-# Resume the same run/config with its optimizer and replay state.
-.venv/bin/python scripts/run_self_play.py \
-  --config config/self_play_5090.toml \
-  --resume --seeds artifacts/corpus/v4_self_play_seeds_4096.json \
-  --output artifacts/self_play/new-run --device cuda
+# Stage 2: see "Recommended stage-2 run" below.
 ```
 
-Collection is limited by its single search thread, not the GPU. `--collect-workers N` splits `--concurrent-games` across N processes sharing the GPU. The main process keeps replay, streamed starts, regret state and training, and workers load its weights at every collect phase. On the 8 GB laptop, 2 workers × 32 games collected 24% faster than one process with 64 games; 4 × 16 saturated the GPU. `--cpu-threads` (default 1) stops idle OpenMP workers from spinning on every core. Both flags are execution-only and keep the resume config identity.
+## Recommended stage-2 run
+
+`scripts/run_self_play.py` defaults to the recipe of the 2026-10 long run on a 16 GB RTX 5070 Ti,
+so starting self-play after stage-1 pretraining needs only an initialization and an output directory:
+
+```bash
+# 1. Add the zeroed auxiliary value heads the recipe trains; stage-1 checkpoints lack them.
+.venv/bin/python scripts/add_auxiliary_value_head.py \
+  --checkpoint artifacts/<stage-1 run>/<checkpoint>.pt --output artifacts/self_play/initial-aux3.pt
+
+# 2. Start the run. It is continuous: it stops only on RUN/STOP or SIGTERM.
+PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True .venv/bin/python scripts/run_self_play.py \
+  --initialize artifacts/self_play/initial-aux3.pt --output artifacts/self_play/new-run
+
+# 3. Every later start goes through the watchdog, which resumes after a crash (at most 3 an hour).
+PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True scripts/self_play_watchdog.sh artifacts/self_play/new-run
+
+# Stop cleanly (the current full state is saved): touch the STOP file, then SIGTERM the run.
+touch artifacts/self_play/new-run/STOP   # remove it before restarting
+```
+
+| Default | Value | Notes |
+|---|---|---|
+| `--config` | `config/self_play.toml` | Plain Gumbel 256, raw Q at value scale 0.5, bf16 collection, fast play-out of decided games, carry-over of in-flight games, 500k replay at reuse 1, constant LR 2e-4, EMA 0.995. See the [config guide](docs/CONFIG_GUIDE.md). |
+| `--seeds` | `artifacts/corpus/v4_self_play_seeds_4096.json` | Held-out monitor openings for screens; build once with `scripts/materialize_corpus.py` and `scripts/prepare_self_play_seeds.py`. Training starts stream from the corpus. |
+| `--collect-workers`, slots | 5 workers x 32 games (config `concurrent_games = 160`) | About 11 GB peak on 16 GB. 6 workers never fit, and 5 x 40 ran out of memory beside a Stockfish eval. |
+| `--cpu-threads` | 1 | Idle OpenMP threads slow the single search thread of each worker. |
+| `--continuous` | on | `--no-continuous` stops after the config's `[run] hours`; `--until` sets a deadline. |
+| `--observe-only-screen` | on | Screens record strength against the initial actor without rollback or promotion; `--no-observe-only-screen` gates on them. |
+| `--screen-games` | 100,000 | About 7 hours. |
+| `--save-every` | 10 | Actor (full trainer state) and EMA files are saved every 10th iteration, at screens and at graceful stops; weights stay in memory between saves. |
+
+Run the workers under the CUDA MPS daemon (`nvidia-cuda-mps-control -d`, or a user systemd unit),
+so the 5 processes share the GPU concurrently. On the 5070 Ti, at commit 8e757d6, the recipe ran at
+about 82k neural evaluations/s and 69 s per iteration: ~14.8k games/hour, ~355k a day, 10-11.5 GB peak.
+On a larger GPU, raise `--collect-workers` and `--concurrent-games`. The 32 GB 5090 ran
+12 workers x 28 games in bf16. Both flags are execution-only and keep the resume identity.
+
+Screens only compare the run against itself. Track strength with Stockfish about twice a day
+(100 games, 512 simulations):
+`scripts/run_stockfish_eval.py --checkpoint <copy of RUN/ema-NNNNNN.pt> --config config/imba_chess_v4_aux3.toml --out <dir> -- --gumbel-simulations 512`.
+Use the first saved EMA at or after the iteration you want, and copy it out first: the run prunes old checkpoint files. The 2026-10 lineage sat at about 44%
+against SF2600 (ema-100 of the LR 2e-4 run).
+
+Collection is limited by its single search thread, not the GPU. `--collect-workers N` (default 5) splits `--concurrent-games` across N processes sharing the GPU. The main process keeps replay, streamed starts, regret state and training, and workers load its weights at every collect phase. On the 8 GB laptop, 2 workers × 32 games collected 24% faster than one process with 64 games; 4 × 16 saturated the GPU. `--cpu-threads` (default 1) stops idle OpenMP workers from spinning on every core. Both flags are execution-only and keep the resume config identity.
 
 Collection aborts on gameplay errors, preserving unfinished launch IDs for retry without labels. Workers have execution-only startup, progress and shutdown timeouts: `--worker-startup-timeout` (900 seconds), `--worker-progress-timeout` (300 seconds), and `--worker-shutdown-timeout` (5 seconds). Progress time excludes coordinator work such as waiting for streamed starts. Stalled workers are killed; Linux workers also die if their coordinator exits. Increase the progress timeout if first-use compilation or a large search cohort needs longer.
 
@@ -81,7 +114,7 @@ Use [the config guide](docs/CONFIG_GUIDE.md) before changing an existing run. Th
 
 The old standalone Gumbel evaluation commands are retired. Select Gumbel explicitly on the common commands. Retired policies and inference optimization/dtype/compile switches are rejected; supervised-training controls remain separate.
 
-Stage-2 screens compare matched held-out prefixes with colors swapped. A run screens at the first phase boundary after `--screen-games` completed games (default 1,500, about 3 hours on the 5090 tactical recipe; the count persists across resumes), or after `--screen-seconds` of wall time instead. A completed 500-game confirmation with paired 95% confidence above 50% is required for best-checkpoint promotion. Incomplete evaluations do not establish a score. Keep full-strength fixed-node Stockfish results separate from historical Elo-limited SF2400 results.
+Stage-2 screens compare matched held-out prefixes with colors swapped. A run screens at the first phase boundary after `--screen-games` completed games (default 100,000, about 7 hours on the 5070 Ti; the count persists across resumes), or after `--screen-seconds` of wall time instead. A completed 500-game confirmation with paired 95% confidence above 50% is required for best-checkpoint promotion. Incomplete evaluations do not establish a score. Keep full-strength fixed-node Stockfish results separate from historical Elo-limited SF2400 results.
 
 Track usable completed positions/hour, completion/discard rates, training positions/second, policy CE/entropy/KL, WDL CE/Brier, predicted versus observed draws, gradient norms, replay age/reuse, and paired strength scores. Lower training loss alone does not prove stronger chess.
 

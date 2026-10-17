@@ -429,6 +429,10 @@ def test_multiple_iterations_and_runner_resume(tmp_path, monkeypatch, failure_st
         str(output),
         "--device",
         "cpu",
+        "--collect-workers",
+        "1",
+        "--no-continuous",
+        "--no-observe-only-screen",
     ]
     every = ["--screen-games", "1"]
     monkeypatch.setattr(
@@ -583,7 +587,7 @@ def test_runner_accepts_previous_config_and_screens_ema(tmp_path, monkeypatch):
     output = tmp_path / "run"
     base = ["run_self_play.py", "--config", "unused", "--seeds", str(seed_path),
             "--output", str(output), "--device", "cpu", "--screen-games", "1",
-            "--observe-only-screen"]
+            "--collect-workers", "1"]
 
     def run(*extra):
         monkeypatch.setattr(sys, "argv", base + list(extra))
@@ -592,6 +596,8 @@ def test_runner_accepts_previous_config_and_screens_ema(tmp_path, monkeypatch):
 
     run("--initialize", str(tmp_path / "weights.pt"), "--max-iterations", "1")
     assert [name for name, _ in screens] == ["screen-000000.json"]
+    start = json.loads((output / "metrics.jsonl").read_text().splitlines()[0])
+    assert start["continuous"] and start["observe_only_screen"]  # the defaults
     cfg[0] = ema
     with pytest.raises(ValueError, match="configuration .*changed"):
         run("--resume", "--max-iterations", "2")
@@ -1406,7 +1412,7 @@ def test_weights_stay_in_memory_between_saves_and_crash_rollback(tmp_path, monke
     def run(output, *extra):
         monkeypatch.setattr(sys, "argv", [
             "run_self_play.py", "--config", "unused", "--seeds", str(seed_path),
-            "--output", str(output), "--device", "cpu", "--observe-only-screen",
+            "--output", str(output), "--device", "cpu", "--collect-workers", "1",
             "--save-every", "2", *extra])
         runner.main()
         return json.loads((output / "state.json").read_text())

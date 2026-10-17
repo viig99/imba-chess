@@ -1,4 +1,5 @@
-"""Manually invoked, bounded collect/train/evaluate loop with restartable phases.
+"""Manually invoked collect/train/evaluate loop with restartable phases; the defaults are the
+recommended stage-2 recipe (README "Recommended stage-2 run").
 
 The external nightly schedule is deliberately not installed by this command.
 """
@@ -29,12 +30,16 @@ from imba_chess.self_play.streaming import StreamingStarts
 from imba_chess.self_play.trainer import Stage2Trainer, atomic_checkpoint
 from imba_chess.self_play.workers import CollectionWorkers, split_games
 
-# About 5 iterations (~347 completed games each), i.e. 3 hours, on the 5090 tactical recipe.
-DEFAULT_SCREEN_GAMES = 1500
+# The defaults are the recommended stage-2 recipe (README "Recommended stage-2 run"): the config of
+# the 2026-10 long run on a 16 GB 5070 Ti, continuous, observe-only screens.
+DEFAULT_CONFIG = Path("config/self_play.toml")
+DEFAULT_SEEDS = Path("artifacts/corpus/v4_self_play_seeds_4096.json")
+# About 7 hours (~14.8k games/h) on the 5070 Ti; screens are observe-only, so rarer is cheaper.
+DEFAULT_SCREEN_GAMES = 100000
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--config", type=Path, required=True)
+    parser.add_argument("--config", type=Path, default=DEFAULT_CONFIG, help=f"default {DEFAULT_CONFIG}")
     source = parser.add_mutually_exclusive_group(required=True)
     source.add_argument("--initialize", type=Path)
     source.add_argument("--resume", action="store_true")
@@ -49,7 +54,7 @@ def main():
         help="With --initialize, screen against this checkpoint (copied into the run) instead of "
              "the initial actor, e.g. to keep a restarted run's screens on the original baseline",
     )
-    parser.add_argument("--seeds", type=Path, required=True)
+    parser.add_argument("--seeds", type=Path, default=DEFAULT_SEEDS, help=f"default {DEFAULT_SEEDS}")
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--device", default="cuda")
     parser.add_argument(
@@ -63,8 +68,12 @@ def main():
         help="torch intra-op CPU threads; overrides OMP_NUM_THREADS. Search CPU tensors are "
              "tiny, and idle OpenMP workers spin on every core and slow the single search thread",
     )
-    parser.add_argument("--continuous", action="store_true", help="Run until interrupted; no time or default iteration cutoff")
-    parser.add_argument("--max-iterations", type=int, default=100000)
+    parser.add_argument(
+        "--continuous", action=argparse.BooleanOptionalAction,
+        help="Run until interrupted (the default unless --until is given); --no-continuous stops "
+             "after the config's [run] hours",
+    )
+    parser.add_argument("--max-iterations", type=int, default=100000, help="Stop after this iteration")
     parser.add_argument(
         "--previous-config",
         type=Path,
@@ -103,12 +112,12 @@ def main():
         "--screen-games",
         type=int,
         help=f"Screen at the first phase boundary after this many completed games "
-             f"(default {DEFAULT_SCREEN_GAMES}, about 3 hours of 5090 tactical Gumbel 512)",
+             f"(default {DEFAULT_SCREEN_GAMES}, about 7 hours on the 5070 Ti)",
     )
     parser.add_argument(
         "--collect-workers",
         type=int,
-        default=1,
+        default=5,
         help="Collection processes sharing the GPU; --concurrent-games is split across them. "
              "One search thread per process is the collection bottleneck (execution-only; "
              "preserves resume config identity)",
@@ -136,8 +145,10 @@ def main():
     )
     parser.add_argument(
         "--observe-only-screen",
-        action="store_true",
-        help="Research runs: record strength screens without rollback or best promotion",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Record strength screens without rollback or best promotion (default); "
+             "--no-observe-only-screen gates the actor on them",
     )
     args = parser.parse_args()
     if args.initialize_optimizer and not args.initialize:
@@ -171,6 +182,8 @@ def main():
         parser.error("--until needs an explicit timezone")
     if args.continuous and args.until is not None:
         parser.error("--continuous cannot be combined with --until")
+    if args.continuous is None:
+        args.continuous = args.until is None
     torch.set_num_threads(args.cpu_threads)
     cfg = load_config(args.config)
     if args.collect_workers > 1:
@@ -461,7 +474,7 @@ def main():
             store.collect_garbage(pinned_shards=pinned)
 
         next_screen = time.monotonic() + (args.screen_seconds or 0)
-        while (args.continuous or state["iteration"] < args.max_iterations) and (not budget.stop()):
+        while state["iteration"] < args.max_iterations and (not budget.stop()):
             if state["phase"] == "collect":
                 if not budget.launch():
                     break

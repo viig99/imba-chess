@@ -6,6 +6,8 @@
 | `imba_chess_v4_laptop.toml` | Laptop supervised continuation from flattened ckpt34 at its saved learning rate, in a separate checkpoint directory. |
 | `imba_chess_v4_aux3.toml` | v4 plus three auxiliary WDL heads; base for stage-2 runs with auxiliary value learning. |
 | `eval_flatten_sf2400.toml` | Frozen SF2400 halving recipe for flattened checkpoints (ckpt34 r4/b2048 confirmation, seed 1042). |
+| `self_play.toml` | **Recommended stage-2 recipe and the default of `run_self_play.py`** (see README "Recommended stage-2 run"): plain Gumbel 256 with raw Q at value scale 0.5, bf16 collection, fast 64-simulation play-out of decided games, in-flight games carried across phases, 160 slots (5 workers x 32 on a 16 GB GPU), 500k replay trained once per position, constant LR 2e-4 with EMA 0.995, policy surprise, 3-horizon auxiliary value (0.15). Same settings as `self_play_s256_bf16_lr2e4_carry.toml`, whose header holds the lineage's history. |
+| `self_play_s256_bf16*.toml` | Configs of the 2026-10 5070 Ti lineage, kept so those runs resume under their recorded identity. |
 | `self_play_5090.toml` | 32 GB recipe of the tactical fork of the vmix run: 256 slots, tactical Gumbel 512 (root forcing, forcing floor, minimax weight 0.5), 1M-position replay, LR 2e-4 with 4-step accumulation, 0.25 search-WDL value mix, 3-horizon auxiliary value (0.15), regret restarts. |
 
 Every stage-2 run streams its starting positions from the training corpus through `[streaming]`. The seed manifest passed with `--seeds` supplies only the held-out monitor openings used by strength screens.

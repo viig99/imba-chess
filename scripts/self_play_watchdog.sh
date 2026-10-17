@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # Restart a self-play run with --resume after it crashes.
 #
-# usage: scripts/self_play_watchdog.sh RUN_DIR -- <run_self_play.py args without --resume/--initialize>
+# usage: scripts/self_play_watchdog.sh RUN_DIR [-- <run_self_play.py args without --resume/--initialize>]
+# With no args the run resumes under run_self_play.py's defaults, the recommended recipe.
 #
 # Every crash is logged to RUN_DIR/watchdog.log with its exit code and last error line. The watchdog
 # stops instead of restarting when the run exits cleanly (exit 0, e.g. after SIGTERM), when
@@ -11,7 +12,7 @@
 set -u
 RUN_DIR=$1
 shift
-[ "$1" = "--" ] && shift
+[ "${1:-}" = "--" ] && shift
 MAX_CRASHES=${MAX_CRASHES:-3}
 WINDOW_SECONDS=${WINDOW_SECONDS:-3600}
 LOG="$RUN_DIR/watchdog.log"
