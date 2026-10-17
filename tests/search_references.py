@@ -23,7 +23,6 @@ def DecoderRunner(model, mode="tensor", suffix_capacity=32):
     runner.model = model
     runner.suffix_capacity = suffix_capacity
     runner.decode = TensorDecoder(model).eval()
-    runner.clear()
     return runner
 
 

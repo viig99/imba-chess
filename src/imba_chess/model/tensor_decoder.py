@@ -1,7 +1,7 @@
-"""Compiled neural decoder with an executor-owned workspace.
+"""Compiled neural decoder over executor-owned inputs.
 
-The workspace belongs to one executor/model, never to a search node. Returned
-K/V are fresh projections, not views into mutable workspace storage.
+Staging and caches belong to the executor's DecodeWorkspace. Returned K/V are
+fresh projections, not views into mutable staging storage.
 """
 
 import torch
@@ -26,7 +26,6 @@ class TensorDecoder(torch.nn.Module):
         prefix_fill,
         suffix_rel,
         suffix_fill,
-        workspace,
     ):
         model = self.model
         x = model.position_embedding.at_positions(
@@ -80,9 +79,8 @@ class TensorDecoder(torch.nn.Module):
 class DecoderRunner:
     """Host-side validation/preparation, kept outside the compiled graph.
 
-    Prefix workspaces are reused while the ordered root-owner cohort is stable.
-    Cohort changes invalidate the prefix contents; this is deliberately not a
-    persistent-slot/paged cache. Memory and retained owners are bounded to one wave.
+    The caller owns prefix and branch storage; the runner retains no search
+    owners or cached decode inputs between calls.
     """
 
     def __init__(self, model, suffix_capacity=32):
@@ -93,13 +91,8 @@ class DecoderRunner:
         self.decode = torch.compile(
             TensorDecoder(model).eval(), fullgraph=True, dynamic=True
         )
-        self.clear()
 
-    def clear(self):
-        self.prefix_owner = None
-        self.workspace = None
-
-    def __call__(self, merged, *, workspace=None):
+    def __call__(self, merged):
         if self.model.training:
             raise ValueError("tensor decoder is inference-only")
         if merged.group_sizes != [1] * len(merged.group_sizes):
@@ -161,5 +154,4 @@ class DecoderRunner:
             prefix_fill,
             suffix_rel,
             suffix_fill,
-            (),
         )

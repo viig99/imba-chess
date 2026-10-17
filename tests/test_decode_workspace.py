@@ -50,7 +50,7 @@ def payload(e, parent=None):
     return e, [(e.extend(parent, "e2e4"), cozy_bridge.board_to_cozy(board))]
 
 
-def compare_results(a, b):
+def compare_results(a, b, *, prior_atol=1e-6):
     for x, y in zip(a, b):
         x, y = x[0], y[0]
         assert x.legal_ids == y.legal_ids and x.legal_ucis == y.legal_ucis
@@ -62,7 +62,7 @@ def compare_results(a, b):
         torch.testing.assert_close(
             torch.tensor(x.legal_log_priors),
             torch.tensor(y.legal_log_priors),
-            atol=1e-6,
+            atol=prior_atol,
             rtol=1e-6,
         )
 
@@ -571,7 +571,11 @@ def test_stable_placement_and_selective_gather(device, mode, monkeypatch):
             aa = [payload(a[i], pa[i] if i == 0 and step < 33 else None) for i in order]
             bb = [payload(b[i], pb[i] if i == 0 and step < 33 else None) for i in order]
             copied = ws.counters["history_copied_bytes"]
-            compare_results(reference(aa), candidate(bb))
+            # Compiled FP32 and the legacy grouped path also differ by ~2e-6
+            # on the committed implementation. Match the decoder tensor test's
+            # absolute tolerance; ownership/gather checks stay exact.
+            compare_results(reference(aa), candidate(bb),
+                            prior_atol=1e-5 if mode == "compiled" else 1e-6)
             if 0 < step < 33:
                 assert ws.counters["history_copied_bytes"] == copied
             for i, x, y in zip(order, aa, bb):

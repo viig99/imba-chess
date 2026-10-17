@@ -56,9 +56,7 @@ def test_whole_decoder_branch_reuse(device, mode):
     runner = DecoderRunner(model, mode)
     with torch.inference_mode():
         merged = request(model, device)
-        workspace = None
         previous_kv = None
-        workspace_ptr = None
         original_prefix = [(k.clone(), v.clone()) for k, v in merged.prefix_kv_grouped]
         for depth in (7, 1, 0, 31):
             next_request = request(model, device, depth=depth)
@@ -66,7 +64,7 @@ def test_whole_decoder_branch_reuse(device, mode):
             merged = next_request
             kwargs = {name: getattr(merged, name) for name in asdict(merged)}
             expected = model.forward_decode_grouped(**kwargs, one_query_per_game=True)
-            actual = runner(merged, workspace=workspace)
+            actual = runner(merged)
             for current, saved in zip(merged.prefix_kv_grouped, original_prefix):
                 for a, b in zip(current, saved):
                     torch.testing.assert_close(a, b, atol=0, rtol=0)
@@ -88,8 +86,6 @@ def test_whole_decoder_branch_reuse(device, mode):
         torch.testing.assert_close(
             runner(merged)["logits"], expected["logits"], atol=1e-05, rtol=1e-05
         )
-        runner.clear()
-        assert runner.workspace is None and runner.prefix_owner is None
         model.prediction_head.weight.mul_(1.1)
         expected = model.forward_decode_grouped(**kwargs, one_query_per_game=True)
         torch.testing.assert_close(

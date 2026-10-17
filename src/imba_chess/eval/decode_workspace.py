@@ -368,7 +368,6 @@ class DecodeWorkspace:
             prefix_fill,
             suffix_rel,
             suffix_fill,
-            (),
         )
         return args, (requests, chains, slots_rows, per_node, width)
 
