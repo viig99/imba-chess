@@ -40,6 +40,10 @@
 # After the fused decode kernel and root reuse the 24576-position phases updated weights every
 # ~65 s; 640 games restores the earlier ~2.5 min cadence and halves the fixed per-phase share.
 # Training per position is unchanged (reuse 1).
+# From iteration ~335 (2026-10-17, resumed with --previous-config set to this file's previous
+# version): reuse 1 -> 2. Each phase trains its 640 fresh games plus ~640 older ones from the
+# 500k-position window (~5750 games, ~8.9 phases, FIFO). Reuse 2 ran before (iterations ~189-325
+# of the older lineage); reuse 5 overfit.
 base_config = "config/imba_chess_v4_aux3.toml"
 
 [search]
@@ -85,13 +89,15 @@ auxiliary_value_lambda = [0.8, 0.9, 0.95]
 value_search_mix = 0.1
 weight_decay = 0.01
 grad_clip = 2.0
-reuse = 1.0
+# Each phase trains on its ~640 fresh games plus as many older positions (~640 games) drawn
+# without replacement from the rest of the FIFO window (~8.9 phases): about two passes per game.
+reuse = 2.0
 microbatch_tokens = 1024
 gradient_accumulation = 4
 policy_surprise_enabled = true
 policy_surprise_fraction = 0.5
 policy_surprise_cap = 3.0
-# Weight EMA over ~200 optimizer steps (~19 iterations at ~10.6 steps each), screened next to
+# Weight EMA over ~200 optimizer steps (~5 iterations of ~41 steps at reuse 2), screened next to
 # the raw actor from iteration 151 on (resumed with --enable-ema); collection keeps raw weights.
 ema_decay = 0.995
 
