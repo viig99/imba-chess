@@ -37,6 +37,14 @@ def policy_metrics(row, reference):
             expectation = wdl[2] + 0.5 * wdl[1]
             result[name + "_mae"] = abs(expectation - root_score)
             result[name + "_mse"] = (expectation - root_score) ** 2
+    # search_wdl averages every simulation, so it is pulled toward the values of
+    # moves Gumbel's halving later discards. The played edge's Q is comparable
+    # across methods; q = W - L, so its expected score is (1 + q) / 2.
+    qvalues = row.get("qvalues")
+    if qvalues is not None and row["visits"][chosen]:
+        expectation = (1 + qvalues[chosen]) / 2
+        result["played_q_mae"] = abs(expectation - root_score)
+        result["played_q_mse"] = (expectation - root_score) ** 2
     return result
 
 

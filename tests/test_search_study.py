@@ -21,6 +21,11 @@ def test_expected_target_regret_and_value_perspective():
     assert result["good_mass"] == 0.75
     assert result["root_wdl_mae"] == pytest.approx(0.1)
     assert result["search_wdl_mae"] == 0
+    assert "played_q_mae" not in result
+    # Played edge a2a4 has q = 0.2, expected score 0.6 against the 0.65 root.
+    result = policy_metrics(dict(observation(), qvalues=[-0.5, 0.2]), REFERENCE)
+    assert result["played_q_mae"] == pytest.approx(0.05)
+    assert result["played_q_mse"] == pytest.approx(0.0025)
     with pytest.raises(ValueError, match="invalid search policy"):
         policy_metrics(observation(policy=(1, 1)), REFERENCE)
 

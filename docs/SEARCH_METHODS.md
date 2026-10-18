@@ -29,7 +29,11 @@ The configurations otherwise copy the established collection and learning recipe
 workers and game concurrency remain execution options. Lc0-style describes the
 selection rule and parent FPU, not a complete Lc0 engine implementation. Variance
 scaling is an interpretable parent-return-variance adaptation, not a complete
-KataGo implementation. PUCT-V follows equation 22 of arXiv:2512.21648.
+KataGo implementation. PUCT-V follows arXiv:2512.21648 (Weichart): Eq. 22 in v1,
+renumbered Eq. 17 in v3, using ln(N + 1) for the paper's log N. Its preset c2 = 3.0
+is tuned on our [-1, 1] value scale, which equals the paper's c2 = 1.5 on [0, 1],
+not the paper default. One deviation from Lc0 remains: FPU uses the mean of child
+returns as parent Q, without the node's own network value.
 
 **RPO changes the returned policy / teaching target. At fixed weights and search
 settings it does not change tree visits or the most-visited move played during
@@ -161,6 +165,11 @@ Let `s(a)` be Stockfish's expected score from the player-to-move perspective,
 - **Good mass:** policy probability within 0.02 of the reference best.
 - **Value MAE/MSE:** absolute/squared error of network or search expected score
   against the independent root reference. This is not three-component WDL MAE.
+  *All-simulation* search value is `search_wdl`, the mean leaf WDL over every
+  simulation. Gumbel spends only ~25% of its simulations on the move it plays
+  (PUCT ~67-71%), so its all-simulation value includes moves that sequential halving
+  discards and is biased low (-0.078 expected score). *Played-move Q* is the played
+  edge's mean value, `(1 + q) / 2`; use it to compare value estimates across methods.
 - **KL(target || network prior):** size of a policy update, not oracle quality.
   Q-values are scores, not probability distributions; we do not take KL of Q-values.
 
@@ -175,14 +184,14 @@ planned root grouping. The full test is 4,110 roots from 822 source games.
 
 Lower regret and value errors are better; higher best-move rate and good mass are better.
 
-| Method | Move regret | Target regret | Best move % | Blunder % | Good mass % | Search value MAE | Search value MSE | Target entropy | KL to prior | Visited actions |
-|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|
-| Gumbel | 0.04328 | 0.04512 | 65.20681 | 16.25304 | 77.31639 | 0.16519 | 0.05099 | 0.52953 | 0.98897 | 14.90754 |
-| PUCT | 0.04060 | 0.05759 | 66.00973 | 15.57178 | 74.58238 | 0.13684 | 0.03597 | 0.93436 | 0.40479 | 6.07470 |
-| Variance PUCT | 0.03974 | 0.05525 | 65.79075 | 15.40146 | 75.21413 | 0.13556 | 0.03572 | 0.80020 | 0.49425 | 5.18905 |
-| PUCT-V | 0.03989 | 0.05903 | 66.27737 | 15.42579 | 74.19603 | 0.13836 | 0.03635 | 0.95675 | 0.36380 | 6.04501 |
-| PUCT + RPO | 0.04060 | 0.04921 | 66.00973 | 15.57178 | 76.54295 | 0.13684 | 0.03597 | 0.64588 | 0.89847 | 6.07470 |
-| Variance PUCT + RPO | 0.03974 | 0.04372 | 65.79075 | 15.40146 | 77.51120 | 0.13556 | 0.03572 | 0.23085 | 1.27709 | 5.18905 |
+| Method | Move regret | Target regret | Best move % | Blunder % | Good mass % | All-sim value MAE | Played-Q value MAE | Played-Q value MSE | Target entropy | KL to prior | Visited actions |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| Gumbel | 0.04328 | 0.04512 | 65.20681 | 16.25304 | 77.31639 | 0.16519 | 0.13710 | 0.03643 | 0.52953 | 0.98897 | 14.90754 |
+| PUCT | 0.04060 | 0.05759 | 66.00973 | 15.57178 | 74.58238 | 0.13684 | 0.13555 | 0.03567 | 0.93436 | 0.40479 | 6.07470 |
+| Variance PUCT | 0.03974 | 0.05525 | 65.79075 | 15.40146 | 75.21413 | 0.13556 | 0.13427 | 0.03522 | 0.80020 | 0.49425 | 5.18905 |
+| PUCT-V | 0.03989 | 0.05903 | 66.27737 | 15.42579 | 74.19603 | 0.13836 | 0.13694 | 0.03591 | 0.95675 | 0.36380 | 6.04501 |
+| PUCT + RPO | 0.04060 | 0.04921 | 66.00973 | 15.57178 | 76.54295 | 0.13684 | 0.13555 | 0.03567 | 0.64588 | 0.89847 | 6.07470 |
+| Variance PUCT + RPO | 0.03974 | 0.04372 | 65.79075 | 15.40146 | 77.51120 | 0.13556 | 0.13427 | 0.03522 | 0.23085 | 1.27709 | 5.18905 |
 
 Variance PUCT reduces played-move regret by 8.2% versus Gumbel, paired source-game
 95% interval for the difference [-0.00662, -0.00080]. Its visit target is worse
@@ -190,6 +199,14 @@ than Gumbel's. RPO retains the same played moves and reduces target regret to
 0.04372; its target advantage over Gumbel is unresolved (difference -0.00140,
 interval [-0.00415, +0.00116]). PUCT-V also improves played-move regret but has
 worse visit targets; it was not advanced to a learning fork.
+
+The all-simulation value column favours PUCT by construction (see the metric
+definitions above). On the played-move Q, every method is within 0.003 MAE of
+Gumbel's 0.13710: no method has a clear value-estimation advantage. Training labels
+inherit this: `value_search_mix` and the auxiliary TD targets consume `search_wdl`,
+so Gumbel runs train on a search value (0.165 MAE) no better than the raw network
+(0.166), while PUCT runs get the improved one. Learning comparisons between the two
+therefore differ in value-label quality as well as policy targets.
 
 ## Two-seed learning screen
 

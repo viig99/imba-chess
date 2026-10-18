@@ -3,7 +3,8 @@
 Lc0-style means PUCT with a visit-dependent coefficient and reduced parent FPU;
 this is not a port of the complete Lc0 engine. Variance scaling regularizes the
 parent's empirical playout variance toward a fixed prior. PUCT-V implements
-Weichart, arXiv:2512.21648, equation 22, with empirical action-return variance.
+Weichart, arXiv:2512.21648 (Eq. 22 in v1, Eq. 17 in v3), with empirical
+action-return variance; its log term uses ln(N + 1) rather than the paper's log N.
 """
 
 from dataclasses import dataclass
@@ -61,7 +62,7 @@ class PuctConfig:
 def rpo_policy(priors, qvalues, regularization):
     """Exact root reverse-KL RPO target, Grill et al. (ICML 2020), Eq. 7.
 
-    Maximize q.y - lambda KL(prior || y). Its solution is
+    Maximize q.y - lambda KL(prior || y), lambda as in their Eq. 4. Its solution is
     y[a] = lambda prior[a] / (alpha - q[a]); find alpha by normalization.
     This changes only the learning target, not tree traversal or the played move.
     """

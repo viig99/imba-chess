@@ -472,7 +472,8 @@ impl NodeStats {
             let n = self.visits[i] as f64;
             let q = if n > 0.0 { self.means[i] } else { unvisited_q };
             let bonus = if cfg.mode == 2 {
-                // Equation 22, Weichart (2025). Rewards here span [-1,1],
+                // Weichart, arXiv:2512.21648 v1 Eq. 22 (v3 Eq. 17), with
+                // ln(N + 1) for the paper's log N. Rewards here span [-1,1],
                 // so the default bias coefficient is twice the [0,1] one.
                 // With fewer than two samples the empirical variance is zero;
                 // the separate bias bonus still drives exploration.
