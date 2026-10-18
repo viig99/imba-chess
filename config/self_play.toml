@@ -5,8 +5,8 @@
 # the command line. Phases are 640 games (fresh_games, from 2026-10-17): 4x the 160 parallel
 # games, ~56k positions, about one weight update per ~2.5 min at the current collection speed.
 # Plain Gumbel 256 (raw Q, value_scale 0.5), bf16 collection in 5 worker processes, fast 64-sim
-# play-out of decided games, in-flight games carried across phases, a 500k-position FIFO replay
-# window (~8.9 phases) at reuse 2 (each phase trains its fresh games plus as many older positions),
+# play-out of decided games, in-flight games carried across phases, a 450k-position FIFO replay
+# window (~8 phases) at reuse 2 (each phase trains its fresh games plus as many older positions),
 # constant lr 2e-4 with EMA 0.995, policy surprise weighting and three
 # auxiliary TD value horizons (needs an aux3 initialization; see scripts/add_auxiliary_value_head.py).
 # Sized for a 16 GB GPU (~11 GB peak at 5 x 32 under CUDA MPS); see README "Recommended stage-2 run".
@@ -43,7 +43,8 @@ decided_plies = 3
 carry_over_games = true
 
 [replay]
-window_positions = 500000
+# ~8 phases of games (640-game phases average ~56k positions), FIFO.
+window_positions = 450000
 flush_games = 16
 flush_positions = 2048
 
@@ -56,7 +57,7 @@ value_search_mix = 0.1
 weight_decay = 0.01
 grad_clip = 2.0
 # Each phase trains on its ~640 fresh games plus as many older positions (~640 games) drawn
-# without replacement from the rest of the FIFO window (~8.9 phases): about two passes per game.
+# without replacement from the rest of the FIFO window (~8 phases): about two passes per game.
 reuse = 2.0
 microbatch_tokens = 1024
 gradient_accumulation = 4

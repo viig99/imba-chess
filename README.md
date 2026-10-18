@@ -75,7 +75,7 @@ touch artifacts/self_play/new-run/STOP   # remove it before restarting
 
 | Default | Value | Notes |
 |---|---|---|
-| `--config` | `config/self_play.toml` | Plain Gumbel 256, raw Q at value scale 0.5, bf16 collection, fast play-out of decided games, carry-over of in-flight games, a 500k-position FIFO replay (~8.9 phases) at reuse 2, constant LR 2e-4, EMA 0.995. See the [config guide](docs/CONFIG_GUIDE.md). |
+| `--config` | `config/self_play.toml` | Plain Gumbel 256, raw Q at value scale 0.5, bf16 collection, fast play-out of decided games, carry-over of in-flight games, a 450k-position FIFO replay (~8 phases) at reuse 2, constant LR 2e-4, EMA 0.995. See the [config guide](docs/CONFIG_GUIDE.md). |
 | `--seeds` | `artifacts/corpus/v4_self_play_seeds_4096.json` | Held-out monitor openings for screens; build once with `scripts/materialize_corpus.py` and `scripts/prepare_self_play_seeds.py`. Training starts stream from the corpus. |
 | `--collect-workers`, slots | 5 workers x 32 games (config `concurrent_games = 160`) | About 11 GB peak on 16 GB. 6 workers never fit, and 5 x 40 ran out of memory beside a Stockfish eval. |
 | `--cpu-threads` | 1 | Idle OpenMP threads slow the single search thread of each worker. |
