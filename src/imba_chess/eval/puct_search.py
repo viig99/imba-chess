@@ -40,12 +40,18 @@ class PuctConfig:
     dirichlet_fraction: float = 0.25
     target_policy: str = "visits"
     rpo_regularization: float = 1.0
+    # With root noise on (self-play), game plies below this play a visit-proportional
+    # sample instead of the most-visited move: AlphaZero's temperature 1 for the opening.
+    # Without it, games from the initial board collapse onto one repeated line.
+    sample_plies: int = 0
 
     def __post_init__(self):
         if self.algorithm not in PUCT_ALGORITHMS:
             raise ValueError("unknown PUCT variant")
         if any(type(v) is not int or v < 1 for v in (self.simulations, self.max_depth)):
             raise ValueError("simulations and max_depth must be positive integers")
+        if type(self.sample_plies) is not int:
+            raise ValueError("sample_plies must be an integer")
         for name, value in vars(self).items():
             if name in ("algorithm", "target_policy"):
                 continue
@@ -169,9 +175,12 @@ def puct_stepwise(*, board, extend, root_handle=None, config=PuctConfig(), rng=N
             for i, probability in enumerate(root_pov):
                 wdl_sums[i] += probability
     visits, _, qvalues = root.stats.snapshot()
-    # Visits define both the deterministic evaluation move and the untempered
-    # training policy. Root exploration affects visits, as in AlphaZero.
-    action = max(range(n), key=lambda i: (visits[i], qvalues[i], root_eval.legal_log_priors[i], -i))
+    # Visits define both the played move and the untempered training policy. Root
+    # exploration affects visits, as in AlphaZero; with noise off the move is deterministic.
+    if noise is None and board.ply() < config.sample_plies:
+        action = rng.choices(range(n), weights=visits)[0]
+    else:
+        action = max(range(n), key=lambda i: (visits[i], qvalues[i], root_eval.legal_log_priors[i], -i))
     if on_played is not None:
         on_played(root.children.get(action))
     policy = [v / config.simulations for v in visits]

@@ -132,3 +132,36 @@ def test_rpo_target_does_not_change_tree_or_played_move():
     assert a.move_uci == b.move_uci
     assert sum(b.policy) == pytest.approx(1)
     assert b.policy != a.policy
+
+
+def test_opening_sampling_follows_visits_only_with_exploration():
+    from dataclasses import replace
+
+    cfg = PuctConfig(algorithm="puct_variance", simulations=64, max_depth=2)
+    sampled = replace(cfg, sample_plies=2)
+    def run(config, board=chess.Board(), seed=0, **kwargs):
+        return select_puct(evaluator=FakeEvaluator(), board=board, rng=random.Random(seed), config=config, **kwargs)
+    def best(result):
+        return result.legal_ids[max(range(len(result.visits)), key=lambda i: (result.visits[i], result.qvalues[i], -i))]
+    differs = 0
+    for seed in range(8):
+        a, b = run(cfg, seed=seed), run(sampled, seed=seed)
+        # Same tree and training target; only the played move changes.
+        assert (a.visits, a.policy) == (b.visits, b.policy)
+        assert a.move_id == best(a)
+        assert b.visits[b.legal_ids.index(b.move_id)] > 0
+        differs += b.move_id != best(b)
+    assert differs
+    # Evaluation (noise off) and plies past the opening keep the most-visited move.
+    assert run(sampled, noise=0.0).move_uci == run(cfg, noise=0.0).move_uci
+    late = chess.Board()
+    for uci in ("e2e4", "e7e5"):
+        late.push_uci(uci)
+    for seed in range(4):
+        result = run(sampled, board=late, seed=seed)
+        assert result.move_id == best(result)
+    with pytest.raises(ValueError):
+        PuctConfig(sample_plies=-1)
+    with pytest.raises(ValueError):
+        PuctConfig(sample_plies=1.5)
+    assert SelfPlayConfig(search=sampled).identifier != SelfPlayConfig(search=cfg).identifier

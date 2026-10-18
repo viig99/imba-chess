@@ -1,4 +1,5 @@
 """Public method names resolve to the tested production search configurations."""
+from dataclasses import replace
 from pathlib import Path
 import runpy
 import sys
@@ -13,7 +14,8 @@ from imba_chess.self_play.config import load_config
 @pytest.mark.parametrize("method", PUCT_METHODS)
 def test_public_preset_matches_training_recipe(method):
     path = Path(f"config/self_play_{method}.toml")
-    trained = load_config(path).search
+    # Opening sampling is self-play only; evaluations play the most-visited move.
+    trained = replace(load_config(path).search, sample_plies=0)
     assert puct_config(method) == trained
     assert puct_config(method, path=path) == trained
     assert puct_config(method, path=path, simulations=19).simulations == 19

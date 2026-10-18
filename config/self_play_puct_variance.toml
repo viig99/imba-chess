@@ -15,6 +15,11 @@ variance_c1 = 1.4142135623730951
 variance_c2 = 6.0
 dirichlet_alpha = 0.3
 dirichlet_fraction = 0.25
+# Play a visit-proportional sample for game plies 0-29 (AlphaZero's opening temperature);
+# evals and screens run without noise and keep the most-visited move. Without it the
+# 2026-10-18 run's initial-board games (25% of starts) collapsed from iteration 99 onto
+# one repeated drawn line. Lichess-seeded starts take over at ply ~48, so they are unaffected.
+sample_plies = 30
 
 [collection]
 concurrent_games = 160

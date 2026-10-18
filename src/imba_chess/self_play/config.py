@@ -212,6 +212,8 @@ class SelfPlayConfig:
             del settings["collection"]["fresh_games"]
         if self.learning.ema_decay == 0:
             del settings["learning"]["ema_decay"]
+        if settings["search"].get("sample_plies") == 0:
+            del settings["search"]["sample_plies"]
         return hashlib.sha256(
             json.dumps(
                 dict(
