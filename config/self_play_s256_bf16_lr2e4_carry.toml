@@ -43,8 +43,7 @@
 # From iteration ~335 (2026-10-17, resumed with --previous-config set to this file's previous
 # version): reuse 1 -> 2. Each phase trains its 640 fresh games plus ~640 older ones from the
 # 500k-position window (~5750 games, ~8.9 phases, FIFO). Reuse 2 ran before (iterations ~189-325
-# of the older lineage); reuse 5 overfit. From iteration ~323 (same day, --previous-config again):
-# window 500k -> 450k positions, ~8 phases (games average ~88 positions).
+# of the older lineage); reuse 5 overfit.
 base_config = "config/imba_chess_v4_aux3.toml"
 
 [search]
@@ -78,8 +77,7 @@ decided_plies = 3
 carry_over_games = true
 
 [replay]
-# ~8 phases of games (640-game phases average ~56k positions), FIFO.
-window_positions = 450000
+window_positions = 500000
 flush_games = 16
 flush_positions = 2048
 
@@ -92,7 +90,7 @@ value_search_mix = 0.1
 weight_decay = 0.01
 grad_clip = 2.0
 # Each phase trains on its ~640 fresh games plus as many older positions (~640 games) drawn
-# without replacement from the rest of the FIFO window (~8 phases): about two passes per game.
+# without replacement from the rest of the FIFO window (~8.9 phases): about two passes per game.
 reuse = 2.0
 microbatch_tokens = 1024
 gradient_accumulation = 4
