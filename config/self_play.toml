@@ -2,7 +2,8 @@
 # (artifacts/self_play/plain-s256-lr2e4-from-rgsc-it441-2026-10-16), the default of
 # scripts/run_self_play.py. Identical to self_play_s256_bf16_lr2e4_carry.toml (which carries the
 # lineage's full history) except concurrent_games = 160, the 5 workers x 32 games that run had on
-# the command line. Phases are 640 games (fresh_games, from 2026-10-17): 4x the 160 parallel
+# the command line, and value_search_source = "improved_wdl" (from 2026-10-18, so resume that
+# run with the carry config). Phases are 640 games (fresh_games, from 2026-10-17): 4x the 160 parallel
 # games, ~56k positions, about one weight update per ~2.5 min at the current collection speed.
 # Plain Gumbel 256 (raw Q, value_scale 0.5), bf16 collection in 5 worker processes, fast 64-sim
 # play-out of decided games, in-flight games carried across phases, a 500k-position FIFO replay
@@ -53,6 +54,10 @@ value_weight = 1.0
 auxiliary_value_weight = 0.15
 auxiliary_value_lambda = [0.8, 0.9, 0.95]
 value_search_mix = 0.1
+# Value mix and auxiliary TD targets use the WDL of the improved policy, not search_wdl's average
+# over every simulation (Gumbel spends ~75% of those on moves its halving discards): 0.138 vs 0.166
+# expected-score MAE against Stockfish under training noise (docs/SEARCH_METHODS.md).
+value_search_source = "improved_wdl"
 weight_decay = 0.01
 grad_clip = 2.0
 # Each phase trains on its ~640 fresh games plus as many older positions (~640 games) drawn

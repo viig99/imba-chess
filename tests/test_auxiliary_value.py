@@ -346,9 +346,10 @@ def test_value_search_source_selects_the_label_for_mix_and_auxiliary_targets():
 def test_value_search_source_default_keeps_run_identity():
     from imba_chess.self_play.config import load_config
 
-    config = load_config("config/self_play.toml")
+    config = load_config("config/self_play_s256_bf16_lr2e4_carry.toml")
     assert config.learning.value_search_source == "search_wdl"
-    # The live Gumbel recipe's identifier before the option existed (main at 97b0fed).
-    assert config.identifier == "fa9936a468c3c5fe67f9a9d0068977e238401702167f90dbc1889b81a83cfc65"
+    # The 2026-10 Gumbel run's identifier before the option existed (main at 97b0fed).
+    assert config.identifier == "5e568af2a742cae80d1845a0d1e16fb6058fdd67dbedaa474b39046343849eaf"
+    assert load_config("config/self_play.toml").learning.value_search_source == "improved_wdl"
     changed = replace(config, learning=replace(config.learning, value_search_source="improved_wdl"))
     assert changed.identifier != config.identifier
