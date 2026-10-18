@@ -297,6 +297,9 @@ struct PuctParameters {
     c2: f64,
     prior_variance: f64,
     prior_weight: f64,
+    // Opt-in paper/Lc0 forms; false keeps the original study arithmetic.
+    lc0_parent_q: bool,
+    paper_log_n: bool,
 }
 
 impl NodeStats {
@@ -424,12 +427,15 @@ impl NodeStats {
     }
 
     /// mode 0: Lc0-style PUCT; 1: parent variance scaling; 2: PUCT-V.
-    #[pyo3(signature = (mode, cpuct, base, factor, fpu, c1, c2, prior_variance, prior_weight, selection_probs=None))]
+    /// lc0_parent_q: FPU parent Q counts the node's own evaluation as a visit.
+    /// paper_log_n: PUCT-V uses log N (Weichart Eq. 17 in v3) instead of ln(N + 1).
+    #[pyo3(signature = (mode, cpuct, base, factor, fpu, c1, c2, prior_variance, prior_weight,
+                        selection_probs=None, lc0_parent_q=false, paper_log_n=false))]
     #[allow(clippy::too_many_arguments)]
     fn configure_puct(
         &mut self, mode: u8, cpuct: f64, base: f64, factor: f64,
         fpu: f64, c1: f64, c2: f64, prior_variance: f64, prior_weight: f64,
-        selection_probs: Option<Vec<f64>>,
+        selection_probs: Option<Vec<f64>>, lc0_parent_q: bool, paper_log_n: bool,
     ) -> PyResult<()> {
         if mode > 2 || [cpuct, base, factor, fpu, c1, c2, prior_variance, prior_weight]
             .iter().any(|x| !x.is_finite() || *x < 0.0)
@@ -449,7 +455,9 @@ impl NodeStats {
         if mode != 0 {
             self.m2 = vec![0.0; self.probs.len()];
         }
-        self.puct = Some(PuctParameters { mode, cpuct, base, factor, fpu, c1, c2, prior_variance, prior_weight });
+        self.puct = Some(PuctParameters {
+            mode, cpuct, base, factor, fpu, c1, c2, prior_variance, prior_weight, lc0_parent_q, paper_log_n,
+        });
         Ok(())
     }
 
@@ -457,7 +465,16 @@ impl NodeStats {
         let cfg = self.puct.as_ref().ok_or_else(|| PyValueError::new_err("PUCT not configured"))?;
         let probs = if self.selection_probs.is_empty() { &self.probs } else { &self.selection_probs };
         let count = self.visits.iter().sum::<u64>() as f64;
-        let parent_q = if count > 0.0 { self.sums.iter().sum::<f64>() / count } else { self.value };
+        let parent_q = if cfg.lc0_parent_q {
+            // Lc0's node Q: its own network value is the node's first visit.
+            (self.value + self.sums.iter().sum::<f64>()) / (count + 1.0)
+        } else if count > 0.0 {
+            self.sums.iter().sum::<f64>() / count
+        } else {
+            self.value
+        };
+        // An empty node never reaches the bonus (see below), so log N stays finite.
+        let log_n = if cfg.paper_log_n { count.max(1.0).ln() } else { (count + 1.0).ln() };
         let visited_mass: f64 = probs.iter().zip(&self.visits).filter_map(|(p, n)| (*n > 0).then_some(*p)).sum();
         let unvisited_q = parent_q - cfg.fpu * visited_mass.sqrt();
         let mut c = cfg.cpuct + cfg.factor * ((count + cfg.base + 1.0) / cfg.base).ln();
@@ -473,13 +490,13 @@ impl NodeStats {
             let q = if n > 0.0 { self.means[i] } else { unvisited_q };
             let bonus = if cfg.mode == 2 {
                 // Weichart, arXiv:2512.21648 v1 Eq. 22 (v3 Eq. 17), with
-                // ln(N + 1) for the paper's log N. Rewards here span [-1,1],
+                // ln(N + 1) unless paper_log_n. Rewards here span [-1,1],
                 // so the default bias coefficient is twice the [0,1] one.
                 // With fewer than two samples the empirical variance is zero;
                 // the separate bias bonus still drives exploration.
                 let stdev = if n > 0.0 { (self.m2[i] / n).max(0.0).sqrt() } else { 0.0 };
                 probs[i] * (cfg.c1 * stdev * count.max(1.0).sqrt()
-                    + cfg.c2 * (count + 1.0).ln()) / (1.0 + n)
+                    + cfg.c2 * log_n) / (1.0 + n)
             } else {
                 c * probs[i] * count.max(1.0).sqrt() / (1.0 + n)
             };

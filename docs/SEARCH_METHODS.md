@@ -33,7 +33,11 @@ KataGo implementation. PUCT-V follows arXiv:2512.21648 (Weichart): Eq. 22 in v1,
 renumbered Eq. 17 in v3, using ln(N + 1) for the paper's log N. Its preset c2 = 3.0
 is tuned on our [-1, 1] value scale, which equals the paper's c2 = 1.5 on [0, 1],
 not the paper default. One deviation from Lc0 remains: FPU uses the mean of child
-returns as parent Q, without the node's own network value.
+returns as parent Q, without the node's own network value. `[search]` options
+`lc0_parent_q = true` (Lc0's parent Q, own evaluation counted as a visit) and
+`paper_log_n = true` (PUCT-V's log N) select the exact forms; both default to false,
+which keeps the study arithmetic and existing run identities. Neither has yet been
+measured on a real network.
 
 **RPO changes the returned policy / teaching target. At fixed weights and search
 settings it does not change tree visits or the most-visited move played during

@@ -5,6 +5,8 @@ this is not a port of the complete Lc0 engine. Variance scaling regularizes the
 parent's empirical playout variance toward a fixed prior. PUCT-V implements
 Weichart, arXiv:2512.21648 (Eq. 22 in v1, Eq. 17 in v3), with empirical
 action-return variance; its log term uses ln(N + 1) rather than the paper's log N.
+lc0_parent_q and paper_log_n opt into the exact Lc0 FPU parent Q and the paper's
+log N; both default off to keep the study arithmetic.
 """
 
 from dataclasses import dataclass
@@ -44,6 +46,10 @@ class PuctConfig:
     # sample instead of the most-visited move: AlphaZero's temperature 1 for the opening.
     # Without it, games from the initial board collapse onto one repeated line.
     sample_plies: int = 0
+    # Lc0 counts a node's own evaluation as a visit of its Q; the study used the
+    # mean of child returns. PUCT-V's paper log N, not ln(N + 1).
+    lc0_parent_q: bool = False
+    paper_log_n: bool = False
 
     def __post_init__(self):
         if self.algorithm not in PUCT_ALGORITHMS:
@@ -52,8 +58,10 @@ class PuctConfig:
             raise ValueError("simulations and max_depth must be positive integers")
         if type(self.sample_plies) is not int:
             raise ValueError("sample_plies must be an integer")
+        if any(type(v) is not bool for v in (self.lc0_parent_q, self.paper_log_n)):
+            raise ValueError("lc0_parent_q and paper_log_n must be booleans")
         for name, value in vars(self).items():
-            if name in ("algorithm", "target_policy"):
+            if name in ("algorithm", "target_policy", "lc0_parent_q", "paper_log_n"):
                 continue
             if not math.isfinite(value) or value < 0:
                 raise ValueError(f"invalid PUCT parameter {name}")
@@ -106,11 +114,15 @@ def puct_stepwise(*, board, extend, root_handle=None, config=PuctConfig(), rng=N
         (root_eval,) = yield EvalRequest([(root_handle, root.board)])
     mode = PUCT_ALGORITHMS.index(config.algorithm)
 
-    def initialize(node, evaluation, selection_probs=None):
+    def configure(stats, selection_probs=None):
+        stats.configure_puct(mode, config.cpuct, config.cpuct_base, config.cpuct_factor,
+                             config.fpu_reduction, config.variance_c1, config.variance_c2,
+                             config.variance_prior, config.variance_prior_weight, selection_probs,
+                             lc0_parent_q=config.lc0_parent_q, paper_log_n=config.paper_log_n)
+
+    def initialize(node, evaluation):
         node.initialize(evaluation)
-        node.stats.configure_puct(mode, config.cpuct, config.cpuct_base, config.cpuct_factor,
-                                  config.fpu_reduction, config.variance_c1, config.variance_c2,
-                                  config.variance_prior, config.variance_prior_weight, selection_probs)
+        configure(node.stats)
 
     initialize(root, root_eval)
     n = len(root_eval.legal_ids)
@@ -126,9 +138,7 @@ def puct_stepwise(*, board, extend, root_handle=None, config=PuctConfig(), rng=N
     if eta is not None and config.dirichlet_fraction:
         fraction = config.dirichlet_fraction
         mixed = [(1 - fraction) * p + fraction * e for p, e in zip(root.stats.probs, eta)]
-        root.stats.configure_puct(mode, config.cpuct, config.cpuct_base, config.cpuct_factor,
-                                  config.fpu_reduction, config.variance_c1, config.variance_c2,
-                                  config.variance_prior, config.variance_prior_weight, mixed)
+        configure(root.stats, mixed)
     evaluations, terminal_hits, cutoffs, deepest = 1, 0, 0, 0
     wdl_sums, wdl_available = [0.0, 0.0, 0.0], True
     edge_wdl_sums = [[0.0, 0.0, 0.0] for _ in range(n)]

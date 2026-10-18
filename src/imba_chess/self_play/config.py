@@ -222,6 +222,10 @@ class SelfPlayConfig:
             del settings["learning"]["value_search_source"]
         if settings["search"].get("sample_plies") == 0:
             del settings["search"]["sample_plies"]
+        # PUCT runs from before the paper-exact options keep their identity.
+        for key in ("lc0_parent_q", "paper_log_n"):
+            if settings["search"].get(key) is False:
+                del settings["search"][key]
         return hashlib.sha256(
             json.dumps(
                 dict(

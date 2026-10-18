@@ -3,10 +3,12 @@
 The reference is written from the papers rather than from gumbel.rs: Lc0's
 cpuct(N) and FPU reduction, parent-variance scaling, PUCT-V (Weichart,
 arXiv:2512.21648 v1 Eq. 22 / v3 Eq. 17), and the RPO target of Grill et al.
-(2020) Eqs. 4 and 7 with completed Q. FakeEvaluator's constant value and uniform
-priors cannot tell formulas apart, so leaves get hashed values and peaked priors.
+(2020) Eqs. 4 and 7 with completed Q. lc0_parent_q / paper_log_n select the exact
+Lc0 parent Q (own evaluation counted as a visit) and the paper's log N.
+FakeEvaluator's constant value and uniform priors cannot tell formulas apart, so leaves get hashed values and peaked priors.
 """
 
+from dataclasses import replace
 import hashlib
 import math
 import random
@@ -79,7 +81,8 @@ def select(node, cfg):
     total = sum(visits)
     if total == 0:
         return max(range(len(probs)), key=lambda i: (probs[i], -i))
-    fpu = sum(sums) / total - cfg.fpu_reduction * math.sqrt(sum(p for p, n in zip(probs, visits) if n))
+    parent_q = (node.evaluation.value_stm + sum(sums)) / (total + 1) if cfg.lc0_parent_q else sum(sums) / total
+    fpu = parent_q - cfg.fpu_reduction * math.sqrt(sum(p for p, n in zip(probs, visits) if n))
     # AlphaZero / Lc0: c(N) = c_init + c_factor log((N + base) / base), N = 1 + child visits.
     c = cfg.cpuct + cfg.cpuct_factor * math.log((total + 1 + cfg.cpuct_base) / cfg.cpuct_base)
     if cfg.algorithm == "puct_variance":
@@ -96,7 +99,7 @@ def select(node, cfg):
             r = node.returns[i]
             sigma = math.sqrt(sum((v - q) ** 2 for v in r) / n) if n else 0.0
             u = (cfg.variance_c1 * p * sigma * math.sqrt(total)
-                 + cfg.variance_c2 * p * math.log(total + 1)) / (1 + n)
+                 + cfg.variance_c2 * p * math.log(total if cfg.paper_log_n else total + 1)) / (1 + n)
         else:
             u = c * p * math.sqrt(total) / (1 + n)
         scores.append(q + u)
@@ -180,12 +183,14 @@ def reference(board, cfg, eta):
 @pytest.mark.parametrize("target", ["visits", "rpo"])
 @pytest.mark.parametrize("noisy", [False, True])
 @pytest.mark.parametrize("fen", FENS)
-def test_native_search_matches_independent_reference(algorithm, target, noisy, fen):
+@pytest.mark.parametrize("exact", [False, True])
+def test_native_search_matches_independent_reference(algorithm, target, noisy, fen, exact):
     board = chess.Board(fen)
     for simulations, depth in ((7, 3), (64, 4), (256, 6)):
         cfg = PuctConfig(algorithm=algorithm, simulations=simulations, max_depth=depth,
                          target_policy=target, rpo_regularization=0.25,
-                         variance_c2=3.0 if algorithm == "puct_v" else 6.0)
+                         variance_c2=3.0 if algorithm == "puct_v" else 6.0,
+                         lc0_parent_q=exact, paper_log_n=exact)
         eta, kwargs = None, dict(noise=0.0)
         if noisy:
             seed = f"{fen}:{simulations}"
@@ -208,3 +213,18 @@ def test_reference_discriminates_formulas():
     visits = [reference(board, PuctConfig(algorithm=a, simulations=128, max_depth=6), None)[1]
               for a in PUCT_ALGORITHMS]
     assert visits[0] != visits[1] != visits[2] != visits[0]
+    for algorithm, flag in (("puct", "lc0_parent_q"), ("puct_variance", "lc0_parent_q"),
+                            ("puct_v", "lc0_parent_q"), ("puct_v", "paper_log_n")):
+        cfg = PuctConfig(algorithm=algorithm, simulations=128, max_depth=6)
+        assert reference(board, cfg, None)[1] != reference(board, replace(cfg, **{flag: True}), None)[1]
+
+
+def test_paper_exact_options_keep_existing_run_identity():
+    from imba_chess.self_play.config import load_config
+
+    config = load_config("config/self_play_puct_variance.toml")
+    # The identifier of this config before the options existed (main at 97b0fed).
+    assert config.identifier == "92da5238fd7d246647ccb526323df6e80e3474668208c40097a3bf20c5a7f28d"
+    assert replace(config, search=replace(config.search, lc0_parent_q=True)).identifier != config.identifier
+    with pytest.raises(ValueError):
+        PuctConfig(lc0_parent_q=1)
