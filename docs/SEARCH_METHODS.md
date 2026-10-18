@@ -208,6 +208,22 @@ so Gumbel runs train on a search value (0.165 MAE) no better than the raw networ
 (0.166), while PUCT runs get the improved one. Learning comparisons between the two
 therefore differ in value-label quality as well as policy targets.
 
+Every search now also records `improved_wdl`, the root-player WDL of its returned
+policy: `sum_a policy(a) WDL_a`, with unvisited moves taking the WDL form of
+completed Q's mixed value. Its W - L is the improved policy's completed-Q value; for
+a PUCT visit target it equals `search_wdl`. `[learning] value_search_source =
+"improved_wdl"` makes `value_search_mix` and the auxiliary TD targets use it; the
+default `"search_wdl"` keeps existing runs' identity. Gumbel, same frozen actor and
+test roots, expected-score error against the Stockfish root:
+
+| Gumbel exploration | `search_wdl` MAE / bias | `improved_wdl` MAE / bias | Difference, 95% game bootstrap |
+|---|---:|---:|---:|
+| None (evaluation) | 0.1652 / -0.0779 | 0.1375 / -0.0037 | -0.0277 [-0.0309, -0.0246] |
+| Training noise, seed 0 | 0.1660 / -0.0803 | 0.1376 / -0.0041 | -0.0284 [-0.0315, -0.0253] |
+| Training noise, seed 1 | 0.1661 / -0.0801 | 0.1377 / -0.0039 | -0.0284 [-0.0316, -0.0253] |
+
+The raw network scores 0.1660 / -0.0333. Results: `artifacts/eval/gumbel-improved-wdl-noise-2026-10-18/`.
+
 ## Two-seed learning screen
 
 The following completed screen tests self-play generation followed by training,

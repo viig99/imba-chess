@@ -31,7 +31,7 @@ def policy_metrics(row, reference):
                   visited_actions=sum(n > 0 for n in row["visits"]),
                   informative=float(best - worst >= 0.02))
     root_score = reference["root"]["expectation"]
-    for name in ("root_wdl", "search_wdl"):
+    for name in ("root_wdl", "search_wdl", "improved_wdl"):
         wdl = row.get(name)
         if wdl is not None:
             expectation = wdl[2] + 0.5 * wdl[1]

@@ -1377,6 +1377,7 @@ def test_ema_tracks_weights_checkpoints_and_upgrades_resume(tmp_path):
     # Disabled EMA keeps the identity runs had before the option existed.
     settings = asdict(cfg)
     del settings["collection"]["inference_dtype"], settings["learning"]["ema_decay"]
+    del settings["learning"]["value_search_source"]
     for key in ("playout_cap", "full_search_probability", "fast_simulations", "fast_top_m",
                 "decided_value", "decided_plies", "carry_over_games", "fresh_games"):
         del settings["collection"][key]

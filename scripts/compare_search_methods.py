@@ -94,7 +94,7 @@ def run_arm(args, arm, positions, checkpoint_hash, reference_hash):
         return dict(position_id=position["position_id"], variant=variant,
                     legal_ucis=[runtime.move_vocab.decode(i) for i in result.legal_ids],
                     **{k: getattr(result, k) for k in ("move_uci", "policy", "visits", "qvalues",
-                       "root_log_priors", "root_value", "root_wdl", "search_wdl", "neural_evaluations",
+                       "root_log_priors", "root_value", "root_wdl", "search_wdl", "improved_wdl", "neural_evaluations",
                        "terminal_hits", "depth_cutoffs", "maximum_depth")})
 
     def fail(key, exc):

@@ -82,10 +82,11 @@ def test_native_search_keeps_rng_visits_targets_and_counters(fen, budget):
         rng=random.Random(42),
     )
     actual = json.loads(json.dumps(asdict(result)))
-    # The historical fixture predates the measurement-only WDL field.
-    # Its backup semantics are covered by test_auxiliary_value; all original
+    # The historical fixture predates the measurement-only WDL fields.
+    # Their semantics are covered by test_auxiliary_value; all original
     # search actions, targets, visits and counters must remain identical.
     actual.pop("search_wdl")
+    actual.pop("improved_wdl")
     assert actual == expected
 
 

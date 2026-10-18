@@ -130,6 +130,27 @@ def completed_q(value, priors, visits, qvalues, config: GumbelConfig, prior_prob
     return [scale * q for q in values]
 
 
+def policy_wdl(policy, visits, edge_wdl_sums, prior_probs, root_wdl):
+    """Root-player WDL of a root policy: sum_a policy[a] * WDL_a.
+
+    WDL_a is the mean leaf WDL of the simulations that began with move a. An
+    unvisited move takes the WDL form of completed Q's mixed value,
+    (root_wdl + N * prior-weighted visited mean) / (N + 1), so W - L of the result
+    is sum_a policy[a] * completed_q[a] (raw Q, no minimax blend). For a visit
+    policy it equals the all-simulation average, search_wdl.
+    """
+    visited = [i for i, n in enumerate(visits) if n]
+    if not visited or root_wdl is None:
+        return None
+    means = [[x / n for x in sums] if n else None for sums, n in zip(edge_wdl_sums, visits)]
+    mass = math.fsum(prior_probs[i] for i in visited)
+    count = sum(visits)
+    mixed = [(root_wdl[k] + count * math.fsum(prior_probs[i] * means[i][k] for i in visited) / mass)
+             / (count + 1) for k in range(3)]
+    return tuple(math.fsum(p * (mean if mean is not None else mixed)[k] for p, mean in zip(policy, means))
+                 for k in range(3))
+
+
 @dataclass(frozen=True)
 class GumbelResult:
     move_uci: str
@@ -150,6 +171,10 @@ class GumbelResult:
     # Distinct from root_wdl (the raw network prediction). Measurement only:
     # neither this distribution nor the auxiliary head affects tree selection.
     search_wdl: tuple[float, float, float] | None = None
+    # Root-player WDL of the returned policy (see policy_wdl): the value label of
+    # the improved policy. Gumbel's search_wdl also averages the simulations spent
+    # on moves its halving discards; this does not.
+    improved_wdl: tuple[float, float, float] | None = None
 
 
 @dataclass(slots=True)
@@ -250,6 +275,7 @@ def gumbel_stepwise(
     max_prior = max(priors)
     evaluations, terminal_hits, cutoffs, deepest = (1, 0, 0, 0)
     wdl_sums = [0.0, 0.0, 0.0]
+    edge_wdl_sums = [[0.0, 0.0, 0.0] for _ in range(n)]
     wdl_available = True
 
     considered = min(config.top_m, n, config.simulations)
@@ -320,8 +346,10 @@ def gumbel_stepwise(
         else:
             # Every chess ply swaps players; draws retain their perspective.
             root_pov = leaf_wdl[::-1] if depth % 2 else leaf_wdl
+            edge = edge_wdl_sums[path[0][1]]
             for i, probability in enumerate(root_pov):
                 wdl_sums[i] += probability
+                edge[i] += probability
     root.visits, root.sums, root.means = root.stats.snapshot()
     action = root_action(max(root.visits))
     if on_played is not None:
@@ -329,11 +357,16 @@ def gumbel_stepwise(
     q = completed_q(
         root.value, priors, root.visits, root.qs(), config, root.stats.probs
     )
+    policy = softmax([p + v for p, v in zip(priors, q)])
+    improved_wdl = policy_wdl(
+        policy, root.visits, edge_wdl_sums, root.stats.probs,
+        root_wdl if root_wdl is not None else root_eval.wdl,
+    ) if wdl_available else None
     return GumbelResult(
         root_eval.legal_ucis[action],
         root_eval.legal_ids[action],
         list(root_eval.legal_ids),
-        softmax([p + v for p, v in zip(priors, q)]),
+        policy,
         root.value,
         root_wdl,
         root.visits,
@@ -345,6 +378,7 @@ def gumbel_stepwise(
         deepest,
         list(priors),
         tuple(p / config.simulations for p in wdl_sums) if wdl_available else None,
+        improved_wdl,
     )
 
 

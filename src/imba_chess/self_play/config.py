@@ -106,6 +106,10 @@ class LearningConfig:
     microbatch_tokens: int = 1024
     # Main value label = (1 - mix) * game result + mix * this ply's search WDL.
     value_search_mix: float = 0.0
+    # The search WDL used by value_search_mix and the auxiliary TD targets:
+    # "search_wdl" averages every simulation (under Gumbel, ~75% of them on moves
+    # halving discards); "improved_wdl" is the WDL of the returned policy.
+    value_search_source: str = "search_wdl"
     # Microbatches summed per optimizer step; each step spans ~10 games per microbatch.
     gradient_accumulation: int = 1
     policy_surprise_enabled: bool = False
@@ -136,6 +140,8 @@ class LearningConfig:
             raise ValueError("value_weight must be finite and nonnegative")
         if not math.isfinite(self.value_search_mix) or not 0 <= self.value_search_mix <= 1:
             raise ValueError("value_search_mix must be in [0, 1]")
+        if self.value_search_source not in ("search_wdl", "improved_wdl"):
+            raise ValueError("value_search_source must be search_wdl or improved_wdl")
         if type(self.gradient_accumulation) is not int or self.gradient_accumulation < 1:
             raise ValueError("gradient_accumulation must be a positive integer")
         if type(self.policy_surprise_enabled) is not bool:
@@ -212,6 +218,8 @@ class SelfPlayConfig:
             del settings["collection"]["fresh_games"]
         if self.learning.ema_decay == 0:
             del settings["learning"]["ema_decay"]
+        if self.learning.value_search_source == "search_wdl":
+            del settings["learning"]["value_search_source"]
         if settings["search"].get("sample_plies") == 0:
             del settings["search"]["sample_plies"]
         return hashlib.sha256(
@@ -249,7 +257,7 @@ def load_config(path):
     ):
         raise ValueError("the fast search must be smaller than the full [search]")
     for section in (cfg.collection, cfg.replay, cfg.learning):
-        if any(not math.isfinite(v) or v <= 0 for k, v in asdict(section).items() if not k.startswith(("policy_surprise_", "auxiliary_value_")) and k not in ("value_weight", "value_search_mix", "inference_dtype", "ema_decay", *CollectionConfig.RESUMABLE_FIELDS)):
+        if any(not math.isfinite(v) or v <= 0 for k, v in asdict(section).items() if not k.startswith(("policy_surprise_", "auxiliary_value_")) and k not in ("value_weight", "value_search_mix", "value_search_source", "inference_dtype", "ema_decay", *CollectionConfig.RESUMABLE_FIELDS)):
             raise ValueError("stage-2 sizes and learning settings must be positive")
     if not all(math.isfinite(v) for v in asdict(cfg.run).values()):
         raise ValueError("run settings must be finite")

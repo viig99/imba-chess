@@ -13,18 +13,19 @@ def outcome_wdl(outcome_white, white_to_move):
     return [float(outcome == -1), float(outcome == 0), float(outcome == 1)]
 
 
-def smoothed_search_wdl(game, decay):
+def smoothed_search_wdl(game, decay, source="search_wdl"):
     """Completed-game TD-style target, current-position side-to-move POV.
 
-    y_t = (1-decay) search_wdl_t + decay * swap(y_{t+1}); y_T is
-    the actual terminal outcome. Uses all continuation plies BEFORE batching.
-    Missing historical search distributions are errors, not raw-root substitutes.
+    y_t = (1-decay) s_t + decay * swap(y_{t+1}), s_t the target's `source` WDL
+    (search_wdl or improved_wdl); y_T is the actual terminal outcome. Uses all
+    continuation plies BEFORE batching. Missing historical search distributions
+    are errors, not raw-root substitutes.
     """
     validate_game(game)
-    return _smoothed_search_wdl(game, decay)
+    return _smoothed_search_wdl(game, decay, source)
 
 
-def _smoothed_search_wdl(game, decay):
+def _smoothed_search_wdl(game, decay, source="search_wdl"):
     """smoothed_search_wdl for an already validated game."""
     if not math.isfinite(decay) or not 0 <= decay <= 1:
         raise ValueError("auxiliary value decay must be in [0, 1]")
@@ -33,9 +34,9 @@ def _smoothed_search_wdl(game, decay):
     following = outcome_wdl(game["outcome_white"], terminal_white_to_move)
     result = [None] * len(targets)
     for index in range(len(targets) - 1, -1, -1):
-        search = targets[index].get("search_wdl")
+        search = targets[index].get(source)
         if search is None:
-            raise ValueError("auxiliary value training requires recorded search_wdl at every ply")
+            raise ValueError(f"auxiliary value training requires recorded {source} at every ply")
         following = [(1 - decay) * p + decay * q
                      for p, q in zip(search, following[::-1])]
         result[index] = following
@@ -117,9 +118,9 @@ def reconstruct(game, *, move_vocab, encoder, max_positions, learning=None):
         if mix > 0:
             # Lc0-style q_ratio: blend the result with this position's own
             # side-to-move search WDL (not the smoothed auxiliary target).
-            search = target.get("search_wdl")
+            search = target.get(learning.value_search_source)
             if search is None:
-                raise ValueError("value_search_mix requires recorded search_wdl at every ply")
+                raise ValueError(f"value_search_mix requires recorded {learning.value_search_source} at every ply")
             outcome = [(1 - mix) * z + mix * q for z, q in zip(outcome, search)]
         values.append(outcome)
         history.record_played_move(uci)
@@ -165,12 +166,12 @@ def reconstruct(game, *, move_vocab, encoder, max_positions, learning=None):
     if learning is not None and learning.auxiliary_value_weight > 0:
         if isinstance(learning.auxiliary_value_lambda, tuple):
             # Per position: one WDL row per horizon, shape (horizons, 3).
-            horizons = [_smoothed_search_wdl(game, decay)
+            horizons = [_smoothed_search_wdl(game, decay, learning.value_search_source)
                         for decay in learning.auxiliary_value_lambda]
             sample["auxiliary_value_target"] = [list(rows) for rows in zip(*horizons)]
         else:
             sample["auxiliary_value_target"] = _smoothed_search_wdl(
-                game, learning.auxiliary_value_lambda
+                game, learning.auxiliary_value_lambda, learning.value_search_source
             )
     return sample
 

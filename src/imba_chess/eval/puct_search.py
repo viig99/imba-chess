@@ -15,7 +15,7 @@ import chess
 import imba_chess_native as cc
 
 from . import cozy_bridge
-from .gumbel_search import GumbelResult, _Node
+from .gumbel_search import GumbelResult, _Node, policy_wdl
 from .search import EvalRequest, _drive, _root_hash_seed
 
 
@@ -131,6 +131,7 @@ def puct_stepwise(*, board, extend, root_handle=None, config=PuctConfig(), rng=N
                                   config.variance_prior, config.variance_prior_weight, mixed)
     evaluations, terminal_hits, cutoffs, deepest = 1, 0, 0, 0
     wdl_sums, wdl_available = [0.0, 0.0, 0.0], True
+    edge_wdl_sums = [[0.0, 0.0, 0.0] for _ in range(n)]
     for _ in range(config.simulations):
         if should_stop():
             raise InterruptedError("search cancelled")
@@ -172,8 +173,10 @@ def puct_stepwise(*, board, extend, root_handle=None, config=PuctConfig(), rng=N
             wdl_available = False
         else:
             root_pov = leaf_wdl[::-1] if depth % 2 else leaf_wdl
+            edge = edge_wdl_sums[path[0][1]]
             for i, probability in enumerate(root_pov):
                 wdl_sums[i] += probability
+                edge[i] += probability
     visits, _, qvalues = root.stats.snapshot()
     # Visits define both the played move and the untempered training policy. Root
     # exploration affects visits, as in AlphaZero; with noise off the move is deterministic.
@@ -193,12 +196,17 @@ def puct_stepwise(*, board, extend, root_handle=None, config=PuctConfig(), rng=N
         c = config.cpuct + config.cpuct_factor * math.log((config.simulations + config.cpuct_base + 1) / config.cpuct_base)
         regularization = config.rpo_regularization * max(c, 1e-6) * math.sqrt(config.simulations) / (config.simulations + n)
         policy = rpo_policy(probs, completed, regularization)
+    root_wdl = root_wdl if root_wdl is not None else root_eval.wdl
+    # A visit policy's WDL is search_wdl; an RPO target's differs.
+    improved_wdl = (policy_wdl(policy, visits, edge_wdl_sums, root.stats.probs, root_wdl)
+                    if wdl_available else None)
     return GumbelResult(root_eval.legal_ucis[action], root_eval.legal_ids[action],
                         list(root_eval.legal_ids), policy,
-                        root.value, root_wdl if root_wdl is not None else root_eval.wdl,
+                        root.value, root_wdl,
                         visits, qvalues, config.simulations, evaluations, terminal_hits, cutoffs,
                         deepest, list(root_eval.legal_log_priors),
-                        tuple(p / config.simulations for p in wdl_sums) if wdl_available else None)
+                        tuple(p / config.simulations for p in wdl_sums) if wdl_available else None,
+                        improved_wdl)
 
 
 def select_puct(*, evaluator, **kwargs):
