@@ -1,4 +1,4 @@
-"""Restartable Gumbel checkpoint pairs or independent Stockfish evaluation."""
+"""Restartable configured-search checkpoint pairs or independent Stockfish evaluation."""
 
 import argparse
 import json
@@ -29,6 +29,7 @@ def main():
     opponent.add_argument("--stockfish", type=Path)
     parser.add_argument("--stockfish-limit-strength", action=argparse.BooleanOptionalAction, default=False)
     parser.add_argument("--stockfish-elo", type=int, default=2400)
+    parser.add_argument("--stockfish-nodes", type=int, default=40000)
     starts = parser.add_mutually_exclusive_group(required=True)
     starts.add_argument("--seeds", type=Path)
     starts.add_argument("--initial-board", action="store_true")
@@ -38,7 +39,7 @@ def main():
     parser.add_argument("--device", default="cuda")
     args = parser.parse_args()
     cfg = load_config(args.config)
-    if args.pairs < 1 or args.seconds <= 0:
+    if args.pairs < 1 or args.seconds <= 0 or args.stockfish_nodes < 1:
         parser.error("bounds must be positive")
     if args.initial_board:
         if not args.stockfish:
@@ -63,6 +64,7 @@ def main():
         if args.stockfish:
             best = StockfishRuntime(
                 runtime, path=str(args.stockfish),
+                nodes=args.stockfish_nodes,
                 limit_strength=args.stockfish_limit_strength, elo=args.stockfish_elo,
             )
             best_id = stable_hash(json.dumps(best.protocol, sort_keys=True))

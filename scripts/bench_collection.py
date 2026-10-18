@@ -19,7 +19,7 @@ Stage timers per worker (host wall time, no added synchronization):
 
 import argparse
 from collections import Counter
-from dataclasses import replace
+from dataclasses import asdict, replace
 import json
 import os
 from pathlib import Path
@@ -112,11 +112,12 @@ class NullStore:
     def __init__(self):
         self.seen = set()
 
-    def add(self, game):
-        pass
+    def add(self, game, *, before_flush=None):
+        self.seen.add(game["game_id"])
 
-    def flush(self):
-        pass
+    def flush(self, publish=True, *, before=None):
+        if before is not None:
+            before()
 
 
 class CyclingStarts:
@@ -124,6 +125,7 @@ class CyclingStarts:
 
     def __init__(self, seeds, prefix):
         self.seeds, self.prefix, self.launches = seeds, prefix, 0
+        self.durable_launches = False
 
     def begin_phase(self, iteration, actor_id, completed, carried=frozenset()):
         pass
@@ -191,6 +193,7 @@ def summarize_phase(metrics, start, end, games_concurrent):
         move_latency_p95=report["move_latency_p95"],
     )
     summary["usable_positions_per_hour"] = 3600 * summary["usable_positions"] / summary["wall"]
+    summary["policy_eligible_positions_per_hour"] = 3600 * summary["full_positions"] / summary["wall"]
     summary["searched_positions_per_hour"] = 3600 * len(events) / summary["wall"]
     summary["evals_per_second"] = summary["neural_evaluations"] / summary["wall"]
     summary["window_evals_per_second"] = sum(e[1] for e in in_window) / max(
@@ -294,7 +297,7 @@ def main():
     cfg = load_config(args.config)
     if args.fresh_positions is not None:
         cfg = replace(
-            cfg, collection=replace(cfg.collection, fresh_positions=args.fresh_positions)
+            cfg, collection=replace(cfg.collection, fresh_positions=args.fresh_positions, fresh_games=0)
         )
     if args.carry_over:
         cfg = replace(cfg, collection=replace(cfg.collection, carry_over_games=True))
@@ -404,10 +407,14 @@ def main():
         phases=len(phases), wall=wall, usable_positions=usable, neural_evaluations=evals,
         usable_positions_per_hour=3600 * usable / wall, evals_per_second=evals / wall,
         drain=sum(p["drain"] for p in phases),
+        policy_eligible_positions=sum(p["full_positions"] for p in phases),
+        policy_eligible_positions_per_hour=3600 * sum(p["full_positions"] for p in phases) / wall,
     )
     end = time.perf_counter()
     start = measured_start
     worker_reports = worker_stage_report(stats_dir)
+    summary["actual_neural_rows"] = sum(w["root_rows"] + w["decode_rows"] for w in worker_reports)
+    summary["actual_neural_rows_per_second"] = summary["actual_neural_rows"] / summary["wall"]
     gpu_rows = []
     for line in (args.output / "gpu.csv").read_text().splitlines():
         parts = [p.strip() for p in line.split(",")]
@@ -419,6 +426,7 @@ def main():
         args={k: str(v) for k, v in vars(args).items()},
         git=subprocess.run(["git", "rev-parse", "HEAD"], capture_output=True,
                            text=True).stdout.strip(),
+        search=asdict(cfg.search),
         startup_seconds=startup,
         warmup_seconds=warmup,
         phase=summary,

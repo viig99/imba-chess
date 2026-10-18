@@ -11,6 +11,7 @@ import torch
 from . import cozy_bridge, search
 from .batch_scheduler import WorkRequest
 from .gumbel_search import gumbel_stepwise, GumbelConfig
+from .puct_search import puct_stepwise, PuctConfig, PUCT_ALGORITHMS
 from .merged_executors import _make_root_eval_executor, _make_decode_wave_executor
 from .position_evaluator import CachedPositionEvaluator
 from .search import PositionEval, HalvingConfig
@@ -18,6 +19,7 @@ from .search import PositionEval, HalvingConfig
 
 INFERENCE_DTYPES = dict(float32=torch.float32, bfloat16=torch.bfloat16)
 RUNTIME_REVISION = "shared-search-v2"
+SINGLE_LEAF_ALGORITHMS = ("gumbel", *PUCT_ALGORITHMS)
 
 
 @dataclass(frozen=True)
@@ -124,7 +126,7 @@ class InferenceRuntime:
         stats=None,
         dtype=torch.float32,
     ):
-        if algorithm not in ("gumbel", "value_search_halving", "policy", "policy_q"):
+        if algorithm not in (*SINGLE_LEAF_ALGORITHMS, "value_search_halving", "policy", "policy_q"):
             raise ValueError("unsupported search algorithm")
         device = torch.device(device)
         if device.type != "cuda":
@@ -226,7 +228,7 @@ class InferenceRuntime:
     ):
         owner = (actor_id, game_id)
         reused = None
-        if self.algorithm == "gumbel":
+        if self.algorithm in SINGLE_LEAF_ALGORITHMS:
             reused = self._take_root_carry(history, owner, board, *history.next_root_key())
         batch = None
         if reused is None:
@@ -297,18 +299,21 @@ class InferenceRuntime:
         carry=None,
         reused=None,
     ):
-        """carry: the game's history object. Gumbel searches leave the played
+        """carry: the game's history object. Single-leaf searches leave the played
         child on it so the next search of the same game reuses that decode as
         its root instead of re-running the whole history (see _RootCarry).
         reused: a carry already validated for this root by search(); batch is
         then None."""
         if self.model.training:
             raise ValueError("search requires an evaluation-mode model")
-        expected = GumbelConfig if self.algorithm == "gumbel" else HalvingConfig
+        expected = (GumbelConfig if self.algorithm == "gumbel" else
+                    PuctConfig if self.algorithm in PUCT_ALGORITHMS else HalvingConfig)
         if self.algorithm not in ("policy", "policy_q") and not isinstance(config, expected):
             raise ValueError("search config does not match runtime algorithm")
-        if isinstance(config, GumbelConfig) and config.max_depth > 32:
-            raise ValueError("Gumbel workspace supports depth <= 32")
+        if isinstance(config, PuctConfig) and config.algorithm != self.algorithm:
+            raise ValueError("PUCT config does not match runtime algorithm")
+        if isinstance(config, (GumbelConfig, PuctConfig)) and config.max_depth > 32:
+            raise ValueError("single-leaf workspace supports depth <= 32")
         if should_stop():
             raise InterruptedError("search cancelled")
         token = self._cache_token
@@ -383,8 +388,9 @@ class InferenceRuntime:
         )
         evaluator._runtime_token = token
         played = []
-        if self.algorithm == "gumbel":
-            gen = gumbel_stepwise(
+        if self.algorithm in SINGLE_LEAF_ALGORITHMS:
+            stepwise = gumbel_stepwise if self.algorithm == "gumbel" else puct_stepwise
+            gen = stepwise(
                 board=board,
                 extend=evaluator.extend,
                 config=config,

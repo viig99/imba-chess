@@ -686,3 +686,38 @@ def _halving_runtime(model, vocab):
         device="cpu",
         algorithm="value_search_halving",
     )
+
+
+@pytest.mark.parametrize("method", ["puct", "puct_variance", "puct_v", "puct_rpo", "puct_variance_rpo"])
+@pytest.mark.parametrize("use_file", [False, True])
+def test_puct_selection_and_resolved_parameters_are_saved(tmp_path, monkeypatch, method, use_file):
+    from dataclasses import asdict
+    from imba_chess.eval.search_options import puct_config, search_backend
+    module = _load_eval_script_module()
+    cfg = tmp_path / "model.toml"
+    cfg.write_text('[eval_vs_stockfish]\nmodel_move_policy = "gumbel"\n')
+    output = tmp_path / "result.json"
+    argv = ["eval_vs_stockfish.py", "--config", str(cfg), "--checkpoint", "unused.pt",
+            "--stockfish-path", sys.executable, "--device", "cpu", "--no-save-games",
+            "--ladder-elos", "2600", "--ladder-games-per-segment", "1",
+            "--no-include-full-strength-segment", "--model-move-policy", method,
+            "--simulations", "37", "--inference-dtype", "bfloat16", "--output-json", str(output)]
+    if use_file:
+        argv += ["--search-config", f"config/self_play_{method}.toml"]
+    monkeypatch.setattr(sys, "argv", argv)
+    def load(**kwargs):
+        assert kwargs["algorithm"] == search_backend(method)
+        return SimpleNamespace(model=None, move_vocab=_mini_vocab(), encoder=BoardStateEncoder()), 128
+    monkeypatch.setattr(module, "load_runtime", load)
+    def segment(**kwargs):
+        assert kwargs["halving_config"] == puct_config(method, simulations=37)
+        return module.EvalSummary(games=1, completed_games=1, draws=1)
+    monkeypatch.setattr(module, "_run_segment", segment)
+    module.main()
+    data = json.loads(output.read_text())
+    for result in [data["aggregate"], data["segments"][0]["results"]]:
+        saved = result["run_config"]
+        assert saved["search"]["resolved"] == asdict(puct_config(method, simulations=37))
+        assert saved["budget"] == 37 and saved["budget_unit"] == "simulations"
+        assert saved["exploration"] == "zero_noise"
+        assert saved["precision"] == "bfloat16"

@@ -278,6 +278,25 @@ pub(crate) struct NodeStats {
     edge_minimax: Vec<f64>,
     forcing: Vec<bool>,
     candidates: Vec<bool>,
+    // PUCT experiments are opt-in: the existing Gumbel arithmetic is unchanged.
+    puct: Option<PuctParameters>,
+    selection_probs: Vec<f64>,
+    m2: Vec<f64>,
+    variance_count: u64,
+    variance_mean: f64,
+    variance_m2: f64,
+}
+
+struct PuctParameters {
+    mode: u8,
+    cpuct: f64,
+    base: f64,
+    factor: f64,
+    fpu: f64,
+    c1: f64,
+    c2: f64,
+    prior_variance: f64,
+    prior_weight: f64,
 }
 
 impl NodeStats {
@@ -359,6 +378,12 @@ impl NodeStats {
             edge_minimax: vec![0.0; n],
             forcing: Vec::new(),
             candidates: Vec::new(),
+            puct: None,
+            selection_probs: Vec::new(),
+            m2: Vec::new(),
+            variance_count: 0,
+            variance_mean: 0.0,
+            variance_m2: 0.0,
         })
     }
 
@@ -396,6 +421,80 @@ impl NodeStats {
     #[getter]
     fn probs(&self) -> Vec<f64> {
         self.probs.clone()
+    }
+
+    /// mode 0: Lc0-style PUCT; 1: parent variance scaling; 2: PUCT-V.
+    #[pyo3(signature = (mode, cpuct, base, factor, fpu, c1, c2, prior_variance, prior_weight, selection_probs=None))]
+    #[allow(clippy::too_many_arguments)]
+    fn configure_puct(
+        &mut self, mode: u8, cpuct: f64, base: f64, factor: f64,
+        fpu: f64, c1: f64, c2: f64, prior_variance: f64, prior_weight: f64,
+        selection_probs: Option<Vec<f64>>,
+    ) -> PyResult<()> {
+        if mode > 2 || [cpuct, base, factor, fpu, c1, c2, prior_variance, prior_weight]
+            .iter().any(|x| !x.is_finite() || *x < 0.0)
+            || base == 0.0 || prior_variance == 0.0 || prior_weight == 0.0
+            || self.visits.iter().any(|n| *n != 0)
+        {
+            return Err(PyValueError::new_err("invalid PUCT parameters or nonempty statistics"));
+        }
+        if let Some(probs) = selection_probs {
+            if probs.len() != self.probs.len() || probs.iter().any(|p| !p.is_finite() || *p < 0.0)
+                || (fsum(probs.iter().copied()) - 1.0).abs() > 1e-6
+            {
+                return Err(PyValueError::new_err("invalid PUCT selection priors"));
+            }
+            self.selection_probs = probs;
+        }
+        if mode != 0 {
+            self.m2 = vec![0.0; self.probs.len()];
+        }
+        self.puct = Some(PuctParameters { mode, cpuct, base, factor, fpu, c1, c2, prior_variance, prior_weight });
+        Ok(())
+    }
+
+    fn select_puct(&self) -> PyResult<usize> {
+        let cfg = self.puct.as_ref().ok_or_else(|| PyValueError::new_err("PUCT not configured"))?;
+        let probs = if self.selection_probs.is_empty() { &self.probs } else { &self.selection_probs };
+        let count = self.visits.iter().sum::<u64>() as f64;
+        let parent_q = if count > 0.0 { self.sums.iter().sum::<f64>() / count } else { self.value };
+        let visited_mass: f64 = probs.iter().zip(&self.visits).filter_map(|(p, n)| (*n > 0).then_some(*p)).sum();
+        let unvisited_q = parent_q - cfg.fpu * visited_mass.sqrt();
+        let mut c = cfg.cpuct + cfg.factor * ((count + cfg.base + 1.0) / cfg.base).ln();
+        if cfg.mode == 1 {
+            let variance = (self.variance_m2 + cfg.prior_weight * cfg.prior_variance)
+                / (self.variance_count as f64 + cfg.prior_weight);
+            c *= (variance.max(0.0) / cfg.prior_variance).sqrt();
+        }
+        let mut best = f64::NEG_INFINITY;
+        let mut selected = 0;
+        for i in 0..probs.len() {
+            let n = self.visits[i] as f64;
+            let q = if n > 0.0 { self.means[i] } else { unvisited_q };
+            let bonus = if cfg.mode == 2 {
+                // Equation 22, Weichart (2025). Rewards here span [-1,1],
+                // so the default bias coefficient is twice the [0,1] one.
+                // With fewer than two samples the empirical variance is zero;
+                // the separate bias bonus still drives exploration.
+                let stdev = if n > 0.0 { (self.m2[i] / n).max(0.0).sqrt() } else { 0.0 };
+                probs[i] * (cfg.c1 * stdev * count.max(1.0).sqrt()
+                    + cfg.c2 * (count + 1.0).ln()) / (1.0 + n)
+            } else {
+                c * probs[i] * count.max(1.0).sqrt() / (1.0 + n)
+            };
+            // At an empty node explicitly prefer the prior, including PUCT-V
+            // whose empirical variance and log term are both zero.
+            let score = if count == 0.0 { probs[i] } else { q + bonus };
+            if score > best {
+                best = score;
+                selected = i;
+            }
+        }
+        Ok(selected)
+    }
+
+    fn variance_snapshot(&self) -> (Vec<f64>, u64, f64, f64) {
+        (self.m2.clone(), self.variance_count, self.variance_mean, self.variance_m2)
     }
 
     /// Forcing flags (capture, check, promotion) per legal move, for the floor.
@@ -529,9 +628,17 @@ fn gumbel_backup(
     for (node, edge) in path.iter().rev() {
         value = -value;
         let mut node = node.try_borrow_mut(py)?;
+        let old_mean = node.means[*edge];
         node.visits[*edge] += 1;
         node.sums[*edge] += value;
         node.means[*edge] = node.sums[*edge] / node.visits[*edge] as f64;
+        if !node.m2.is_empty() {
+            node.m2[*edge] += (value - old_mean) * (value - node.means[*edge]);
+            node.variance_count += 1;
+            let delta = value - node.variance_mean;
+            node.variance_mean += delta / node.variance_count as f64;
+            node.variance_m2 += delta * (value - node.variance_mean);
+        }
         node.edge_minimax[*edge] = -child_value;
         child_value = node.side_to_move_value();
     }

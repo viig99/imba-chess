@@ -100,7 +100,7 @@ def play_game(
         run_seed=run_seed,
         config_id=config_id,
         search_config=asdict(search_config),
-        reference_revision=REFERENCE_REVISION,
+        reference_revision=REFERENCE_REVISION if not hasattr(search_config, "algorithm") else "puct-family-v1-arxiv2512.21648",
         inference_config=getattr(runtime, "options", {}),
     )
     rng = random.Random(f"{run_seed}:{game_id}")
@@ -114,9 +114,8 @@ def play_game(
             raise ValueError("playout_cap needs an enabled config and a single actor")
         # A separate stream, so the Gumbel noise draws do not depend on the coin flips.
         cap_rng = random.Random(f"{run_seed}:{game_id}:playout-cap")
-        fast_config = replace(
-            search_config, simulations=playout_cap.fast_simulations, top_m=playout_cap.fast_top_m
-        )
+        fast_config = replace(search_config, simulations=playout_cap.fast_simulations,
+                              **({"top_m": playout_cap.fast_top_m} if hasattr(search_config, "top_m") else {}))
         game["playout_cap"] = asdict(playout_cap)
     try:
         while True:

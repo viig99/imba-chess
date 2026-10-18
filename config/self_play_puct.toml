@@ -1,0 +1,77 @@
+# Experimental puct; collection and learning match self_play.toml.
+base_config = "config/imba_chess_v4_aux3.toml"
+
+[search]
+algorithm = 'puct'
+simulations = 256
+max_depth = 32
+cpuct = 1.0
+cpuct_base = 38739.0
+cpuct_factor = 3.89
+fpu_reduction = 0.33
+variance_prior = 0.25
+variance_prior_weight = 8.0
+variance_c1 = 1.4142135623730951
+variance_c2 = 6.0
+dirichlet_alpha = 0.3
+dirichlet_fraction = 0.25
+
+[collection]
+concurrent_games = 160
+root_batch_tokens = 1024
+max_game_plies = 512
+fresh_games = 640
+inference_dtype = "bfloat16"
+# Fast play-out of decided games only (from iteration ~238, 2026-10-14, resumed with
+# --previous-config): every undecided move keeps the full search (full_search_probability 1, so
+# no playout cap randomization); once the last 3 root values all have |v| >= 0.98, moves get the
+# fast 64-simulation search with value targets only. On the replay buffer at iteration 235, ~40%
+# of plies came after that trigger (resigning there would have been wrong in 0.74% of games), and
+# their policy targets were flat (KL ~0.1). The matched-hours PCR test found it safe: no reversed
+# results, 0.6% draws after the trigger.
+playout_cap = true
+full_search_probability = 1.0
+fast_simulations = 64
+fast_top_m = 8
+decided_value = 0.98
+decided_plies = 3
+carry_over_games = true
+
+[replay]
+window_positions = 500000
+flush_games = 16
+flush_positions = 2048
+
+[learning]
+lr = 2e-4
+value_weight = 1.0
+auxiliary_value_weight = 0.15
+auxiliary_value_lambda = [0.8, 0.9, 0.95]
+value_search_mix = 0.1
+weight_decay = 0.01
+grad_clip = 2.0
+# Each phase trains on its ~640 fresh games plus as many older positions (~640 games) drawn
+# without replacement from the rest of the FIFO window (~8.9 phases): about two passes per game.
+reuse = 2.0
+microbatch_tokens = 1024
+gradient_accumulation = 4
+policy_surprise_enabled = true
+policy_surprise_fraction = 0.5
+policy_surprise_cap = 3.0
+# Weight EMA over ~200 optimizer steps (~5 iterations of ~41 steps at reuse 2), screened next to
+# the raw actor from iteration 151 on (resumed with --enable-ema); collection keeps raw weights.
+ema_decay = 0.995
+
+[run]
+seed = 42
+hours = 48.0
+reserve_minutes = 15.0
+drain_minutes = 10.0
+screen_pairs = 50
+confirmation_pairs = 250
+
+[streaming]
+block_rows = 10000
+prefetch_blocks = 2
+startup_timeout = 900.0
+shutdown_timeout = 5.0

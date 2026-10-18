@@ -29,3 +29,11 @@ A collection phase's size is `[collection] fresh_positions` (training positions)
 The collection worker startup/progress/shutdown timeout flags are also execution-only. Gameplay errors abort the collection phase; interrupted launches remain journaled for retry. Without regret restarts the start stream is journaled before each replay flush rather than at every launch, so a crash can reissue only starts whose games were lost unpublished. Replay shards are fsynced at every flush, while the manifest that indexes them is rewritten only at phase ends and garbage collection; a restart indexes any shards it lacks. Completed-phase counters recover from replay manifest summaries. Older manifests acquire those summaries in one pass through each surviving legacy shard, without changing trajectory data.
 
 The shared inference runtime revision `shared-search-v2` preserves root capture/check/promotion flags and backs up pure negamax values before applying `minimax_weight` once per edge. Existing self-play weights and optimizer state can resume with these corrections; future games use the corrected search. An in-progress evaluation saved with the previous runtime revision requires a new output file or, for `run_stockfish_eval.py`, a new output directory. The batched SF runner checks both its manifest and each completed batch so old results cannot be mixed with the corrected search protocol.
+
+## Search method selection
+
+Gumbel remains the default. The PUCT family has dedicated `config/self_play_puct*.toml`
+recipes and runs through the existing collection workers and replay format.
+See [search methods, results and usage](SEARCH_METHODS.md) for exact presets,
+training/resume commands and per-side inference choices. Changing search settings
+requires a new run output; use the matching config again on resume.

@@ -10,6 +10,15 @@ try:
 except ModuleNotFoundError:  # Python 3.10
     import tomli as tomllib
 from imba_chess.eval.gumbel_search import GumbelConfig
+from imba_chess.eval.puct_search import PuctConfig
+
+
+def search_config(**settings):
+    algorithm = settings.get("algorithm", "gumbel")
+    if algorithm == "gumbel":
+        settings.pop("algorithm", None)
+        return GumbelConfig(**settings)
+    return PuctConfig(**settings)
 
 
 @dataclass(frozen=True)
@@ -176,7 +185,7 @@ class RegretConfig:
 @dataclass(frozen=True)
 class SelfPlayConfig:
     base_config: str = "config/imba_chess_v4.toml"
-    search: GumbelConfig = field(default_factory=GumbelConfig)
+    search: GumbelConfig | PuctConfig = field(default_factory=GumbelConfig)
     collection: CollectionConfig = field(default_factory=CollectionConfig)
     replay: ReplayConfig = field(default_factory=ReplayConfig)
     learning: LearningConfig = field(default_factory=LearningConfig)
@@ -219,7 +228,7 @@ class SelfPlayConfig:
 def load_config(path):
     raw = tomllib.loads(Path(path).read_text())
     constructors = dict(
-        search=GumbelConfig,
+        search=search_config,
         collection=CollectionConfig,
         replay=ReplayConfig,
         learning=LearningConfig,
@@ -234,7 +243,7 @@ def load_config(path):
         raise ValueError("collection.inference_dtype must be float32 or bfloat16")
     if cfg.collection.playout_cap and (
         cfg.collection.fast_simulations >= cfg.search.simulations
-        or cfg.collection.fast_top_m > cfg.search.top_m
+        or (isinstance(cfg.search, GumbelConfig) and cfg.collection.fast_top_m > cfg.search.top_m)
     ):
         raise ValueError("the fast search must be smaller than the full [search]")
     for section in (cfg.collection, cfg.replay, cfg.learning):

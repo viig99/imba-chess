@@ -1,0 +1,35 @@
+# Frozen after the 500-root tuning grid and target ablation, 2026-10-18.
+# Test results must not be used to change these settings.
+[[arms]]
+name = 'gumbel'
+algorithm = 'gumbel'
+
+[[arms]]
+name = 'puct'
+algorithm = 'puct'
+cpuct = 1.0
+
+[[arms]]
+name = 'puct_variance'
+algorithm = 'puct_variance'
+cpuct = 1.75
+
+[[arms]]
+name = 'puct_v'
+algorithm = 'puct_v'
+variance_c2 = 3.0
+
+[[arms]]
+name = 'puct_rpo'
+algorithm = 'puct'
+cpuct = 1.0
+target_policy = 'rpo'
+rpo_regularization = 0.25
+
+# Added before held-out comparison, following the cached tuning-target check.
+[[arms]]
+name = 'puct_variance_rpo'
+algorithm = 'puct_variance'
+cpuct = 1.75
+target_policy = 'rpo'
+rpo_regularization = 0.015625

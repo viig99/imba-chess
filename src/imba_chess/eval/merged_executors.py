@@ -417,12 +417,12 @@ def _make_decode_wave_executor(
     stats: "TimingStatsLike | None",
     algorithm: str = "value_search_halving",
 ):
-    if algorithm not in ("gumbel", "value_search_halving"):
+    if algorithm not in ("gumbel", "puct", "puct_variance", "puct_v", "value_search_halving"):
         raise ValueError("unknown search algorithm")
     from imba_chess.model.tensor_decoder import DecoderRunner
     from .decode_workspace import DecodeWorkspace
 
-    single = algorithm == "gumbel"
+    single = algorithm != "value_search_halving"
     runner = DecoderRunner(model) if single else None
     reusable = DecodeWorkspace(runner) if single else None
     cached_owners = ()

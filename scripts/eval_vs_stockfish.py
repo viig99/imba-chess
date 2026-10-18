@@ -1,13 +1,14 @@
 from __future__ import annotations
-from imba_chess.eval.inference_runtime import INFERENCE_DTYPES, RUNTIME_REVISION, load_runtime
+from imba_chess.eval.inference_runtime import INFERENCE_DTYPES, RUNTIME_REVISION, SINGLE_LEAF_ALGORITHMS, load_runtime
 from imba_chess.eval.gumbel_search import GumbelConfig
+from imba_chess.eval.search_options import PUCT_METHODS, SEARCH_METHODS, puct_config, search_backend
 import argparse
 import json
 import math
 import os
 import random
 import time
-from dataclasses import dataclass, field
+from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any, Generator, Iterator
 import chess
@@ -123,7 +124,7 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--device", choices=["auto", "cpu", "cuda"], default=None)
     parser.add_argument(
         "--model-move-policy",
-        choices=["gumbel", "value_search_halving", "policy", "policy_q"],
+        choices=SEARCH_METHODS,
         default=None,
         help="Model move selection on legal moves (policy: greedy argmax pi, no search; policy_q: greedy argmax of KLENT pi' using the Q head).",
     )
@@ -146,6 +147,8 @@ def _parse_args() -> argparse.Namespace:
         default=None,
         help="Weight for halving search value adjustment.",
     )
+    parser.add_argument("--simulations", type=int, default=None, help="Gumbel/PUCT simulation budget.")
+    parser.add_argument("--search-config", type=Path, help="PUCT parameters from a self-play TOML [search] section; must match --model-move-policy.")
     parser.add_argument("--gumbel-simulations", type=int, default=None)
     parser.add_argument(
         "--gumbel-value-scale",
@@ -291,7 +294,7 @@ def _select_model_move_stepwise(
         batch=batch,
         owner=(id(runtime), id(batch)),
         config=config,
-        noise=0.0 if runtime.algorithm == "gumbel" else None,
+        noise=0.0 if runtime.algorithm in SINGLE_LEAF_ALGORITHMS else None,
         root_observer=observe if debug_topk else None,
     )
     legal = board.legal_moves.count()
@@ -316,7 +319,7 @@ def _select_model_move_stepwise(
             terminal_hits=result.terminal_hits,
             depth_cutoffs=result.depth_cutoffs,
         )
-    if runtime.algorithm == "gumbel":
+    if runtime.algorithm in SINGLE_LEAF_ALGORITHMS:
         debug["analysis"] = _gumbel_analysis(result, runtime.move_vocab)
     return (chess.Move.from_uci(result.move_uci), debug)
 
@@ -486,17 +489,17 @@ def _summary_to_payload(
             "opening_random_plies": int(opening_random_plies),
             "search": search_knobs,
             "algorithm": model_move_policy,
-            "precision": "float32",
+            "precision": str(dtype).removeprefix("torch."),
             "tf32": False,
             "exploration": "zero_noise"
-            if model_move_policy == "gumbel"
+            if search_backend(model_move_policy) in SINGLE_LEAF_ALGORITHMS
             else "deterministic",
             "runtime_revision": RUNTIME_REVISION,
             "budget": search_knobs["gumbel_simulations"]
             if model_move_policy == "gumbel"
-            else search_knobs["search_budget"],
+            else (search_knobs["resolved"]["simulations"] if model_move_policy in PUCT_METHODS else search_knobs["search_budget"]),
             "budget_unit": "simulations"
-            if model_move_policy == "gumbel"
+            if search_backend(model_move_policy) in SINGLE_LEAF_ALGORITHMS
             else "neural_evaluations",
         },
     }
@@ -1151,7 +1154,19 @@ def main() -> None:
         if args.model_move_policy is None
         else args.model_move_policy
     )
-    if args.model_move_policy == "gumbel":
+    if args.simulations is not None:
+        if args.model_move_policy == "gumbel":
+            if args.gumbel_simulations is not None:
+                raise ValueError("use only one of --simulations and --gumbel-simulations")
+            args.gumbel_simulations = args.simulations
+        elif args.model_move_policy not in PUCT_METHODS:
+            raise ValueError("--simulations applies only to Gumbel/PUCT")
+    selected_puct = None
+    if args.model_move_policy in PUCT_METHODS:
+        selected_puct = puct_config(args.model_move_policy, path=args.search_config, simulations=args.simulations)
+    elif args.search_config is not None:
+        raise ValueError("--search-config applies only to PUCT methods")
+    if args.model_move_policy == "gumbel" or selected_puct is not None:
         for flag in (
             "search_budget",
             "search_lambda",
@@ -1165,7 +1180,7 @@ def main() -> None:
                 raise ValueError(
                     f"--{flag.replace('_', '-')} applies only to value_search_halving"
                 )
-    elif args.gumbel_simulations is not None:
+    if args.model_move_policy != "gumbel" and args.gumbel_simulations is not None:
         raise ValueError("--gumbel-simulations applies only to gumbel")
     if args.model_move_policy != "gumbel" and (
         args.gumbel_root_forcing or args.gumbel_forcing_floor or args.gumbel_minimax_weight
@@ -1262,7 +1277,7 @@ def main() -> None:
         raise ValueError("--opening-random-plies must be >= 0")
     if float(args.search_lambda) < 0.0:
         raise ValueError("--search-lambda must be >= 0")
-    if args.model_move_policy not in {"gumbel", "value_search_halving", "policy", "policy_q"}:
+    if args.model_move_policy not in SEARCH_METHODS:
         raise ValueError("unsupported search algorithm")
     if args.search_budget < 1:
         raise ValueError("--search-budget must be >= 1")
@@ -1292,7 +1307,7 @@ def main() -> None:
         repo_config=repo_config,
         checkpoint=args.checkpoint,
         device=device,
-        algorithm=args.model_move_policy,
+        algorithm=search_backend(args.model_move_policy),
         dtype=dtype,
         value_source=args.value_source,
     )
@@ -1301,7 +1316,7 @@ def main() -> None:
         runtime.move_vocab,
         runtime.encoder,
     )
-    compile_enabled = args.model_move_policy == "gumbel"
+    compile_enabled = search_backend(args.model_move_policy) in SINGLE_LEAF_ALGORITHMS
     engine_limit = _build_engine_limit(args)
     segment_specs = _build_segment_specs(args)
     print("Running model vs Stockfish")
@@ -1343,6 +1358,8 @@ def main() -> None:
                 visit_cap=int(args.gumbel_visit_cap),
                 rescale_values=bool(args.gumbel_rescale_values),
             )
+        if selected_puct is not None:
+            halving_config = selected_puct
         segment_summary = _run_segment(
             stockfish_path=args.stockfish_path,
             segment_options=segment_options,
@@ -1385,6 +1402,7 @@ def main() -> None:
             search_lambda=float(args.search_lambda),
             opening_random_plies=int(args.opening_random_plies),
             search_knobs={
+                "resolved": asdict(halving_config),
                 "gumbel_simulations": int(args.gumbel_simulations),
                 "search_budget": int(args.search_budget),
                 "search_top_m": int(args.search_top_m),
@@ -1438,6 +1456,7 @@ def main() -> None:
         search_lambda=float(args.search_lambda),
         opening_random_plies=int(args.opening_random_plies),
         search_knobs={
+            "resolved": asdict(halving_config),
             "gumbel_simulations": int(args.gumbel_simulations),
             "search_budget": int(args.search_budget),
             "search_top_m": int(args.search_top_m),

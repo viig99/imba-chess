@@ -1,18 +1,18 @@
 # imba-chess
 
-Chess sequence modeling, Gumbel self-play learning, and model evaluation against Stockfish. The HSTU model consumes complete board/move histories; native chess primitives handle legal moves, board encoding and terminal rules.
+Chess sequence modeling, configurable search self-play learning, and model evaluation against Stockfish. The HSTU model consumes complete board/move histories; native chess primitives handle legal moves, board encoding and terminal rules.
 
 ## Current workflows
 
 | Task | Entrypoint |
 |---|---|
 | Supervised pretraining / fine-tuning | `scripts/train.py` |
-| Established halving evaluation against Stockfish | `scripts/eval_vs_stockfish.py` |
-| Halving model A versus model B | `scripts/match_two_checkpoints.py` |
+| Configured search against Stockfish | `scripts/eval_vs_stockfish.py` |
+| Model A versus model B with per-side search | `scripts/match_two_checkpoints.py` |
 | Prepare the held-out monitor-opening manifest | `scripts/materialize_corpus.py`, `scripts/prepare_self_play_seeds.py` |
 | Train from stage-2 replay | `scripts/train_self_play.py` |
 | Alternate streamed collection, training and paired evaluation | `scripts/run_self_play.py` |
-| Gumbel model pairs or Gumbel versus Stockfish | `scripts/eval_self_play.py` |
+| Configured model pairs or model versus Stockfish | `scripts/eval_self_play.py` |
 | Live TensorBoard metrics | `scripts/monitor_self_play.py` |
 
 The offline halving-target generator and its storage format have been retired. Both the halving search algorithm and the Stockfish evaluation pipeline remain supported.
@@ -33,7 +33,7 @@ does not itself promote a checkpoint.
 
 Stage 1 learns human moves with full-vocabulary cross entropy and configured Elo weighting. Stockfish annotations supervise the value head where present, using the fixed win-percent transform; moves-left supervision remains available. See [event alignment](TRAINING_EVENT_SCHEMA.md), [board encoding](FEN_TO_BOARD_STATE.md) and [value targets](docs/VALUE_TARGET_WINPERCENT_HANDOFF.md).
 
-Stage 2 starts from a checkpoint and human-game prefixes streamed from the training corpus. One frozen actor controls both colors through each continuation. Completed games provide noise-free improved Gumbel policies and actual outcome WDL targets; human prefixes provide unsupervised context. Loss is soft legal-policy cross entropy plus outcome WDL cross entropy, with no Elo weighting or moves-left loss. Unfinished games receive no labels.
+Stage 2 starts from a checkpoint and human-game prefixes streamed from the training corpus. One frozen actor controls both colors through each continuation. Completed games provide the configured search policies and actual outcome WDL targets; human prefixes provide unsupervised context. Loss is soft legal-policy cross entropy plus outcome WDL cross entropy, with no Elo weighting or moves-left loss. Unfinished games receive no labels.
 
 Collection and training alternate on one GPU. Optimizer steps occur per training batch; the collection actor advances after a completed training phase. Immutable replay, atomic checkpoints, RNG/sampler state and phase progress support resume. Search uses one pending neural leaf per game, exact terminal values, full repetition history and explicit context limits.
 
@@ -105,13 +105,26 @@ Worker deadlines also cover incomplete pipe messages. Stop requests prevent new 
 
 `--initialize-optimizer` carries the supervised optimizer and remaining OneCycleLR schedule into self-play. After that schedule ends, learning continues at each parameter group's terminal minimum rate. This behavior and the schedule clock survive stage-2 checkpoints.
 
-Search inference uses CUDA FP32 with TF32 disabled. Gumbel uses the compiled decoder and reusable workspace (maximum depth 32); halving uses the grouped cached decoder with its configured depth. Runtime choices follow the selected algorithm. Ordinary model-component SDPA remains unchanged. Compilation adds first-use latency. Historical measurements remain in the [readiness report](docs/SELF_PLAY_READINESS_REVIEW_2026-09-11.md).
+Search inference supports CUDA FP32 or BF16 with TF32 disabled. Gumbel and the PUCT family use the compiled decoder and reusable workspace (maximum depth 32); halving uses the grouped cached decoder with its configured depth. Runtime choices follow the selected algorithm. Ordinary model-component SDPA remains unchanged. Compilation adds first-use latency. Historical measurements remain in the [readiness report](docs/SELF_PLAY_READINESS_REVIEW_2026-09-11.md).
 
 Use [the config guide](docs/CONFIG_GUIDE.md) before changing an existing run. The 5090 recipe reproduces the running tactical fork of the vmix run (auxiliary-value base config); it is not a measured performance promise.
 
 ## Evaluation and monitoring
 
-`eval_vs_stockfish.py` and `match_two_checkpoints.py` expose `--model-move-policy value_search_halving` (default) or `--model-move-policy gumbel`. One algorithm applies to the entire match. Halving uses `--search-budget` neural evaluations and `--search-lambda`; Gumbel uses `--gumbel-simulations` and explicitly supplies zero exploration noise for standalone evaluation. These budgets are different units. Both paths use shared inference and scheduling; Stockfish calls remain concurrent. Halving retains its existing game concurrency (6 in the config; recent Stockfish runs use 4). PGN/HTML traces remain supported. `match_two_checkpoints.py` compares models directly without Stockfish.
+`eval_vs_stockfish.py` and `match_two_checkpoints.py` expose Gumbel, PUCT,
+variance-scaled PUCT, PUCT-V, and the PUCT/RPO target variants alongside halving
+and greedy policies. Use `--model-move-policy puct_variance --simulations 256`;
+`--search-config config/self_play_puct_variance.toml` loads matching search parameters.
+Checkpoint matches also accept per-side choices. Standalone search evaluations
+explicitly disable exploration. Halving uses `--search-budget` neural evaluations;
+Gumbel and PUCT use simulations. Both paths share inference and scheduling,
+with concurrent Stockfish calls and saved PGN/HTML traces.
+
+See [Search methods: results and usage](docs/SEARCH_METHODS.md) for all presets,
+training/resume/inference commands, the full 4,110-position comparison, two-seed
+learning results, confidence intervals, and throughput. Variance-scaled PUCT
+without RPO is the strongest short-run policy learner in that screen; Gumbel
+remains the production default pending longer training and strength validation.
 
 The old standalone Gumbel evaluation commands are retired. Select Gumbel explicitly on the common commands. Retired policies and inference optimization/dtype/compile switches are rejected; supervised-training controls remain separate.
 

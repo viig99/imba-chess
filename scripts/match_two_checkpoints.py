@@ -12,7 +12,7 @@ Two variance reductions on top of that:
 1. **Paired openings with colour reversal.** Every opening is played twice --
    once with A as White, once with B as White. Opening imbalance and colour
    advantage cancel within the pair instead of being averaged over.
-2. **Real openings.** Both players run deterministic `value_search_halving`,
+2. **Real openings.** Evaluation search is deterministic,
    so from the initial position every game would be the SAME game. Openings are the first `--opening-plies` moves of
    real Lichess games, which are varied and roughly balanced -- unlike
    uniform-random legal plies, which reach lopsided junk positions.
@@ -23,8 +23,10 @@ yields one merged forward per model per tick with no scheduler changes.
 """
 
 from __future__ import annotations
-from imba_chess.eval.inference_runtime import INFERENCE_DTYPES, load_runtime
+from imba_chess.eval.inference_runtime import INFERENCE_DTYPES, SINGLE_LEAF_ALGORITHMS, load_runtime
 from imba_chess.eval.gumbel_search import GumbelConfig
+from imba_chess.eval.search_options import PUCT_METHODS, SEARCH_METHODS, puct_config, search_backend
+from dataclasses import asdict
 
 import argparse
 import json
@@ -55,7 +57,7 @@ def _select_move(*, side, board, history, runtime, config, rng):
         game_id=str(id(history)),
         config=config,
         rng=rng,
-        noise=0.0 if runtime.algorithm == "gumbel" else None,
+        noise=0.0 if runtime.algorithm in SINGLE_LEAF_ALGORITHMS else None,
     )
     try:
         request = next(gen)
@@ -81,6 +83,7 @@ def _play_game(
     max_plies: int,
     seed: int,
     game_key: str,
+    search_configs=None,
 ) -> Generator[WorkRequest, Any, dict[str, Any]]:
     """Plays one full game. Returns a result dict scored from A's perspective."""
     board = chess.Board()
@@ -107,7 +110,7 @@ def _play_game(
             board=board,
             history=history,
             runtime=models[side],
-            config=halving_config,
+            config=search_configs[side] if search_configs is not None else halving_config,
             rng=random.Random(f"{seed}:{game_key}:{len(board.move_stack)}"),
         )
         history.append_observed_position(board)
@@ -171,19 +174,21 @@ def _parse_args() -> argparse.Namespace:
     p.add_argument("--device", type=str, default=None)
     p.add_argument(
         "--model-move-policy",
-        choices=["gumbel", "value_search_halving", "policy", "policy_q"],
+        choices=SEARCH_METHODS,
         default="value_search_halving",
     )
-    # Greedy modes need no search config, so each side may pick its own; e.g.
-    # a KLENT checkpoint can play policy_q (uses its Q head) against a
-    # Q-less baseline playing policy.
+    # Each side can select a traversal, budget and PUCT target configuration.
     for side in ("a", "b"):
         p.add_argument(
             f"--model-move-policy-{side}",
-            choices=["policy", "policy_q"],
+            choices=SEARCH_METHODS,
             default=None,
-            help=f"Greedy move choice for side {side.upper()} (default: --model-move-policy).",
+            help=f"Move choice for side {side.upper()} (default: --model-move-policy).",
         )
+        p.add_argument(f"--search-config-{side}", type=Path, help="PUCT TOML [search] parameters.")
+        p.add_argument(f"--simulations-{side}", type=int, default=None)
+    p.add_argument("--simulations", type=int, default=None, help="Shared Gumbel/PUCT budget; per-side flags override.")
+    p.add_argument("--search-config", type=Path, help="Shared PUCT TOML [search] parameters.")
     p.add_argument("--gumbel-simulations", type=int, default=None)
     p.add_argument("--search-budget", type=int, default=None)
     p.add_argument("--search-max-depth", type=int, default=None)
@@ -191,34 +196,62 @@ def _parse_args() -> argparse.Namespace:
     return p.parse_args()
 
 
+def _search_budget(config, method):
+    if method in ("policy", "policy_q"):
+        return 0
+    return config.simulations if search_backend(method) in SINGLE_LEAF_ALGORITHMS else config.budget
+
+
+def _search_configs(args, eval_cfg, side_policies):
+    if args.simulations is not None and args.gumbel_simulations is not None:
+        raise ValueError("use only one of --simulations and --gumbel-simulations")
+    if args.gumbel_simulations is not None and "gumbel" not in side_policies.values():
+        raise ValueError("--gumbel-simulations applies only to gumbel")
+    configs = {}
+    for side, method in side_policies.items():
+        side_budget = getattr(args, f"simulations_{side.lower()}")
+        budget = side_budget if side_budget is not None else args.simulations
+        path = getattr(args, f"search_config_{side.lower()}") or args.search_config
+        if path is not None and method not in PUCT_METHODS:
+            raise ValueError("--search-config applies only to PUCT methods; use per-side flags for mixed matches")
+        if method in PUCT_METHODS:
+            if args.search_budget is not None or args.search_max_depth is not None:
+                raise ValueError("--search-budget and --search-max-depth apply only to value_search_halving")
+            configs[side] = puct_config(method, path=path, simulations=budget)
+        elif method == "gumbel":
+            if args.search_budget is not None or args.search_max_depth is not None:
+                raise ValueError("--search-budget and --search-max-depth apply only to value_search_halving")
+            configs[side] = GumbelConfig(simulations=budget if budget is not None else (
+                args.gumbel_simulations if args.gumbel_simulations is not None else 128))
+        else:
+            if budget is not None:
+                raise ValueError("--simulations applies only to Gumbel/PUCT")
+            configs[side] = HalvingConfig(
+                budget=args.search_budget if args.search_budget is not None else eval_cfg.search_budget,
+                top_m=eval_cfg.search_top_m, rounds=eval_cfg.halving_rounds,
+                refutation_top_r=eval_cfg.search_refutation_top_r, expand_top=eval_cfg.search_expand_top,
+                max_depth=args.search_max_depth if args.search_max_depth is not None else eval_cfg.search_max_depth,
+                lam=eval_cfg.search_lambda,
+            )
+    return configs
+
+
 def main() -> None:
     args = _parse_args()
     repo_config = load_repo_config(args.config)
     eval_cfg = repo_config.eval_vs_stockfish
 
-    if args.model_move_policy == "gumbel" and (
-        args.search_budget is not None or args.search_max_depth is not None
-    ):
-        raise ValueError(
-            "--search-budget and --search-max-depth apply only to value_search_halving"
-        )
-    if args.model_move_policy != "gumbel" and args.gumbel_simulations is not None:
-        raise ValueError("--gumbel-simulations applies only to gumbel")
-    args.gumbel_simulations = (
-        128 if args.gumbel_simulations is None else args.gumbel_simulations
-    )
+    side_policies = {
+        "A": args.model_move_policy_a or args.model_move_policy,
+        "B": args.model_move_policy_b or args.model_move_policy,
+    }
+    search_configs = _search_configs(args, eval_cfg, side_policies)
     device_arg = args.device or eval_cfg.device
     if device_arg == "auto":
         device_arg = "cuda" if torch.cuda.is_available() else "cpu"
     device = torch.device(device_arg)
     dtype = torch.float32
     models = {}
-    side_policies = {
-        "A": args.model_move_policy_a or args.model_move_policy,
-        "B": args.model_move_policy_b or args.model_move_policy,
-    }
-    if len(set(side_policies.values())) > 1 and not set(side_policies.values()) <= {"policy", "policy_q"}:
-        raise ValueError("per-side move policies must both be greedy (policy or policy_q)")
     for side, checkpoint, side_dtype in (
         ("A", args.checkpoint_a, args.inference_dtype_a),
         ("B", args.checkpoint_b, args.inference_dtype_b),
@@ -227,31 +260,13 @@ def main() -> None:
             repo_config=repo_config,
             checkpoint=checkpoint,
             device=device,
-            algorithm=side_policies[side],
+            algorithm=search_backend(side_policies[side]),
             dtype=INFERENCE_DTYPES[side_dtype],
         )
     move_vocab = models["A"].move_vocab
     board_state_encoder = models["A"].encoder
 
-    halving_config = HalvingConfig(
-        budget=int(
-            args.search_budget
-            if args.search_budget is not None
-            else eval_cfg.search_budget
-        ),
-        top_m=int(eval_cfg.search_top_m),
-        rounds=int(eval_cfg.halving_rounds),
-        refutation_top_r=int(eval_cfg.search_refutation_top_r),
-        expand_top=int(eval_cfg.search_expand_top),
-        max_depth=int(
-            args.search_max_depth
-            if args.search_max_depth is not None
-            else eval_cfg.search_max_depth
-        ),
-        lam=float(eval_cfg.search_lambda),
-    )
-    if args.model_move_policy == "gumbel":
-        halving_config = GumbelConfig(simulations=args.gumbel_simulations)
+    halving_config = search_configs["A"]
     max_plies = int(
         args.max_plies if args.max_plies is not None else eval_cfg.max_plies
     )
@@ -297,6 +312,7 @@ def main() -> None:
                         device=device,
                         dtype=dtype,
                         halving_config=halving_config,
+                        search_configs=search_configs,
                         max_plies=max_plies,
                         seed=args.seed,
                         game_key=key,
@@ -367,19 +383,23 @@ def main() -> None:
         "a_score_rate": score,
         "a_score_se": se,
         "adjudicated_draws": sum(1 for r in results if r["adjudicated"]),
-        "algorithm": args.model_move_policy,
+        "algorithm": side_policies["A"] if side_policies["A"] == side_policies["B"] else "mixed",
         "algorithm_a": side_policies["A"],
         "algorithm_b": side_policies["B"],
-        "budget": halving_config.simulations
-        if args.model_move_policy == "gumbel"
-        else halving_config.budget,
-        "exploration": "zero_noise"
-        if args.model_move_policy == "gumbel"
-        else "deterministic",
-        "budget_unit": "simulations"
-        if args.model_move_policy == "gumbel"
-        else "neural_evaluations",
-        "precision": "float32",
+        "search_a": asdict(search_configs["A"]),
+        "search_b": asdict(search_configs["B"]),
+        "budget_a": _search_budget(search_configs["A"], side_policies["A"]),
+        "budget_b": _search_budget(search_configs["B"], side_policies["B"]),
+        "budget": _search_budget(halving_config, side_policies["A"]),
+        "exploration": "zero_noise" if search_backend(side_policies["A"]) in SINGLE_LEAF_ALGORITHMS else "deterministic",
+        "budget_unit": "simulations" if search_backend(side_policies["A"]) in SINGLE_LEAF_ALGORITHMS else "neural_evaluations",
+        "budget_unit_a": "simulations" if search_backend(side_policies["A"]) in SINGLE_LEAF_ALGORITHMS else "neural_evaluations",
+        "budget_unit_b": "simulations" if search_backend(side_policies["B"]) in SINGLE_LEAF_ALGORITHMS else "neural_evaluations",
+        "precision": args.inference_dtype_a if args.inference_dtype_a == args.inference_dtype_b else "mixed",
+        "precision_a": args.inference_dtype_a,
+        "precision_b": args.inference_dtype_b,
+        "exploration_a": "zero_noise" if search_backend(side_policies["A"]) in SINGLE_LEAF_ALGORITHMS else "deterministic",
+        "exploration_b": "zero_noise" if search_backend(side_policies["B"]) in SINGLE_LEAF_ALGORITHMS else "deterministic",
         "tf32": False,
         "runtime_revision": models["A"].options["runtime_revision"],
         "search_max_depth": halving_config.max_depth,

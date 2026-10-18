@@ -1,0 +1,87 @@
+# Root-target ablation; choose using tuning positions only.
+
+[[arms]]
+name = 'gumbel'
+algorithm = 'gumbel'
+
+[[arms]]
+name = 'puct'
+algorithm = 'puct'
+cpuct = 1.0
+
+[[arms]]
+name = 'puct_rpo0p25'
+algorithm = 'puct'
+cpuct = 1.0
+target_policy = 'rpo'
+rpo_regularization = 0.25
+
+[[arms]]
+name = 'puct_rpo1p0'
+algorithm = 'puct'
+cpuct = 1.0
+target_policy = 'rpo'
+rpo_regularization = 1.0
+
+[[arms]]
+name = 'puct_rpo4p0'
+algorithm = 'puct'
+cpuct = 1.0
+target_policy = 'rpo'
+rpo_regularization = 4.0
+
+[[arms]]
+name = 'puct_variance'
+algorithm = 'puct_variance'
+cpuct = 1.75
+
+[[arms]]
+name = 'puct_variance_rpo0p25'
+algorithm = 'puct_variance'
+cpuct = 1.75
+target_policy = 'rpo'
+rpo_regularization = 0.25
+
+[[arms]]
+name = 'puct_variance_rpo1p0'
+algorithm = 'puct_variance'
+cpuct = 1.75
+target_policy = 'rpo'
+rpo_regularization = 1.0
+
+[[arms]]
+name = 'puct_variance_rpo4p0'
+algorithm = 'puct_variance'
+cpuct = 1.75
+target_policy = 'rpo'
+rpo_regularization = 4.0
+
+[[arms]]
+name = 'puct_v'
+algorithm = 'puct_v'
+cpuct = 1.75
+variance_c2 = 3.0
+
+[[arms]]
+name = 'puct_v_rpo0p25'
+algorithm = 'puct_v'
+cpuct = 1.75
+variance_c2 = 3.0
+target_policy = 'rpo'
+rpo_regularization = 0.25
+
+[[arms]]
+name = 'puct_v_rpo1p0'
+algorithm = 'puct_v'
+cpuct = 1.75
+variance_c2 = 3.0
+target_policy = 'rpo'
+rpo_regularization = 1.0
+
+[[arms]]
+name = 'puct_v_rpo4p0'
+algorithm = 'puct_v'
+cpuct = 1.75
+variance_c2 = 3.0
+target_policy = 'rpo'
+rpo_regularization = 4.0

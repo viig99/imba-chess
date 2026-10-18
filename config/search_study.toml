@@ -1,0 +1,16 @@
+# Initial fixed baselines. Tune on the tune split before a locked-test run.
+[[arms]]
+name = "gumbel"
+algorithm = "gumbel"
+
+[[arms]]
+name = "puct"
+algorithm = "puct"
+
+[[arms]]
+name = "puct_variance"
+algorithm = "puct_variance"
+
+[[arms]]
+name = "puct_v"
+algorithm = "puct_v"

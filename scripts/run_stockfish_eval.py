@@ -16,6 +16,7 @@ Defaults are the SF2600 protocol used for the self-play evals: UCI_Elo 2600,
 8 concurrent games, no random opening plies.
 """
 import argparse
+import hashlib
 from datetime import datetime
 import json
 import os
@@ -37,13 +38,14 @@ def atomic_json(path, value):
 
 def eval_arguments(args, batch, out, extra):
     """eval_vs_stockfish.py arguments for one batch (the SF protocol plus search options)."""
+    gumbel_default = [] if any(x.startswith("--model-move-policy") for x in extra) else ["--gumbel-value-scale", "0.5"]
     return ["--config", str(args.config), "--checkpoint", str(args.checkpoint),
             "--games", str(args.batch_games), "--ladder-elos", str(args.elo),
             "--ladder-games-per-segment", str(args.batch_games), "--no-include-full-strength-segment",
             "--stockfish-limit-strength", "--stockfish-elo", str(args.elo),
             "--stockfish-path", args.stockfish, "--stockfish-time-sec", "5",
             "--stockfish-nodes", str(args.nodes), "--stockfish-threads", "1", "--stockfish-hash-mb", "64",
-            "--device", "cuda", "--model-move-policy", "gumbel", "--gumbel-value-scale", "0.5",
+            "--device", "cuda", "--model-move-policy", "gumbel", *gumbel_default,
             "--concurrent-games", str(args.concurrent_games), "--max-plies", "512",
             "--opening-random-plies", "0", "--seed", str(args.seed_base + batch),
             "--save-games", "--save-games-dir", str(out / "games"),
@@ -78,6 +80,11 @@ def main():
                     runtime_revision=RUNTIME_REVISION,
                     git_head=subprocess.run(["git", "-C", str(ROOT), "rev-parse", "HEAD"],
                                             capture_output=True, text=True).stdout.strip())
+    search_parser = argparse.ArgumentParser(add_help=False)
+    search_parser.add_argument("--search-config", type=Path)
+    search_file, _ = search_parser.parse_known_args(extra)
+    if search_file.search_config is not None:
+        manifest["search_config_sha256"] = hashlib.sha256(search_file.search_config.read_bytes()).hexdigest()
     manifest_path = args.out / "manifest.json"
     if manifest_path.exists():
         saved = json.loads(manifest_path.read_text())

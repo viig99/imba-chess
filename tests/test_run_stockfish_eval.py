@@ -96,3 +96,41 @@ def test_runner_resumes_real_ladder_results(monkeypatch, tmp_path, stale):
         runner["main"]()
         aggregate = json.loads((out / "results.json").read_text())["aggregate"]
         assert aggregate["games"] == 50 and aggregate["score"] == 0.3
+
+
+def test_puct_runner_does_not_inject_gumbel_only_flags(monkeypatch, tmp_path):
+    runner = runpy.run_path("scripts/run_stockfish_eval.py")
+    evaluator = runpy.run_path("scripts/eval_vs_stockfish.py")
+    args = SimpleNamespace(config=Path("config/imba_chess_v4_aux3.toml"), checkpoint=tmp_path / "actor.pt",
+                           batch_games=50, elo=2600, stockfish="/usr/bin/stockfish", nodes=40000,
+                           concurrent_games=8, seed_base=1042)
+    extra = ["--model-move-policy", "puct_variance_rpo", "--simulations", "256",
+             "--search-config", "config/self_play_puct_variance_rpo.toml"]
+    argv = runner["eval_arguments"](args, 0, tmp_path, extra)
+    monkeypatch.setattr(sys, "argv", ["eval_vs_stockfish.py", *argv])
+    parsed = evaluator["_parse_args"]()
+    assert parsed.model_move_policy == "puct_variance_rpo"
+    assert parsed.gumbel_value_scale is None and parsed.gumbel_simulations is None
+    assert parsed.simulations == 256
+
+
+def test_runner_rejects_changed_search_file_on_resume(monkeypatch, tmp_path):
+    import hashlib
+    runner = runpy.run_path("scripts/run_stockfish_eval.py")
+    checkpoint, config, search = (tmp_path / f for f in ("actor.pt", "model.toml", "search.toml"))
+    checkpoint.touch()
+    config.touch()
+    search.write_text('[search]\nalgorithm="puct_variance"\ncpuct=1.75\n')
+    out = tmp_path / "eval"
+    out.mkdir()
+    extra = ["--model-move-policy", "puct_variance", "--search-config", str(search)]
+    manifest = dict(checkpoint=str(checkpoint.resolve()), config=str(config.resolve()), games=50,
+                    batch_games=50, seed_base=1042, stockfish_elo=2600, stockfish_nodes=40000,
+                    concurrent_games=8, search_args=extra, runtime_revision=runner["RUNTIME_REVISION"],
+                    search_config_sha256=hashlib.sha256(search.read_bytes()).hexdigest())
+    (out / "manifest.json").write_text(json.dumps(manifest))
+    search.write_text(search.read_text().replace("1.75", "2.0"))
+    monkeypatch.setattr(sys, "argv", ["run_stockfish_eval.py", "--checkpoint", str(checkpoint),
+                                     "--config", str(config), "--out", str(out), "--games", "50", "--", *extra])
+    with pytest.raises(SystemExit, match="search_config_sha256"):
+        runner["main"]()

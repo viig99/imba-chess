@@ -71,11 +71,12 @@ def evaluate_pair_checkpoints(
         raise ValueError(f"evaluation needs {pairs} held-out source-game prefixes")
     if len({s.source_id for s in seeds[:pairs]}) != pairs:
         raise ValueError("evaluation prefixes must have distinct source games")
+    algorithm = getattr(config.search, "algorithm", "gumbel")
     if any(
-        getattr(runtime, "algorithm", "gumbel") != "gumbel"
+        getattr(runtime, "algorithm", algorithm) != algorithm
         for runtime in (candidate, best)
     ):
-        raise ValueError("self-play screening requires Gumbel for the entire match")
+        raise ValueError("self-play screening requires the configured search for the entire match")
     output = Path(output)
     import json
 
@@ -88,9 +89,9 @@ def evaluate_pair_checkpoints(
         inference=dict(
             candidate=getattr(candidate, "options", {}),
             best=getattr(best, "options", {}),
-            algorithm="gumbel",
+            algorithm=algorithm,
             simulations=config.search.simulations,
-            exploration="gumbel_noise" if gumbel_noise else "zero_gumbel_noise",
+            exploration=("gumbel_noise" if gumbel_noise else "zero_gumbel_noise") if algorithm == "gumbel" else ("dirichlet_noise" if gumbel_noise else "zero_dirichlet_noise"),
             precision="float32",
             tf32=False,
         ),

@@ -174,8 +174,9 @@ class EvalVsStockfishConfig:
     concurrent_games: int = 1
 
     def __post_init__(self):
-        if self.model_move_policy not in ("gumbel", "value_search_halving"):
-            raise ValueError("model_move_policy must be gumbel or value_search_halving")
+        if self.model_move_policy not in ("gumbel", "value_search_halving", "policy", "policy_q",
+                                         "puct", "puct_variance", "puct_v", "puct_rpo", "puct_variance_rpo"):
+            raise ValueError("unsupported model_move_policy")
 
 
 @dataclass(frozen=True)

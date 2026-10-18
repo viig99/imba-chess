@@ -10,6 +10,7 @@ import torch
 from imba_chess.eval import cozy_bridge
 from imba_chess.eval import inference_runtime as runtime
 from imba_chess.eval.gumbel_search import GumbelConfig
+from imba_chess.eval.puct_search import PuctConfig, select_puct
 from imba_chess.eval.search import HalvingConfig, PositionEval
 from tests.test_self_play import VOCAB, ENCODER
 
@@ -38,7 +39,7 @@ def make_runtime(monkeypatch, algorithm):
 
 
 @pytest.mark.parametrize(
-    "algorithm,single", [("gumbel", True), ("value_search_halving", False)]
+    "algorithm,single", [("gumbel", True), ("puct", True), ("puct_variance", True), ("puct_v", True), ("value_search_halving", False)]
 )
 def test_algorithm_owns_execution_choices(monkeypatch, algorithm, single):
     instance, options = make_runtime(monkeypatch, algorithm)
@@ -129,6 +130,10 @@ class UniformEvaluator:
     "algorithm,config",
     [
         ("gumbel", GumbelConfig(simulations=16, top_m=4)),
+        *[(algorithm, PuctConfig(algorithm=algorithm, simulations=16, max_depth=3))
+          for algorithm in ("puct", "puct_variance", "puct_v")],
+        ("puct_variance", PuctConfig(algorithm="puct_variance", simulations=16,
+                                     max_depth=3, target_policy="rpo", rpo_regularization=0.015625)),
         ("value_search_halving", HalvingConfig(budget=32, top_m=4, max_depth=3)),
     ],
 )
@@ -145,7 +150,7 @@ def test_shared_dispatch_preserves_search_results(monkeypatch, algorithm, config
     logits = torch.zeros(len(VOCAB))
     root = dict(logits=logits[None], value_logits=torch.zeros(1, 3), kv_caches=[])
     owner = ("actor", "game")
-    noise = 0.0 if algorithm == "gumbel" else None
+    noise = 0.0 if algorithm != "value_search_halving" else None
     gen = instance.search_batch(
         board=board,
         batch={"total_tokens": 1},
@@ -168,8 +173,9 @@ def test_shared_dispatch_preserves_search_results(monkeypatch, algorithm, config
             request = gen.send((owner, answer))
     except StopIteration as stop:
         actual = stop.value
-    if algorithm == "gumbel":
-        expected = select_gumbel(
+    if algorithm != "value_search_halving":
+        select = select_gumbel if algorithm == "gumbel" else select_puct
+        expected = select(
             evaluator=evaluator,
             board=board,
             config=config,

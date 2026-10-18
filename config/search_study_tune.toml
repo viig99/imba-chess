@@ -1,0 +1,65 @@
+# Small prespecified tuning grid. Never select parameters on the test split.
+
+[[arms]]
+name = 'gumbel'
+algorithm = 'gumbel'
+
+[[arms]]
+name = 'puct_c0p25'
+algorithm = 'puct'
+cpuct = 0.25
+
+[[arms]]
+name = 'puct_c0p5'
+algorithm = 'puct'
+cpuct = 0.5
+
+[[arms]]
+name = 'puct_c1p0'
+algorithm = 'puct'
+cpuct = 1.0
+
+[[arms]]
+name = 'puct_c1p75'
+algorithm = 'puct'
+cpuct = 1.75
+
+[[arms]]
+name = 'puct_variance_c0p25'
+algorithm = 'puct_variance'
+cpuct = 0.25
+
+[[arms]]
+name = 'puct_variance_c0p5'
+algorithm = 'puct_variance'
+cpuct = 0.5
+
+[[arms]]
+name = 'puct_variance_c1p0'
+algorithm = 'puct_variance'
+cpuct = 1.0
+
+[[arms]]
+name = 'puct_variance_c1p75'
+algorithm = 'puct_variance'
+cpuct = 1.75
+
+[[arms]]
+name = 'puct_v_b0p5'
+algorithm = 'puct_v'
+variance_c2 = 0.5
+
+[[arms]]
+name = 'puct_v_b1p5'
+algorithm = 'puct_v'
+variance_c2 = 1.5
+
+[[arms]]
+name = 'puct_v_b3p0'
+algorithm = 'puct_v'
+variance_c2 = 3.0
+
+[[arms]]
+name = 'puct_v_b6p0'
+algorithm = 'puct_v'
+variance_c2 = 6.0

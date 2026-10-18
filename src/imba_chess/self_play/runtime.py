@@ -25,7 +25,7 @@ def load_runtime(config, checkpoint, device, *, stats=None, dtype="float32"):
         repo_config=load_repo_config(Path(config.base_config)),
         checkpoint=checkpoint,
         device=device,
-        algorithm="gumbel",
+        algorithm=getattr(config.search, "algorithm", "gumbel"),
         root_batch_tokens=config.collection.root_batch_tokens,
         stats=stats,
         dtype=INFERENCE_DTYPES[dtype],
