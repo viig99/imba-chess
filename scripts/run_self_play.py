@@ -335,6 +335,10 @@ def main():
                 if kept and not Path(kept["best"]).exists():
                     kept = {}
                 state = dict(restored, config_id=cfg.identifier, **kept)
+                if "actor_id" not in state:
+                    # The initial actor-000000.pt is saved before its own hash is known;
+                    # initialization then sets actor_id to that file's hash.
+                    state["actor_id"] = file_hash(checkpoint)
                 ema_actor = state.get("ema_actor")
                 if ema_actor and not Path(ema_actor).exists():
                     # Pruned since; the full state holds the same EMA weights.

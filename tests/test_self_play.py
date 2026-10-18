@@ -700,6 +700,60 @@ def test_runner_accepts_previous_config_and_screens_ema(tmp_path, monkeypatch):
     assert [name for name, _ in screens[-2:]] == ["screen-000003.json", "screen-ema-000003.json"]
 
 
+def test_runner_resumes_a_crash_before_the_first_full_save(tmp_path, monkeypatch):
+    import sys
+    import scripts.run_self_play as runner
+    from imba_chess.self_play.config import (
+        SelfPlayConfig, RunConfig, CollectionConfig, ReplayConfig,
+    )
+
+    def runtime(cfg, checkpoint, device):
+        model = tiny_model()
+        if checkpoint.exists():
+            model.load_state_dict(torch.load(checkpoint, weights_only=False)["model"])
+        return IdentifiedRuntime(model), 128
+
+    cfg = SelfPlayConfig(
+        learning=LearningConfig(auxiliary_value_weight=0.0),
+        search=GumbelConfig(simulations=1, max_depth=1),
+        collection=CollectionConfig(concurrent_games=2, fresh_positions=2),
+        replay=ReplayConfig(window_positions=20, flush_games=2),
+        run=RunConfig(screen_pairs=1, confirmation_pairs=1),
+    )
+    source = "monitor"
+    while source_split(source) != "monitor":
+        source += "x"
+    monitor = [Seed("monitor", source, ["f2f3", "e7e5", "g2g4"], 3, "monitor", "c")]
+    seed_path = tmp_path / "seeds.json"
+    seed_path.write_text("test")
+    monkeypatch.setattr(runner, "load_config", lambda path: cfg)
+    monkeypatch.setattr(runner, "load_runtime", runtime)
+    monkeypatch.setattr(runner, "load_seeds", lambda path, split: monitor)
+    monkeypatch.setattr(
+        runner, "StreamingStarts",
+        lambda directory, config, should_stop, durable_launches: mate_starts(
+            directory, config, per_bucket=64, should_stop=should_stop,
+            durable_launches=durable_launches)[0],
+    )
+    output = tmp_path / "run"
+    base = ["run_self_play.py", "--config", "unused", "--seeds", str(seed_path),
+            "--output", str(output), "--device", "cpu", "--collect-workers", "1",
+            "--no-continuous", "--screen-games", "1000"]
+
+    def run(*extra):
+        monkeypatch.setattr(sys, "argv", base + list(extra))
+        runner.main()
+        return json.loads((output / "state.json").read_text())
+
+    initial = run("--initialize", str(tmp_path / "weights.pt"), "--max-iterations", "0")
+    assert initial["checkpoint"].endswith("actor-000000.pt")
+    # A crash after the first iterations but before the first full save leaves state.json
+    # ahead of the initial actor, whose saved progress predates its own actor_id.
+    (output / "state.json").write_text(json.dumps(dict(initial, iteration=1, actor_id="later")))
+    state = run("--resume", "--max-iterations", "2")
+    assert state["iteration"] == 2 and not state["halted"]
+
+
 def test_hard_budget_exits_process():
     import subprocess
     import sys
