@@ -24,7 +24,9 @@ A matched comparison is staged but not launched: both arms use `improved_wdl` at
 on Gumbel-trained weights. On ema-554 at 512 simulations it scored 0.365 against
 Stockfish 2600 over 200 games; earlier checkpoints scored about 0.44 with Gumbel.
 It visits about 5 root moves, against Gumbel's 15, and misses low-prior best moves.
-Evaluate with Gumbel.
+Evaluate with Gumbel. As a teacher it is also weaker under training noise. Every PUCT
+visit target scores 0.013 to 0.019 more target regret than Gumbel's, and Lc0's
+self-play FPU of 0 makes it worse. See the 2026-10-19 rerun below.
 
 RPO is not advanced. Its preset factor (1/64) was tuned on frozen target regret,
 which rewards concentrating mass on the best-Q move. It produces near one-hot
@@ -269,6 +271,58 @@ test roots, expected-score error against the Stockfish root:
 | Training noise, seed 1 | 0.1661 / -0.0801 | 0.1377 / -0.0039 | -0.0284 [-0.0316, -0.0253] |
 
 The raw network scores 0.1660 / -0.0333. Results: `artifacts/eval/gumbel-improved-wdl-noise-2026-10-18/`.
+
+### Training-noise rerun of every fixed variant (2026-10-19)
+
+Self-play trains on searches run with root noise. This rerun scores those searches
+directly, with every fix since the study above in place: Gumbel's `improved_wdl`,
+the exact Lc0 parent Q (`lc0_parent_q`), PUCT-V's paper log N (`paper_log_n`), and
+self-play FPU settings. Setup: same frozen actor-000550 and 4,110 test roots, 256
+simulations, bf16. Each root has one noise-off search and two training-noise seeds,
+and every arm uses the same noise draws. Differences are paired by source game, in
+the same order as the table (negative favours the row).
+
+| Variant | Target regret, training noise | vs variance PUCT | vs Gumbel | Visited root moves | Target entropy | Value label MAE |
+|---|---:|---:|---:|---:|---:|---:|
+| Gumbel | **0.0458** | -0.0132 | — | 14.9 | 0.52 | 0.1377 |
+| Variance PUCT (recipe) | 0.0591 | — | +0.0132 | 6.9 | 0.88 | 0.1358 |
+| Variance PUCT, Lc0 parent Q | 0.0588 | -0.0003 | +0.0130 | 6.8 | 0.88 | 0.1355 |
+| Variance PUCT, self-play FPU 0 at the root | 0.0756 | +0.0165 | +0.0297 | 18.7 | 1.31 | 0.1375 |
+| Variance PUCT, self-play FPU 0 everywhere | 0.0744 | +0.0153 | +0.0285 | 18.8 | 1.30 | 0.1391 |
+| Lc0 self-play constants (PUCT, cpuct 1.2, no growth, FPU 0) | 0.0795 | +0.0204 | +0.0336 | 19.2 | 1.44 | 0.1399 |
+| PUCT | 0.0635 | +0.0044 | +0.0176 | 8.7 | 1.08 | 0.1371 |
+| PUCT, Lc0 parent Q | 0.0633 | +0.0043 | +0.0175 | 8.7 | 1.08 | 0.1368 |
+| PUCT-V | 0.0648 | +0.0057 | +0.0190 | 8.6 | 1.10 | 0.1387 |
+| PUCT-V, paper log N and Lc0 parent Q | 0.0645 | +0.0055 | +0.0187 | 8.6 | 1.10 | 0.1385 |
+| PUCT + RPO | 0.0497 | -0.0094 | +0.0039 | 8.7 | 0.64 | 0.1363 |
+| Variance PUCT + RPO | 0.0445 | -0.0146 | -0.0014 | 6.9 | 0.23 | 0.1349 |
+
+The difference columns average the two seeds. Each seed's 95% interval excludes zero,
+with two exceptions. Lc0 parent Q is significant in one seed only. Variance PUCT +
+RPO against Gumbel is within noise, for example [-0.0047, +0.0013] in seed 0. The value
+label is `improved_wdl` for Gumbel. For PUCT's visit target it equals `search_wdl`.
+
+- Under training noise, every PUCT visit target is 0.013 to 0.019 worse than Gumbel's.
+  Gumbel's target barely changes with noise on (0.0456 noise off, 0.0458 on).
+  Variance PUCT's gets 0.004 worse.
+- Self-play FPU 0, Lc0's self-play setting, is rejected. It nearly triples the
+  visited root moves, but the policy target is raw visit counts. At 256 simulations,
+  the visits it spends on bad moves enter that target directly. Lc0 self-play
+  searches far more nodes per move. The option was not merged.
+- The exact Lc0 parent Q and paper log N change target regret by 0.0003 or less.
+  Both stay off by default.
+- On the real network, the variance factor on cpuct averages 0.40 (median 0.37, p10
+  0.21, p90 0.63), so variance PUCT's effective cpuct is about 0.7.
+- Only RPO matches Gumbel's target regret, and only with near one-hot targets.
+  Those targets did not train a better network in the screen below.
+- Value labels are now within 0.005 MAE across methods.
+
+Reruns with identical inputs are bit-identical (Gumbel: 12,330 of 12,330 searches).
+Noise-off and training-noise searches share bf16 batches. An arm whose training-noise
+searches differ therefore perturbs a few noise-off searches (29 to 69 of 4,110 roots,
+no move changes), even though noise-off code paths are unchanged. Results, the
+analysis script and the per-root variance log are in
+`artifacts/eval/puct-selfplay-fpu-2026-10-19/`.
 
 ## Two-seed learning screen
 
