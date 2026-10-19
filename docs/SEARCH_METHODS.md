@@ -4,12 +4,33 @@ All commands below run from the repository root. Gumbel remains the default.
 The added methods use the same native chess transitions and node statistics,
 compiled single-leaf CUDA decoder, KV workspace, root carry, batch scheduler,
 collection workers, and replay schema. They need no checkpoint conversion.
-Ordinary self-play has not been restarted as part of this integration.
 
-**Current learning candidate: variance-scaled PUCT without RPO.** It improved
-raw policy expected Stockfish regret in both short training seeds. RPO remains
-available for ablations; its frozen-target advantage did not become a repeated
-learning advantage. No method has established an Elo gain in this study.
+**Status (2026-10-19): Gumbel is the default and the live recipe, now trained on
+`improved_wdl` at `value_search_mix = 0.25`. Whether variance-scaled PUCT learns
+better is open.** Variance-scaled PUCT without RPO is still the only method with
+a repeated learning gain: raw policy regret in both short seeds of the screen
+below. That screen predates two changes that bear on it:
+
+- Gumbel's value label was fixed. Its old `search_wdl` label was about as poor
+  as the raw network (see the value table below).
+- PUCT self-play played the most-visited move. The first real PUCT run (2026-10-18)
+  collapsed its initial-board games onto one repeated drawn line. Even on the same
+  weights at iteration 0, 19.5% of its games ended in threefold repetition, against
+  7.4% for Gumbel. Self-play now samples moves, through `sample_plies` and the late
+  sampling options (see Train and resume).
+
+A matched comparison is staged but not launched: both arms use `improved_wdl` at mix
+0.25 and differ only in `[search]`. As an inference search, variance PUCT is weaker
+on Gumbel-trained weights. On ema-554 at 512 simulations it scored 0.365 against
+Stockfish 2600 over 200 games; earlier checkpoints scored about 0.44 with Gumbel.
+It visits about 5 root moves, against Gumbel's 15, and misses low-prior best moves.
+Evaluate with Gumbel.
+
+RPO is not advanced. Its preset factor (1/64) was tuned on frozen target regret,
+which rewards concentrating mass on the best-Q move. It produces near one-hot
+targets: entropy 0.23 against Gumbel's 0.53. It tied Gumbel on raw policy and had
+higher value error. A retry should choose the factor for a Gumbel-like target
+entropy, not for frozen regret. No method has established an Elo gain over Gumbel.
 
 ## Supported choices and exact presets
 
@@ -78,6 +99,27 @@ The TOML `[search]` section uses canonical `algorithm = "puct_variance"` with
 alias. Collection retains seeded root exploration. Standalone evaluations and
 normal checkpoint screens explicitly disable exploration. Fast decided-game
 playouts also work with these methods; `fast_top_m` only applies to Gumbel.
+
+PUCT self-play chooses the played move with three `[search]` options. All of
+them leave the training target unchanged, and they apply only while root noise
+is on, so evaluations always play the most-visited move. Gumbel needs none of
+them: its noise already varies the played move at every ply.
+
+- `sample_plies`: game plies below it play a visit-proportional sample
+  (AlphaZero's opening temperature).
+- `late_temperature` and `late_value_cutoff`: from ply `sample_plies` on, play a
+  `visits^(1/T)` sample among visited moves whose Q is within the cutoff of the
+  most-visited move's.
+
+All three default to 0, which keeps the most-visited move. They are dropped from
+the run identifier at 0. `self_play_puct_variance.toml` sets 30, 1.0 and 0.05.
+These settings were calibrated on stored targets after ply 30. They depart from
+the most-visited move at 24.8% of positions, for a mean Q loss of 0.001 and none
+above 0.05. Gumbel's played move departs from its greedy choice at 26.7%, with a
+mean loss of 0.006 and 4.4% above 0.05. Whether they bring PUCT's threefold
+rate down to Gumbel's has not yet been measured in games. Start buckets cover
+plies 0, 1-30, 31-70 and 71-120, so `sample_plies` alone never reaches half of
+the starts.
 The new methods retain the existing maximum CUDA workspace depth of 32.
 
 ## Inference and matches
@@ -340,6 +382,12 @@ The next learning comparison should prioritize **Gumbel versus variance-scaled
 PUCT without RPO** over a longer training budget. Keep the starting checkpoint,
 exposure budgets, and evaluation cohort matched. The current results do not
 justify selecting RPO as the stronger learner solely from frozen-target regret.
+
+Update, 2026-10-19: this screen ran with Gumbel's old `search_wdl` value label
+and with PUCT playing the most-visited move after the opening. Both have since
+changed (see the status at the top), so the gain above is not yet a result
+under the current recipe. Compare at matched hours, and evaluate both arms with
+Gumbel. Also watch the raw policy's golden-set regret and the threefold rate.
 
 Detailed source results: `raw-learning-test/summary.json`,
 `seed-43/raw-learning-test/summary.json`,
