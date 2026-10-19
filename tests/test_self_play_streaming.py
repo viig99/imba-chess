@@ -229,3 +229,68 @@ def test_real_producer_restart_preserves_next_block(tmp_path, rows):
         )
         assert actual["groups"] == expected
         assert actual["source_rows"] == 12
+
+
+def _local_stream_config(tmp_path, rows, **streaming):
+    from pathlib import Path
+
+    corpus = tmp_path / "corpus.parquet"
+    pq.write_table(pa.Table.from_pylist(rows), corpus, row_group_size=7)
+    base = tmp_path / "base.toml"
+    base.write_text(
+        Path("config/imba_chess_v4.toml")
+        .read_text()
+        .replace("[dataset]", f'[dataset]\nlocal_corpus_path = "{corpus}"')
+    )
+    return replace(SelfPlayConfig(), base_config=str(base),
+                   streaming=StreamingConfig(block_rows=12, startup_timeout=20, **streaming)), base
+
+
+def test_child_stream_continues_after_parent_instead_of_replaying_it(tmp_path, rows):
+    cfg, base = _local_stream_config(tmp_path, rows)
+    parent = tmp_path / "parent"
+    with StreamingStarts(parent, cfg) as sampler:
+        first = sampler._block(0)
+    produced = len(list(parent.glob("block-*.json")))
+    assert produced in (1, 2)
+    child = tmp_path / "child"
+    with StreamingStarts(child, cfg, continue_from=[parent]) as continued:
+        block = continued._block(0)
+        dataset, source = open_source(dataset_settings(base))
+        expected = make_block(dataset, list(source)[12 * produced:12 * produced + 12],
+                              identity=continued.identity, number=0, run_seed=cfg.run.seed)
+        assert block["groups"] == expected
+        assert continued.identity != sampler.identity
+    parent_sources = {s["source_id"] for f in parent.glob("block-*.json")
+                      for group in json.loads(f.read_text())["groups"] for s in group}
+    child_sources = {s["source_id"] for group in block["groups"] for s in group}
+    assert child_sources and not child_sources & parent_sources
+    # Without the fix, a new stream restarts the corpus and replays the parent's first block.
+    with StreamingStarts(tmp_path / "fresh", cfg) as fresh:
+        assert fresh._block(0)["groups"] == make_block(
+            dataset, list(open_source(dataset_settings(base))[1])[:12],
+            identity=fresh.identity, number=0, run_seed=cfg.run.seed)
+        assert fresh.identity == sampler.identity and first["groups"] == fresh._block(0)["groups"]
+    # A resumed child keeps its start; re-applying a parent to an existing stream is refused.
+    restored = StreamingStarts(child, cfg, start_worker=False)
+    assert restored.identity == continued.identity
+    with pytest.raises(ValueError, match="only to a new stream"):
+        StreamingStarts(child, cfg, start_worker=False, continue_from=[parent])
+
+
+def test_continuation_takes_the_furthest_parent_and_rejects_other_corpora(tmp_path, rows):
+    from imba_chess.self_play.streaming import continuation_start
+
+    cfg, base = _local_stream_config(tmp_path, rows)
+    behind_cfg = replace(cfg, streaming=replace(cfg.streaming, prefetch_blocks=1))
+    ahead, behind = tmp_path / "ahead", tmp_path / "behind"
+    with StreamingStarts(ahead, cfg) as sampler:
+        sampler._block(1)
+    with StreamingStarts(behind, behind_cfg) as sampler:
+        sampler._block(0)
+    assert len(list(behind.glob("block-*.json"))) == 1 < len(list(ahead.glob("block-*.json")))
+    dataset = json.loads(json.dumps(dataset_settings(base)))
+    for order in ([behind, ahead], [ahead, behind]):
+        assert continuation_start(order, dataset)["parent"] == str(ahead)
+    with pytest.raises(ValueError, match="different corpus"):
+        continuation_start([ahead], dict(dataset, min_elo=dataset.get("min_elo", 0) + 1))

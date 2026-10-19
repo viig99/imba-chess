@@ -149,6 +149,9 @@ def produce(directory):
                 dataset, source = open_source(settings["dataset"])
                 if last:
                     source.load_state_dict(last["source_state"])
+                elif "start" in settings:
+                    # A run continuing its parent's stream reads from where the parent stopped.
+                    source.load_state_dict(settings["start"]["source_state"])
                 iterator = iter(source)
             rows, exhausted = [], False
             for _ in range(settings["block_rows"]):
@@ -187,11 +190,51 @@ def produce(directory):
             number += 1
 
 
+def _source_position(state):
+    """(epoch, shard, row in shard) of a checkpointed streaming source."""
+    node = state
+    while "examples_iterable" in node:
+        node = node["examples_iterable"]
+    if "shard_idx" not in node or "shard_example_idx" not in node:
+        raise ValueError("cannot order streaming source states")
+    return state.get("epoch", 0), node["shard_idx"], node["shard_example_idx"]
+
+
+def continuation_start(parents, dataset):
+    """The source state after the last block any parent stream produced, furthest first.
+
+    A run initialized from another run otherwise restarts the corpus at row 0 and replays
+    the parent's starts exactly: block 0 was byte-identical across the 2026-10 lineage.
+    Parents must read the same corpus with the same filters, or their states are not
+    positions in this stream.
+    """
+    candidates = []
+    for directory in map(Path, parents):
+        parent = json.loads((directory / "settings.json").read_text())
+        if parent["dataset"] != dataset:
+            raise ValueError(f"{directory}: parent stream reads a different corpus")
+        blocks = sorted(directory.glob("block-*.json"))
+        if not blocks:
+            raise ValueError(f"{directory}: parent stream has no blocks")
+        last = json.loads(blocks[-1].read_text())
+        if last["exhausted"]:
+            raise ValueError(f"{directory}: parent stream exhausted the corpus")
+        candidates.append(dict(source_state=last["source_state"], parent=str(directory),
+                               parent_identity=parent["identity"], parent_blocks=len(blocks)))
+    if not candidates:
+        raise ValueError("no parent streams")
+    if len(candidates) > 1:
+        candidates.sort(key=lambda c: _source_position(c["source_state"]))
+    return candidates[-1]
+
+
 class StreamingStarts:
     def __init__(
         self, directory, config, *, should_stop=lambda: False, start_worker=True,
-        durable_launches=True,
+        durable_launches=True, continue_from=(),
     ):
+        # continue_from: parent run stream directories for a new stream to continue
+        # (see continuation_start); a resumed stream keeps the start it was created with.
         # durable_launches=False skips the per-launch fsync; the caller saves
         # (or reconciles) once per batch of launches. Self-play collection then
         # journals before every replay flush, so every published game's launch
@@ -225,10 +268,16 @@ class StreamingStarts:
                 max_game_plies=config.collection.max_game_plies,
                 max_depth=config.search.max_depth,
             )
+        path = self.directory / "settings.json"
+        if continue_from:
+            if path.exists():
+                raise ValueError("continue_from applies only to a new stream")
+            settings["start"] = continuation_start(continue_from, json.loads(json.dumps(settings["dataset"])))
+        elif path.exists() and "start" in (saved := json.loads(path.read_text())):
+            settings["start"] = saved["start"]
         settings["identity"] = stable_hash(json.dumps(settings, sort_keys=True))
         # Normalize tuples through JSON before comparing saved settings.
         settings = json.loads(json.dumps(settings))
-        path = self.directory / "settings.json"
         if path.exists():
             if json.loads(path.read_text()) != settings:
                 raise ValueError("stream settings changed; use a separate run")

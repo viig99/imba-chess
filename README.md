@@ -105,6 +105,8 @@ Worker deadlines also cover incomplete pipe messages. Stop requests prevent new 
 
 `--initialize-optimizer` carries the supervised optimizer and remaining OneCycleLR schedule into self-play. After that schedule ends, learning continues at each parameter group's terminal minimum rate. This behavior and the schedule clock survive stage-2 checkpoints.
 
+Streamed starts read the Lichess corpus in a fixed order, from row 0 of a new run's stream. A run initialized from another run therefore replays its parent's starts exactly (same games, same takeover plies) unless it continues the parent's stream. `--stream-from RUN_DIR [RUN_DIR ...]` (with `--initialize`) starts the new stream after the last block any listed run produced. List every earlier run of the lineage, and the furthest one is used. The start position becomes part of the stream identity, and a resumed run keeps it. Without the flag, new streams keep their previous identity.
+
 Search inference supports CUDA FP32 or BF16 with TF32 disabled. Gumbel and the PUCT family use the compiled decoder and reusable workspace (maximum depth 32); halving uses the grouped cached decoder with its configured depth. Runtime choices follow the selected algorithm. Ordinary model-component SDPA remains unchanged. Compilation adds first-use latency. Historical measurements remain in the [readiness report](docs/SELF_PLAY_READINESS_REVIEW_2026-09-11.md).
 
 Use [the config guide](docs/CONFIG_GUIDE.md) before changing an existing run. The 5090 recipe reproduces the running tactical fork of the vmix run (auxiliary-value base config); it is not a measured performance promise.

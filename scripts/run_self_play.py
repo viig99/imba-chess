@@ -54,6 +54,12 @@ def main():
         help="With --initialize, screen against this checkpoint (copied into the run) instead of "
              "the initial actor, e.g. to keep a restarted run's screens on the original baseline",
     )
+    parser.add_argument(
+        "--stream-from", type=Path, nargs="+", default=[], metavar="RUN_DIR",
+        help="With --initialize, continue the Lichess start stream after the furthest point any of "
+             "these runs reached (each RUN_DIR/stream), instead of restarting the corpus at row 0 "
+             "and replaying the parent's starts",
+    )
     parser.add_argument("--seeds", type=Path, default=DEFAULT_SEEDS, help=f"default {DEFAULT_SEEDS}")
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--device", default="cuda")
@@ -156,6 +162,8 @@ def main():
         parser.error("--initialize-optimizer requires --initialize")
     if args.screen_best and not args.initialize:
         parser.error("--screen-best requires --initialize")
+    if args.stream_from and not args.initialize:
+        parser.error("--stream-from requires --initialize")
     if args.concurrent_games is not None and args.concurrent_games < 1:
         parser.error("--concurrent-games must be positive")
     if args.collect_workers < 1:
@@ -273,6 +281,7 @@ def main():
                 args.output / "stream", cfg, should_stop=lambda: not budget.launch(),
                 # Collection journals launches before each replay flush instead.
                 durable_launches=cfg.regret is not None,
+                **({"continue_from": [d / "stream" for d in args.stream_from]} if args.stream_from else {}),
             )
         )
         if args.resume and state.get("stream_identity") != start_sampler.identity:
