@@ -220,8 +220,9 @@ class SelfPlayConfig:
             del settings["learning"]["ema_decay"]
         if self.learning.value_search_source == "search_wdl":
             del settings["learning"]["value_search_source"]
-        if settings["search"].get("sample_plies") == 0:
-            del settings["search"]["sample_plies"]
+        for key in ("sample_plies", "late_temperature", "late_value_cutoff"):
+            if settings["search"].get(key) == 0:
+                del settings["search"][key]
         # PUCT runs from before the paper-exact options keep their identity.
         for key in ("lc0_parent_q", "paper_log_n"):
             if settings["search"].get(key) is False:

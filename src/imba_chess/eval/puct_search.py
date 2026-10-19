@@ -50,6 +50,13 @@ class PuctConfig:
     # mean of child returns. PUCT-V's paper log N, not ln(N + 1).
     lc0_parent_q: bool = False
     paper_log_n: bool = False
+    # With root noise on, plies from sample_plies on play a visits^(1/T) sample among
+    # visited moves whose Q is within late_value_cutoff of the most-visited move's
+    # (Lc0's endgame temperature and value cutoff); 0 keeps the most-visited move.
+    # Gumbel's noise already varies its played move at every ply; without this,
+    # PUCT self-play ended ~2.5x as many games in threefold repetition.
+    late_temperature: float = 0.0
+    late_value_cutoff: float = 0.0
 
     def __post_init__(self):
         if self.algorithm not in PUCT_ALGORITHMS:
@@ -190,10 +197,16 @@ def puct_stepwise(*, board, extend, root_handle=None, config=PuctConfig(), rng=N
     visits, _, qvalues = root.stats.snapshot()
     # Visits define both the played move and the untempered training policy. Root
     # exploration affects visits, as in AlphaZero; with noise off the move is deterministic.
+    action = max(range(n), key=lambda i: (visits[i], qvalues[i], root_eval.legal_log_priors[i], -i))
     if noise is None and board.ply() < config.sample_plies:
         action = rng.choices(range(n), weights=visits)[0]
-    else:
-        action = max(range(n), key=lambda i: (visits[i], qvalues[i], root_eval.legal_log_priors[i], -i))
+    elif noise is None and config.late_temperature:
+        floor = qvalues[action] - config.late_value_cutoff
+        candidates = [i for i in range(n) if visits[i] and qvalues[i] >= floor]
+        # Scaled by the top count so a small temperature cannot overflow.
+        top = visits[action]
+        action = rng.choices(candidates, weights=[(visits[i] / top) ** (1 / config.late_temperature)
+                                                  for i in candidates])[0]
     if on_played is not None:
         on_played(root.children.get(action))
     policy = [v / config.simulations for v in visits]

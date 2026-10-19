@@ -18,8 +18,16 @@ dirichlet_fraction = 0.25
 # Play a visit-proportional sample for game plies 0-29 (AlphaZero's opening temperature);
 # evals and screens run without noise and keep the most-visited move. Without it the
 # 2026-10-18 run's initial-board games (25% of starts) collapsed from iteration 99 onto
-# one repeated drawn line. Lichess-seeded starts take over at ply ~48, so they are unaffected.
+# one repeated drawn line. Lichess starts in the 1-30 bucket are sampled up to ply 30.
 sample_plies = 30
+# From ply 30, sample visits^(1/T) among visited moves within 0.05 Q of the most-visited
+# move. Argmax play after the opening ended 19.5% of iteration-0 games in threefold
+# repetition (Gumbel, whose noise varies its played move every ply: 7.4%), in every start
+# bucket. On stored targets these settings stray from the most-visited move at 24.8% of
+# positions after ply 30 for a mean Q loss of 0.001 and none above 0.05; Gumbel's played
+# move strays from its greedy one at 26.7%, mean loss 0.006, 4.4% above 0.05.
+late_temperature = 1.0
+late_value_cutoff = 0.05
 
 [collection]
 concurrent_games = 160

@@ -38,8 +38,9 @@ def puct_config(method: str, *, path: Path | None = None,
     if path is not None:
         with Path(path).open("rb") as handle:
             settings = tomllib.load(handle)["search"]
-        # Self-play opening sampling; evaluations always play the most-visited move.
-        settings.pop("sample_plies", None)
+        # Self-play move sampling; evaluations always play the most-visited move.
+        for key in ("sample_plies", "late_temperature", "late_value_cutoff"):
+            settings.pop(key, None)
         config = PuctConfig(**settings)
         if config.algorithm != backend or config.target_policy != ("rpo" if rpo else "visits"):
             raise ValueError("search config algorithm/target_policy does not match the selected method")

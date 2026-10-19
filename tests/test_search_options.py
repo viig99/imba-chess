@@ -14,8 +14,8 @@ from imba_chess.self_play.config import load_config
 @pytest.mark.parametrize("method", PUCT_METHODS)
 def test_public_preset_matches_training_recipe(method):
     path = Path(f"config/self_play_{method}.toml")
-    # Opening sampling is self-play only; evaluations play the most-visited move.
-    trained = replace(load_config(path).search, sample_plies=0)
+    # Move sampling is self-play only; evaluations play the most-visited move.
+    trained = replace(load_config(path).search, sample_plies=0, late_temperature=0.0, late_value_cutoff=0.0)
     assert puct_config(method) == trained
     assert puct_config(method, path=path) == trained
     assert puct_config(method, path=path, simulations=19).simulations == 19

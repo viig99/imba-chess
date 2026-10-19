@@ -223,7 +223,10 @@ def test_paper_exact_options_keep_existing_run_identity():
     from imba_chess.self_play.config import load_config
 
     config = load_config("config/self_play_puct_variance.toml")
-    # The identifier of this config before the options existed (main at 97b0fed).
+    # Without late sampling, the identifier of this config before the options existed
+    # (main at 97b0fed), so the stopped 2026-10-18 run stays resumable.
+    assert config.search.late_temperature
+    config = replace(config, search=replace(config.search, late_temperature=0.0, late_value_cutoff=0.0))
     assert config.identifier == "92da5238fd7d246647ccb526323df6e80e3474668208c40097a3bf20c5a7f28d"
     assert replace(config, search=replace(config.search, lc0_parent_q=True)).identifier != config.identifier
     with pytest.raises(ValueError):

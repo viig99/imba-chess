@@ -165,3 +165,86 @@ def test_opening_sampling_follows_visits_only_with_exploration():
     with pytest.raises(ValueError):
         PuctConfig(sample_plies=1.5)
     assert SelfPlayConfig(search=sampled).identifier != SelfPlayConfig(search=cfg).identifier
+
+
+class RecordingRandom(random.Random):
+    def __init__(self, seed):
+        super().__init__(seed)
+        self.draws = []
+
+    def choices(self, population, weights=None, **kwargs):
+        self.draws.append((list(population), list(weights)))
+        return super().choices(population, weights=weights, **kwargs)
+
+
+def test_late_sampling_draws_tempered_visits_within_the_value_cutoff():
+    from dataclasses import replace
+    from tests.test_puct_reference import FENS, HashEvaluator
+
+    def run(config, fen, **kwargs):
+        rng = RecordingRandom(3)
+        result = select_puct(evaluator=HashEvaluator(), board=chess.Board(fen), config=config, rng=rng, **kwargs)
+        best = max(range(len(result.visits)), key=lambda i: (result.visits[i], result.qvalues[i],
+                                                           result.root_log_priors[i], -i))
+        return result, best, rng.draws
+
+    cfg = PuctConfig(algorithm="puct_variance", simulations=128, max_depth=4)
+    late = replace(cfg, late_temperature=0.5, late_value_cutoff=0.05)
+    greedy, best, draws = run(cfg, FENS[3])
+    assert not draws and greedy.move_id == greedy.legal_ids[best]
+    result, best, ((population, weights),) = run(late, FENS[3])
+    # Same tree and training target; only the played move is drawn.
+    assert (result.visits, result.policy) == (greedy.visits, greedy.policy)
+    visited = [i for i, v in enumerate(result.visits) if v]
+    assert population == [i for i in visited if result.qvalues[i] >= result.qvalues[best] - 0.05]
+    assert 1 < len(population) < len(visited)
+    assert weights == pytest.approx([(result.visits[i] / result.visits[best]) ** 2 for i in population])
+    assert result.legal_ids.index(result.move_id) in population
+    # The cutoff keeps a mate in one: no other visited move is within 0.05 of it.
+    result, best, ((population, _),) = run(late, FENS[1])
+    assert population == [best] and result.move_uci == "h5f7"
+    # Evaluations (noise off) and plies inside the opening window ignore it.
+    result, best, draws = run(late, FENS[3], noise=0.0)
+    assert not draws and result.move_id == result.legal_ids[best]
+    _, _, ((population, weights),) = run(replace(late, sample_plies=100), FENS[3])
+    assert population == list(range(len(greedy.visits))) and weights == greedy.visits
+
+
+def test_self_play_collection_samples_puct_moves_after_the_opening():
+    from imba_chess.eval.batch_scheduler import WorkRequest
+    from imba_chess.self_play.collector import play_game
+    from imba_chess.self_play.seeds import Seed, source_split
+    from tests.test_self_play import ENCODER, VOCAB
+
+    class PuctRuntime:
+        move_vocab, encoder = VOCAB, ENCODER
+
+        def search(self, *, board, config, rng, noise=None, **kwargs):
+            yield WorkRequest("tick", None)
+            return select_puct(evaluator=FakeEvaluator(), board=board, config=config, rng=rng,
+                               **({} if noise is None else {"noise": noise}))
+
+    source = "train-source"
+    while source_split(source) != "train":
+        source += "x"
+    cfg = PuctConfig(algorithm="puct_variance", simulations=32, max_depth=2, sample_plies=2,
+                     late_temperature=1.0, late_value_cutoff=2.0)
+
+    def greedy_flags(gid, **kwargs):
+        results = []
+        gen = play_game(seed=Seed("s", source, [], 0, "train", "c"), game_id=gid, actor_id="a",
+                        runtime=PuctRuntime(), search_config=cfg, max_positions=256, max_game_plies=8,
+                        on_position=lambda result, elapsed: results.append(result), **kwargs)
+        try:
+            next(gen)
+            while True:
+                gen.send(None)
+        except StopIteration:
+            pass
+        assert len(results) == 8
+        return [r.move_id == r.legal_ids[max(range(len(r.visits)), key=lambda i: (
+            r.visits[i], r.qvalues[i], r.root_log_priors[i], -i))] for r in results]
+
+    # Self-play turns sampling on past the opening window; evaluation-style play does not.
+    assert not all(flag for gid in range(6) for flag in greedy_flags(f"g{gid}")[2:])
+    assert all(flag for gid in range(3) for flag in greedy_flags(f"g{gid}", gumbel_noise=False))
