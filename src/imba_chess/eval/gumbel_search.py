@@ -168,12 +168,16 @@ class GumbelResult:
     maximum_depth: int
     root_log_priors: list[float] | None = None
     # Mean backed-up leaf WDL over the exact simulations, root-player POV.
-    # Distinct from root_wdl (the raw network prediction). Measurement only:
-    # neither this distribution nor the auxiliary head affects tree selection.
+    # Distinct from root_wdl (the raw network prediction). Neither WDL field
+    # affects tree selection, but both can be training labels: [learning]
+    # value_search_source picks one for value_search_mix and the auxiliary TD
+    # targets. Under Gumbel this average includes the simulations halving spends
+    # on moves it discards (~75% at 256 x 16), so as a label it is no better than
+    # the raw network (golden-set MAE 0.166, bias -0.08 against Stockfish).
     search_wdl: tuple[float, float, float] | None = None
     # Root-player WDL of the returned policy (see policy_wdl): the value label of
-    # the improved policy. Gumbel's search_wdl also averages the simulations spent
-    # on moves its halving discards; this does not.
+    # the improved policy (golden-set MAE 0.138, bias -0.004); the recipe trains
+    # on it. For a PUCT visit target it equals search_wdl.
     improved_wdl: tuple[float, float, float] | None = None
 
 
