@@ -2,13 +2,14 @@
 # (artifacts/self_play/plain-s256-lr2e4-from-rgsc-it441-2026-10-16), the default of
 # scripts/run_self_play.py. Identical to self_play_s256_bf16_lr2e4_carry.toml (which carries the
 # lineage's full history) except concurrent_games = 160, the 5 workers x 32 games that run had on
-# the command line, value_search_source = "improved_wdl" and value_search_mix = 0.25 (both from
-# 2026-10-18, so resume that run with the carry config). Phases are 640 games (fresh_games, from 2026-10-17): 4x the 160 parallel
+# the command line, value_search_source = "improved_wdl" (from 2026-10-18), value_search_mix = 0.5 and
+# lr 5e-5 (both from 2026-10-19; resume the 2026-10-18 improved_wdl run, started at mix 0.25 and lr 2e-4,
+# with --previous-config config/self_play_iwdl_lr2e4.toml, and the older lr2e4 run with the carry config). Phases are 640 games (fresh_games, from 2026-10-17): 4x the 160 parallel
 # games, ~56k positions, about one weight update per ~2.5 min at the current collection speed.
 # Plain Gumbel 256 (raw Q, value_scale 0.5), bf16 collection in 5 worker processes, fast 64-sim
 # play-out of decided games, in-flight games carried across phases, a 500k-position FIFO replay
 # window (~8.9 phases) at reuse 2 (each phase trains its fresh games plus as many older positions),
-# constant lr 2e-4 with EMA 0.995, policy surprise weighting and three
+# constant lr 5e-5 (2e-4 until 2026-10-19; see [learning]) with EMA 0.995, policy surprise weighting and three
 # auxiliary TD value horizons (needs an aux3 initialization; see scripts/add_auxiliary_value_head.py).
 # Sized for a 16 GB GPU (~11 GB peak at 5 x 32 under CUDA MPS); see README "Recommended stage-2 run".
 base_config = "config/imba_chess_v4_aux3.toml"
@@ -49,14 +50,24 @@ flush_games = 16
 flush_positions = 2048
 
 [learning]
-lr = 2e-4
+# 5e-5 from 2026-10-19 (was 2e-4; resume runs started at 2e-4 with --previous-config
+# config/self_play_iwdl_lr2e4.toml). Offline distillation from actor-000290 on a frozen 454k-position
+# replay snapshot, held-out games at 6 passes (artifacts/eval/learning-diagnostics-2026-10-19):
+# at 2e-4 held-out KL to the search target rose 0.77 -> 1.07, top-move agreement fell 60% -> 55%
+# and golden value MAE rose 0.164 -> 0.169. At 5e-5: 0.79, 59% and 0.158. No rate transferred
+# policy gains to unseen games, but 2e-4 actively damaged both heads.
+lr = 5e-5
 value_weight = 1.0
 auxiliary_value_weight = 0.15
 auxiliary_value_lambda = [0.8, 0.9, 0.95]
-# 0.25 from 2026-10-18 (was 0.1): with improved_wdl, per-position label error against Stockfish on
-# golden roots from complete games is 0.122 at 0.1, 0.092 at 0.25, 0.056 at 0.5; 0.25 keeps 75% of
-# the target on the actual game result, bounding self-reinforcement of the search's own errors.
-value_search_mix = 0.25
+# 0.5 from 2026-10-19 (0.1 until 2026-10-18, then 0.25). Offline from actor-000290 at lr 5e-5, the
+# golden-set Gumbel-256 played-move regret after training rose with the label's game-result share,
+# against the untrained actor's 0.0417 (paired 95% intervals, artifacts/eval/learning-diagnostics-2026-10-19):
+# +0.0103 [+0.0067, +0.0139] at mix 0, +0.0044 at 0.1, +0.0048 at 0.25, and +0.0004 [-0.0027, +0.0035]
+# at 0.5 (0.75 and 1.0 also within noise). Value MAE ran the other way, best at 0-0.1, so it rewards
+# calibration to results, not the move ranking search relies on. Label error against Stockfish:
+# 0.122 at 0.1, 0.092 at 0.25, 0.056 at 0.5.
+value_search_mix = 0.5
 # Value mix and auxiliary TD targets use the WDL of the improved policy, not search_wdl's average
 # over every simulation (Gumbel spends ~75% of those on moves its halving discards): 0.138 vs 0.166
 # expected-score MAE against Stockfish under training noise (docs/SEARCH_METHODS.md).
