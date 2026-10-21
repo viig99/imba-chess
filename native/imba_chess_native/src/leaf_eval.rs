@@ -365,8 +365,8 @@ impl LeafEvaluation {
         }
         NodeStats::from_parts(
             self.value,
-            self.priors.clone(),
-            Some(self.wdl.to_vec()),
+            &self.priors,
+            Some(&self.wdl),
             minimax_weight,
             with_forcing.then(|| legal.forcing_flags().clone()),
         )

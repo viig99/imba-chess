@@ -154,3 +154,34 @@ def test_node_initialize_validates_evaluations(value, priors, wdl, forcing, expe
     else:
         with pytest.raises(ValueError, match=expected):
             cc._gumbel_node_stats(evaluation, GumbelConfig(), False)
+
+
+def test_native_fsum_is_math_fsum_bit_for_bit():
+    """The exact fixed-point fast path and the expansion fallback both
+    reproduce math.fsum, including half-way ties decided by tiny tails."""
+    import struct
+    from imba_chess_native.imba_chess_native import _expansion_sum, _fsum
+
+    rng = random.Random(9071)
+
+    def cases():
+        for _ in range(4000):
+            n = rng.choice([0, 1, 2, 5, 35, 218, 1024, 1025])
+            logits = [rng.gauss(0, rng.choice([1, 60, 300])) for _ in range(n)]
+            top = max(logits, default=0.0)
+            yield [math.exp(x - top) for x in logits]
+            yield [rng.uniform(-1, 1) * rng.random() ** rng.choice([1, 40]) for _ in range(n)]
+            yield [rng.uniform(-3, 3) for _ in range(n)]
+            big = [rng.random() for _ in range(rng.randrange(1, 4))]
+            half = math.ulp(math.fsum(big)) / 2
+            tail = [rng.choice([1, -1]) * 2.0 ** rng.randrange(-200, -60) for _ in range(rng.randrange(3))]
+            yield big + [half] + tail
+            yield [rng.choice([1, -1]) * rng.choice([5e-324, 1e-300, 2**-64, 2**-65, 0.0, -0.0]) for _ in range(n)]
+
+    def bits(x):
+        return struct.pack("<d", x)
+
+    for values in cases():
+        expected = bits(math.fsum(values))
+        assert bits(_fsum(values)) == expected, values
+        assert bits(_expansion_sum(values)) == expected, values

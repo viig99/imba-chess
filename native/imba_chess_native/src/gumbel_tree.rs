@@ -24,7 +24,7 @@ use crate::board::Board;
 use crate::chess_move::ChessMove;
 use crate::gumbel::NodeStats;
 use crate::leaf_eval::LeafEvaluation;
-use crate::terminal::{push_classify, terminal};
+use crate::terminal::{repetition_hash, terminal, terminal_value};
 
 const NONE: u32 = u32::MAX;
 
@@ -111,13 +111,16 @@ enum State {
 
 struct Node {
     board: State,
-    history: Vec<u64>,
+    // This position's repetition-hash history: a range of GumbelTree.histories.
+    history: (usize, usize),
     handle: PyObject,
     value: f64,
     evaluation: Evaluation,
     wdl: Option<[f64; 3]>,
     stats: Option<NodeStats>,
-    children: Vec<u32>,
+    // Offset of this node's child indices (one per action) in
+    // GumbelTree.child_slots; unused for terminal and pending nodes.
+    children: usize,
 }
 
 /// The legal-projection error the Python _Node.initialize raised.
@@ -190,6 +193,9 @@ pub struct GumbelTree {
     config: Config,
     transition: Option<PyObject>,
     nodes: Vec<Node>,
+    // Flat per-tree storage, so a node owns no allocations of its own.
+    histories: Vec<u64>,
+    child_slots: Vec<u32>,
     schedule: Vec<u64>,
     next_visit: usize,
     path: Vec<(u32, usize)>,
@@ -234,9 +240,17 @@ impl GumbelTree {
         }
     }
 
-    /// Play `action` at `node`: (child position, child hash history, terminal value).
-    fn push(&self, py: Python<'_>, node: u32, action: usize) -> PyResult<(State, Vec<u64>, Option<f64>)> {
+    /// Play `action` at `node`: (child position, child history range in
+    /// `histories`, terminal value).
+    fn push(
+        &mut self,
+        py: Python<'_>,
+        node: u32,
+        action: usize,
+    ) -> PyResult<(State, (usize, usize), Option<f64>)> {
         let parent = &self.nodes[node as usize];
+        let (start, len) = parent.history;
+        let child_start = self.histories.len();
         match (&self.transition, &parent.board) {
             (None, State::Chess(board)) => {
                 let mv = match &parent.evaluation {
@@ -248,16 +262,24 @@ impl GumbelTree {
                         .ok_or_else(|| PyValueError::new_err("legal move index out of range"))?,
                     _ => self.edge_move(py, node, action)?.extract::<ChessMove>()?.0,
                 };
-                let (child, history, terminal) = push_classify(board, mv, &parent.history, true);
-                Ok((State::Chess(child), history, terminal))
+                // push_and_classify, appending the child's history to the store.
+                let mut child = board.clone();
+                child.play_unchecked(mv);
+                if child.halfmove_clock() != 0 {
+                    self.histories.extend_from_within(start..start + len);
+                    self.histories.push(repetition_hash(board));
+                }
+                let terminal = terminal_value(&child, true, &self.histories[child_start..]);
+                Ok((State::Chess(child), (child_start, self.histories.len() - child_start), terminal))
             }
             (Some(transition), State::Opaque(board)) => {
                 let mv = self.edge_move(py, node, action)?;
                 let (child, history, terminal): (PyObject, Vec<u64>, Option<f64>) = transition
                     .bind(py)
-                    .call1((board.clone_ref(py), mv, parent.history.clone(), true))?
+                    .call1((board.clone_ref(py), mv, self.histories[start..start + len].to_vec(), true))?
                     .extract()?;
-                Ok((State::Opaque(child), history, terminal))
+                self.histories.extend_from_slice(&history);
+                Ok((State::Opaque(child), (child_start, history.len()), terminal))
             }
             _ => unreachable!("positions match the environment"),
         }
@@ -357,14 +379,16 @@ impl GumbelTree {
             transition,
             nodes: vec![Node {
                 board,
-                history,
+                history: (0, history.len()),
                 handle,
                 value,
                 evaluation,
                 wdl,
                 stats: Some(stats),
-                children: vec![NONE; n],
+                children: 0,
             }],
+            histories: history,
+            child_slots: vec![NONE; n],
             schedule: Vec::new(),
             next_visit: 0,
             path: Vec::with_capacity(33),
@@ -466,14 +490,15 @@ impl GumbelTree {
                 self.path.push((node, action));
                 depth += 1;
                 self.deepest = self.deepest.max(depth);
-                let child = self.nodes[node as usize].children[action];
+                let slot = self.nodes[node as usize].children + action;
+                let child = self.child_slots[slot];
                 if child == NONE {
                     let (board, history, terminal) = self.push(py, node, action)?;
                     let index = u32::try_from(self.nodes.len())
                         .ok()
                         .filter(|i| *i != NONE)
                         .ok_or_else(|| PyRuntimeError::new_err("search tree is full"))?;
-                    self.nodes[node as usize].children[action] = index;
+                    self.child_slots[slot] = index;
                     match terminal {
                         Some(value) => {
                             self.nodes.push(Node {
@@ -484,7 +509,7 @@ impl GumbelTree {
                                 evaluation: Evaluation::Terminal,
                                 wdl: None,
                                 stats: None,
-                                children: Vec::new(),
+                                children: usize::MAX,
                             });
                             self.terminal_hits += 1;
                             break index;
@@ -504,7 +529,7 @@ impl GumbelTree {
                                 evaluation: Evaluation::Terminal,
                                 wdl: None,
                                 stats: None,
-                                children: Vec::new(),
+                                children: usize::MAX,
                             });
                             self.pending = Some(Pending { child: index, depth });
                             return Ok(Some((parent_handle, uci, id, child_board)));
@@ -548,7 +573,8 @@ impl GumbelTree {
         node.stats = Some(stats);
         node.value = value;
         node.wdl = wdl;
-        node.children = vec![NONE; n];
+        node.children = self.child_slots.len();
+        self.child_slots.resize(self.child_slots.len() + n, NONE);
         self.evaluations += 1;
         if depth == self.config.max_depth {
             self.cutoffs += 1;
@@ -585,7 +611,7 @@ impl GumbelTree {
         let (visits, _, qvalues) = root.snapshot();
         let top = visits.iter().copied().max().unwrap_or(0);
         let action = self.root_action(top)?;
-        let child = self.nodes[0].children[action];
+        let child = self.child_slots[self.nodes[0].children + action];
         let played = (child != NONE).then(|| {
             let node = &self.nodes[child as usize];
             let evaluation = match &node.evaluation {

@@ -109,7 +109,7 @@ fn ep_has_legal_capturer(board: &cozy_chess::Board) -> bool {
     false
 }
 
-fn repetition_hash(board: &cozy_chess::Board) -> u64 {
+pub(crate) fn repetition_hash(board: &cozy_chess::Board) -> u64 {
     if board.en_passant().is_some() && !ep_has_legal_capturer(board) {
         board.hash_without_ep()
     } else {
@@ -118,7 +118,7 @@ fn repetition_hash(board: &cozy_chess::Board) -> u64 {
 }
 
 /// Exact game result from `color`'s POV, or None if the game is not over.
-fn terminal_value(
+pub(crate) fn terminal_value(
     board: &cozy_chess::Board,
     color_is_stm: bool,
     hash_history: &[u64],
@@ -211,7 +211,7 @@ pub fn push_and_classify(
 }
 
 /// push_and_classify for native callers.
-pub(crate) fn push_classify(
+fn push_classify(
     board: &cozy_chess::Board,
     mv: cozy_chess::Move,
     hash_history: &[u64],
