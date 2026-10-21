@@ -375,12 +375,14 @@ class DecodeWorkspace:
         On CUDA each (buffer generation, batch size) gets one captured
         graph of the compiled decoder: the same kernels on the same static
         buffers (prefix inputs, arena, metadata), replayed without Python
-        launches. The first wave of a shape runs normally (its result is used),
-        then the shape is captured. Graph outputs are overwritten by the next
+        launches. The arena scatter and logit packing (_scatter_and_pack) are
+        part of each graph. The first wave of a shape runs normally (its result
+        is used), then the shape is captured. Graph outputs are overwritten by the next
         replay, so callers consume them before decoding again (consume() does)."""
 
         def run():
-            return self.runner.decode(*args)
+            out = self.runner.decode(*args)
+            return dict(out, packed=self._scatter_and_pack(out))
 
         if self.device.type != "cuda":
             return run()
@@ -447,6 +449,19 @@ class DecodeWorkspace:
             ),
         )
 
+    def _scatter_and_pack(self, out):
+        """Write the wave's K/V rows into the arena and pack every row's legal
+        logits (all legal_capacity columns; consume reads each row's own
+        width) with its value logits for one readback. Pure data movement on
+        the device, so it can run inside a captured decoder graph."""
+        # Every layer's new K and V rows in one scatter: [layers, 2, g, heads, dim].
+        layers = len(out["kv"])
+        rows = torch.stack([t.squeeze(2) for pair in out["kv"] for t in pair])
+        rows = rows.view(layers, 2, *rows.shape[1:])
+        self.arena_stack.index_copy_(2, self.device_fields[2][3], rows)
+        picked = out["logits"].float().gather(1, self.device_fields[4])
+        return torch.cat((picked, out["value_logits"].float()), dim=1)
+
     def consume(self, state, out):
         requests, nodes, slots_rows, per_node, width = state
         for req, (slot, _) in zip(requests, slots_rows):
@@ -456,22 +471,22 @@ class DecodeWorkspace:
                 for node in req.nodes:
                     if node.history_token is not token:
                         raise RuntimeError("stale or foreign history handle")
-        # Every layer's new K and V rows in one scatter: [layers, 2, g, heads, dim].
-        layers = len(out["kv"])
-        rows = torch.stack([t.squeeze(2) for pair in out["kv"] for t in pair])
-        rows = rows.view(layers, 2, *rows.shape[1:])
-        self.arena_stack.index_copy_(2, self.device_fields[2][3], rows)
-        self.counters["scatter_bytes"] += rows.numel() * rows.element_size()
+        packed = out.get("packed")
+        if packed is None:  # A bare decoder output (runner.decode), not decode().
+            packed = self._scatter_and_pack(out)
+        arena = self.arena_stack
+        self.counters["scatter_bytes"] += (
+            arena.size(0) * 2 * len(nodes) * arena.size(3) * arena.size(4) * arena.element_size()
+        )
         # Each node's chain: its parent's plus the row its K/V was written to.
         cc.extend_arena_chains(nodes, [dest for _, dest in slots_rows])
-        picked = out["logits"].float().gather(1, self.device_fields[4][:, :width])
         # Blocking readback also protects pinned metadata from CPU overwrite.
-        packed = torch.cat((picked, out["value_logits"].float()), dim=1).cpu()
+        packed = packed.cpu()
         self.counters["readbacks"] += 1
         self.counters["d2h_bytes"] += packed.numel() * packed.element_size()
         # The same CPU float32 operations as before; native code only widens
         # the results to f64 (as .tolist() did) and builds one object per row.
-        wdls = torch.softmax(packed[:, width:].contiguous(), -1)
+        wdls = torch.softmax(packed[:, self.legal_capacity:].contiguous(), -1)
         values = (wdls[:, 2] - wdls[:, 0]).contiguous()
         lens = torch.tensor([len(legal) for legal in per_node])
         # Match the reference's logical width and contiguous CPU normalization.
