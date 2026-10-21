@@ -1,7 +1,7 @@
 """Read-only study of leaf-WDL averaging; production search stays untouched.
 
-A line observer records the existing search's root-perspective leaf WDL before
-its accumulation. GPU inference is outside the tracing scope. A/B/C/D are all
+The search's leaf observer hook (GumbelTree.set_observer) records each
+simulation's root-perspective leaf WDL before its accumulation. GPU inference is outside the tracing scope. A/B/C/D are all
 computed from that one realized search, never from rerunning alternative labels.
 """
 from __future__ import annotations
@@ -19,7 +19,6 @@ import os
 from pathlib import Path
 import random
 import statistics
-import sys
 import time
 
 from imba_chess.eval import gumbel_search, inference_runtime
@@ -36,45 +35,30 @@ class LeafObserver:
         self.terminal_samples = 0
         self.odd_depth_samples = 0
         self.metadata = None
-        lines, start = inspect.getsourcelines(gumbel_search.gumbel_stepwise)
-        matches = [start + i for i, line in enumerate(lines)
-                   if 'root_pov = leaf_wdl[::-1] if depth % 2 else leaf_wdl' in line]
-        if len(matches) != 1:
-            raise RuntimeError('search observation point changed; re-audit instrumentation')
-        self.line = matches[0]
-        self.code = gumbel_search.gumbel_stepwise.__code__
 
-    def trace(self, frame, event, arg):
-        if frame.f_code is not self.code:
-            return None
-        if event == 'line' and frame.f_lineno == self.line:
-            self.observe(frame.f_locals)
-        return self.trace
+    def root(self, root_eval, noise, priors, considered):
+        config = self.kwargs['config']
+        n = len(root_eval.legal_ids)
+        self.counts = [0] * n
+        self.edge_sums = [[0.0, 0.0, 0.0] for _ in range(n)]
+        order = sorted(range(n), key=lambda i: (-(noise[i] + priors[i]), i))
+        top = set(order[:min(config.top_m, n)])
+        forcing = {i for i, flag in enumerate(root_eval.legal_forcing) if flag}
+        candidates = top | forcing if config.root_forcing else top
+        self.metadata = dict(legal_ids=list(root_eval.legal_ids), legal_ucis=list(root_eval.legal_ucis),
+                             legal_forcing=list(root_eval.legal_forcing),
+                             noise=noise, root_log_priors=priors,
+                             base_top_m=sorted(top), forcing_only=sorted(forcing - top),
+                             eligible_root_candidates=len(candidates),
+                             root_candidates=int(considered))
 
-    def observe(self, local):
-        root, config = local['root_eval'], self.kwargs['config']
-        if self.counts is None:
-            n = len(root.legal_ids)
-            self.counts = [0] * n
-            self.edge_sums = [[0.0, 0.0, 0.0] for _ in range(n)]
-            noise, priors = list(local['noise']), list(local['priors'])
-            order = sorted(range(n), key=lambda i: (-(noise[i] + priors[i]), i))
-            top = set(order[:min(config.top_m, n)])
-            forcing = {i for i, flag in enumerate(root.legal_forcing) if flag}
-            candidates = top | forcing if config.root_forcing else top
-            self.metadata = dict(legal_ids=list(root.legal_ids), legal_ucis=list(root.legal_ucis),
-                                 legal_forcing=list(root.legal_forcing),
-                                 noise=noise, root_log_priors=priors,
-                                 base_top_m=sorted(top), forcing_only=sorted(forcing - top),
-                                 eligible_root_candidates=len(candidates),
-                                 root_candidates=int(local['considered']))
-        edge = local['path'][0][1]
-        depth, leaf = local['depth'], local['leaf']
-        wdl = tuple(local['leaf_wdl'])
+    def leaf(self, edge, depth, leaf_wdl, terminal):
+        """The search's leaf WDL (leaf side to move) before its accumulation."""
+        wdl = tuple(leaf_wdl)
         if depth % 2:
             wdl = wdl[::-1]
             self.odd_depth_samples += 1
-        self.terminal_samples += leaf.evaluation is None
+        self.terminal_samples += terminal
         self.samples += 1
         self.counts[edge] += 1
         for i, probability in enumerate(wdl):
@@ -121,25 +105,13 @@ def capture_leaf_wdl():
 
     def measured(**kwargs):
         observer = LeafObserver(kwargs)
-        gen = original(**kwargs)
-        first, answer = True, None
+        gen = original(**kwargs, observer=observer)
         try:
-            while True:
-                prior_trace = sys.gettrace()
-                if prior_trace is not None:
-                    raise RuntimeError('measurement cannot replace an existing Python trace')
-                sys.settrace(observer.trace)
-                try:
-                    request = next(gen) if first else gen.send(answer)
-                except StopIteration as stop:
-                    observed[id(stop.value)] = observer.finish(stop.value)
-                    return stop.value
-                finally:
-                    sys.settrace(prior_trace)
-                first = False
-                answer = yield request
+            result = yield from gen
         finally:
             gen.close()
+        observed[id(result)] = observer.finish(result)
+        return result
 
     inference_runtime.gumbel_stepwise = measured
     try:

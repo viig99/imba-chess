@@ -336,6 +336,14 @@ def project_legal_lean(cozy_board: cc.Board, move_vocab: MoveVocab) -> "cc.Legal
     return _projector(move_vocab).project_lean(cozy_board)
 
 
+def project_wave(
+    cozy_boards: list[cc.Board], move_vocab: MoveVocab
+) -> tuple[list["cc.LegalSet"], int]:
+    """project_legal_lean over a decode wave's boards in one native call:
+    the legal sets and the widest one's length."""
+    return _projector(move_vocab).project_wave(cozy_boards)
+
+
 def _projector(move_vocab: MoveVocab) -> "cc.MoveProjector":
     projector = _PROJECTORS.get(move_vocab)
     if projector is None:

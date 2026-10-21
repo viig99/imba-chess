@@ -206,17 +206,34 @@ pub fn push_and_classify(
     hash_history: Vec<u64>,
     color_is_stm: bool,
 ) -> PushResult {
-    let mut child = board.0.clone();
-    child.play_unchecked(mv.0);
+    let (child, child_history, value) = push_classify(&board.0, mv.0, &hash_history, color_is_stm);
+    (Board(child), child_history, value)
+}
+
+/// push_and_classify for native callers.
+pub(crate) fn push_classify(
+    board: &cozy_chess::Board,
+    mv: cozy_chess::Move,
+    hash_history: &[u64],
+    color_is_stm: bool,
+) -> (cozy_chess::Board, Vec<u64>, Option<f64>) {
+    let mut child = board.clone();
+    child.play_unchecked(mv);
     let child_history = if child.halfmove_clock() == 0 {
         Vec::new()
     } else {
-        let mut history = hash_history;
-        history.push(repetition_hash(&board.0));
+        let mut history = Vec::with_capacity(hash_history.len() + 1);
+        history.extend_from_slice(hash_history);
+        history.push(repetition_hash(board));
         history
     };
     let value = terminal_value(&child, color_is_stm, &child_history);
-    (Board(child), child_history, value)
+    (child, child_history, value)
+}
+
+/// terminal_value_of for native callers.
+pub(crate) fn terminal(board: &cozy_chess::Board, color_is_stm: bool, hash_history: &[u64]) -> Option<f64> {
+    terminal_value(board, color_is_stm, hash_history)
 }
 
 /// Standalone classification, for boards not reached by pushing an edge.

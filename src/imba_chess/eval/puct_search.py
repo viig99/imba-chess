@@ -9,16 +9,17 @@ lc0_parent_q and paper_log_n opt into the exact Lc0 FPU parent Q and the paper's
 log N; both default off to keep the study arithmetic.
 """
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 import math
 import random
+from typing import Any
 
 import chess
 import imba_chess_native as cc
 
 from . import cozy_bridge
-from .gumbel_search import GumbelResult, _Node, policy_wdl
-from .search import EvalRequest, _drive, _root_hash_seed
+from .gumbel_search import GumbelResult, policy_wdl
+from .search import EvalRequest, PositionEval, _drive, _root_hash_seed
 
 
 PUCT_ALGORITHMS = ("puct", "puct_variance", "puct_v")
@@ -109,6 +110,42 @@ def rpo_policy(priors, qvalues, regularization):
     weights = [regularization * p / max(high - q, 1e-15) for p, q in zip(priors, qvalues)]
     total = math.fsum(weights)
     return [w / total for w in weights]
+
+
+@dataclass(slots=True)
+class _Node:
+    # Slots: a search allocates and frees one node per simulation.
+    board: Any
+    history: list[int]
+    handle: Any
+    value: float | None = None
+    evaluation: PositionEval | None = None
+    children: dict[int, Any] = field(default_factory=dict)
+    stats: Any = None
+
+    def initialize(self, evaluation):
+        if isinstance(evaluation, cc.LeafEvaluation):
+            # Native decode results validate and build their stats in one call.
+            stats = evaluation.node_stats()
+        else:
+            n = len(evaluation.legal_ids)
+            if (
+                not n
+                or len(evaluation.legal_moves) != n
+                or len(evaluation.legal_ucis) != n
+                or len(evaluation.legal_log_priors) != n
+            ):
+                raise ValueError("nonterminal evaluation has invalid legal projection")
+            # Native: finite value/prior and WDL validation, then the FLT_MIN-clamped
+            # prior softmax, bit-identical to the former Python implementation.
+            stats = cc.NodeStats.from_evaluation(
+                evaluation.value_stm, list(evaluation.legal_log_priors), evaluation.wdl
+            )
+            if len(evaluation.legal_forcing) != n:
+                raise ValueError("nonterminal evaluation has invalid legal projection")
+        self.evaluation = evaluation
+        self.value = evaluation.value_stm
+        self.stats = stats
 
 
 def puct_stepwise(*, board, extend, root_handle=None, config=PuctConfig(), rng=None,

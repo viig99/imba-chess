@@ -200,11 +200,11 @@ def test_arena_growth_slot_reclamation_and_empty_projection(monkeypatch):
     model = _tiny_model(len(VOCAB)).eval()
     ws = DecodeWorkspace(DecoderRunner(model, "tensor"))
     owner = evaluator(model, 3)
-    original_projection = cozy_bridge.project_legal_lean
+    original_projection = cozy_bridge.project_wave
     # A projector over an empty vocabulary maps no legal move.
     empty = cc.MoveProjector({})
     monkeypatch.setattr(
-        cozy_bridge, "project_legal_lean", lambda board, vocab: empty.project_lean(board)
+        cozy_bridge, "project_wave", lambda boards, vocab: empty.project_wave(boards)
     )
     with torch.inference_mode():
         saved = None
@@ -224,7 +224,7 @@ def test_arena_growth_slot_reclamation_and_empty_projection(monkeypatch):
         gc.collect()
         assert ref() is None
         owner = evaluator(model, 2)
-        monkeypatch.setattr(cozy_bridge, "project_legal_lean", original_projection)
+        monkeypatch.setattr(cozy_bridge, "project_wave", original_projection)
         args, state = ws.prepare([payload(owner)])
         ws.consume(state, ws.runner.decode(*args))
         assert len(ws.slots) == 1 and ws.arena[0].data_ptr() == pointer
@@ -558,7 +558,8 @@ def test_stable_placement_and_ancestor_chains(device, mode, monkeypatch):
     def checked_prepare(*args, **kwargs):
         decoder_args, state = prepare(*args, **kwargs)
         # Each row's chain names exactly its node's ancestor arena rows.
-        for row, chain in enumerate(state[1]):
+        for row, node in enumerate(state[1]):
+            chain = [] if node.parent is None else node.parent.arena_chain
             assert decoder_args[4][row, : len(chain)].tolist() == chain
             assert int(decoder_args[6][row]) == len(chain)
         depths.update(decoder_args[6].tolist())

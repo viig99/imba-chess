@@ -265,6 +265,17 @@ impl MoveProjector {
         Ok(legal)
     }
 
+    /// project_lean over every board of a decode wave in one call: the legal
+    /// sets and the widest one's length (0 for no boards).
+    fn project_wave(&self, boards: Vec<PyRef<'_, Board>>) -> PyResult<(Vec<LegalSet>, usize)> {
+        let legal = boards
+            .iter()
+            .map(|board| self.project_lean(board))
+            .collect::<PyResult<Vec<_>>>()?;
+        let width = legal.iter().map(|l| l.ids.len()).max().unwrap_or(0);
+        Ok((legal, width))
+    }
+
     fn __len__(&self) -> usize {
         self.entries.len()
     }

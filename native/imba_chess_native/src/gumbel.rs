@@ -2,21 +2,76 @@
 use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
 
+/// fsum's partial sums: on the stack, spilling to the heap only past 32
+/// (non-overlapping partials of real search sums number a handful).
+struct Partials {
+    inline: [f64; 32],
+    len: usize,
+    heap: Option<Vec<f64>>,
+}
+
+impl Partials {
+    fn new() -> Self {
+        Self { inline: [0.0; 32], len: 0, heap: None }
+    }
+
+    fn slice(&mut self) -> &mut [f64] {
+        match &mut self.heap {
+            Some(heap) => heap,
+            None => &mut self.inline[..self.len],
+        }
+    }
+
+    fn truncate(&mut self, len: usize) {
+        match &mut self.heap {
+            Some(heap) => heap.truncate(len),
+            None => self.len = len,
+        }
+    }
+
+    fn push(&mut self, x: f64) {
+        match &mut self.heap {
+            Some(heap) => heap.push(x),
+            None if self.len < self.inline.len() => {
+                self.inline[self.len] = x;
+                self.len += 1;
+            }
+            None => {
+                let mut heap = self.inline.to_vec();
+                heap.push(x);
+                self.heap = Some(heap);
+            }
+        }
+    }
+
+    fn pop(&mut self) -> Option<f64> {
+        match &mut self.heap {
+            Some(heap) => heap.pop(),
+            None if self.len > 0 => {
+                self.len -= 1;
+                Some(self.inline[self.len])
+            }
+            None => None,
+        }
+    }
+}
+
 // Expansion summation, including the final half-even correction. Ordinary
 // compensated running sums do not reproduce math.fsum on cancellation/ties.
 fn fsum(values: impl IntoIterator<Item = f64>) -> f64 {
-    let mut partials: Vec<f64> = Vec::with_capacity(32);
+    let mut partials = Partials::new();
     for mut x in values {
         let mut i = 0;
-        for j in 0..partials.len() {
-            let mut y = partials[j];
+        let current = partials.slice();
+        for j in 0..current.len() {
+            let mut y = current[j];
             if x.abs() < y.abs() {
                 std::mem::swap(&mut x, &mut y);
             }
             let hi = x + y;
             let lo = y - (hi - x);
             if lo != 0.0 {
-                partials[i] = lo;
+                current[i] = lo;
                 i += 1;
             }
             x = hi;
@@ -36,7 +91,7 @@ fn fsum(values: impl IntoIterator<Item = f64>) -> f64 {
             break;
         }
     }
-    if let Some(&tail) = partials.last() {
+    if let Some(&tail) = partials.slice().last() {
         if (lo < 0.0 && tail < 0.0) || (lo > 0.0 && tail > 0.0) {
             let y = lo * 2.0;
             let x = hi + y;
@@ -48,6 +103,7 @@ fn fsum(values: impl IntoIterator<Item = f64>) -> f64 {
     hi
 }
 
+#[allow(clippy::too_many_arguments)]
 fn completed(
     value: f64,
     visits: &[u64],
@@ -59,6 +115,28 @@ fn completed(
     visit_cap: u64,
     rescale_values: bool,
 ) -> PyResult<Vec<f64>> {
+    let mut values = Vec::with_capacity(visits.len());
+    completed_into(
+        value, visits, qvalues, probs, maxvisit_init, value_scale, epsilon, visit_cap,
+        rescale_values, &mut values,
+    )?;
+    Ok(values)
+}
+
+/// completed() into a reused buffer.
+#[allow(clippy::too_many_arguments)]
+fn completed_into(
+    value: f64,
+    visits: &[u64],
+    qvalues: &[f64],
+    probs: &[f64],
+    maxvisit_init: f64,
+    value_scale: f64,
+    epsilon: f64,
+    visit_cap: u64,
+    rescale_values: bool,
+    values: &mut Vec<f64>,
+) -> PyResult<()> {
     if visits.is_empty()
         || visits.len() != qvalues.len()
         || visits.len() != probs.len()
@@ -96,11 +174,13 @@ fn completed(
         0.0
     };
     let mixed = (value + count as f64 * weighted) / ((count as u128 + 1) as f64);
-    let mut values: Vec<f64> = qvalues
-        .iter()
-        .zip(visits)
-        .map(|(q, n)| if *n != 0 { *q } else { mixed })
-        .collect();
+    values.clear();
+    values.extend(
+        qvalues
+            .iter()
+            .zip(visits)
+            .map(|(q, n)| if *n != 0 { *q } else { mixed }),
+    );
     // visit_cap > 0 bounds the visit term so larger budgets deepen search without
     // growing the value bonus beyond its value at that visit count.
     let top = *visits.iter().max().unwrap();
@@ -115,14 +195,26 @@ fn completed(
         let low = values.iter().copied().fold(f64::INFINITY, f64::min);
         let high = values.iter().copied().fold(f64::NEG_INFINITY, f64::max);
         let denominator = (high - low).max(epsilon);
-        for q in &mut values {
+        for q in values.iter_mut() {
             *q = (*q - low) / denominator;
         }
     }
-    for q in &mut values {
+    for q in values.iter_mut() {
         *q *= scale;
     }
-    Ok(values)
+    Ok(())
+}
+
+/// Per-thread buffers for selection, so a simulation allocates nothing.
+#[derive(Default)]
+struct Scratch {
+    values: Vec<f64>,
+    weights: Vec<f64>,
+    qvalues: Vec<f64>,
+}
+
+thread_local! {
+    static SCRATCH: std::cell::RefCell<Scratch> = std::cell::RefCell::new(Scratch::default());
 }
 
 // CPython 3.12+ builtin sum() over floats (Neumaier compensation), for the
@@ -182,9 +274,11 @@ fn gumbel_interior_action(
     candidates: &[bool],
     visit_cap: u64,
     rescale_values: bool,
+    scratch: &mut Scratch,
 ) -> PyResult<usize> {
     validate_priors(&priors, visits.len())?;
-    let q = completed(
+    let Scratch { values: logits, weights, .. } = scratch;
+    completed_into(
         value,
         &visits,
         &qvalues,
@@ -194,10 +288,15 @@ fn gumbel_interior_action(
         epsilon,
         visit_cap,
         rescale_values,
+        logits,
     )?;
-    let logits: Vec<f64> = priors.iter().zip(q).map(|(p, q)| p + q).collect();
+    // Completed Q becomes the logits in place: prior + q.
+    for (q, p) in logits.iter_mut().zip(priors) {
+        *q = p + *q;
+    }
     let maximum = logits.iter().copied().fold(f64::NEG_INFINITY, f64::max);
-    let weights: Vec<f64> = logits.iter().map(|x| (x - maximum).exp()).collect();
+    weights.clear();
+    weights.extend(logits.iter().map(|x| (x - maximum).exp()));
     let total = fsum(weights.iter().copied());
     let denominator = (visits.iter().map(|n| *n as u128).sum::<u128>() + 1) as f64;
     let mut action = 0;
@@ -232,13 +331,15 @@ fn gumbel_root_action(
     candidates: &[bool],
     visit_cap: u64,
     rescale_values: bool,
+    scratch: &mut Scratch,
 ) -> PyResult<usize> {
     validate_priors(&priors, visits.len())?;
     if noise.len() != visits.len() || noise.iter().any(|x| !x.is_finite()) || !max_prior.is_finite()
     {
         return Err(PyValueError::new_err("invalid root noise"));
     }
-    let q = completed(
+    let q = &mut scratch.values;
+    completed_into(
         value,
         &visits,
         &qvalues,
@@ -248,6 +349,7 @@ fn gumbel_root_action(
         epsilon,
         visit_cap,
         rescale_values,
+        q,
     )?;
     let mut action = None;
     let mut best = f64::NEG_INFINITY;
@@ -321,16 +423,61 @@ impl NodeStats {
     /// Edge Q used for selection and reported to Python: the running mean, or
     /// (1 - w) * mean + w * negamax for visited edges when minimax_weight > 0.
     fn qvalues(&self) -> Vec<f64> {
+        let mut out = Vec::new();
+        self.qvalues_into(&mut out).to_vec()
+    }
+
+    /// qvalues() without a copy: the means themselves, or the blend in `out`.
+    fn qvalues_into<'a>(&'a self, out: &'a mut Vec<f64>) -> &'a [f64] {
         let w = self.minimax_weight;
         if w == 0.0 {
-            return self.means.clone();
+            return &self.means;
         }
-        self.means
-            .iter()
-            .zip(&self.edge_minimax)
-            .zip(&self.visits)
-            .map(|((m, mm), n)| if *n != 0 { (1.0 - w) * m + w * mm } else { *m })
-            .collect()
+        out.clear();
+        out.extend(
+            self.means
+                .iter()
+                .zip(&self.edge_minimax)
+                .zip(&self.visits)
+                .map(|((m, mm), n)| if *n != 0 { (1.0 - w) * m + w * mm } else { *m }),
+        );
+        out
+    }
+
+    /// Whether `edge` can take one more backup (validated before any mutation).
+    pub(crate) fn backup_ok(&self, edge: usize) -> bool {
+        edge < self.visits.len() && self.visits[edge] != u64::MAX
+    }
+
+    /// One edge of a backup: `value` is already from this node's side to move,
+    /// `child_value` is the side-to-move value of the node below the edge.
+    /// Returns this node's side-to-move value for the edge above it.
+    pub(crate) fn backup_edge(&mut self, edge: usize, value: f64, child_value: f64) -> f64 {
+        let old_mean = self.means[edge];
+        self.visits[edge] += 1;
+        self.sums[edge] += value;
+        self.means[edge] = self.sums[edge] / self.visits[edge] as f64;
+        if !self.m2.is_empty() {
+            self.m2[edge] += (value - old_mean) * (value - self.means[edge]);
+            self.variance_count += 1;
+            let delta = value - self.variance_mean;
+            self.variance_mean += delta / self.variance_count as f64;
+            self.variance_m2 += delta * (value - self.variance_mean);
+        }
+        self.edge_minimax[edge] = -child_value;
+        self.side_to_move_value()
+    }
+
+    pub(crate) fn len(&self) -> usize {
+        self.priors.len()
+    }
+
+    pub(crate) fn priors(&self) -> &[f64] {
+        &self.priors
+    }
+
+    pub(crate) fn visits(&self) -> &[u64] {
+        &self.visits
     }
 
     /// Pure negamax value of this node, independent of the selection blend.
@@ -394,7 +541,7 @@ impl NodeStats {
     /// prior softmax of the Python _Node.initialize, bit-for-bit, in one call.
     #[staticmethod]
     #[pyo3(signature = (value, priors, wdl=None, minimax_weight=0.0))]
-    fn from_evaluation(
+    pub(crate) fn from_evaluation(
         value: f64,
         priors: Vec<f64>,
         wdl: Option<Vec<f64>>,
@@ -422,7 +569,7 @@ impl NodeStats {
 
     /// Clamped prior probabilities, as completed-Q expects them.
     #[getter]
-    fn probs(&self) -> Vec<f64> {
+    pub(crate) fn probs(&self) -> Vec<f64> {
         self.probs.clone()
     }
 
@@ -516,7 +663,7 @@ impl NodeStats {
     }
 
     /// Forcing flags (capture, check, promotion) per legal move, for the floor.
-    fn set_forcing(&mut self, forcing: Vec<bool>) -> PyResult<()> {
+    pub(crate) fn set_forcing(&mut self, forcing: Vec<bool>) -> PyResult<()> {
         if forcing.len() != self.priors.len() {
             return Err(PyValueError::new_err("invalid forcing mask"));
         }
@@ -525,7 +672,7 @@ impl NodeStats {
     }
 
     /// Selectable actions: root halving candidates, or an interior width cap. Empty = all.
-    fn set_candidates(&mut self, candidates: Vec<bool>) -> PyResult<()> {
+    pub(crate) fn set_candidates(&mut self, candidates: Vec<bool>) -> PyResult<()> {
         if candidates.len() != self.priors.len() || !candidates.iter().any(|c| *c) {
             return Err(PyValueError::new_err("invalid candidate mask"));
         }
@@ -533,7 +680,7 @@ impl NodeStats {
         Ok(())
     }
 
-    fn set_noise(&mut self, noise: Vec<f64>) -> PyResult<()> {
+    pub(crate) fn set_noise(&mut self, noise: Vec<f64>) -> PyResult<()> {
         if noise.len() != self.priors.len() || noise.iter().any(|x| !x.is_finite()) {
             return Err(PyValueError::new_err("invalid root noise"));
         }
@@ -542,7 +689,7 @@ impl NodeStats {
     }
 
     #[pyo3(signature = (maxvisit_init, value_scale, epsilon, forcing_floor=false, visit_cap=0, rescale_values=false))]
-    fn interior(
+    pub(crate) fn interior(
         &self,
         maxvisit_init: f64,
         value_scale: f64,
@@ -569,24 +716,29 @@ impl NodeStats {
                 return Ok(i);
             }
         }
-        let q = self.qvalues();
-        gumbel_interior_action(
-            self.value,
-            &self.priors,
-            &self.visits,
-            &q,
-            &self.probs,
-            maxvisit_init,
-            value_scale,
-            epsilon,
-            &self.candidates,
-            visit_cap,
-            rescale_values,
-        )
+        SCRATCH.with_borrow_mut(|scratch| {
+            let mut blended = std::mem::take(&mut scratch.qvalues);
+            let result = gumbel_interior_action(
+                self.value,
+                &self.priors,
+                &self.visits,
+                self.qvalues_into(&mut blended),
+                &self.probs,
+                maxvisit_init,
+                value_scale,
+                epsilon,
+                &self.candidates,
+                visit_cap,
+                rescale_values,
+                scratch,
+            );
+            scratch.qvalues = blended;
+            result
+        })
     }
 
     #[pyo3(signature = (visit, maxvisit_init, value_scale, epsilon, visit_cap=0, rescale_values=false))]
-    fn root(
+    pub(crate) fn root(
         &self,
         visit: u64,
         maxvisit_init: f64,
@@ -595,26 +747,31 @@ impl NodeStats {
         visit_cap: u64,
         rescale_values: bool,
     ) -> PyResult<usize> {
-        let q = self.qvalues();
-        gumbel_root_action(
-            self.value,
-            &self.priors,
-            &self.visits,
-            &q,
-            &self.probs,
-            maxvisit_init,
-            value_scale,
-            epsilon,
-            &self.noise,
-            visit,
-            self.max_prior,
-            &self.candidates,
-            visit_cap,
-            rescale_values,
-        )
+        SCRATCH.with_borrow_mut(|scratch| {
+            let mut blended = std::mem::take(&mut scratch.qvalues);
+            let result = gumbel_root_action(
+                self.value,
+                &self.priors,
+                &self.visits,
+                self.qvalues_into(&mut blended),
+                &self.probs,
+                maxvisit_init,
+                value_scale,
+                epsilon,
+                &self.noise,
+                visit,
+                self.max_prior,
+                &self.candidates,
+                visit_cap,
+                rescale_values,
+                scratch,
+            );
+            scratch.qvalues = blended;
+            result
+        })
     }
 
-    fn snapshot(&self) -> (Vec<u64>, Vec<f64>, Vec<f64>) {
+    pub(crate) fn snapshot(&self) -> (Vec<u64>, Vec<f64>, Vec<f64>) {
         (self.visits.clone(), self.sums.clone(), self.qvalues())
     }
 }
@@ -636,7 +793,7 @@ fn gumbel_backup(
             return Err(PyValueError::new_err("duplicate backup node"));
         }
         let node = node.try_borrow(py)?;
-        if *edge >= node.visits.len() || node.visits[*edge] == u64::MAX {
+        if !node.backup_ok(*edge) {
             return Err(PyValueError::new_err("invalid backup edge or overflow"));
         }
     }
@@ -645,20 +802,7 @@ fn gumbel_backup(
     let mut child_value = value;
     for (node, edge) in path.iter().rev() {
         value = -value;
-        let mut node = node.try_borrow_mut(py)?;
-        let old_mean = node.means[*edge];
-        node.visits[*edge] += 1;
-        node.sums[*edge] += value;
-        node.means[*edge] = node.sums[*edge] / node.visits[*edge] as f64;
-        if !node.m2.is_empty() {
-            node.m2[*edge] += (value - old_mean) * (value - node.means[*edge]);
-            node.variance_count += 1;
-            let delta = value - node.variance_mean;
-            node.variance_mean += delta / node.variance_count as f64;
-            node.variance_m2 += delta * (value - node.variance_mean);
-        }
-        node.edge_minimax[*edge] = -child_value;
-        child_value = node.side_to_move_value();
+        child_value = node.try_borrow_mut(py)?.backup_edge(*edge, value, child_value);
     }
     Ok(())
 }

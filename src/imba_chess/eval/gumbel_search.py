@@ -10,8 +10,8 @@ DeepMind Technologies Limited. No JAX/mctx runtime dependency.
 from __future__ import annotations
 import math
 import random
-from dataclasses import dataclass, field
-from typing import Any, Callable
+from dataclasses import dataclass
+from typing import Any, Callable, NamedTuple
 import chess
 import imba_chess_native as cc
 from . import cozy_bridge
@@ -181,60 +181,12 @@ class GumbelResult:
     improved_wdl: tuple[float, float, float] | None = None
 
 
-@dataclass(slots=True)
-class _Node:
-    # Slots: a search allocates and frees one node per simulation.
-    board: Any
-    history: list[int]
+class PlayedChild(NamedTuple):
+    """The played root child: its search handle and evaluation (both None
+    for a terminal child)."""
+
     handle: Any
-    value: float | None = None
-    evaluation: PositionEval | None = None
-    visits: list[int] | None = None
-    sums: list[float] | None = None
-    means: list[float] | None = None
-    children: dict[int, Any] = field(default_factory=dict)
-    stats: Any = None
-    priors: list[float] | None = None
-
-    def initialize(self, evaluation, config=None, role="root"):
-        """role: "root", "opponent" (opponent to move) or "own" (root player, not root)."""
-        minimax_weight = 0.0 if config is None else config.minimax_weight
-        floors = config is not None and (config.forcing_floor or config.own_forcing_floor)
-        if isinstance(evaluation, cc.LeafEvaluation):
-            # Native decode results validate and build their stats in one call.
-            stats = evaluation.node_stats(minimax_weight, floors)
-            n, priors = len(evaluation), None
-        else:
-            n = len(evaluation.legal_ids)
-            if (
-                not n
-                or len(evaluation.legal_moves) != n
-                or len(evaluation.legal_ucis) != n
-                or len(evaluation.legal_log_priors) != n
-            ):
-                raise ValueError("nonterminal evaluation has invalid legal projection")
-            priors = list(evaluation.legal_log_priors)
-            # Native: finite value/prior and WDL validation, then the FLT_MIN-clamped
-            # prior softmax, bit-identical to the former Python implementation.
-            stats = cc.NodeStats.from_evaluation(
-                evaluation.value_stm, priors, evaluation.wdl, minimax_weight
-            )
-            if len(evaluation.legal_forcing) != n:
-                raise ValueError("nonterminal evaluation has invalid legal projection")
-            if floors:
-                stats.set_forcing(list(evaluation.legal_forcing))
-        self.evaluation = evaluation
-        self.value = evaluation.value_stm
-        self.priors = priors
-        self.stats = stats
-        if config is not None and config.own_width and role == "own" and n > config.own_width:
-            if priors is None:
-                priors = evaluation.legal_log_priors
-            keep = set(sorted(range(n), key=lambda i: (-priors[i], i))[: config.own_width])
-            self.stats.set_candidates([i in keep for i in range(n)])
-
-    def qs(self):
-        return self.means
+    evaluation: Any
 
 
 def gumbel_stepwise(
@@ -249,121 +201,53 @@ def gumbel_stepwise(
     root_wdl=None,
     should_stop: Callable[[], bool] = lambda: False,
     on_played: Callable | None = None,
+    transition: Callable | None = None,
+    observer=None,
 ):
     """Yield at most one new neural leaf per simulation; retain history per path.
 
-    on_played, if given, receives the played action's child node (or None).
+    The tree and every simulation live in native code (cc.GumbelTree); this
+    generator only scores the leaves it asks for. on_played, if given,
+    receives the played action's PlayedChild (or None). transition replaces
+    chess with a synthetic environment (see GumbelTree; tests only). observer,
+    for measurement only, gets observer.root(root_eval, noise, priors,
+    considered) once and observer.leaf(...) after every simulation (see
+    GumbelTree.set_observer).
 
     A supplied root_eval is counted as one neural evaluation too. Terminal
     roots are not playable and raise ValueError. Cancellation raises InterruptedError.
     """
-    root = _Node(cozy_bridge.board_to_cozy(board), _root_hash_seed(board), root_handle)
-    if (
-        cozy_bridge.terminal_value_native(
-            root.board, color_is_stm=True, hash_history=root.history
-        )
-        is not None
-    ):
+    root_board, history = cozy_bridge.board_to_cozy(board), _root_hash_seed(board)
+    if transition is None and cc.gumbel_root_is_terminal(root_board, list(history)):
         raise ValueError("cannot search terminal root")
     if root_eval is None:
-        (root_eval,) = yield EvalRequest([(root_handle, root.board)])
-    root.initialize(root_eval, config)
-    n = len(root_eval.legal_ids)
+        (root_eval,) = yield EvalRequest([(root_handle, root_board)])
+    tree = cc.GumbelTree(config, root_board, list(history), root_handle, root_eval, transition)
+    n = len(tree)
     if noise is None:
         rng = rng or random.Random()
         noise = [-math.log(-math.log(max(rng.random(), 1e-12))) for _ in range(n)]
-    if len(noise) != n or not all((math.isfinite(x) for x in noise)):
-        raise ValueError("noise must contain one finite value per legal action")
-    root.stats.set_noise(noise)
-    priors = root_eval.legal_log_priors
-    max_prior = max(priors)
-    evaluations, terminal_hits, cutoffs, deepest = (1, 0, 0, 0)
-    wdl_sums = [0.0, 0.0, 0.0]
-    edge_wdl_sums = [[0.0, 0.0, 0.0] for _ in range(n)]
-    wdl_available = True
-
-    considered = min(config.top_m, n, config.simulations)
-    if config.root_forcing:
-        # Root halving over the usual top_m (by noise + prior) plus every forcing move.
-        order = sorted(range(n), key=lambda i: (-(noise[i] + priors[i]), i))
-        candidates = set(order[: min(config.top_m, n)])
-        candidates.update(i for i, forcing in enumerate(root_eval.legal_forcing) if forcing)
-        root.stats.set_candidates([i in candidates for i in range(n)])
-        considered = min(len(candidates), config.simulations)
-
-    def root_action(visit):
-        return root.stats.root(
-            visit, config.maxvisit_init, config.value_scale, config.epsilon, config.visit_cap,
-            config.rescale_values,
-        )
-
-    for visit in considered_visits(considered, config.simulations):
-        if should_stop():
-            raise InterruptedError("search cancelled")
-        node, action, depth, path = (root, root_action(visit), 0, [])
-        while True:
-            path.append((node, action))
-            depth += 1
-            deepest = max(deepest, depth)
-            if action not in node.children:
-                ev = node.evaluation
-                child_board, history, terminal = cc.push_and_classify(
-                    node.board, ev.move_at(action), node.history, True
-                )
-                child = _Node(child_board, history, None, value=terminal)
-                node.children[action] = child
-                if terminal is None:
-                    child.handle = extend(
-                        node.handle, ev.uci_at(action), ev.id_at(action)
-                    )
-                    (evaluation,) = yield EvalRequest([(child.handle, child.board)])
-                    child.initialize(evaluation, config, "opponent" if depth % 2 else "own")
-                    evaluations += 1
-                leaf = child
-                if terminal is not None:
-                    terminal_hits += 1
-                elif depth == config.max_depth:
-                    cutoffs += 1
-                break
-            node = node.children[action]
-            if node.evaluation is None:
-                terminal_hits += 1
-                leaf = node
-                break
-            if depth == config.max_depth:
-                cutoffs += 1
-                leaf = node
-                break
-            floor = config.forcing_floor if depth % 2 == 1 else config.own_forcing_floor
-            action = node.stats.interior(
-                config.maxvisit_init, config.value_scale, config.epsilon, floor, config.visit_cap,
-                config.rescale_values,
-            )
-            continue
-        cc.gumbel_backup([(n.stats, a) for n, a in path], leaf.value)
-        if leaf.evaluation is None:
-            leaf_wdl = (float(leaf.value == -1), float(leaf.value == 0), float(leaf.value == 1))
-        else:
-            leaf_wdl = leaf.evaluation.wdl
-        if leaf_wdl is None:
-            wdl_available = False
-        else:
-            # Every chess ply swaps players; draws retain their perspective.
-            root_pov = leaf_wdl[::-1] if depth % 2 else leaf_wdl
-            edge = edge_wdl_sums[path[0][1]]
-            for i, probability in enumerate(root_pov):
-                wdl_sums[i] += probability
-                edge[i] += probability
-    root.visits, root.sums, root.means = root.stats.snapshot()
-    action = root_action(max(root.visits))
+    tree.set_root_noise(list(noise))
+    if observer is not None:
+        observer.root(root_eval, list(noise), list(root_eval.legal_log_priors), tree.considered)
+        tree.set_observer(observer.leaf)
+    while (leaf := tree.next_leaf(should_stop)) is not None:
+        parent, uci, move_id, child_board = leaf
+        handle = extend(parent, uci, move_id)
+        (evaluation,) = yield EvalRequest([(handle, child_board)])
+        tree.attach(handle, evaluation)
+    (
+        visits, qs, probs, action, evaluations, terminal_hits, cutoffs, deepest,
+        wdl_sums, edge_wdl_sums, wdl_available, played,
+    ) = tree.finish()
     if on_played is not None:
-        on_played(root.children.get(action))
-    q = completed_q(
-        root.value, priors, root.visits, root.qs(), config, root.stats.probs
-    )
+        on_played(None if played is None else PlayedChild(*played))
+    priors = root_eval.legal_log_priors
+    root_value = root_eval.value_stm
+    q = completed_q(root_value, priors, visits, qs, config, probs)
     policy = softmax([p + v for p, v in zip(priors, q)])
     improved_wdl = policy_wdl(
-        policy, root.visits, edge_wdl_sums, root.stats.probs,
+        policy, visits, edge_wdl_sums, probs,
         root_wdl if root_wdl is not None else root_eval.wdl,
     ) if wdl_available else None
     return GumbelResult(
@@ -371,10 +255,10 @@ def gumbel_stepwise(
         root_eval.legal_ids[action],
         list(root_eval.legal_ids),
         policy,
-        root.value,
+        root_value,
         root_wdl,
-        root.visits,
-        root.qs(),
+        visits,
+        qs,
         config.simulations,
         evaluations,
         terminal_hits,

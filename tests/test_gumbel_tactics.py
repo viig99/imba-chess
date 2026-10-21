@@ -10,7 +10,7 @@ import pytest
 from imba_chess.eval import cozy_bridge
 from dataclasses import replace
 
-from imba_chess.eval import gumbel_search
+from types import SimpleNamespace
 from imba_chess.eval.gumbel_search import GumbelConfig, select_gumbel
 from tests.test_gumbel_search import FakeEvaluator
 
@@ -144,8 +144,8 @@ def test_minimax_blends_once_independently_of_tactic_depth(depth, weight):
 def _node(role, config):
     board = chess.Board(FENS[1])
     evaluation = VariedEvaluator().evaluate([(("x",), cozy_bridge.board_to_cozy(board))])[0]
-    node = gumbel_search._Node(cozy_bridge.board_to_cozy(board), [], None)
-    node.initialize(evaluation, config, role)
+    stats, value = cc._gumbel_node_stats(evaluation, config, role == "own")
+    node = SimpleNamespace(stats=stats, value=value, priors=list(evaluation.legal_log_priors))
     return node, evaluation
 
 

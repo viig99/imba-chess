@@ -14,8 +14,9 @@
 use std::sync::Arc;
 
 use pyo3::buffer::PyBuffer;
-use pyo3::exceptions::PyValueError;
+use pyo3::exceptions::{PyRuntimeError, PyValueError};
 use pyo3::prelude::*;
+use pyo3::types::PyList;
 
 use crate::board::Board;
 use crate::board_state::{encode, EncodeConfig};
@@ -36,7 +37,7 @@ pub struct LegalSet {
 
 impl LegalSet {
     /// Promotion, capture or check per move, computed once on first use.
-    fn forcing_flags(&self) -> &Vec<bool> {
+    pub(crate) fn forcing_flags(&self) -> &Vec<bool> {
         self.forcing
             .get_or_init(|| self.moves.iter().map(|mv| is_forcing(&self.board, *mv)).collect())
     }
@@ -127,49 +128,107 @@ impl WaveStager {
         })
     }
 
-    /// Fill, for each row: 64 piece ids at row * 64; the event token and five
-    /// board scalars at scalars_offset + k * pitch + row (k = 0..6; k = 6, the
-    /// previous move id, belongs to the caller); and the row's legal ids at
-    /// legal_offset + row * legal_capacity. Unwritten entries keep their value.
+    /// Everything DecodeWorkspace.prepare writes per row, in one call. Per row:
+    /// 64 piece ids at row * 64; the event token, five board scalars and the
+    /// node's move id at scalars + k * pitch + row (k = 0..7); position (prefix
+    /// length + depth), prefix length, ancestor count and destination row at
+    /// positions + k * pitch + row (k = 0..4); the parent's arena chain at
+    /// ancestors + row * ancestor_capacity; legal ids at legal + row *
+    /// legal_capacity. Unwritten entries keep their value. Raises like the
+    /// Python staging did when a parent was never decoded or the chain does not
+    /// match the node's depth.
     #[allow(clippy::too_many_arguments)]
-    fn stage(
+    fn stage_wave(
         &self,
         py: Python<'_>,
         host: &Bound<'_, PyAny>,
+        nodes: Vec<Bound<'_, PyAny>>,
         boards: Vec<PyRef<'_, Board>>,
         legal: Vec<PyRef<'_, LegalSet>>,
-        pitch: usize,
-        scalars_offset: usize,
-        legal_offset: usize,
-        legal_capacity: usize,
+        prefix_lens: Vec<i64>,
+        dests: Vec<i64>,
+        layout: WaveLayout,
     ) -> PyResult<()> {
         let g = boards.len();
-        if legal.len() != g || pitch < g {
+        let l = &layout;
+        if [nodes.len(), legal.len(), prefix_lens.len(), dests.len()].iter().any(|n| *n != g)
+            || l.pitch < g
+        {
             return Err(PyValueError::new_err("invalid wave staging layout"));
         }
         let buffer = PyBuffer::<i64>::get(host)?;
         let out = writable(py, &buffer)?;
         let needed = [
             64 * g,
-            scalars_offset + 6 * pitch + g,
-            legal_offset + legal_capacity * g,
+            l.scalars + 6 * l.pitch + g,
+            l.positions + 3 * l.pitch + g,
+            l.ancestors + l.ancestor_capacity * g,
+            l.legal + l.legal_capacity * g,
         ];
-        if needed.iter().any(|n| *n > out.len()) || scalars_offset < 64 * g {
+        if needed.iter().any(|n| *n > out.len()) || l.scalars < 64 * g {
             return Err(PyValueError::new_err("staging buffer is too small"));
         }
-        for (row, (board, legal)) in boards.iter().zip(&legal).enumerate() {
-            if legal.ids.len() > legal_capacity {
+        let (parent_name, depth_name, move_name, chain_name) = (
+            pyo3::intern!(py, "parent"),
+            pyo3::intern!(py, "depth"),
+            pyo3::intern!(py, "move_id"),
+            pyo3::intern!(py, "arena_chain"),
+        );
+        for row in 0..g {
+            let node = &nodes[row];
+            let depth: usize = node.getattr(depth_name)?.extract()?;
+            let parent = node.getattr(parent_name)?;
+            let chain = if parent.is_none() {
+                None
+            } else {
+                let chain = parent.getattr(chain_name)?;
+                if chain.is_none() {
+                    return Err(PyRuntimeError::new_err(
+                        "Cannot decode a child before evaluating its parent",
+                    ));
+                }
+                Some(chain)
+            };
+            let count = match &chain {
+                None => 0,
+                Some(chain) => chain.len()?,
+            };
+            if count != depth || count > l.ancestor_capacity {
+                return Err(PyValueError::new_err(
+                    "search suffix exceeds capacity or has invalid ancestry",
+                ));
+            }
+            if let Some(chain) = chain {
+                let base = l.ancestors + row * l.ancestor_capacity;
+                if let Ok(list) = chain.downcast::<PyList>() {
+                    for (j, item) in list.iter().enumerate() {
+                        out[base + j].set(item.extract()?);
+                    }
+                } else {
+                    for (j, item) in chain.try_iter()?.enumerate() {
+                        out[base + j].set(item?.extract()?);
+                    }
+                }
+            }
+            let legal = &legal[row];
+            if legal.ids.len() > l.legal_capacity {
                 return Err(PyValueError::new_err("legal ids exceed staging capacity"));
             }
-            let (pieces, scalars) = encode(&board.0, &self.cfg);
+            let (pieces, scalars) = encode(&boards[row].0, &self.cfg);
             for (square, id) in pieces.iter().enumerate() {
                 out[row * 64 + square].set(i64::from(*id));
             }
-            out[scalars_offset + row].set(self.event_token);
+            out[l.scalars + row].set(self.event_token);
             for (k, value) in scalars.iter().enumerate() {
-                out[scalars_offset + (k + 1) * pitch + row].set(*value);
+                out[l.scalars + (k + 1) * l.pitch + row].set(*value);
             }
-            let base = legal_offset + row * legal_capacity;
+            out[l.scalars + 6 * l.pitch + row].set(node.getattr(move_name)?.extract()?);
+            let prefix = prefix_lens[row];
+            out[l.positions + row].set(prefix + depth as i64);
+            out[l.positions + l.pitch + row].set(prefix);
+            out[l.positions + 2 * l.pitch + row].set(count as i64);
+            out[l.positions + 3 * l.pitch + row].set(dests[row]);
+            let base = l.legal + row * l.legal_capacity;
             for (j, id) in legal.ids.iter().enumerate() {
                 out[base + j].set(*id);
             }
@@ -178,18 +237,57 @@ impl WaveStager {
     }
 }
 
+/// Field offsets of the packed decode-wave buffer (DecodeWorkspace._fields).
+#[derive(FromPyObject)]
+#[pyo3(from_item_all)]
+pub struct WaveLayout {
+    pitch: usize,
+    scalars: usize,
+    positions: usize,
+    ancestors: usize,
+    ancestor_capacity: usize,
+    legal: usize,
+    legal_capacity: usize,
+}
+
+/// After a decode wave: each node's arena chain becomes its parent's chain
+/// plus the row its own K/V was written to.
+#[pyfunction]
+pub fn extend_arena_chains(
+    py: Python<'_>,
+    nodes: Vec<Bound<'_, PyAny>>,
+    dests: Vec<i64>,
+) -> PyResult<()> {
+    if nodes.len() != dests.len() {
+        return Err(PyValueError::new_err("one destination row per node"));
+    }
+    let (parent_name, chain_name) = (pyo3::intern!(py, "parent"), pyo3::intern!(py, "arena_chain"));
+    for (node, dest) in nodes.iter().zip(dests) {
+        let parent = node.getattr(parent_name)?;
+        let chain = PyList::empty(py);
+        if !parent.is_none() {
+            for item in parent.getattr(chain_name)?.try_iter()? {
+                chain.append(item?)?;
+            }
+        }
+        chain.append(dest)?;
+        node.setattr(chain_name, chain)?;
+    }
+    Ok(())
+}
+
 /// A network evaluation of one nonterminal leaf, ready to become search stats.
 #[pyclass(frozen)]
 pub struct LeafEvaluation {
-    value: f64,
-    wdl: [f64; 3],
-    priors: Vec<f64>,
+    pub(crate) value: f64,
+    pub(crate) wdl: [f64; 3],
+    pub(crate) priors: Vec<f64>,
     // The node's projection, shared rather than copied.
-    legal: Py<LegalSet>,
+    pub(crate) legal: Py<LegalSet>,
 }
 
 impl LeafEvaluation {
-    fn legal(&self) -> &LegalSet {
+    pub(crate) fn legal(&self) -> &LegalSet {
         self.legal.get()
     }
 
@@ -258,7 +356,7 @@ impl LeafEvaluation {
     /// NodeStats.from_evaluation over this evaluation, plus forcing flags
     /// when the search's forcing floors need them.
     #[pyo3(signature = (minimax_weight=0.0, with_forcing=false))]
-    fn node_stats(&self, minimax_weight: f64, with_forcing: bool) -> PyResult<NodeStats> {
+    pub(crate) fn node_stats(&self, minimax_weight: f64, with_forcing: bool) -> PyResult<NodeStats> {
         let legal = self.legal();
         if legal.ids.is_empty() {
             return Err(PyValueError::new_err(
@@ -331,5 +429,6 @@ pub fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<WaveStager>()?;
     m.add_class::<LeafEvaluation>()?;
     m.add_function(wrap_pyfunction!(make_evaluations, m)?)?;
+    m.add_function(wrap_pyfunction!(extend_arena_chains, m)?)?;
     Ok(())
 }

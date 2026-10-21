@@ -237,29 +237,21 @@ class DecodeWorkspace:
                 self.free_rows.extend(slot.rows)
                 del self.slots[key]
         requests = [_stage_request(e, batch) for e, batch in payloads]
-        chains = []
-        for req in requests:
-            node = req.nodes[0]
-            chain = [] if node.parent is None else node.parent.arena_chain
-            if chain is None:
-                raise RuntimeError("Cannot decode a child before evaluating its parent")
-            if len(chain) != node.depth or len(chain) > self.capacity:
-                raise ValueError(
-                    "search suffix exceeds capacity or has invalid ancestry"
-                )
-            chains.append(chain)
-        per_node = [
-            cozy_bridge.project_legal_lean(req.boards[0], e._move_vocab)
-            for (e, _), req in zip(payloads, requests)
-        ]
+        nodes = [req.nodes[0] for req in requests]
+        boards = [req.boards[0] for req in requests]
         encoder = payloads[0][0]._board_state_encoder
+        vocab = payloads[0][0]._move_vocab
         if any(e._board_state_encoder is not encoder for e, _ in payloads):
             raise ValueError("decode wave mixes board-state encoders")
+        if any(e._move_vocab is not vocab for e, _ in payloads):
+            raise ValueError("decode wave mixes move vocabularies")
+        # Native: every row's legal set in one call, and the widest row.
+        per_node, width = cozy_bridge.project_wave(boards, vocab)
         if self._stager is None or self._stager[0] is not encoder:
             self._stager = (encoder, _wave_stager(encoder))
         slots_rows = [self._slot(e, req) for (e, _), req in zip(payloads, requests)]
-        g, p = len(requests), max(r.prefix_len for r in requests)
-        width = max(len(legal) for legal in per_node)
+        prefix_lens = [r.prefix_len for r in requests]
+        g, p = len(requests), max(prefix_lens)
         full_refresh = False
         if (
             g > self.batch_capacity
@@ -321,29 +313,31 @@ class DecodeWorkspace:
         # Logical rows are contiguous just like the compiled reference. Capacity
         # padding lives after the used range, outside each layer's active view.
         keys = FEATURE_KEYS
-        # Native: piece ids, the event token, five board scalars and legal ids.
+        # Native, in _fields' layout: piece ids, the event token, five board
+        # scalars and the move id; position, prefix length, ancestor count and
+        # destination row; the parent's arena chain (validated against the
+        # node's depth); and the legal ids.
         pitch = (g + 31) // 32 * 32
-        self._stager[1].stage(
+        dests = [dest for _, dest in slots_rows]
+        self._stager[1].stage_wave(
             self.numpy,
-            [req.boards[0] for req in requests],
+            nodes,
+            boards,
             per_node,
-            pitch,
-            64 * g,
-            64 * g + 11 * pitch + 32 * g,
-            self.legal_capacity,
+            prefix_lens,
+            dests,
+            dict(
+                pitch=pitch,
+                scalars=64 * g,
+                positions=64 * g + 7 * pitch,
+                ancestors=64 * g + 11 * pitch,
+                ancestor_capacity=self.capacity,
+                legal=64 * g + 11 * pitch + self.capacity * g,
+                legal_capacity=self.legal_capacity,
+            ),
         )
-        nodes = [req.nodes[0] for req in requests]
-        host_fields[1][6] = [node.move_id for node in nodes]
-        host_fields[2][0] = [
-            req.prefix_len + node.depth for req, node in zip(requests, nodes)
-        ]
-        host_fields[2][1] = [req.prefix_len for req in requests]
-        host_fields[2][2] = [len(chain) for chain in chains]
-        host_fields[2][3] = [dest for _, dest in slots_rows]
         dirty = []
-        for row, (chain, (slot, _)) in enumerate(zip(chains, slots_rows)):
-            if chain:
-                host_fields[3][row, : len(chain)] = chain
+        for row, (slot, _) in enumerate(slots_rows):
             owner = (slot.owner, slot.stamp)
             if self.row_owners[row] != owner:
                 dirty.append(row)
@@ -373,7 +367,7 @@ class DecodeWorkspace:
             lengths,
             depths,
         )
-        return args, (requests, chains, slots_rows, per_node, width)
+        return args, (requests, nodes, slots_rows, per_node, width)
 
     def decode(self, args):
         """Run the decoder on prepare() arguments.
@@ -454,7 +448,7 @@ class DecodeWorkspace:
         )
 
     def consume(self, state, out):
-        requests, chains, slots_rows, per_node, width = state
+        requests, nodes, slots_rows, per_node, width = state
         for req, (slot, _) in zip(requests, slots_rows):
             owner = slot.owner()
             if owner is not None:
@@ -468,8 +462,8 @@ class DecodeWorkspace:
         rows = rows.view(layers, 2, *rows.shape[1:])
         self.arena_stack.index_copy_(2, self.device_fields[2][3], rows)
         self.counters["scatter_bytes"] += rows.numel() * rows.element_size()
-        for req, chain, (_, dest) in zip(requests, chains, slots_rows):
-            req.nodes[0].arena_chain = chain + [dest]
+        # Each node's chain: its parent's plus the row its K/V was written to.
+        cc.extend_arena_chains(nodes, [dest for _, dest in slots_rows])
         picked = out["logits"].float().gather(1, self.device_fields[4][:, :width])
         # Blocking readback also protects pinned metadata from CPU overwrite.
         packed = torch.cat((picked, out["value_logits"].float()), dim=1).cpu()

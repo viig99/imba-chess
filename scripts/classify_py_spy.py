@@ -100,26 +100,28 @@ def classify(frames):
     if inside("gumbel_stepwise", "gumbel_search.py"):
         sub = below("gumbel_stepwise", "gumbel_search.py")
         names = " ".join(f[0] for f in sub)
+        # The tree and its simulations are native (gumbel_tree.rs); Rust v0
+        # symbols are mangled, so match distinctive substrings, innermost first.
         for needle, label in (
-            ("push_and_classify", "search: push_and_classify (child board+terminal)"),
-            ("gumbel_backup", "search: backup"),
-            ("from_evaluation", "search: node init (NodeStats.from_evaluation)"),
-            ("set_forcing", "search: node init (set_forcing)"),
-            ("initialize", "search: node init (python)"),
-            ("interior", "search: interior selection"),
-            ("root", "search: root selection"),
+            ("drop_glue", "search: native tree teardown"),
+            ("8interior", "search: native interior selection"),
+            ("NodeStats4root", "search: native root selection"),
+            ("push_classify", "search: native push/classify (child board+terminal)"),
+            ("backup_edge", "search: native backup"),
+            ("attach", "search: native leaf init (attach)"),
+            ("next_leaf", "search: native tree walk (next_leaf)"),
             ("extend", "search: extend handle"),
             ("completed_q", "search: final completed_q/softmax"),
             ("softmax", "search: final completed_q/softmax"),
-            ("snapshot", "search: final snapshot"),
-            ("considered_visits", "search: considered_visits"),
-            ("__init__", "search: _Node creation"),
+            ("finish", "search: final snapshot"),
         ):
             if needle in names:
                 return label
-        return "search: python tree walk (self)"
+        return "search: python driver (self)"
     if inside("search_batch", "inference_runtime.py"):
         sub = below("search_batch", "inference_runtime.py")
+        if native_has(sub, "drop_glue"):
+            return "search: native tree teardown"
         if any("_project_legal_logits" in f[0] for f in sub):
             return "root setup: python-chess legal projection"
         if any("py_move_to_cozy" in f[0] or "gives_check" in f[0] or "is_capture" in f[0] for f in sub):

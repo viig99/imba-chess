@@ -1,6 +1,7 @@
 """Multi-depth goldens from actual DeepMind mctx, with production native stats.
 
-Only environment transitions and neural evaluations are synthetic. Sequential
+Only environment transitions (the native tree's transition hook) and neural
+evaluations are synthetic. Sequential
 halving, interior selection, backups, depth cutoff and targets use production code.
 """
 import json
@@ -38,10 +39,8 @@ def run_synthetic(*, k, seed, budget, top_m, depth, terminal, scale, noise):
     with (
         patch('imba_chess.eval.gumbel_search.cozy_bridge.board_to_cozy', return_value=(1, 0)),
         patch('imba_chess.eval.gumbel_search._root_hash_seed', return_value=[]),
-        patch('imba_chess.eval.gumbel_search.cozy_bridge.terminal_value_native', return_value=None),
-        patch('imba_chess.eval.gumbel_search.cc.push_and_classify', side_effect=push),
     ):
-        return select_gumbel(evaluator=Evaluator(), board=None, noise=noise,
+        return select_gumbel(evaluator=Evaluator(), board=None, noise=noise, transition=push,
                              config=GumbelConfig(simulations=budget, top_m=top_m,
                                                  max_depth=depth, value_scale=scale, rescale_values=True))
 

@@ -142,16 +142,15 @@ INVALID_PROJECTION = "nonterminal evaluation has invalid legal projection"
     ],
 )
 def test_node_initialize_validates_evaluations(value, priors, wdl, forcing, expected):
-    from imba_chess.eval.gumbel_search import _Node
     from imba_chess.eval.search import PositionEval
 
     n = len(priors)
     evaluation = PositionEval(value, [None] * n, ["a"] * n, priors, forcing, list(range(n)), wdl=wdl)
-    node = _Node(None, [], None)
     if expected is None:
-        node.initialize(evaluation, GumbelConfig(forcing_floor=True, minimax_weight=0.5, rescale_values=True, value_scale=0.1))
-        assert node.value == value and node.priors == priors
-        assert node.stats.probs == [max(p, 1.1754943508222875e-38) for p in softmax(priors)]
+        config = GumbelConfig(forcing_floor=True, minimax_weight=0.5, rescale_values=True, value_scale=0.1)
+        stats, node_value = cc._gumbel_node_stats(evaluation, config, False)
+        assert node_value == value
+        assert stats.probs == [max(p, 1.1754943508222875e-38) for p in softmax(priors)]
     else:
         with pytest.raises(ValueError, match=expected):
-            node.initialize(evaluation)
+            cc._gumbel_node_stats(evaluation, GumbelConfig(), False)
