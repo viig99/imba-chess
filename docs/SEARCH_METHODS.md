@@ -5,7 +5,15 @@ The added methods use the same native chess transitions and node statistics,
 compiled single-leaf CUDA decoder, KV workspace, root carry, batch scheduler,
 collection workers, and replay schema. They need no checkpoint conversion.
 
-**Status (2026-10-19): Gumbel is the default and the live recipe, now trained on
+**Current status (2026-10-23):** Gumbel remains the live recipe, with
+`improved_wdl`, value-search mix 0.5 and LR 5e-5. The live accumulation-16
+candidate's EMA-2000 scored **60.5% vs SF2600** over 100 games at Gumbel 512;
+its fixed golden-set policy regret and value error both improved against EMA-554.
+See the [results and debugging lessons](SELF_PLAY_PROGRESS_2026-10-23.md).
+This is evidence for the current Gumbel recipe, not a matched comparison against
+the alternative search learners below.
+
+**Historical status (2026-10-19, before the LR/mix migration): Gumbel was the live recipe, trained on
 `improved_wdl` at `value_search_mix = 0.25`. Whether variance-scaled PUCT learns
 better is open.** Variance-scaled PUCT without RPO is still the only method with
 a repeated learning gain: raw policy regret in both short seeds of the screen

@@ -2,6 +2,32 @@
 
 Chess sequence modeling, configurable search self-play learning, and model evaluation against Stockfish. The HSTU model consumes complete board/move histories; native chess primitives handle legal moves, board encoding and terminal rules.
 
+## Latest self-play result — 2026-10-23
+
+**EMA-2000 scored 60.5% against strength-limited Stockfish 2600: 47 wins,
+27 draws and 26 losses in 100 games**, our highest completed SF2600 aggregate
+recorded so far. EMA-1085 scored 49% under the same protocol. Both used plain
+Gumbel 512, FP32, zero exploration, and Stockfish at 40k nodes with a 5-second cap.
+The implied performance is **2674 Elo (approximate 95% interval 2616–2736)**
+relative to this benchmark, not a calibrated FIDE rating.
+
+The same EMA-2000 scored **67.5% against the run's starting EMA-554** over
+200 color-swapped opening pairs. On the fixed 4,110-position golden set, policy
+regret improved **0.1162 → 0.1085** and value MAE **0.1642 → 0.1531**, with paired
+intervals supporting both improvements. This is a promising continuing candidate;
+100 SF games do not establish a precise rating or guarantee monotonic progress.
+
+The main practical lesson is to increase useful completed games per day while
+checking that the network absorbs useful targets. Recent wall-clock throughput
+was about **400k games/day**, roughly four times the earlier reported 100k/day.
+Native search ownership, less Python/allocation overhead, batched decoder staging,
+and five CUDA MPS collectors made longer learning experiments practical. Value
+target fixes, lower learning rate and larger training batches also changed during
+this lineage; throughput alone has not been isolated as the cause of the gain.
+
+See the [results, key insights and debugging playbook](docs/SELF_PLAY_PROGRESS_2026-10-23.md)
+and [committed measurement record](docs/results/self-play-2026-10-23.json).
+
 ## Current workflows
 
 | Task | Entrypoint |
@@ -27,9 +53,9 @@ one model architecture, with no pooling switch or runtime checkpoint conversion.
 For a training warm start use `--init-weights`; `--resume` requires a flattened checkpoint
 with compatible optimizer state. See [continuation and promotion](docs/FLATTEN_BOARD_CONTINUATION.md).
 
-**The experiment baseline remains the verified flattened copy of ckpt34 until a trained
-candidate passes the matched SF2400 halving comparison.** Architecture adoption
-does not itself promote a checkpoint.
+The historical architecture-adoption baseline is the verified flattened copy of
+ckpt34; its SF2400 halving promotion gate is separate from the current SF2600
+self-play measurements above. Architecture adoption does not itself promote a checkpoint.
 
 Stage 1 learns human moves with full-vocabulary cross entropy and configured Elo weighting. Stockfish annotations supervise the value head where present, using the fixed win-percent transform; moves-left supervision remains available. See [event alignment](TRAINING_EVENT_SCHEMA.md), [board encoding](FEN_TO_BOARD_STATE.md) and [value targets](docs/VALUE_TARGET_WINPERCENT_HANDOFF.md).
 
@@ -75,29 +101,33 @@ touch artifacts/self_play/new-run/STOP   # remove it before restarting
 
 | Default | Value | Notes |
 |---|---|---|
-| `--config` | `config/self_play.toml` | Plain Gumbel 256, raw Q at value scale 0.5, bf16 collection, fast play-out of decided games, carry-over of in-flight games, a 500k-position FIFO replay (~8.9 phases) at reuse 2, constant LR 2e-4, EMA 0.995. See the [config guide](docs/CONFIG_GUIDE.md). |
+| `--config` | `config/self_play.toml` | Plain Gumbel 256, raw Q at value scale 0.5, bf16 collection, fast play-out of decided games, carry-over of in-flight games, a 500k-position FIFO replay (~8.9 phases) at reuse 2, constant LR 5e-5, improved-policy WDL mix 0.5, EMA 0.995. The live candidate uses gradient accumulation 16; this default uses 4. See the [config guide](docs/CONFIG_GUIDE.md). |
 | `--seeds` | `artifacts/corpus/v4_self_play_seeds_4096.json` | Held-out monitor openings for screens; build once with `scripts/materialize_corpus.py` and `scripts/prepare_self_play_seeds.py`. Training starts stream from the corpus. |
 | `--collect-workers`, slots | 5 workers x 32 games (config `concurrent_games = 160`) | About 11 GB peak on 16 GB. 6 workers never fit, and 5 x 40 ran out of memory beside a Stockfish eval. |
 | `--cpu-threads` | 1 | Idle OpenMP threads slow the single search thread of each worker. |
 | `--continuous` | on | `--no-continuous` stops after the config's `[run] hours`; `--until` sets a deadline. |
 | `--observe-only-screen` | on | Screens record strength against the initial actor without rollback or promotion; `--no-observe-only-screen` gates on them. |
-| `--screen-games` | 100,000 | About 7 hours. |
-| `--save-every` | 5 | The actor (a full trainer state, EMA included) is saved every 5th iteration (~12 min with 640-game phases), at screens and at graceful stops; weights stay in memory between saves. Screens also write the EMA they evaluate. |
+| `--screen-games` | 100,000 | About 6 hours at the recent pace. The live supervisor schedules its own screens; see the progress report. |
+| `--save-every` | 5 | The actor (a full trainer state, EMA included) is saved every 5th iteration, at screens and at graceful stops; weights stay in memory between saves. Screens also write the EMA they evaluate. |
 
 Run the workers under the CUDA MPS daemon (`nvidia-cuda-mps-control -d`, or a user systemd unit),
 so the 5 processes share the GPU concurrently. On the 5070 Ti, at commit 8e757d6, the recipe ran at
-about 82k neural evaluations/s and 69 s per iteration: ~14.8k games/hour, ~355k a day, 10-11.5 GB peak.
+about 82k neural evaluations/s: ~14.8k games/hour, ~355k a day, 10-11.5 GB peak
+(historical configuration). Recent wall-clock measurements are about 16.7k games/hour,
+or 400k/day including alternating training; longer exclusive evaluations reduce that total.
 On a larger GPU, raise `--collect-workers` and `--concurrent-games`. The 32 GB 5090 ran
 12 workers x 28 games in bf16. Both flags are execution-only and keep the resume identity.
 
-Screens only compare the run against itself. Track strength with Stockfish about twice a day
+Screens compare checkpoints against fixed networks. Track external strength with Stockfish
 (100 games, 512 simulations):
 `scripts/extract_ema.py --checkpoint RUN/actor-NNNNNN.pt --output <dir>/ema-NNNNNN.pt`, then
 `scripts/run_stockfish_eval.py --checkpoint <dir>/ema-NNNNNN.pt --config config/imba_chess_v4_aux3.toml --out <dir> -- --gumbel-simulations 512`.
-Use the first saved actor at or after the iteration you want, and extract its EMA promptly: the run prunes old checkpoint files. The 2026-10 lineage sat at about 44%
-against SF2600 (ema-100 of the LR 2e-4 run).
+Use the first saved actor at or after the iteration you want, and extract its EMA promptly:
+the run prunes old checkpoint files. The live supervisor's one-off EMA-2000 test completed
+at 60.5%; it does not automatically schedule subsequent SF2600 tests.
 
-Collection is limited by its single search thread, not the GPU. `--collect-workers N` (default 5) splits `--concurrent-games` across N processes sharing the GPU. The main process keeps replay, streamed starts, regret state and training, and workers load its weights at every collect phase. On the 8 GB laptop, 2 workers × 32 games collected 24% faster than one process with 64 games; 4 × 16 saturated the GPU. `--cpu-threads` (default 1) stops idle OpenMP workers from spinning on every core. Both flags are execution-only and keep the resume config identity.
+CPU search overhead was an important collection bottleneck; profile the current worker
+and GPU timeline before assuming the same limit still applies. `--collect-workers N` (default 5) splits `--concurrent-games` across N processes sharing the GPU. The main process keeps replay, streamed starts, regret state and training, and workers load its weights at every collect phase. On the 8 GB laptop, 2 workers × 32 games collected 24% faster than one process with 64 games; 4 × 16 saturated the GPU. `--cpu-threads` (default 1) stops idle OpenMP workers from spinning on every core. Both flags are execution-only and keep the resume config identity.
 
 Collection aborts on gameplay errors, preserving unfinished launch IDs for retry without labels. Workers have execution-only startup, progress and shutdown timeouts: `--worker-startup-timeout` (900 seconds), `--worker-progress-timeout` (300 seconds), and `--worker-shutdown-timeout` (5 seconds). Progress time excludes coordinator work such as waiting for streamed starts. Stalled workers are killed; Linux workers also die if their coordinator exits. Increase the progress timeout if first-use compilation or a large search cohort needs longer.
 
@@ -130,7 +160,7 @@ remains the production default pending longer training and strength validation.
 
 The old standalone Gumbel evaluation commands are retired. Select Gumbel explicitly on the common commands. Retired policies and inference optimization/dtype/compile switches are rejected; supervised-training controls remain separate.
 
-Stage-2 screens compare matched held-out prefixes with colors swapped. A run screens at the first phase boundary after `--screen-games` completed games (default 100,000, about 7 hours on the 5070 Ti; the count persists across resumes), or after `--screen-seconds` of wall time instead. A completed 500-game confirmation with paired 95% confidence above 50% is required for best-checkpoint promotion. Incomplete evaluations do not establish a score. Keep full-strength fixed-node Stockfish results separate from historical Elo-limited SF2400 results.
+Stage-2 screens compare matched held-out prefixes with colors swapped. A run screens at the first phase boundary after `--screen-games` completed games (default 100,000, about 6 hours at the recent pace; the count persists across resumes), or after `--screen-seconds` of wall time instead. A completed 500-game confirmation with paired 95% confidence above 50% is required for best-checkpoint promotion. Incomplete evaluations do not establish a score. Keep full-strength fixed-node Stockfish results separate from Elo-limited SF2400/SF2600 results.
 
 Track usable completed positions/hour, completion/discard rates, training positions/second, policy CE/entropy/KL, WDL CE/Brier, predicted versus observed draws, gradient norms, replay age/reuse, and paired strength scores. Lower training loss alone does not prove stronger chess.
 
@@ -147,6 +177,7 @@ The extended suite should run on decoder, attention or native-rule changes. Reta
 
 ## Status and retained history
 
+- [2026-10-23 self-play progress, results and debugging playbook](docs/SELF_PLAY_PROGRESS_2026-10-23.md)
 - [Self-play implementation, measurements and remaining gates](docs/SELF_PLAY_READINESS_REVIEW_2026-09-11.md)
 - [Current roadmap](PLAN.md)
 - [Configuration compatibility](docs/CONFIG_GUIDE.md)
